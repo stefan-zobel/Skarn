@@ -170,6 +170,22 @@ println("value=" + value)        // => value=42
 
 Bindings are **block scoped**: a name introduced inside a `{ ... }` block is not visible outside it.
 
+### Module constants — `const`
+
+For a value that never changes and lives at the top level of a module, use a `const`. Unlike a top-level
+`let` (which is private module-init state), a `const` is a real, exportable declaration — mark it `pub` and
+other modules can `use` it. Its value must be a single literal, and the type annotation is required:
+
+```rust
+const MAX_RETRIES: Int = 5
+const GREETING: String = "hello"
+
+fn attempts() -> Int { MAX_RETRIES * 2 }   // => 10
+```
+
+A `const` is **inlined** at each use site (it has no runtime storage), so referencing one is exactly as cheap
+as writing the literal. `std::math`'s `PI` and `E` are consts of this kind.
+
 ---
 
 ## 5. Operators
@@ -299,6 +315,29 @@ NaN, infinite, or out of `Int` range (import it with `use std::math::*`).
 use std::math::*
 println(toIntChecked(3.9))                  // => Ok(3)
 println(toIntChecked(1.0 / 0.0))            // => Err("toIntChecked: value out of Int range")
+```
+
+`std::math` also provides the usual numeric functions (all opt-in with `use std::math::*`). The `Double`
+functions follow IEEE semantics — a domain error yields `NaN` or `±∞` rather than trapping, and `isNaN` /
+`isInfinite` let you test for those:
+
+- **Powers / roots:** `sqrt`, `cbrt`, `pow(x, y)`, `hypot(x, y)`
+- **Exp / log:** `exp`, `ln` (natural log), `log2`, `log10`
+- **Trig:** `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2(y, x)`
+- **Sign / magnitude:** `abs` (`Double`), `absInt` (`Int`), `sign` (`Double`), `signInt` (`Int`)
+- **Integer:** `gcd(a, b)`, `lcm(a, b)`
+- **Scalar min/max/clamp** — generic over any ordered type (`Int`, `Double`, `String`), so they preserve the
+  type: `minOf(a, b)`, `maxOf(a, b)`, `clamp(x, lo, hi)`. (The bare `min`/`max` are the *iterator* terminals of
+  [§19](#19-iterators); scalar versions get the `-Of` suffix because Skarn has no overloading.)
+- **Constants:** `PI` and `E` (see the `const` note in [§4](#4-bindings-let-and-let-mut)).
+
+```rust
+use std::math::*
+println(sqrt(2.0))                           // => 1.4142135623730951
+println(gcd(12, 18))                         // => 6
+println(minOf(3, 7))                         // => 3   (Int in, Int out)
+println(clamp(15, 0, 10))                    // => 10
+println(PI)                                  // => 3.141592653589793
 ```
 
 To parse text into a number, use `parseInt` or `parseDouble`. These can fail, so they return a `Result`
@@ -917,6 +956,18 @@ println("arr[1]=" + arr[1])   // => arr[1]=20
 println("len="    + len(arr)) // => len=3
 ```
 
+Indexing is **bounds-checked**: `a[i]` aborts (a located panic) if `i` is out of range. When a miss should be
+handled instead of fatal, use `get(a, i)`, which returns an `Option[T]` (`None` for an out-of-range index):
+
+```rust
+let mut arr = array(3, 0)
+arr[0] = 10
+match get(arr, 9) {
+    Some(x) => println("got " + x),
+    None    => println("arr[9]=None")   // => arr[9]=None
+}
+```
+
 ### Growable vectors: `Vec[T]`
 
 `vec()` creates an empty, growable vector. `push(v, x)` appends and `pop(v)` removes the last element
@@ -930,6 +981,25 @@ push(v, 3)
 let last = pop(v)
 println("len="  + len(v))            // => len=2
 println("last=" + toString(last))    // => last=Some(3)
+```
+
+A vector also supports random access with `v[i]`, exactly like an array: reading is bounds-checked (aborts on
+an out-of-range index), and `get(v, i)` is the safe `Option` form. Assigning to an element (`v[i] = x`) needs a
+`mut` binding — note that `push`/`pop` mutate in place *without* `mut` (they go through a mutable parameter),
+but an index **assignment** is a mutation of the binding itself, so it requires `mut`:
+
+```rust
+let mut v: Vec[Int] = vec()
+push(v, 10)
+push(v, 20)
+push(v, 30)
+println("v[1]=" + v[1])              // => v[1]=20
+v[1] = 99
+println("v[1]=" + v[1])              // => v[1]=99
+match get(v, 5) {
+    Some(x) => println("got " + x),
+    None    => println("v[5]=None")  // => v[5]=None
+}
 ```
 
 ### Maps: `Map[K, V]`
@@ -996,6 +1066,20 @@ bytes. Bytes read and write as `Int` values in the range `0..255`. Convert with 
 let b = toBytes("Hi")
 println("b[0]=" + b[0])              // => b[0]=72
 println("back=" + fromBytes(b))      // => back=Hi
+```
+
+`bytes()` starts an empty buffer that you grow with `push`; `b[i]` reads a byte and `b[i] = n` writes one (a
+write masks the value with `& 0xFF`; like any index assignment it needs a `mut` binding). Indexing is
+bounds-checked (`b[i]` aborts on an out-of-range index; `get(b, i)` returns an `Option[Int]`). This is how you
+build a string from computed bytes:
+
+```rust
+let mut b = bytes()
+push(b, 72)                          // 'H'
+push(b, 105)                         // 'i'
+b[0] = 74                            // 'J'
+println("str=" + fromBytes(b))       // => str=Ji
+println("len=" + len(b))             // => len=2
 ```
 
 ---
@@ -1521,6 +1605,22 @@ let biggest = maxBy(range(1, 5), fn(a: Int, b: Int) -> Bool { a < b })
 println("maxBy=" + toString(biggest))   // => maxBy=Some(4)
 ```
 
+To order a whole collection, `sorted(v)` returns a **new**, sorted `Vec` (leaving `v` untouched), `sort(v)`
+sorts a `mut` vector **in place**, and `sortBy(v, less)` orders by a custom comparator. All three are a
+**stable** merge sort; `sorted`/`sort` use `Ord` (numbers and strings), so they work on any ordered element:
+
+```rust
+let names = sorted(toVec(["cherry", "apple", "banana"]))
+println(toString(names))                          // => ["apple", "banana", "cherry"]
+
+let byLen = sortBy(toVec(["ccc", "a", "bb"]), fn(a: String, b: String) -> Bool { len(a) < len(b) })
+println(toString(byLen))                          // => ["a", "bb", "ccc"]
+
+let mut ns = toVec([3, 1, 2])
+sort(ns)                                          // sorts ns in place
+println(toString(ns))                             // => [1, 2, 3]
+```
+
 `enumerate` and `zip` yield tuples, which pair beautifully with a destructuring `for`:
 
 ```rust
@@ -1716,8 +1816,8 @@ The prelude is organized into `std` modules. The **ring** modules are auto-impor
 names are available **unqualified** with no `use`:
 
 - `std::core` — `Option`, `Result`, `Some`/`None`/`Ok`/`Err`, and their combinators.
-- `std::iter` — the `Iterator`/`IntoIterator`/`Iterable` traits, `Ord`, and all the stream sources, stages,
-  and terminals from [§19](#19-iterators).
+- `std::iter` — the `Iterator`/`IntoIterator`/`Iterable` traits, `Ord`, all the stream sources, stages,
+  and terminals from [§19](#19-iterators), and the `Vec` sorts `sort`/`sorted`/`sortBy`.
 - `std::string` — string helpers: `slice`/`charStr`/`charAt`/`isEmpty`, search (`indexOf`/`lastIndexOf`/
   `startsWith`/`endsWith`/`hasSubstr`), `trim`/`trimStart`/`trimEnd`, `toUpper`/`toLower`,
   `replace`/`padStart`/`padEnd`/`repeatStr`, and the `isAscii…` classification family + `hasControl`.
@@ -1727,8 +1827,10 @@ The **opt-in** modules must be brought in with a `use` before their functions re
 - `std::io` — `readFile`, `writeFile`, `appendFile`, `readTextFile`, `writeTextFile`, `appendTextFile`, `deleteFile`, `rename`, `copyFile`, `mkdir`, `listDir`, `fileExists`, `isFile`, `isDir`, `fileSize`, `readLine`, `readAllStdin`.
 - `std::env` — `getEnv`, `args`, `nanoTime`, `millisTime`.
 - `std::process` — `run`, `runWith`, `runText`, `sh`.
-- `std::math` — `toIntChecked` (the fallible `Double → Int`). The rounding builtins `floor`/`ceil`/`trunc`/
-  `round`/`roundHalfToEven` and `toInt` are always-available and need no `use`.
+- `std::math` — numeric functions: `sqrt`/`cbrt`/`pow`/`hypot`, `exp`/`ln`/`log2`/`log10`, the trig family
+  (`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`), `abs`/`absInt`/`sign`/`signInt`, `gcd`/`lcm`, the generic
+  `minOf`/`maxOf`/`clamp`, `isNaN`/`isInfinite`, the constants `PI`/`E`, and the fallible `toIntChecked`. (The
+  rounding builtins `floor`/`ceil`/`trunc`/`round`/`roundHalfToEven` and `toInt` are always-available — no `use`.)
 
 Any prelude name can also be reached explicitly as `std::name` (useful when a local definition shadows it).
 
@@ -2065,6 +2167,19 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `parseDouble(s)` | `String` → `Result[Double, String]` |
 | `toIntChecked(d)` *(`std::math`)* | `Double` → `Result[Int, String]` (`Err` on NaN / ∞ / overflow) |
 
+**Math** *(all `std::math` — `use std::math::*`)*
+
+| Function | Purpose |
+|----------|---------|
+| `sqrt` / `cbrt` / `pow(x,y)` / `hypot(x,y)` | roots and powers |
+| `exp` / `ln` / `log2` / `log10` | exponential and logarithms (`ln` = natural log) |
+| `sin` / `cos` / `tan` / `asin` / `acos` / `atan` / `atan2(y,x)` | trigonometry |
+| `abs` / `absInt` / `sign` / `signInt` | magnitude and sign (`Double` and `Int` forms) |
+| `gcd(a,b)` / `lcm(a,b)` | integer gcd / lcm |
+| `minOf(a,b)` / `maxOf(a,b)` / `clamp(x,lo,hi)` | scalar min/max/clamp, generic over any ordered type |
+| `isNaN(x)` / `isInfinite(x)` | IEEE predicates |
+| `PI` / `E` | constants |
+
 **Strings and bytes**
 
 | Function | Purpose |
@@ -2092,7 +2207,10 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 |----------|---------|
 | `array(n, init)` / `vec()` / `bytes()` | create an `Array` / `Vec` / `Bytes` |
 | `push(c, x)` / `pop(c)` | append to / remove the last element of a `Vec` or `Bytes` (`pop` returns `Option`) |
+| `c[i]` / `c[i] = x` | read / write an element of an `Array`, `Vec`, or `Bytes` by index (bounds-checked — aborts on out-of-range; assignment needs a `mut` binding) |
 | `len(c)` | number of elements |
+| `get(c, i)` | safe indexed read of an `Array` / `Vec` / `Bytes` — `Option` (`None` if out of range) |
+| `m[k]` / `m[k] = v` | read (aborts if the key is missing) / insert-or-update a `Map` entry (assignment needs a `mut` binding) |
 | `has(m, k)` / `get(m, k)` | map membership test / safe lookup (`Option`) |
 | `delete(m, k)` | remove a map entry |
 | `keys(m)` / `values(m)` | snapshot a map's keys / values |
@@ -2142,6 +2260,14 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `any` / `all` / `find` / `position` / `contains` | search predicates |
 | `min` / `max` / `minBy` / `maxBy` | extremes |
 | `partition` / `unzip` / `join` / `toMap` | split by predicate / split pairs / join strings / build a map |
+
+**Sorting a `Vec`** *(`std::iter`)*
+
+| Function | Purpose |
+|----------|---------|
+| `sorted(v)` | new sorted `Vec` (`Ord`; non-mutating), stable |
+| `sort(v)` | sort a `mut` `Vec` in place (`Ord`), stable |
+| `sortBy(v, less)` | new `Vec` sorted by a `fn(T,T) -> Bool` comparator, stable |
 
 **Input / output natives** (opt-in — `use std::env::*` / `std::io` / `std::process`; see [§20](#20-modules))
 

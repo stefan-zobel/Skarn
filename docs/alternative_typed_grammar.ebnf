@@ -29,8 +29,12 @@
 program      = { terminator } , { item , { terminator } } ;
 (* `pub` (visibility) may precede only an exported item: fn / struct / enum / trait. Default is    *)
 (* module-private; `pub` exports the item cross-module (fields + enum variants inherit).           *)
-item         = [ "pub" ] , ( fn_item | struct_item | enum_item | trait_item )
+item         = [ "pub" ] , ( fn_item | struct_item | enum_item | trait_item | const_item )
              | impl_item | import_item | use_item | statement ;
+
+(* A compile-time module constant, inlined at each use site. The initializer is restricted to a
+   single literal (an optional leading '-' on a number is folded in); the type is mandatory. *)
+const_item   = "const" , ( lident | uident ) , ":" , type , "=" , [ "-" ] , literal ;
 
 (* -- modules (whole-program v1; one `.skn` file = one module) ----------------- *)
 (* `import` loads a module (runs its top-level init + makes `mod::name` reachable);*)
