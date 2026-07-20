@@ -363,7 +363,8 @@ A `String` is a sequence of bytes. If your source file is UTF-8, string literals
 text round-trips faithfully — but the language treats a string as bytes, not as Unicode code points. In
 particular, `len` returns the number of **bytes**.
 
-String literals support the escapes `\n \t \r \\ \" \' \0`.
+String literals support the escapes `\n \t \r \\ \" \' \0` and `\$` for escaping a literal `${` (the string
+interpolation symbol).
 
 ```rust
 let greeting = "Hello" + ", " + "world"
@@ -377,6 +378,24 @@ let oneChar = charStr(66)                // build a one-byte String from a byte 
 println("oneChar=" + oneChar)            // => oneChar=B
 
 println("less=" + ("apple" < "banana"))  // => less=true
+```
+
+Because a string is a sequence of bytes, `for c in s` iterates its **bytes** — each `c` is an `Int` in the
+range `0..255`, exactly like a char literal (`'A'` is the byte `65`). This is the natural fit for ASCII
+scanning; it does **not** decode UTF-8 into code points (that is a separate, future capability).
+
+```rust
+let mut sum = 0
+for c in "abc" {                         // c: Int -- the byte value of each character
+    sum = sum + c
+}
+println("sum=" + sum)                    // => sum=294   (97 + 98 + 99)
+
+let mut vowels = 0
+for c in "banana" {
+    if c == 'a' { vowels = vowels + 1 }  // compare the byte to a char literal
+}
+println("a-count=" + vowels)             // => a-count=3
 ```
 
 Any value can be turned into text with `toString`. Primitives render as you would expect, and compound values
@@ -404,6 +423,51 @@ println(toString(m))                     // => #{"k" => 9}
 
 Recall that when you concatenate with `+`, a *scalar* (number or `Bool`) is stringified automatically, but a
 compound value is not — so `"pt=" + toString(p)` works while `"pt=" + p` does not.
+
+### String interpolation
+
+Any string literal may embed expressions with `${ … }`. Each hole is stringified (exactly as `toString`) and
+spliced into the surrounding text:
+
+```rust
+let name = "Ada"
+let n    = 42
+println("hello ${name}, n=${n}")         // => hello Ada, n=42
+println("sum = ${n + n}")                // => sum = 84
+```
+
+A hole may hold **any** type — including compound values, which is where interpolation is more convenient than
+`+` (recall `"pt=" + p` is a type error, but the hole below is fine):
+
+```rust
+struct Pt { x: Int, y: Int }
+let p = Pt { x: 1, y: 2 }
+println("p = ${p}")                      // => p = Pt { x: 1, y: 2 }
+println("some = ${Some(7)}")             // => some = Some(7)
+```
+
+Interpolations **nest** — a hole can contain another interpolated string:
+
+```rust
+let x = 5
+println("outer ${ "inner ${x}" } done")  // => outer inner 5 done
+```
+
+Only the exact sequence `${` starts a hole. A lone `$` is a literal dollar sign (no escaping needed); to write
+a literal `${`, escape the dollar with `\$`:
+
+```rust
+println("price: $5")                     // => price: $5
+println("literal \${x}")                 // => literal ${x}
+```
+
+Interpolation is pure syntactic sugar: `"a=${x}, b=${y}"` is exactly `"a=" + toString(x) + ", b=" +
+toString(y)`, so it behaves identically to writing that chain by hand.
+
+> **Not yet supported (reserved for a future version):** format specifiers such as `${x:.2f}` (width /
+> precision / base). For now a hole always renders at `toString` quality. A `StringBuilder` helper for
+> assembling large strings efficiently in a loop is also planned as a separate `std::string` addition; until
+> then, build big strings via a `Bytes` buffer (`bytes()` → `push` → `fromBytes`, shown below).
 
 You can move between a `String` and its raw bytes with `toBytes` and `fromBytes`. This is how you build a
 string from computed bytes (there is no character type to append):
@@ -679,6 +743,31 @@ fn adder(by: Int) -> fn(Int) -> Int {
 let add10 = adder(10)
 println("closure=" + add10(5))   // => closure=15
 ```
+
+### Type inference for lambdas
+
+A lambda's parameter and return types are **inferred from context** whenever the surrounding code already fixes
+which function type is expected — most commonly a call argument (`map`, `filter`, `fold`, …) or a `let` with an
+explicit function type. In those positions you can drop every annotation:
+
+```rust
+let evens = collect(filter(range(0, 10), fn(x) { x % 2 == 0 }))  // x: Int, -> Bool  (from filter)
+println(toString(evens))                                        // => [0, 2, 4, 6, 8]
+
+let f: fn(Int) -> Int = fn(x) { x + 1 }                         // x: Int, -> Int   (from the let type)
+println("f=" + f(41))                                           // => f=42
+```
+
+The one place you must annotate is a lambda with **no** expected type — such as a bare `let` binding, where
+there is nothing to infer from:
+
+```rust
+let inc = fn(x: Int) -> Int { x + 1 }   // annotations required -- nothing here fixes x's type
+```
+
+Omitting them there is a compile error (`cannot infer the type of lambda parameter 'x'`). This is the same
+annotate-at-the-boundary discipline Skarn uses throughout: types are inferred locally, but never guessed across a
+definition boundary.
 
 Function values combine naturally with the pipe operator and with the iterator combinators in
 [§19](#19-iterators).
@@ -1547,14 +1636,17 @@ source, then each stage, then a terminal — instead of inside-out:
 ```rust
 let s =
     range(0, 10)
-    |> filter(fn(x: Int) -> Bool { x % 2 == 0 })
-    |> map(fn(x: Int) -> Int { x * x })
+    |> filter(fn(x) { x % 2 == 0 })
+    |> map(fn(x) { x * x })
     |> sum
 println("pipeline=" + s)   // => pipeline=120   (0 + 4 + 16 + 36 + 64)
 ```
 
-That is the same computation as the nested `sum(map(filter(range(0, 10), ...), ...))`, just easier to read. The
-rest of this section uses `|>` wherever a value flows through a chain.
+The lambdas here carry no type annotations — `filter` and `map` fix the parameter and result types, so they are
+inferred (see [§10](#10-closures-and-function-values)). That is the same computation as the nested
+`sum(map(filter(range(0, 10), ...), ...))`, just easier to read. The rest of this section uses `|>` wherever a
+value flows through a chain, and spells out the lambda types where it helps document what each combinator expects
+— but you can drop them anywhere the combinator's signature already fixes the type.
 
 ### Terminals: producing a result
 
@@ -1831,6 +1923,10 @@ The **opt-in** modules must be brought in with a `use` before their functions re
   (`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`), `abs`/`absInt`/`sign`/`signInt`, `gcd`/`lcm`, the generic
   `minOf`/`maxOf`/`clamp`, `isNaN`/`isInfinite`, the constants `PI`/`E`, and the fallible `toIntChecked`. (The
   rounding builtins `floor`/`ceil`/`trunc`/`round`/`roundHalfToEven` and `toInt` are always-available — no `use`.)
+- `std::bytes` — a little-endian binary reader/writer over `Bytes`: the writers `writeU8`/`writeU16LE`/`writeU32LE`/
+  `writeI32LE`/`writeVarU`/`writeBytes` (each returns the buffer, so they chain with `|>`), and a `reader(b)` cursor
+  (`ByteReader`) with `readU8`/`readU16LE`/`readU32LE`/`readI32LE`/`readVarU`/`readBytes(n)` (each returns
+  `Result[…, String]` — an underrun is `Err`, never a trap), plus `remaining`/`atEnd`.
 
 Any prelude name can also be reached explicitly as `std::name` (useful when a local definition shadows it).
 
@@ -2179,6 +2275,20 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `minOf(a,b)` / `maxOf(a,b)` / `clamp(x,lo,hi)` | scalar min/max/clamp, generic over any ordered type |
 | `isNaN(x)` / `isInfinite(x)` | IEEE predicates |
 | `PI` / `E` | constants |
+
+**Binary I/O** *(all `std::bytes` — `use std::bytes::*`; little-endian)*
+
+| Function | Purpose |
+|----------|---------|
+| `writeU8(b,v)` / `writeU16LE(b,v)` / `writeU32LE(b,v)` | append an unsigned 1/2/4-byte value (masking); returns `b` |
+| `writeI32LE(b,v)` | append a signed 4-byte value (two's complement); returns `b` |
+| `writeVarU(b,v)` | append `v ≥ 0` as unsigned LEB128 (1–7 bytes); returns `b` |
+| `writeBytes(b,src)` | append the raw bytes of `src`; returns `b` |
+| `reader(b)` | a `ByteReader` cursor over `b` (`pos` starts at 0) |
+| `readU8(r)` / `readU16LE(r)` / `readU32LE(r)` / `readI32LE(r)` | read a 1/2/4-byte value → `Result[Int, String]` (`Err` on underrun) |
+| `readVarU(r)` | read an unsigned LEB128 → `Result[Int, String]` |
+| `readBytes(r,n)` | read `n` raw bytes → `Result[Bytes, String]` |
+| `remaining(r)` / `atEnd(r)` | bytes left to read / whether the cursor is at the end |
 
 **Strings and bytes**
 

@@ -2,7 +2,7 @@
 (* Skarn -- EBNF grammar. SOUND static type discipline; types checked at       *)
 (* compile time and ERASED at runtime (like Gleam / OCaml / Rust).             *)
 (*                                                                             *)
-(* LEXICAL CASE RULE (new): identifiers split into two token classes by their  *)
+(* LEXICAL CASE RULE: identifiers split into two token classes by their        *)
 (* first character. This removes the bare-constructor-vs-binding ambiguity     *)
 (* (e.g. `None`) at the LEXER, so the parser never consults the namespace.     *)
 (*   uident : starts A..Z  -> types, type variables, structs, enums,           *)
@@ -11,15 +11,15 @@
 (*            fields. (A lone `_` lexes as the wildcard, not an lident.)       *)
 (* Type variables are UPPERCASE (Rust-style: `[T, E]`), NOT Haskell-style.     *)
 (*                                                                             *)
-(* Other changes vs. the previous grammar:                                     *)
+(* Notable design points:                                                      *)
 (*   - Index syntax unified: only `a[i]` (total, bounds-checked) remains.      *)
-(*     The map sigil `m.[k]` is GONE; map lookup is a normal fallible call     *)
+(*     map lookup is a normal fallible call                                    *)
 (*     `get(m, k) -> Option[V]` (pipe-friendly: `m |> get(k)`). `.` now means  *)
 (*     field access only.                                                      *)
 (*   - Aggregate literals follow "literal for the common, constructor for the  *)
 (*     rest": `[...]` sequence literal and `#{...}` map literal stay in the    *)
-(*     grammar; ARRAY and VECTOR drop their sigils (`#[...]`, `#v[...]`) and   *)
-(*     become ordinary calls `array([...])` / `vec([...])` -- NO grammar rule  *)
+(*     grammar; ARRAY and VECTOR become ordinary calls                         *)
+(*     `array([...])` / `vec([...])` -- NO grammar rule                        *)
 (*     (just an lident path + call_suffix on a `[...]` literal).               *)
 (*   - `#{` for maps is kept ON PURPOSE: in expression position a bare `{`     *)
 (*     opens a block, so the map literal needs a disambiguating prefix (LL(1); *)
@@ -27,8 +27,8 @@
 (* =========================================================================== *)
 
 program      = { terminator } , { item , { terminator } } ;
-(* `pub` (visibility) may precede only an exported item: fn / struct / enum / trait. Default is    *)
-(* module-private; `pub` exports the item cross-module (fields + enum variants inherit).           *)
+(* `pub` (visibility) may precede only an exported item: fn / struct / enum / trait / const.       *)
+(* Default is module-private; `pub` exports it cross-module (fields + enum variants inherit).      *)
 item         = [ "pub" ] , ( fn_item | struct_item | enum_item | trait_item | const_item )
              | impl_item | import_item | use_item | statement ;
 
@@ -36,7 +36,7 @@ item         = [ "pub" ] , ( fn_item | struct_item | enum_item | trait_item | co
    single literal (an optional leading '-' on a number is folded in); the type is mandatory. *)
 const_item   = "const" , ( lident | uident ) , ":" , type , "=" , [ "-" ] , literal ;
 
-(* -- modules (whole-program v1; one `.skn` file = one module) ----------------- *)
+(* -- modules (whole-program v1; one `.skn` file = one module) ------------------- *)
 (* `import` loads a module (runs its top-level init + makes `mod::name` reachable);*)
 (* `use` additionally binds names UNQUALIFIED (a single name, a `{ list }`, or a   *)
 (* `*` WEAK glob -- a glob is silently overridden by a local def or an explicit    *)
@@ -52,7 +52,7 @@ const_item   = "const" , ( lident | uident ) , ":" , type , "=" , [ "-" ] , lite
 (* re-export in v1.                                                                *)
 import_item  = "import" , lident , { "::" , lident } ;
 use_item     = "use" , lident , "::" , use_rest ;
-use_rest     = ident                                        (* single: the imported name *)
+use_rest     = ident                                         (* single: the imported name *)
              | lident , "::" , use_rest                      (* a further module segment  *)
              | "{" , ident , { "," , ident } , [ "," ] , "}" (* name list *)
              | "*" ;                                         (* glob (weak shadowing) *)
@@ -64,7 +64,7 @@ bound          = named_bound , { "+" , named_bound } ; (* e.g. Display + Clone *
 named_bound    = uident , [ "[" , type , { "," , type } , "]" ] ; (* Iterable[T] *)
 
 (* -- definitions -- *)
-(* fn name is lident; params mandatorily typed; return type mandatory.        *)
+(* fn name is lident; params mandatorily typed; return type mandatory.         *)
 (* (Relax return to Gleam-style inference by using `[ "->" , type ]`.)         *)
 fn_item      = "fn" , lident , [ generic_params ] ,
                "(" , [ param_list ] , ")" , "->" , type , block ;
@@ -75,7 +75,7 @@ struct_item  = "struct" , uident , [ generic_params ] ,
                | (* nothing -- nullary tuple struct *) ) ;
 
 param_list   = param , { "," , param } , [ "," ] ;
-(* A leading `mut` permits in-place mutation of the binding; the checker         *)
+(* A leading `mut` permits in-place mutation of the binding; the checker          *)
 (* restricts it to AGGREGATE types (structs / tuples / Array / Vec / Bytes / Map) *)
 (* -- a scalar / enum / List / fn `mut` param is a checker error. It is a         *)
 (* binding-local qualifier, NOT part of the fn/method type or signature.          *)
@@ -83,7 +83,7 @@ param        = [ "mut" ] , lident , ":" , type ;
 
 field_defs   = { terminator } , { field_def , [ "," ] , { terminator } } ;
 field_def    = lident , ":" , type ;
-(* Tuple-struct fields are POSITIONAL types (like enum tuple variants); the      *)
+(* Tuple-struct fields are POSITIONAL types (like enum tuple variants); the       *)
 (* compiler synthesizes field names _0, _1, ...  A `(...)`-form struct differs    *)
 (* from a `{...}` record struct only in print style (Name(...) vs Name{...}).     *)
 tuple_fields = type , { "," , type } , [ "," ] ;
@@ -96,8 +96,8 @@ enum_item    = "enum" , uident , [ generic_params ] ,
 enum_variant = uident , [ "(" , type , { "," , type } , [ "," ] , ")"
                         | "{" , field_defs , "}" ] ;
 
-(* -- traits / protocols (dynamic single-dispatch on arg 0 `self`; call is a *)
-(* plain function / pipe, never method-dot). Trait + supertrait names UPPER.  *)
+(* -- traits / protocols (dynamic single-dispatch on arg 0 `self`; call is a   *)
+(* plain function / pipe, never method-dot). Trait + supertrait names UPPER.   *)
 (* A trait may be PARAMETRIC: `trait Iterable[T] { fn iter(self) -> Vec[T] }`, *)
 (* the type params appear in method signatures and are solved as OUTPUTS from  *)
 (* the matching impl at a bound's use site (functional-dependency rule).       *)
@@ -111,9 +111,9 @@ impl_item    = "impl" , [ generic_params ] , uident ,
                [ "[" , type , { "," , type } , "]" ] , "for" , named_type ,
                "{" , { terminator } , { method , { terminator } } , "}" ;
 
-(* method name is lident; params mandatorily typed EXCEPT a leading bare      *)
-(* `self` (its type is the impl/trait receiver `Self`, resolved by checker).  *)
-(* A required trait method omits the block; a default or impl method has one. *)
+(* method name is lident; params mandatorily typed EXCEPT a leading bare       *)
+(* `self` (its type is the impl/trait receiver `Self`, resolved by checker).   *)
+(* A required trait method omits the block; a default or impl method has one.  *)
 (* `mut self` permits in-place mutation of the receiver (checker-gated to an   *)
 (* aggregate `Self`; binding-local, not part of the signature -- an impl may   *)
 (* add or omit it independently of the trait declaration).                     *)
@@ -144,7 +144,7 @@ shift        = additive , { ( "<<" | ">>" | ">>>" ) , additive } ;
 additive     = multiplicative , { ( "+" | "-" ) , multiplicative } ;
 multiplicative = unary , { ( "*" | "/" | "%" ) , unary } ;
 unary        = ( "-" | "!" | "~" ) , unary | postfix ;
-(* CHANGED: map_index_suffix removed -- only one index form remains.          *)
+(* Only one index form (a[i]); no separate map-index suffix.                  *)
 postfix      = primary , { call_suffix | index_suffix | field_suffix | try_suffix } ;
 call_suffix  = "(" , [ arg_list ] , ")" ;
 index_suffix = "[" , expr , "]" ;                (* a[i] -- bounds-checked, total-ish *)
@@ -154,10 +154,10 @@ field_suffix = "." , ( lident | int ) ;   (* `.name` struct field | `.N` tuple i
 try_suffix   = "?" ;
 arg_list     = expr , { "," , expr } , [ "," ] ;
 
-(* CHANGED: array/vector literals dropped. `array([...])` and `vec([...])`     *)
-(* are ordinary calls (an lident path + call_suffix on a `[...]` literal),     *)
-(* so they need no primary form.                                              *)
+(* array/vector literals are ordinary calls (an lident path + call_suffix on a *)
+(* `[...]` literal), so they need no primary form.                             *)
 primary      = literal
+             | interp_string
              | path
              | struct_lit
              | "(" , [ expr , { "," , expr } , [ "," ] ] , ")"   (* group / tuple / `()` = unit *)
@@ -168,7 +168,7 @@ primary      = literal
 
 literal      = int | double | string | char_lit | atom | "true" | "false" ;
 
-(* Value path: lident = variable / function; uident = a nullary constructor   *)
+(* Value path: lident = variable / function; uident = a nullary constructor    *)
 (* or a constructor used as a value/function (applied via call_suffix, e.g.    *)
 (* `Some(x)`); `Trait::method` = qualified trait-method call / pipe target.    *)
 (* A module qualifier (`mod::name` fn/value, `mod::Ctor` constructor, or the   *)
@@ -177,17 +177,17 @@ literal      = int | double | string | char_lit | atom | "true" | "false" ;
 path         = lident , [ "::" , ident ]
              | uident , [ "::" , lident ] ;
 
-(* A bare `Name { ... }` is NOT a struct literal in an if/match/while header   *)
-(* (the `{` opens the block); parenthesize to force the struct literal there.  *)
+(* A bare `Name { ... }` is NOT a struct literal in an if/match/while header    *)
+(* (the `{` opens the block); parenthesize to force the struct literal there.   *)
 (* An optional module qualifier (`mod::Point { .. }` / `std::..`) constructs a  *)
-(* foreign struct inline without a `use`.                                      *)
+(* foreign struct inline without a `use`.                                       *)
 struct_lit   = [ lident , "::" ] , uident , "{" , { terminator } ,
                { field_init , [ "," ] , { terminator } } , "}" ;
 field_init   = lident , [ ":" , expr ] ;         (* shorthand: `{ x }` = `{ x: x }` *)
 
 block        = "{" , { terminator } , { statement , { terminator } } , "}" ;
 if_expr      = "if" , ( header_expr | if_let_head ) , block , [ "else" , ( if_expr | block ) ] ;
-(* `if let PAT = E { … } else { … }` -- refutable single-pattern conditional binding; the parser  *)
+(* `if let PAT = E { … } else { … }` -- refutable single-pattern conditional binding; the parser   *)
 (* DESUGARS it to a 2-arm `match E { PAT => then, _ => (else | ()) }` (the `_` arm makes it        *)
 (* exhaustive; PAT's bindings scope to `then`). An IRREFUTABLE PAT is rejected (use a plain `let`).*)
 if_let_head  = "let" , pattern , "=" , header_expr ;
@@ -245,7 +245,7 @@ map_pat_entry = expr , "=>" , pattern ;
 
 (* -- types; type names + type variables are UPPERCASE (uident) -- *)
 type         = named_type | fn_type | tuple_type | dyn_type ;
-(* `List[T]`; a bare uident is a declared type or an in-scope type variable    *)
+(* `List[T]`; a bare uident is a declared type or an in-scope type variable     *)
 (* (the checker resolves which). `()` via tuple_type = unit type. An optional   *)
 (* module qualifier annotates a foreign type inline (`mod::Point`, `std::..`).  *)
 named_type   = [ lident , "::" ] , uident , [ "[" , [ type , { "," , type } ] , "]" ] ;
@@ -268,7 +268,13 @@ ident        = lident | uident ;                 (* case-agnostic union; used on
 int          = digit , { digit } ;
 double       = digit , { digit } , ( ( "." , digit , { digit } , [ exponent ] ) | exponent ) ;  (* 64-bit `Double`, no `Float`; an exponent alone (1e6) makes it a Double *)
 exponent     = ( "e" | "E" ) , [ "+" | "-" ] , digit , { digit } ;
-string       = '"' , { char } , '"' ;
+string       = '"' , { char } , '"' ;             (* a plain string literal (no `${` hole) *)
+(* String interpolation: a `"..."` containing one or more `${ expr }` holes. A pure lexer/parser   *)
+(* DESUGAR to `text0 + toString(e0) + text1 + ... ` (empty text pieces dropped), so it inherits    *)
+(* `toString` (any-type holes) and `+` (String concat) with no new AST/checker/codegen. Holes      *)
+(* nest (an `expr` may be another interp_string). `$` is literal unless immediately before `{`; a  *)
+(* literal `${` is written `\$` + `{`. Rejected in pattern / const-initializer position.           *)
+interp_string = '"' , text , { "${" , expr , "}" , text } , '"' ;   (* >= 1 hole *)
 char_lit     = "'" , ( char_no_squote_no_bslash | escape ) , "'" ;
              (* a single BYTE 0..255, typed Int (there is NO scalar Char type);      *)
              (* escapes \n \t \r \\ \0 \' \"; a multi-byte literal (e.g. 'é' = 2     *)
