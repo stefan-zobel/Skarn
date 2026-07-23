@@ -221,7 +221,7 @@
     "prelude-types": {
       "comment": "Prelude / std types, enums and constants.",
       "name": "support.type.prelude.skarn",
-      "match": "\\b(ByteReader|E|Err|GcStats|IntoIterator|Iterable|Iterator|Json|JsonEntry|None|Ok|Option|Ord|PI|ProcessOutput|ProcessText|Result|Some|StringBuilder|Unwrap)\\b"
+      "match": "\\b(ByteReader|E|Err|GcStats|Hashable|IntoIterator|Iterable|Iterator|Json|JsonEntry|None|Ok|Option|Ord|PI|ProcessOutput|ProcessText|Result|Some|StringBuilder|Unwrap)\\b"
     },
 
     "builtin-functions": {

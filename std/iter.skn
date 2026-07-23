@@ -241,7 +241,7 @@ fn _joinGo(s: dyn Iterator[String], sb: StringBuilder, sep: String) -> StringBui
 pub fn join(s: dyn Iterator[String], sep: String) -> String { match next(s) { Some(first) => build(_joinGo(s, append(stringBuilder(), first), sep)), None => "" } }
 // toMap: collect (K, V) pairs into a Map (later pairs overwrite earlier on a duplicate key).
 fn _toMapGo[K, V](mut m: Map[K, V], s: dyn Iterator[(K, V)]) -> Map[K, V] { match next(s) { Some(kv) => { let (k, v) = kv  m[k] = v  _toMapGo(m, s) }, None => m } }
-pub fn toMap[K, V](s: dyn Iterator[(K, V)]) -> Map[K, V] { let m: Map[K, V] = #{}  _toMapGo(m, s) }
+pub fn toMap[K: Hashable, V](s: dyn Iterator[(K, V)]) -> Map[K, V] { let m: Map[K, V] = #{}  _toMapGo(m, s) }
 // Sorting -- a STABLE top-down merge sort over a Vec. `sortBy` takes a less-than comparator; `sorted`
 // uses Ord; `sort` mutates the vec in place. All return a Vec (`sort` returns the mutated vec, for chaining).
 fn _sortMerge[T](a: Vec[T], b: Vec[T], lt: fn(T, T) -> Bool) -> Vec[T] {

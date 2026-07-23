@@ -1,7 +1,7 @@
 // Dates and times: strict UTC, millisecond precision. Pure Skarn (no VM change, no new native) -- the
 // calendar math is Howard Hinnant's civil<->days algorithm (proleptic Gregorian, exact 48-bit integer),
 // so the whole module is deterministic and differential-testable. The ONLY impure surface is `now()` and
-// the `Stopwatch` (they read the wall-clock / monotonic natives), so they are excluded from the oracle.
+// the `Stopwatch` (they read the wall-clock / monotonic natives).
 //
 // REPRESENTATION: the canonical instant is epoch MILLISECONDS as an Int. That fits the 48-bit signed Int
 // over roughly year -2490 .. 6429 (the +/-2^47 ms window around 1970); dates outside that range cannot be

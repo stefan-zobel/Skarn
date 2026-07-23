@@ -1,6 +1,6 @@
 // Process spawn (over the rawRun native). ProcessOutput holds raw Bytes; ProcessText is the
 // UTF-8-decoded view. run/runWith take a List literal and convert it to the Vec the native wants;
-// runText decodes and keeps the exit code; sh wraps cmd.exe (Windows-only project). OPT-IN: reach
+// runText decodes and keeps the exit code; sh wraps cmd.exe (Windows-only!). OPT-IN: reach
 // these (and the rawRun native they wrap) via `use std::process::*`. Same-module code (these very
 // wrappers) may use rawRun freely (the native's home module is std::process).
 pub struct ProcessOutput { stdout: Bytes, stderr: Bytes, exitCode: Int }

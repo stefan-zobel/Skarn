@@ -2,23 +2,25 @@
 // verbs delegate to the Map builtins applied to the `.m` field (`has`/`delete`/`len`/`keys`), which take a
 // Map -- so there is no name clash with those builtins or with the Iterator `contains`/`count` terminals.
 //
-// The element type T must be a permitted Map key -- Int / Double / Bool / String / Atom. A Set of a struct /
-// tuple / other heap type COMPILES but TRAPS at runtime, exactly as a Map with such keys does (there is no
-// `Hashable` bound yet). T is monomorphic, so Map's int-vs-double SameValueZero hazard cannot arise --
-// `Set[Int]` / `Set[String]` are fully sound. Iteration is HASH-ORDER (unspecified), like Map.
+// The element type T must be `Hashable` -- a permitted Map key: Int / Double / Bool / String / Atom.
+// The `T: Hashable` bound makes `Set[SomeStruct]` a COMPILE error (it would build a `Map[SomeStruct, Bool]`,
+// which the checker now rejects at construction) rather than a runtime "Invalid map key type" trap. Only the
+// CONSTRUCTING verbs carry the bound; pass-through/read verbs (`insert`/`remove`/`isMember`/`size`/`isSubset`/
+// `isDisjoint`/`intoIter`) leave T unbounded -- you cannot obtain a `Set[T]` value without constructing one.
+// T is monomorphic, so Map's int-vs-double SameValueZero hazard cannot arise. Iteration is HASH-ORDER, like Map.
 //
 // OPT-IN: reach these via `use std::set::*` (or a qualified std::set::name). Tree-shaken.
 
-pub struct Set[T] { m: Map[T, Bool] }
+pub struct Set[T: Hashable] { m: Map[T, Bool] }
 
 // An empty set.
-pub fn set[T]() -> Set[T] {
+pub fn set[T: Hashable]() -> Set[T] {
   let m0: Map[T, Bool] = #{}
   Set { m: m0 }
 }
 
 // A set holding the distinct elements of `v`.
-pub fn setOf[T](v: Vec[T]) -> Set[T] {
+pub fn setOf[T: Hashable](v: Vec[T]) -> Set[T] {
   let mut s: Set[T] = set()
   for x in v { insert(s, x) }
   s
@@ -42,20 +44,20 @@ pub fn remove[T](mut s: Set[T], x: T) -> Bool { delete(s.m, x) }
 
 // --- algebra (non-mutating; each returns a fresh set) ---
 
-pub fn union[T](a: Set[T], b: Set[T]) -> Set[T] {
+pub fn union[T: Hashable](a: Set[T], b: Set[T]) -> Set[T] {
   let mut r: Set[T] = set()
   for x in keys(a.m) { insert(r, x) }
   for x in keys(b.m) { insert(r, x) }
   r
 }
 
-pub fn intersect[T](a: Set[T], b: Set[T]) -> Set[T] {
+pub fn intersect[T: Hashable](a: Set[T], b: Set[T]) -> Set[T] {
   let mut r: Set[T] = set()
   for x in keys(a.m) { if isMember(b, x) { insert(r, x) } }
   r
 }
 
-pub fn difference[T](a: Set[T], b: Set[T]) -> Set[T] {
+pub fn difference[T: Hashable](a: Set[T], b: Set[T]) -> Set[T] {
   let mut r: Set[T] = set()
   for x in keys(a.m) { if !isMember(b, x) { insert(r, x) } }
   r

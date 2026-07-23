@@ -7,13 +7,7 @@
 // SIGNED integers get a compact zigzag varint (writeVarI/readVarI); a String is length-prefixed
 // (writeStr/readStr = a varU byte-length then the raw bytes). OPT-IN: reach these via
 // `use std::bytes::*` (or a qualified std::bytes::name). Tree-shaken.
-//
-// Generally useful for any little-endian binary format. NOTE: the shipping SKBC bytecode container is
-// a C++ writer/reader (vmcore/BytecodeIO.h) that uses FIXED-WIDTH encoding -- fixed u32/u16 integers and
-// u32-length-prefixed strings -- and does NOT go through std::bytes at all. A future Skarn-side reader/
-// writer (North Star P1) would use these primitives; to stay SKBC-compatible it would use the fixed-width
-// u32 forms (writeU32LE/readU32LE + writeBytes/readBytes), while the compact varint/zigzag + varStr forms
-// below suit a new, compact format (protobuf-style deltas/offsets, self-describing strings).
+// Generally useful for any little-endian binary format.
 
 // A read cursor over an immutable Bytes buffer. `pos` is the next byte to read.
 pub struct ByteReader { buf: Bytes, pos: Int }

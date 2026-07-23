@@ -37,6 +37,20 @@ impl[T, E] Unwrap[T] for Result[T, E] {
 pub fn unwrapErr[T, E](r: Result[T, E]) -> E { match r { Err(e) => e, Ok(v) => panic("called unwrapErr on Ok: " + toString(v)) } }
 pub fn assert(cond: Bool, msg: String) -> () { if !cond { panic(msg) } }
 
+// A method-less MARKER trait naming the types permitted as a map KEY (and hence a set element). The
+// checker enforces it as a bound on a Map's key type at every map-construction site (a `#{...}` literal
+// or a `Map[K, V]`-typed `#{}`), so `Map[BadKey, V]` / `Set[BadKey]` is a COMPILE error rather than the
+// runtime "Invalid map key type" trap it is today. Erased -- no methods, no runtime cost, no trait-table
+// row. Deliberately NOT user-extensible to arbitrary types: a heap object's pointer bits are not stable
+// under the moving GC, so only these fixed primitives hash soundly (Int/Double/Bool by bits --
+// SameValueZero -- String by content, Atom by bits). Reads on an already-built map need no bound.
+pub trait Hashable {}
+impl Hashable for Int {}
+impl Hashable for Double {}
+impl Hashable for Bool {}
+impl Hashable for String {}
+impl Hashable for Atom {}
+
 // Map ergonomics -- pure helpers over the `get` builtin + the `m[k] = v` index-assign. `getOr`/`getOrElse`
 // are non-mutating (a fallback for an absent key); `getOrPut`/`upsert` mutate `m` in place (caller-visible,
 // since a Map is a heap object and `mut m` is a valid assignment root). The element V must match the map's
@@ -69,7 +83,7 @@ pub trait Clone { fn clone(self) -> Self }
 impl[T] Clone for Vec[T] {
   fn clone(self) -> Vec[T] { let o: Vec[T] = vec()  for x in self { push(o, x) }  o }
 }
-impl[K, V] Clone for Map[K, V] {
+impl[K: Hashable, V] Clone for Map[K, V] {
   fn clone(self) -> Map[K, V] { let mut o: Map[K, V] = #{}  for (k, v) in self { o[k] = v }  o }
 }
 impl Clone for Bytes {
@@ -90,9 +104,7 @@ impl[T] Clone for Array[T] {
 // GC introspection. gcStats() reports the live Heap::GcStats counters as a struct; gcResetStats()
 // (a bare native) clears them, so a region can be measured: gcResetStats() ... code ... gcStats().
 // The counters are uint64 in the VM but surface as Double -- a Double carries a 53-bit exact
-// integer, more than a 48-bit Int, so bytesAlloced/gcNanosTotal stay exact for any realistic run
-// (the ".0" in a printed count is harmless). Non-deterministic (depends on heap history), so these
-// are excluded from the differential oracle, like nanoTime.
+// integer, more than a 48-bit Int, so bytesAlloced/gcNanosTotal stay exact for any realistic run.
 pub struct GcStats { collections: Double, objectsAlloced: Double, bytesAlloced: Double, fromUsedSum: Double, survivorsSum: Double, gcNanosTotal: Double, gcNanosMax: Double, growEvents: Double }
 pub fn gcStats() -> GcStats {
     let a: Array[Double] = rawGcStats()

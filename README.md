@@ -1401,6 +1401,17 @@ println("square 5 = " + memoSquare(5))          // => square 5 = 25   (miss — 
 println("computed " + len(computed) + " time(s)") // => computed 2 time(s)
 ```
 
+A map's **key type must be `Hashable`** — one of `Int`, `Double`, `Bool`, or `String`. Using any other
+type as a key (a struct, tuple, `Vec`, enum, …) is a **compile error**, not a runtime surprise:
+
+```rust
+struct Point { x: Int, y: Int }
+let m: Map[Point, Int] = #{}   // error: type Point cannot be a map key (does not satisfy 'Hashable')
+```
+
+If you write a generic function that builds a map, give its key parameter the bound: `fn index[K: Hashable](…)`.
+(The same rule powers `std::set`, since a `Set[T]` is a `Map[T, Bool]` under the hood.)
+
 ### Cons lists: `List[T]`
 
 A list literal `[a, b, c]` builds an immutable singly-linked list. Lists shine with the `[h, ..t]` pattern
@@ -2234,8 +2245,9 @@ The **opt-in** modules must be brought in with a `use` before their functions re
   its own; for an unpredictable seed pass one in yourself (e.g. `use std::env` and `seedRng(nanoTime())`).
 - `std::set` — a hash **`Set[T]`** (over `Map[T, Bool]`): `set()` / `setOf(vec)`, `insert`/`remove` (each returns
   a `Bool`), `isMember`, `size`, the algebra `union`/`intersect`/`difference`/`isSubset`/`isDisjoint`, and
-  `for x in s` (plus the lazy combinators) via `IntoIterator`. The element type `T` must be a permitted map key
-  (`Int`/`Double`/`Bool`/`String`/`Atom`); iteration is hash-order (unspecified), like `Map`.
+  `for x in s` (plus the lazy combinators) via `IntoIterator`. The element type `T` must be `Hashable`
+  (`Int`/`Double`/`Bool`/`String`) — a `Set` of any other type is a **compile error** (see below);
+  iteration is hash-order (unspecified), like `Map`.
 - `std::time` — dates and times, **strict UTC** at **millisecond** precision. Three value types plus a
   `Stopwatch`: an `Instant` (a point on the timeline, epoch milliseconds), a `Duration` (a span), and a
   `DateTime` (the decomposed civil fields). `now() -> Instant` reads the wall clock; `toDateTime`/`fromDateTime`
@@ -2701,7 +2713,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `jump(r)` / `splitRng(r)` | advance one stream / return a fresh non-overlapping stream |
 | `fillU32(r, out, n)` / `fillDoubles(r, out, n)` | append `n` draws to a `Vec` (bulk, load/store-optimized) |
 
-**Sets** *(all `std::set` — `use std::set::*`; `T` must be a permitted map key)*
+**Sets** *(all `std::set` — `use std::set::*`; `T` must be `Hashable`)*
 
 | Function | Purpose |
 |----------|---------|

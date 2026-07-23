@@ -5,7 +5,7 @@ pub fn charStr(b: Int) -> String { fromBytes(push(bytes(), b)) }
 // A byte-range substring of an ALREADY-materialized Bytes -- clamped to [0, len], bulk-memcpy'd (no
 // per-byte loop). Prefer this over slice() in a hot loop that holds ONE Bytes and slices many ranges
 // from it: slice(String,..) calls toBytes(s) on the WHOLE string every call (O(n) each), so slicing
-// per token/element is O(n^2); sliceBytes over a held Bytes is O(range). (P2 lexer finding.)
+// per token/element is O(n^2); sliceBytes over a held Bytes is O(range).
 pub fn sliceBytes(src: Bytes, start: Int, end: Int) -> String {
   let n = len(src)
   let mut lo = start
@@ -180,7 +180,7 @@ pub fn sbLen(sb: StringBuilder) -> Int { len(sb.buf) }
 //        type   x/X hex, b binary, o octal, d decimal, f fixed Double, s string
 //      SCALARS ONLY (Int/Double/String/Bool), matching `+`. An inapplicable field is ignored (a
 //      formatting op never aborts). Negatives in a non-decimal base are sign-magnitude ('-ff'), NOT
-//      two's-complement. All pure Skarn -- no VM/opcode change; the differential oracle runs it as-is.
+//      two's-complement. All pure Skarn -- no VM/opcode change
 pub trait Format { fn format(self, spec: String) -> String }
 
 // A parsed spec. align: 0 none, 1 '<', 2 '>', 3 '^'. prec: -1 if absent. ty: the type char (0 if none).
