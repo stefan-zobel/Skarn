@@ -90,6 +90,9 @@ tuple_fields = type , { "," , type } , [ "," ] ;
 
 (* Generic params CHECKED then erased. Each variant registers as a fixed-     *)
 (* shape constructor in the global namespace; variant names are UPPERCASE.    *)
+(* A tuple/nullary variant is built + matched as `V(..)` / `V`; a RECORD      *)
+(* variant `V { f: T }` is built + matched with brace (struct) syntax         *)
+(* `V { f: v }` -- same forms as a record struct, but its type is the enum.   *)
 enum_item    = "enum" , uident , [ generic_params ] ,
                "{" , { terminator } ,
                { enum_variant , [ "," ] , { terminator } } , "}" ;
@@ -168,7 +171,7 @@ primary      = literal
              | if_expr | match_expr | while_expr | for_expr | loop_expr | lambda | block
              | break_expr | "continue" | return_expr ;
 
-literal      = int | double | string | char_lit | atom | "true" | "false" ;
+literal      = int | double | string | raw_string | char_lit | atom | "true" | "false" ;
 
 (* Value path: lident = variable / function; uident = a nullary constructor    *)
 (* or a constructor used as a value/function (applied via call_suffix, e.g.    *)
@@ -195,8 +198,11 @@ if_expr      = "if" , ( header_expr | if_let_head ) , block , [ "else" , ( if_ex
 (* `if let PAT = E { … } else { … }` -- refutable single-pattern conditional binding; the parser   *)
 (* DESUGARS it to a 2-arm `match E { PAT => then, _ => (else | ()) }` (the `_` arm makes it        *)
 (* exhaustive; PAT's bindings scope to `then`). An IRREFUTABLE PAT is rejected (use a plain `let`).*)
-if_let_head  = "let" , pattern , "=" , header_expr ;
-while_expr   = "while" , header_expr , block ;
+if_let_head  = "let" , arm_pattern , "=" , header_expr ;
+while_expr   = "while" , ( header_expr | while_let_head ) , block ;
+(* `while let PAT = E { … }` desugars (parser) to `loop { match E { PAT => …, _ => break } }` -- reuses  *)
+(* loop/match/break, no new AST/checker/codegen. The valueless break gives the loop the unit type.       *)
+while_let_head = "let" , arm_pattern , "=" , header_expr ;
 (* External iteration; `pat` is an irrefutable binding (lident / `_` / tuple). *)
 for_expr     = "for" , pattern , "in" , header_expr , block ;
 (* `loop { … }` -- the condition-less infinite loop. No header, so no header_expr    *)
@@ -211,7 +217,12 @@ loop_expr    = "loop" , block ;
 break_expr   = "break" , [ expr ] ;
 match_expr   = "match" , header_expr , "{" , { terminator } ,
                { match_arm , [ "," ] , { terminator } } , "}" ;
-match_arm    = pattern , [ "if" , expr ] , "=>" , expr ;
+match_arm    = arm_pattern , [ "if" , expr ] , "=>" , expr ;
+(* An or-pattern `A | B | C` (with an optional leading `|`) matches if ANY alternative *)
+(* matches; the `if` guard applies to the whole or-pattern. v1: TOP-LEVEL only (no `|` *)
+(* nested inside a sub-pattern) and NO bindings in the alternatives (literals / `_` /  *)
+(* nullary constructors) -- all alternatives must bind the same (empty) variable set.  *)
+arm_pattern  = [ "|" ] , pattern , { "|" , pattern } ;
 (* lambda params + return stay OPTIONAL (check position supplies the expected  *)
 (* type). Uses lambda_params, not the mandatory param_list.                    *)
 lambda        = "fn" , "(" , [ lambda_params ] , ")" , [ "->" , type ] , block ;
@@ -232,6 +243,7 @@ map_entry    = expr , "=>" , expr ;
 (* A constructor pattern (nullary / record / tuple) may carry an optional      *)
 (* module qualifier `mod::Ctor` (e.g. `pal::Red`, `geo::Point{ x, y }`).       *)
 pattern      = "_"
+             | range_pat                                   (* lo..hi -- must precede the plain-literal alt *)
              | literal | "-" , ( int | double )
              | [ "mut" ] , lident                          (* fresh binding *)
              | [ lident , "::" ] , uident                  (* nullary constructor, e.g. None *)
@@ -243,6 +255,11 @@ pattern      = "_"
                  { map_pat_entry , [ "," ] , { terminator } } , "}" ;  (* map (match-only) *)
 field_pats   = { terminator } , { field_pat , [ "," ] , { terminator } } ;
 field_pat    = lident , [ ":" , pattern ] ;
+(* Range pattern `lo..hi` -- INCLUSIVE, bounds are Int/Double literals (a char literal is an Int).       *)
+(* Binds nothing; never completes a signature (the numeric types are unbounded), so a match built only   *)
+(* of ranges still needs a `_`. Codegen: `scrut >= lo && scrut <= hi` (BLT_NUM/BGT_NUM). No VM change.    *)
+num_lit      = [ "-" ] , ( int | double ) ;
+range_pat    = num_lit , ".." , num_lit ;
 list_pat_items = { pattern , "," } , [ pattern | ".." , [ pattern ] ] ;
 (* Partial map pattern; key is a literal expr (enforced in codegen), value    *)
 (* side is a sub-pattern (`_` = presence-only).                               *)
@@ -282,6 +299,13 @@ binary_digit = "0" | "1" ;
 double       = digit , { digit } , ( ( "." , digit , { digit } , [ exponent ] ) | exponent ) ;  (* 64-bit `Double`, no `Float`; an exponent alone (1e6) makes it a Double *)
 exponent     = ( "e" | "E" ) , [ "+" | "-" ] , digit , { digit } ;
 string       = '"' , { char } , '"' ;             (* a plain string literal (no `${` hole) *)
+(* Raw string: an `r` prefix takes the contents VERBATIM -- no backslash escapes, no `${` holes;      *)
+(* multi-line allowed. The hash form `r#"..."#` (or `r##"..."##`, ...) ends only at a `"` followed by *)
+(* the matching count of `#`, so a bare `"` is content (regex / paths / JSON templates). Lexer-only:  *)
+(* it emits the SAME plain Str token as `string`, so it is a `literal` usable everywhere (incl. a     *)
+(* `${...}` hole of a normal string, and patterns). Only a lowercase `r` abutting `"`/`#"` triggers   *)
+(* it; `range` / a bare `r` are ordinary identifiers. Never interpolated.                             *)
+raw_string   = "r" , { "#" } , '"' , { char_verbatim } , '"' , { "#" } ;   (* opening/closing `#` counts match *)
 (* String interpolation: a `"..."` containing one or more `${ expr }` holes. A pure lexer/parser    *)
 (* DESUGAR to `text0 + toString(e0) + text1 + ... ` (empty text pieces dropped), so it inherits     *)
 (* `toString` (any-type holes) and `+` (String concat) with no new AST/checker/codegen. Holes       *)
@@ -294,7 +318,7 @@ string       = '"' , { char } , '"' ;             (* a plain string literal (no 
 interp_string = '"' , text , { "${" , expr , [ ':' , fmt_spec ] , "}" , text } , '"' ;   (* >= 1 hole *)
 fmt_spec     = [ [ fill ] , align ] , [ '0' ] , [ width ] , [ '.' , precision ] , [ fmt_type ] ;
 align        = '<' | '>' | '^' ;   fill = char ;   width = digit , { digit } ;   precision = digit , { digit } ;
-fmt_type     = 'x' | 'X' | 'b' | 'o' | 'd' | 'f' | 's' ;
+fmt_type     = 'x' | 'X' | 'b' | 'o' | 'd' | 'f' | 'g' | 's' ;   (* g = shortest round-trip Double (precision ignored in v1) *)
 char_lit     = "'" , ( char_no_squote_no_bslash | escape ) , "'" ;
              (* a single BYTE 0..255, typed Int (there is NO scalar Char type);      *)
              (* escapes \n \t \r \\ \0 \' \"; a multi-byte literal (e.g. 'é' = 2     *)

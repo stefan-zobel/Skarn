@@ -281,7 +281,8 @@ fn _dblBody(d: Double, fs: FmtSpec) -> String {
     let a = if neg { 0.0 - d } else { d }
     let sign = if neg { "-" } else { "" }
     let digits =
-      if fs.prec < 0 { toString(a) }            // default: shortest round-trip of the magnitude
+      if fs.ty == 103 { toString(a) }            // 'g' -- shortest round-trip
+      else if fs.prec < 0 { toString(a) }        // default: shortest round-trip of the magnitude
       else if fs.prec == 0 { toString(toInt(roundHalfToEven(a))) }
       else {
         let scale = _pow10(fs.prec)

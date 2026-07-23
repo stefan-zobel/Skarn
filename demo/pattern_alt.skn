@@ -1,0 +1,40 @@
+// Or-patterns: `A | B | C => body` matches an arm if ANY alternative matches.
+// v1a: top-level in a match arm / if-let, and alternatives may NOT bind variables
+// (literals / `_` / nullary constructors only). Front-end only -- no VM change.
+
+// A byte classifier: the motivating use case (replaces a long `||` chain).
+fn classify(c: Int) -> String {
+    match c {
+        '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' => "digit",
+        'a' | 'e' | 'i' | 'o' | 'u' => "vowel",
+        ' ' | '\t' | '\n' => "space",
+        _ => "other"
+    }
+}
+
+println(classify('7'))     // => digit
+println(classify('e'))     // => vowel
+println(classify(' '))     // => space
+println(classify('z'))     // => other
+
+// Or-patterns count toward exhaustiveness: one arm covers every variant, no wildcard.
+enum Dir { North, South, East, West }
+
+fn axis(d: Dir) -> String {
+    match d {
+        North | South => "vertical",
+        East  | West  => "horizontal"
+    }
+}
+
+println(axis(North))       // => vertical
+println(axis(West))        // => horizontal
+
+// if-let with an or-pattern (a leading `|` is allowed for vertical lists).
+let code = 404
+let bucket = if let 200 | 201 | 204 = code {
+    "ok"
+} else {
+    if let 400 | 401 | 403 | 404 = code { "client-error" } else { "other" }
+}
+println(bucket)            // => client-error

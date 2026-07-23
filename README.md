@@ -491,7 +491,8 @@ precision, and numeric base. The specifier grammar is a subset of Rust's:
 - **`0`** — zero-pad flag (for a number the zeros go after the sign).
 - **width** — the minimum field width.
 - **`.`precision** — the number of decimals (for a `Double`).
-- **type** — `x`/`X` hex, `b` binary, `o` octal, `d` decimal, `f` fixed-point `Double`, `s` string.
+- **type** — `x`/`X` hex, `b` binary, `o` octal, `d` decimal, `f` fixed-point `Double`, `g` shortest
+  round-trip `Double`, `s` string.
 
 ```rust
 let n = 255
@@ -500,6 +501,7 @@ println("[${42:>6}] [${42:<6}] [${42:^6}]")  // => [    42] [42    ] [  42  ]
 println("[${42:06}] [${-42:06}]")            // => [000042] [-00042]
 let pi = 3.14159
 println("pi=${pi:.2f}")                      // => pi=3.14
+println("g=${1000000.5:g}")                  // => g=1000000.5   (shortest round-trip)
 println("[${"hi":*^8}]")                     // => [***hi***]
 ```
 
@@ -513,9 +515,46 @@ Under the hood `${value:spec}` desugars to `format(value, "spec")` — an ordina
 directly — so, like the rest of interpolation, specifiers add nothing to the runtime.
 
 > **Not yet supported (reserved for v2):** a sign flag (`+`), the `#` alternate form (a `0x`/`0b` prefix),
-> scientific notation (`e`/`E`/`g`), digit grouping, dynamic width/precision (`${x:>{w}}`), named arguments,
-> string precision (truncation), and two's-complement negative bases. To assemble a large string efficiently
-> in a loop, use the `StringBuilder` helper (below) rather than a long `+` chain.
+> scientific notation (`e`/`E`), significant-digit precision for `g` (`${x:.3g}` currently ignores the
+> precision), digit grouping, dynamic width/precision (`${x:>{w}}`), named arguments, string precision
+> (truncation), and two's-complement negative bases. To assemble a large string efficiently in a loop, use
+> the `StringBuilder` helper (below) rather than a long `+` chain.
+
+### Raw strings
+
+A **raw string** is written with an `r` prefix — `r"…"` — and takes its contents **byte for byte**: no
+backslash escapes and no `${ … }` interpolation are processed. A `\` is just a backslash and a `${` is just
+those two characters. This is the natural choice for regexes, Windows paths, and any text full of backslashes
+or `$` that you would otherwise have to escape.
+
+```rust
+let path = r"C:\Users\name\file.txt"     // no \U / \n / \f escaping needed
+let re   = r"\d+\.\d+"                    // a regex, verbatim
+println(path)                            // => C:\Users\name\file.txt
+println("len=${len(re)}")                // => len=8   (\d+\.\d+ is 8 bytes)
+```
+
+To include a `"` inside a raw string, use the **hash form**: open with `r#"` and close with `"#`. The string
+then ends only at a `"` followed by the matching number of `#`, so a bare `"` is content. Add more `#`s
+(`r##"…"##`) if the text itself contains `"#`.
+
+```rust
+let json = r#"{"key": "value with \" backslash-quote"}"#
+println(json)                            // => {"key": "value with \" backslash-quote"}
+```
+
+A raw string may span multiple lines — a newline in the source is part of the string:
+
+```rust
+let banner = r"line one
+line two"
+println(banner)                          // prints both lines
+```
+
+A raw string is an ordinary `String` (the `r` is purely lexical), so it works everywhere a string literal
+does — including as an operand of `+`, inside a `${ … }` hole of a *normal* string, and in patterns. Only the
+lowercase `r` immediately before the quote (or `#`) starts a raw string; an identifier like `range` or a bare
+`r` on its own is unaffected.
 
 You can move between a `String` and its raw bytes with `toBytes` and `fromBytes`. This is how you build a
 string from computed bytes (there is no character type to append):
@@ -971,6 +1010,28 @@ println("circle=" + area(Circle(2.0)))    // => circle=12.56636
 println("rect="   + area(Rect(3.0, 4.0))) // => rect=12.0
 ```
 
+A variant's payload can also be **named fields** — a *record variant* `V { f: T }`. It is built and
+matched with the same brace syntax as a record struct (fields by name, order-free), but its type is the
+enum. Tuple variants, record variants, and nullary variants can be mixed freely in one enum:
+
+```rust
+enum Shape {
+    Dot,
+    Circle { r: Double },
+    Rect { w: Double, h: Double }
+}
+
+fn area(s: Shape) -> Double {
+    match s {
+        Dot              => 0.0,
+        Circle { r }     => 3.14159 * r * r,
+        Rect { w, h }    => w * h
+    }
+}
+println("circle=" + area(Circle { r: 2.0 }))       // => circle=12.56636
+println("rect="   + area(Rect { h: 4.0, w: 3.0 })) // => rect=12.0  (fields are order-free)
+```
+
 Enums can be generic and recursive, which lets you build tree-shaped data:
 
 ```rust
@@ -1048,6 +1109,63 @@ println("vowel a=" + isVowel('a'))   // => vowel a=true
 println("vowel z=" + isVowel('z'))   // => vowel z=false
 ```
 
+### Or-patterns: one arm, several shapes
+
+When several patterns should run the **same** arm, join them with `|`. The arm matches if **any**
+alternative matches, so the five-arm vowel table above collapses to one line:
+
+```rust
+fn isVowel(c: Int) -> Bool {
+    match c {
+        'a' | 'e' | 'i' | 'o' | 'u' => true,
+        _ => false
+    }
+}
+println("vowel e=" + isVowel('e'))   // => vowel e=true
+```
+
+Or-patterns count toward exhaustiveness, so a single arm can cover every case of an enum without a
+wildcard, and a guard (`if …`) applies to the whole group:
+
+```rust
+enum Dir { North, South, East, West }
+
+fn axis(d: Dir) -> String {
+    match d {
+        North | South => "vertical",
+        East  | West  => "horizontal"
+    }
+}
+println(axis(East))   // => horizontal
+```
+
+A leading `|` is allowed (handy when you list alternatives vertically). Two rules keep them sound: the
+alternatives may **not bind variables** (use literals, `_`, or nullary constructors — for value-carrying
+variants that need a binding, write separate arms), and an alternative that can never match (already
+covered by an earlier one) is reported as an unreachable-pattern warning.
+
+### Range patterns
+
+A numeric range `lo..hi` matches any value **from `lo` to `hi`, inclusive of both ends**. The bounds must be
+`Int` or `Double` literals (a character literal is an `Int`, so `'0'..'9'` matches the digit bytes). This
+replaces a chain of `>=`/`<=` guards for byte and number classification:
+
+```rust
+fn classify(c: Int) -> String {
+    match c {
+        '0'..'9' => "digit",
+        'a'..'z' | 'A'..'Z' => "letter",
+        ' ' | '\t' | '\n' => "space",
+        _ => "other"
+    }
+}
+println(classify('7'))   // => digit
+println(classify('Q'))   // => letter
+```
+
+A range binds nothing, and — because the numeric types are unbounded — a range never makes a match
+exhaustive on its own: a `match` built only from ranges still needs a `_` arm.
+
 ### Struct, enum, and tuple patterns
 
 Patterns mirror the shapes you can construct. You can match specific field values and bind the rest:
@@ -1118,6 +1236,23 @@ if let Some(v) = maybe {
 } else {
     println("nothing")
 }
+```
+
+### `while let`
+
+`while let` is the looping sibling: it repeats a block **as long as** a value keeps matching a pattern,
+binding along the way. It is the concise form of a `loop` that `break`s when the pattern stops matching —
+ideal for draining a container or consuming a cursor:
+
+```rust
+let v: Vec[Int] = vec()
+push(v, 1) push(v, 2) push(v, 3)
+
+let mut total = 0
+while let Some(x) = pop(v) {   // stops when pop returns None
+    total = total + x
+}
+println("total=" + total)      // => total=6
 ```
 
 ---
@@ -2707,11 +2842,11 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 
 ### Where to go next
 
-- The grammar in `docs/alternative_typed_grammar.ebnf` is the precise reference for the syntax.
+- The grammar in `docs/skarn_grammar.ebnf` is the precise reference for the syntax.
 - The `demo/` directory has larger runnable programs — an iterator showcase (`iterator_for`), JSON both ways
   (`json_parser` from scratch and `json` over `std::json`), one demo per standard-library module (`math`,
   `random`, `set`, `time`, `bytes`, `map_helpers`), string/byte iteration (`string_iter`), trait objects
-  (`dyn_traits`), string interpolation (`interp`), and file I/O (`file_io`).
+  (`dyn_traits`), string interpolation (`interp`), and file I/O (`file_io`). Run one with
+  `static_vmrun demo/<name>.skn`.
 - A few features exist in the language's design space but are intentionally not part of this guide because they
-  are not built yet (for example loop labels, `while let`, and a handful of extra iterator combinators like
-  `rev` and `cycle`).
+  are not built yet (for example loop labels and a handful of extra iterator combinators like `rev` and `cycle`).
