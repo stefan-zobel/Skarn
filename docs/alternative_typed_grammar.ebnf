@@ -129,7 +129,9 @@ statement    = let_stmt | assign_stmt | expr_stmt ;
 let_stmt     = "let" , [ "mut" ] , pattern , [ ":" , type ] , "=" , expr ;
 assign_stmt  = lvalue , "=" , expr ;           (* reassign a `mut` binding *)
 expr_stmt    = expr ;
-lvalue       = expr ;                          (* ident / field / index target *)
+lvalue       = expr ;                          (* a place path: ident, or any field/index      *)
+(* chain over one -- `p.x`, `a[i]`, `a[i].x`, `p.x.y`, `m[k].x`, `a[i][j]`. The ROOT binding   *)
+(* must be `mut` (M5); a non-binding root (e.g. `mk().x`) is "cannot assign to a temporary".   *)
 
 (* -- expressions: lowest precedence (pipe) to highest (postfix) -- *)
 expr         = pipe ;
@@ -181,8 +183,11 @@ path         = lident , [ "::" , ident ]
 (* (the `{` opens the block); parenthesize to force the struct literal there.   *)
 (* An optional module qualifier (`mod::Point { .. }` / `std::..`) constructs a  *)
 (* foreign struct inline without a `use`.                                       *)
+(* A trailing `..expr` (record update) copies every unlisted field from `expr` (same struct type,  *)
+(* evaluated once); it must be LAST. `Name { ..base }` alone is a functional copy.                 *)
 struct_lit   = [ lident , "::" ] , uident , "{" , { terminator } ,
-               { field_init , [ "," ] , { terminator } } , "}" ;
+               { field_init , [ "," ] , { terminator } } ,
+               [ ".." , expr , { terminator } ] , "}" ;
 field_init   = lident , [ ":" , expr ] ;         (* shorthand: `{ x }` = `{ x: x }` *)
 
 block        = "{" , { terminator } , { statement , { terminator } } , "}" ;
@@ -265,16 +270,31 @@ dyn_type     = "dyn" , [ lident , "::" ] , uident ,
 uident       = uppercase_letter , { letter | digit | "_" } ;          (* types / constructors *)
 lident       = ( lowercase_letter | "_" ) , { letter | digit | "_" } ; (* values / functions; a lone `_` is the wildcard, not lident *)
 ident        = lident | uident ;                 (* case-agnostic union; used only where case is irrelevant (atoms) *)
-int          = digit , { digit } ;
+int          = hex_int | octal_int | binary_int | ( digit , { digit } ) ;
+(* Radix literals are a BIT PATTERN up to 48 bits, sign-extended from bit 47 (Option B): so             *)
+(* 0xFFFFFFFFFFFF == -1, 0x800000000000 == MIN_48. A plain decimal int stays a signed magnitude < 2^47. *)
+hex_int      = "0" , ( "x" | "X" ) , hex_digit , { hex_digit } ;
+octal_int    = "0" , ( "o" | "O" ) , octal_digit , { octal_digit } ;
+binary_int   = "0" , ( "b" | "B" ) , binary_digit , { binary_digit } ;
+hex_digit    = digit | "a".."f" | "A".."F" ;
+octal_digit  = "0".."7" ;
+binary_digit = "0" | "1" ;
 double       = digit , { digit } , ( ( "." , digit , { digit } , [ exponent ] ) | exponent ) ;  (* 64-bit `Double`, no `Float`; an exponent alone (1e6) makes it a Double *)
 exponent     = ( "e" | "E" ) , [ "+" | "-" ] , digit , { digit } ;
 string       = '"' , { char } , '"' ;             (* a plain string literal (no `${` hole) *)
-(* String interpolation: a `"..."` containing one or more `${ expr }` holes. A pure lexer/parser   *)
-(* DESUGAR to `text0 + toString(e0) + text1 + ... ` (empty text pieces dropped), so it inherits    *)
-(* `toString` (any-type holes) and `+` (String concat) with no new AST/checker/codegen. Holes      *)
-(* nest (an `expr` may be another interp_string). `$` is literal unless immediately before `{`; a  *)
-(* literal `${` is written `\$` + `{`. Rejected in pattern / const-initializer position.           *)
-interp_string = '"' , text , { "${" , expr , "}" , text } , '"' ;   (* >= 1 hole *)
+(* String interpolation: a `"..."` containing one or more `${ expr }` holes. A pure lexer/parser    *)
+(* DESUGAR to `text0 + toString(e0) + text1 + ... ` (empty text pieces dropped), so it inherits     *)
+(* `toString` (any-type holes) and `+` (String concat) with no new AST/checker/codegen. Holes       *)
+(* nest (an `expr` may be another interp_string). `$` is literal unless immediately before `{`; a   *)
+(* literal `${` is written `\$` + `{`. Rejected in pattern / const-initializer position.            *)
+(* A hole may carry a `:spec` format specifier: `${e:spec}` desugars to `format(e, "spec")` (the    *)
+(* `Format` trait; scalars only). The spec is scanned as raw text up to the hole-closing `}` (only  *)
+(* a top-level `:` -- all of ()/[]/{} balanced -- starts it, so an atom `:x` or a lambda-param `:`  *)
+(* is untouched); its grammar (below) is validated at parse time.                                   *)
+interp_string = '"' , text , { "${" , expr , [ ':' , fmt_spec ] , "}" , text } , '"' ;   (* >= 1 hole *)
+fmt_spec     = [ [ fill ] , align ] , [ '0' ] , [ width ] , [ '.' , precision ] , [ fmt_type ] ;
+align        = '<' | '>' | '^' ;   fill = char ;   width = digit , { digit } ;   precision = digit , { digit } ;
+fmt_type     = 'x' | 'X' | 'b' | 'o' | 'd' | 'f' | 's' ;
 char_lit     = "'" , ( char_no_squote_no_bslash | escape ) , "'" ;
              (* a single BYTE 0..255, typed Int (there is NO scalar Char type);      *)
              (* escapes \n \t \r \\ \0 \' \"; a multi-byte literal (e.g. 'é' = 2     *)

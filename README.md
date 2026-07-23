@@ -130,6 +130,20 @@ println("char=" + aChar)        // => char=65
 A `Double` literal may also be written in **scientific notation** with an `e`/`E` exponent — `6e-3`, `1.5e10`,
 `2.5E+8`. An exponent makes the literal a `Double` even without a decimal point (`1e6` is `1000000.0`).
 
+An `Int` literal may be written in **hexadecimal** (`0x` / `0X`), **octal** (`0o` / `0O`), or **binary**
+(`0b` / `0B`): `0xFF` is 255, `0o17` is 15, `0b1010` is 10. Unlike a decimal literal (a signed magnitude that
+must be below 2⁴⁷), a radix literal is a **bit pattern** of up to the full 48-bit width, sign-extended from
+bit 47 — so `0x800000000000` is the smallest `Int` and **`0xFFFFFFFFFFFF` (all 48 bits set) is `-1`**, a
+convenient full-width mask. A value beyond 48 bits (e.g. `0x1000000000000`) is a compile error.
+
+```rust
+let flags   = 0xFF          // 255
+let allOnes = 0xFFFFFFFFFFFF // -1  (every bit set, in 48-bit two's complement)
+let masked  = allOnes & 0x0F // 15
+let perms   = 0o755          // 493
+let bits    = 0b1011         // 11
+```
+
 Note that a `Double` always prints with a decimal point (`3.5`, and `4.0` rather than `4`), so you can always
 tell the two numeric types apart in output.
 
@@ -464,10 +478,44 @@ println("literal \${x}")                 // => literal ${x}
 Interpolation is pure syntactic sugar: `"a=${x}, b=${y}"` is exactly `"a=" + toString(x) + ", b=" +
 toString(y)`, so it behaves identically to writing that chain by hand.
 
-> **Not yet supported (reserved for a future version):** format specifiers such as `${x:.2f}` (width /
-> precision / base). For now a hole always renders at `toString` quality. A `StringBuilder` helper for
-> assembling large strings efficiently in a loop is also planned as a separate `std::string` addition; until
-> then, build big strings via a `Bytes` buffer (`bytes()` → `push` → `fromBytes`, shown below).
+#### Format specifiers
+
+A hole may carry a **format specifier** after a colon — `${value:spec}` — to control width, alignment,
+precision, and numeric base. The specifier grammar is a subset of Rust's:
+
+```
+[[fill]align] ['0'] [width] ['.'precision] [type]
+```
+
+- **align** — `<` left, `>` right, `^` center; a character *before* the align is the fill (default space).
+- **`0`** — zero-pad flag (for a number the zeros go after the sign).
+- **width** — the minimum field width.
+- **`.`precision** — the number of decimals (for a `Double`).
+- **type** — `x`/`X` hex, `b` binary, `o` octal, `d` decimal, `f` fixed-point `Double`, `s` string.
+
+```rust
+let n = 255
+println("hex ${n:x}, bin ${n:b}")            // => hex ff, bin 11111111
+println("[${42:>6}] [${42:<6}] [${42:^6}]")  // => [    42] [42    ] [  42  ]
+println("[${42:06}] [${-42:06}]")            // => [000042] [-00042]
+let pi = 3.14159
+println("pi=${pi:.2f}")                      // => pi=3.14
+println("[${"hi":*^8}]")                     // => [***hi***]
+```
+
+Specifiers apply to **scalars only** (`Int`, `Double`, `String`, `Bool`) — the same rule as `+`. A specifier on
+a compound value is a type error (`… does not implement Format`); use a plain `${value}` hole for those. An
+inapplicable field is ignored (e.g. a precision on an `Int`), and the specifier grammar is checked at compile
+time, so a malformed `${x:zq}` is a compile error. A negative number in a non-decimal base prints
+sign-magnitude (`${-255:x}` => `-ff`).
+
+Under the hood `${value:spec}` desugars to `format(value, "spec")` — an ordinary function you can also call
+directly — so, like the rest of interpolation, specifiers add nothing to the runtime.
+
+> **Not yet supported (reserved for v2):** a sign flag (`+`), the `#` alternate form (a `0x`/`0b` prefix),
+> scientific notation (`e`/`E`/`g`), digit grouping, dynamic width/precision (`${x:>{w}}`), named arguments,
+> string precision (truncation), and two's-complement negative bases. To assemble a large string efficiently
+> in a loop, use the `StringBuilder` helper (below) rather than a long `+` chain.
 
 You can move between a `String` and its raw bytes with `toBytes` and `fromBytes`. This is how you build a
 string from computed bytes (there is no character type to append):
@@ -494,6 +542,28 @@ fn repeatChar(c: Int, times: Int) -> String {
 
 println("stars=" + repeatChar('*', 5))   // => stars=*****
 ```
+
+### Building strings efficiently — `StringBuilder`
+
+Concatenating with `+` in a loop allocates a fresh intermediate string at every step (`O(n²)` overall). When
+you assemble a string piece by piece, reach for `StringBuilder` instead: it accumulates into a `Bytes` buffer
+(one bulk copy per append) and hands you the finished `String` with `build`.
+
+```rust
+let sb = stringBuilder()      // or stringBuilderCap(64) to pre-size the buffer
+append(sb, "items: ")
+let mut i = 0
+while i < 3 {
+    append(sb, "[")
+    appendByte(sb, '0' + i)   // append a single byte
+    append(sb, "]")
+    i = i + 1
+}
+println(build(sb))            // => items: [0][1][2]
+```
+
+`append`/`appendByte` mutate the builder in place (and also return it, so calls can chain); `sbLen(sb)` is the
+number of bytes accumulated so far. `StringBuilder` lives in the always-available `std::string` ring.
 
 ### String helpers
 
@@ -805,6 +875,31 @@ let moved = Point { x: p.x + 1, y: p.y }
 println("moved.x=" + moved.x)   // => moved.x=4
 ```
 
+Spelling out every unchanged field gets tedious. **Record update** `Name { field: value, ..base }` copies
+every field you *don't* list from `base` (the same struct type, evaluated once), so you write only what
+changes. It must come last; `Point { ..base }` alone is a plain copy:
+
+```rust
+struct Config { host: String, port: Int, tls: Bool }
+
+let base = Config { host: "localhost", port: 8080, tls: false }
+let secure = Config { port: 443, tls: true, ..base }   // host copied from base
+println("host=" + secure.host + " port=" + secure.port)   // => host=localhost port=443
+```
+
+When the binding *is* `mut`, you can assign through a whole **place path** — any chain of field (`.x`) and
+index (`[i]`) steps, e.g. `pts[0].x = 40` or `line.start.y = 9`. Only the **root** binding needs `mut`
+(assigning through a temporary such as `mk().x` is rejected):
+
+```rust
+struct Pt { x: Int, y: Int }
+
+let mut pts: Vec[Pt] = vec()
+push(pts, Pt { x: 1, y: 2 })
+pts[0].x = 40                       // index-then-field, through the mut root `pts`
+println("pts[0].x=" + pts[0].x)     // => pts[0].x=40
+```
+
 ### Tuple structs
 
 A struct can have positional fields instead of named ones. You read them by destructuring (see
@@ -1034,7 +1129,9 @@ Skarn provides several collection types. They all work with `for`, `len`, and (w
 ### Fixed-size arrays: `Array[T]`
 
 `array(n, init)` creates an array of `n` elements all equal to `init`. Index with `a[i]`. To assign to an
-element, the array binding must be `mut`.
+element, the array binding must be `mut`. An `init` value is required because Skarn types are non-nullable — a
+fresh slot must already hold a real `T` (there is no zero-fill). For the empty case, `emptyArray()` builds an
+empty `Array[T]` (its element type inferred from context, like `vec()`).
 
 ```rust
 let mut arr = array(3, 0)
@@ -1132,6 +1229,43 @@ delete(scores, "b")
 println("after="  + len(keys(scores))) // => after=2
 ```
 
+Four helpers make the common lookup-with-fallback and read-modify-write patterns concise. `getOr(m, k, dflt)`
+returns the value or a default; `getOrElse(m, k, f)` computes the default lazily via a thunk (only on a miss);
+`getOrPut(m, k, dflt)` inserts the default if the key is absent and returns the stored value; and
+`upsert(m, k, dflt, f)` inserts `dflt` on a miss or replaces the value with `f(current)` on a hit. The last two
+mutate the map, so the binding must be `mut`.
+
+```rust
+let mut counts: Map[String, Int] = #{}
+for w in ["a", "b", "a", "c", "a"] {
+    upsert(counts, w, 1, fn(c) { c + 1 })   // insert 1, or bump the existing count
+}
+println("a=" + getOr(counts, "a", 0))       // => a=3
+println("z=" + getOr(counts, "z", 0))       // => z=0
+```
+
+Because `getOrElse` runs its thunk only on a miss, and a closure can mutate a captured heap value (a `Map` or
+`Vec` is a shared reference), the two compose into a lazy **memoize**: the fallback both computes the value and
+stores it, so the work happens once per distinct input.
+
+```rust
+let mut cache: Map[Int, Int] = #{}
+let mut computed: Vec[Int] = vec()
+let memoSquare = fn(n: Int) -> Int {
+    getOrElse(cache, n, fn() {
+        push(computed, n)   // record the miss
+        let v = n * n
+        cache[n] = v        // populate the cache from inside the thunk
+        v
+    })
+}
+
+println("square 4 = " + memoSquare(4))          // => square 4 = 16   (miss — computed)
+println("square 4 = " + memoSquare(4))          // => square 4 = 16   (hit  — thunk not run)
+println("square 5 = " + memoSquare(5))          // => square 5 = 25   (miss — computed)
+println("computed " + len(computed) + " time(s)") // => computed 2 time(s)
+```
+
 ### Cons lists: `List[T]`
 
 A list literal `[a, b, c]` builds an immutable singly-linked list. Lists shine with the `[h, ..t]` pattern
@@ -1169,6 +1303,31 @@ push(b, 105)                         // 'i'
 b[0] = 74                            // 'J'
 println("str=" + fromBytes(b))       // => str=Ji
 println("len=" + len(b))             // => len=2
+```
+
+### Cloning: `clone`
+
+`clone(x)` (or `x |> clone`) makes an **independent shallow copy** of a container — `Vec`, `Map`, `Bytes`, and
+`Array` are all supported. The copy has its own top-level storage, so mutating it never touches the original
+(nested heap references are shared, not deep-copied).
+
+```rust
+let a: Vec[Int] = vec()
+push(a, 1) push(a, 2)
+let b = clone(a)
+push(b, 3)
+println("orig=" + len(a) + " copy=" + len(b))   // => orig=2 copy=3
+```
+
+`clone` is a trait, so it is **user-extensible** — implement it for your own types and `clone` dispatches to
+your body:
+
+```rust
+struct Point { x: Int, y: Int }
+impl Clone for Point { fn clone(self) -> Point { Point { ..self } } }
+let p = Point { x: 3, y: 4 }
+let q = p |> clone
+println("q=(" + q.x + ", " + q.y + ")")          // => q=(3, 4)
 ```
 
 ---
@@ -1912,7 +2071,8 @@ names are available **unqualified** with no `use`:
   and terminals from [§19](#19-iterators), and the `Vec` sorts `sort`/`sorted`/`sortBy`.
 - `std::string` — string helpers: `slice`/`charStr`/`charAt`/`isEmpty`, search (`indexOf`/`lastIndexOf`/
   `startsWith`/`endsWith`/`hasSubstr`), `trim`/`trimStart`/`trimEnd`, `toUpper`/`toLower`,
-  `replace`/`padStart`/`padEnd`/`repeatStr`, and the `isAscii…` classification family + `hasControl`.
+  `replace`/`padStart`/`padEnd`/`repeatStr`, the `isAscii…` classification family + `hasControl`, and the
+  `StringBuilder` accumulator (`stringBuilder`/`append`/`appendByte`/`build`/`sbLen`).
 
 The **opt-in** modules must be brought in with a `use` before their functions resolve:
 
@@ -1924,9 +2084,97 @@ The **opt-in** modules must be brought in with a `use` before their functions re
   `minOf`/`maxOf`/`clamp`, `isNaN`/`isInfinite`, the constants `PI`/`E`, and the fallible `toIntChecked`. (The
   rounding builtins `floor`/`ceil`/`trunc`/`round`/`roundHalfToEven` and `toInt` are always-available — no `use`.)
 - `std::bytes` — a little-endian binary reader/writer over `Bytes`: the writers `writeU8`/`writeU16LE`/`writeU32LE`/
-  `writeI32LE`/`writeVarU`/`writeBytes` (each returns the buffer, so they chain with `|>`), and a `reader(b)` cursor
-  (`ByteReader`) with `readU8`/`readU16LE`/`readU32LE`/`readI32LE`/`readVarU`/`readBytes(n)` (each returns
-  `Result[…, String]` — an underrun is `Err`, never a trap), plus `remaining`/`atEnd`.
+  `writeI32LE`/`writeVarU`/`writeVarI`/`writeStr`/`writeBytes` (each returns the buffer, so they chain with `|>`), and a
+  `reader(b)` cursor (`ByteReader`) with `readU8`/`readU16LE`/`readU32LE`/`readI32LE`/`readVarU`/`readVarI`/`readStr`/
+  `readBytes(n)` (each returns `Result[…, String]` — an underrun is `Err`, never a trap), plus `remaining`/`atEnd`.
+  `writeVarI`/`readVarI` are a compact zigzag varint for signed `Int`s; `writeStr`/`readStr` length-prefix a `String`.
+- `std::json` — a JSON parser and serializer over a `Json` value tree: `parse(s) -> Result[Json, String]`,
+  `stringify(j)` / `stringifyChecked(j) -> Result[String, String]` / `stringifyPretty(j, indent)`, and the
+  accessors `getField`/`at`/`asInt`/`asDouble`/`asStr`/`asBool`/`asArr`/`asObj`/`asMap`/`isNull`.
+- `std::random` — a pseudo-random generator (the xoshiro128\*\* algorithm). Seed once with `seedRng(seed) -> Rng`,
+  then draw: `nextU32`, `nextInt(lo, hi)` / `nextIntBounded(bound)`, `nextInt48`, `nextBool`, `nextDouble` (in
+  `[0, 1)`) / `nextDoubleRange(lo, hi)`; plus `shuffle`/`choice` for `Vec`s, `jump`/`splitRng` for independent
+  streams, and the bulk `fillU32`/`fillDoubles`. It is **deterministic** (same seed → same stream, so it is fully
+  reproducible) and **not cryptographically secure** — do not use it for keys or secrets. It pulls no entropy on
+  its own; for an unpredictable seed pass one in yourself (e.g. `use std::env` and `seedRng(nanoTime())`).
+- `std::set` — a hash **`Set[T]`** (over `Map[T, Bool]`): `set()` / `setOf(vec)`, `insert`/`remove` (each returns
+  a `Bool`), `isMember`, `size`, the algebra `union`/`intersect`/`difference`/`isSubset`/`isDisjoint`, and
+  `for x in s` (plus the lazy combinators) via `IntoIterator`. The element type `T` must be a permitted map key
+  (`Int`/`Double`/`Bool`/`String`/`Atom`); iteration is hash-order (unspecified), like `Map`.
+- `std::time` — dates and times, **strict UTC** at **millisecond** precision. Three value types plus a
+  `Stopwatch`: an `Instant` (a point on the timeline, epoch milliseconds), a `Duration` (a span), and a
+  `DateTime` (the decomposed civil fields). `now() -> Instant` reads the wall clock; `toDateTime`/`fromDateTime`
+  convert; `dateTime(y, mo, d, h, mi, s, ms) -> Option[DateTime]` validates strictly (bad fields → `None`);
+  `toIso`/`parseIso` round-trip an ISO-8601 string; `weekday` (ISO Mon=1..Sun=7), `isLeapYear`, `daysInMonth`;
+  `Duration` constructors `millis`/`seconds`/`minutes`/`hours`/`days` with `in*` accessors and arithmetic. An
+  `Instant` spans roughly year -2490..6429 (the ±2⁴⁷-ms window); sub-millisecond precision and time zones are
+  out of scope for v1.
+
+For example, `std::json` round-trips a document through its `Json` value tree:
+
+```rust
+use std::json::*
+
+let doc = unwrap(parse("{\"name\": \"Ada\", \"age\": 36}"))
+let name = unwrap(asStr(unwrap(getField(doc, "name"))))
+println(name)                  // => Ada
+println(stringify(doc))        // => {"name":"Ada","age":36}
+```
+
+And `std::random`, seeded for reproducibility, rolls a die and shuffles a deck:
+
+```rust
+use std::random::*
+
+let mut rng = seedRng(42)
+println(nextInt(rng, 1, 7))    // a fair die: an Int in [1, 6]
+println(nextDouble(rng))       // a Double in [0, 1)
+
+let mut deck: Vec[Int] = vec()
+let mut i = 1
+while i <= 5 {
+  push(deck, i)
+  i = i + 1
+}
+shuffle(rng, deck)             // a uniformly-random permutation, in place
+println(toString(deck))
+```
+
+And `std::set` deduplicates and answers membership / set-algebra questions:
+
+```rust
+use std::set::*
+
+let mut v: Vec[Int] = vec()
+push(v, 1) push(v, 2) push(v, 2) push(v, 3)
+let a = setOf(v)               // {1, 2, 3}
+println(size(a))               // 3
+println(isMember(a, 2))        // true
+
+let mut w: Vec[Int] = vec()
+push(w, 2) push(w, 3) push(w, 4)
+let b = setOf(w)
+println(size(intersect(a, b))) // 2   ({2, 3})
+```
+
+And `std::time` decomposes an instant, does duration arithmetic, and round-trips ISO-8601:
+
+```rust
+use std::time::*
+
+let t = instantFromMillis(1784644215123)   // 2026-07-21 14:30:15.123 UTC
+let dt = toDateTime(t)
+println(toIso(dt))                          // => 2026-07-21T14:30:15.123Z
+println(weekday(dt))                        // => 2   (ISO Mon=1..Sun=7 -> Tuesday)
+
+let later = addDuration(t, hours(2))
+println(inMinutes(durationBetween(t, later)))   // => 120
+
+match parseIso("2000-02-29T12:00:00.000Z") {
+  Ok(d)  => println(d.year),                // => 2000
+  Err(m) => println(m)
+}
+```
 
 Any prelude name can also be reached explicitly as `std::name` (useful when a local definition shadows it).
 
@@ -2283,12 +2531,68 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `writeU8(b,v)` / `writeU16LE(b,v)` / `writeU32LE(b,v)` | append an unsigned 1/2/4-byte value (masking); returns `b` |
 | `writeI32LE(b,v)` | append a signed 4-byte value (two's complement); returns `b` |
 | `writeVarU(b,v)` | append `v ≥ 0` as unsigned LEB128 (1–7 bytes); returns `b` |
+| `writeVarI(b,v)` | append a signed `Int` as a zigzag varint (compact for small magnitudes); returns `b` |
+| `writeStr(b,s)` | append a length-prefixed `String` (varU byte-length + raw bytes); returns `b` |
 | `writeBytes(b,src)` | append the raw bytes of `src`; returns `b` |
 | `reader(b)` | a `ByteReader` cursor over `b` (`pos` starts at 0) |
 | `readU8(r)` / `readU16LE(r)` / `readU32LE(r)` / `readI32LE(r)` | read a 1/2/4-byte value → `Result[Int, String]` (`Err` on underrun) |
-| `readVarU(r)` | read an unsigned LEB128 → `Result[Int, String]` |
+| `readVarU(r)` / `readVarI(r)` | read an unsigned LEB128 / a signed zigzag varint → `Result[Int, String]` |
+| `readStr(r)` | read a length-prefixed `String` → `Result[String, String]` |
 | `readBytes(r,n)` | read `n` raw bytes → `Result[Bytes, String]` |
 | `remaining(r)` / `atEnd(r)` | bytes left to read / whether the cursor is at the end |
+
+**JSON** *(all `std::json` — `use std::json::*`)*
+
+| Function | Purpose |
+|----------|---------|
+| `parse(s)` | parse JSON text → `Result[Json, String]` |
+| `stringify(j)` / `stringifyPretty(j, indent)` | serialize a `Json` to compact / indented text |
+| `stringifyChecked(j)` | serialize → `Result[String, String]` (`Err` on a non-finite number) |
+| `getField(j, key)` / `at(j, i)` | look up an object field / array element → `Option[Json]` |
+| `asInt`/`asDouble`/`asStr`/`asBool`/`asArr`/`asObj`/`asMap`/`isNull` | extract a `Json` case (each `Option`, except `isNull` → `Bool`) |
+
+**Randomness** *(all `std::random` — `use std::random::*`; deterministic, NOT cryptographic)*
+
+| Function | Purpose |
+|----------|---------|
+| `seedRng(seed)` | a new `Rng` from an `Int` seed (reproducible) |
+| `rngFromState(a,b,c,d)` | a new `Rng` from raw 32-bit state words (advanced) |
+| `nextU32(r)` | a raw 32-bit draw in `[0, 2³²)` |
+| `nextIntBounded(r, bound)` / `nextInt(r, lo, hi)` | a uniform `Int` in `[0, bound)` / `[lo, hi)` (bias-free) |
+| `nextInt48(r)` | a uniform `Int` over the full signed range (can be negative) |
+| `nextBool(r)` | a random `Bool` |
+| `nextDouble(r)` / `nextDoubleRange(r, lo, hi)` | a uniform `Double` in `[0, 1)` / `[lo, hi)` |
+| `shuffle(r, v)` / `choice(r, v)` | shuffle a `Vec` in place / a random element → `Option[T]` |
+| `jump(r)` / `splitRng(r)` | advance one stream / return a fresh non-overlapping stream |
+| `fillU32(r, out, n)` / `fillDoubles(r, out, n)` | append `n` draws to a `Vec` (bulk, load/store-optimized) |
+
+**Sets** *(all `std::set` — `use std::set::*`; `T` must be a permitted map key)*
+
+| Function | Purpose |
+|----------|---------|
+| `set()` / `setOf(v)` | an empty `Set[T]` / a set of the distinct elements of a `Vec` |
+| `insert(s, x)` / `remove(s, x)` | add / delete `x` → `Bool` (was-new / was-present); `s` must be `mut` |
+| `isMember(s, x)` / `size(s)` | membership → `Bool` / cardinality → `Int` (both O(1)) |
+| `union` / `intersect` / `difference` `(a, b)` | the combined / common / left-only set |
+| `isSubset(a, b)` / `isDisjoint(a, b)` | `a ⊆ b` / `a ∩ b = ∅` → `Bool` |
+
+**Dates and times** *(all `std::time` — `use std::time::*`; strict UTC, millisecond precision)*
+
+| Function | Purpose |
+|----------|---------|
+| `now()` | the current wall-clock `Instant` (UTC) |
+| `instantFromMillis(ms)` / `toEpochMillis(t)` | build / unwrap an `Instant` ↔ epoch milliseconds |
+| `toDateTime(t)` / `fromDateTime(dt)` | `Instant` ↔ decomposed civil `DateTime` (UTC) |
+| `dateTime(y,mo,d,h,mi,s,ms)` / `dateOnly(y,mo,d)` | a strictly-validated `DateTime` → `Option` (bad fields → `None`) |
+| `toIso(dt)` / `parseIso(s)` | ISO-8601 `YYYY-MM-DDThh:mm:ss.sssZ` ↔ `DateTime` (`parseIso` → `Result`) |
+| `weekday(dt)` | ISO weekday, Monday=1 .. Sunday=7 |
+| `isLeapYear(y)` / `daysInMonth(y, mo)` | calendar predicates |
+| `millis`/`seconds`/`minutes`/`hours`/`days` `(n)` | build a `Duration` |
+| `inMillis`/`inSeconds`/`inMinutes`/`inHours`/`inDays` `(d)` | a `Duration` as an `Int` (truncating) |
+| `addDuration(t,d)` / `subDuration(t,d)` / `durationBetween(a,b)` | `Instant` arithmetic |
+| `addDurations` / `subDurations` / `scaleDuration` / `negateDuration` | `Duration` algebra |
+| `isBefore(a, b)` / `isAfter(a, b)` | order two `Instant`s → `Bool` |
+| `startStopwatch()` / `elapsedNanos(sw)` / `elapsedMillis(sw)` | a monotonic stopwatch |
 
 **Strings and bytes**
 
@@ -2310,12 +2614,17 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `toBytes(s)` / `fromBytes(b)` | convert between `String` and `Bytes` |
 | `split(s, sep)` | lazily split into fields on a literal separator (empties kept; inverse of `join`) |
 | `lines(s)` | lazily split into lines (terminator semantics; `CRLF` handled) |
+| `stringBuilder()` / `stringBuilderCap(n)` | a `StringBuilder` accumulator over `Bytes` (empty / pre-sized to `n`) |
+| `append(sb, s)` / `appendByte(sb, c)` | append a `String` / one byte to a `StringBuilder` (mutates in place; returns `sb`) |
+| `build(sb)` / `sbLen(sb)` | the accumulated `String` / its current byte length |
+| `format(x, spec)` | format a scalar per a `${x:spec}` specifier (width/align/precision/base) → `String` |
 
 **Collections**
 
 | Function | Purpose |
 |----------|---------|
-| `array(n, init)` / `vec()` / `bytes()` | create an `Array` / `Vec` / `Bytes` |
+| `array(n, init)` / `emptyArray()` / `vec()` / `bytes()` | create an `Array` (filled / empty) / `Vec` / `Bytes` |
+| `clone(c)` | an independent shallow copy of a `Vec` / `Map` / `Bytes` / `Array` (a `Clone` trait — implement it for your own types) |
 | `push(c, x)` / `pop(c)` | append to / remove the last element of a `Vec` or `Bytes` (`pop` returns `Option`) |
 | `c[i]` / `c[i] = x` | read / write an element of an `Array`, `Vec`, or `Bytes` by index (bounds-checked — aborts on out-of-range; assignment needs a `mut` binding) |
 | `len(c)` | number of elements |
@@ -2324,6 +2633,8 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `has(m, k)` / `get(m, k)` | map membership test / safe lookup (`Option`) |
 | `delete(m, k)` | remove a map entry |
 | `keys(m)` / `values(m)` | snapshot a map's keys / values |
+| `getOr(m, k, dflt)` / `getOrElse(m, k, f)` | map lookup with an eager / lazy default (non-mutating) |
+| `getOrPut(m, k, dflt)` / `upsert(m, k, dflt, f)` | insert-if-absent / read-modify-write a `Map` entry (needs a `mut` binding) |
 
 **Option and Result**
 
@@ -2397,6 +2708,10 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 ### Where to go next
 
 - The grammar in `docs/alternative_typed_grammar.ebnf` is the precise reference for the syntax.
+- The `demo/` directory has larger runnable programs — an iterator showcase (`iterator_for`), JSON both ways
+  (`json_parser` from scratch and `json` over `std::json`), one demo per standard-library module (`math`,
+  `random`, `set`, `time`, `bytes`, `map_helpers`), string/byte iteration (`string_iter`), trait objects
+  (`dyn_traits`), string interpolation (`interp`), and file I/O (`file_io`).
 - A few features exist in the language's design space but are intentionally not part of this guide because they
   are not built yet (for example loop labels, `while let`, and a handful of extra iterator combinators like
   `rev` and `cycle`).
