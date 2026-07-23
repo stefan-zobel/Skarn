@@ -1,0 +1,287 @@
+// json_parser.skn -- an idiomatic recursive-descent JSON parser in Skarn.
+//
+// Dogfoods the string/number primitives that landed 2026-07-16:
+//   * char literals ('{', '"', '0' ...) throughout the scanner
+//   * len(String) / toBytes / fromBytes
+//   * parseInt / parseDouble on number spans extracted with the prelude `slice`
+//   * toInt (rounding a parsed Double)
+//   * the static Bytes builder (push(Bytes, Int) -> Bytes) to DECODE string values,
+//     including \uXXXX -> UTF-8 via bit-ops + push
+//
+// Structure is plain Skarn: a recursive `enum` through Vec, a `mut` cursor,
+// Result + `?` for error propagation, `match`, generics-free. NO escape hatch.
+
+enum Json {
+  JNull,
+  JBool(Bool),
+  JInt(Int),
+  JNum(Double),
+  JStr(String),
+  JArr(Vec[Json]),
+  JObj(Vec[Entry]),
+}
+
+struct Entry { key: String, val: Json }
+
+// ---- cursor over the input --------------------------------------------------
+struct Cur { s: String, b: Bytes, n: Int, i: Int }
+
+fn newCur(s: String) -> Cur {
+  let bs = toBytes(s)
+  Cur { s: s, b: bs, n: len(bs), i: 0 }
+}
+fn peek(c: Cur) -> Int { if c.i < c.n { c.b[c.i] } else { 0 - 1 } }
+fn adv(mut c: Cur) -> () { c.i = c.i + 1 }
+fn atEnd(c: Cur) -> Bool { c.i >= c.n }
+
+fn isWs(b: Int) -> Bool { b == ' ' || b == '\t' || b == '\n' || b == '\r' }
+fn skipWs(mut c: Cur) -> () { while isWs(peek(c)) { adv(c) } }
+
+fn eat(mut c: Cur, ch: Int) -> Result[(), String] {
+  if peek(c) == ch { adv(c) Ok(()) }
+  else { Err("expected '" + charStr(ch) + "' at position " + toString(c.i)) }
+}
+
+// ---- values -----------------------------------------------------------------
+fn parseValue(mut c: Cur) -> Result[Json, String] {
+  skipWs(c)
+  let ch = peek(c)
+  if ch == '{' { parseObject(c) }
+  else if ch == '[' { parseArray(c) }
+  else if ch == '"' { let s = parseString(c)? Ok(JStr(s)) }
+  else if ch == 't' || ch == 'f' { parseBool(c) }
+  else if ch == 'n' { parseLit(c, "null")? Ok(JNull) }
+  else if ch == '-' || (ch >= '0' && ch <= '9') { parseNumber(c) }
+  else { Err("unexpected character '" + charStr(ch) + "' at position " + toString(c.i)) }
+}
+
+fn parseBool(mut c: Cur) -> Result[Json, String] {
+  if peek(c) == 't' { parseLit(c, "true")? Ok(JBool(true)) }
+  else { parseLit(c, "false")? Ok(JBool(false)) }
+}
+
+// Match a fixed keyword against the input, consuming it.
+fn parseLit(mut c: Cur, kw: String) -> Result[(), String] {
+  let kb = toBytes(kw)
+  let m = len(kb)
+  let mut k = 0
+  while k < m {
+    if peek(c) != kb[k] { return Err("invalid literal at position " + toString(c.i)) }
+    adv(c)
+    k = k + 1
+  }
+  Ok(())
+}
+
+// ---- numbers: scan the span, `slice` it out, then parseInt / parseDouble ------
+fn isNumByte(b: Int) -> Bool {
+  (b >= '0' && b <= '9') || b == '-' || b == '+' || b == '.' || b == 'e' || b == 'E'
+}
+fn parseNumber(mut c: Cur) -> Result[Json, String] {
+  let start = c.i
+  let mut isReal = false
+  while isNumByte(peek(c)) {
+    let ch = peek(c)
+    if ch == '.' || ch == 'e' || ch == 'E' { isReal = true }
+    adv(c)
+  }
+  let text = slice(c.s, start, c.i)
+  if isReal {
+    match parseDouble(text) { Ok(d) => Ok(JNum(d)), Err(e) => Err(e) }
+  } else {
+    // An integer that overflows the 48-bit range falls back to a Double.
+    match parseInt(text) {
+      Ok(n)  => Ok(JInt(n)),
+      Err(_) => match parseDouble(text) { Ok(d) => Ok(JNum(d)), Err(e) => Err(e) },
+    }
+  }
+}
+
+// ---- strings: decode escapes into a fresh byte buffer, then fromBytes --------
+fn hexVal(ch: Int) -> Result[Int, String] {
+  if      ch >= '0' && ch <= '9' { Ok(ch - '0') }
+  else if ch >= 'a' && ch <= 'f' { Ok(ch - 'a' + 10) }
+  else if ch >= 'A' && ch <= 'F' { Ok(ch - 'A' + 10) }
+  else { Err("bad hex digit at position " + toString(ch)) }
+}
+fn parseHex4(mut c: Cur) -> Result[Int, String] {
+  let mut val = 0
+  let mut k = 0
+  while k < 4 {
+    let h = hexVal(peek(c))?
+    val = val * 16 + h
+    adv(c)
+    k = k + 1
+  }
+  Ok(val)
+}
+// Encode a Unicode code point (BMP only -- no surrogate pairs in v1) into UTF-8,
+// pushing 1..3 bytes onto `buf`. Dogfoods the Bytes builder + bitwise ops.
+fn pushUtf8(buf: Bytes, cp: Int) -> () {
+  if cp < 128 {
+    push(buf, cp)
+  } else if cp < 2048 {
+    push(buf, 192 | (cp >> 6))
+    push(buf, 128 | (cp & 63))
+  } else {
+    push(buf, 224 | (cp >> 12))
+    push(buf, 128 | ((cp >> 6) & 63))
+    push(buf, 128 | (cp & 63))
+  }
+}
+fn parseString(mut c: Cur) -> Result[String, String] {
+  eat(c, '"')?
+  let buf = bytes()
+  loop {
+    if atEnd(c) { return Err("unterminated string at position " + toString(c.i)) }
+    let ch = peek(c)
+    adv(c)
+    if ch == '"' {
+      break
+    } else if ch == '\\' {
+      let e = peek(c)
+      adv(c)
+      if      e == '"'  { push(buf, '"') }
+      else if e == '\\' { push(buf, '\\') }
+      else if e == '/'  { push(buf, '/') }
+      else if e == 'n'  { push(buf, '\n') }
+      else if e == 't'  { push(buf, '\t') }
+      else if e == 'r'  { push(buf, '\r') }
+      else if e == 'b'  { push(buf, 8) }
+      else if e == 'f'  { push(buf, 12) }
+      else if e == 'u'  { let cp = parseHex4(c)? pushUtf8(buf, cp) }
+      else { return Err("invalid escape at position " + toString(c.i)) }
+    } else {
+      push(buf, ch)
+    }
+  }
+  Ok(fromBytes(buf))
+}
+
+// ---- arrays / objects (recursive) -------------------------------------------
+fn parseArray(mut c: Cur) -> Result[Json, String] {
+  eat(c, '[')?
+  let items: Vec[Json] = vec()
+  skipWs(c)
+  if peek(c) == ']' { adv(c) return Ok(JArr(items)) }
+  loop {
+    let v = parseValue(c)?
+    push(items, v)
+    skipWs(c)
+    let ch = peek(c)
+    if ch == ',' { adv(c) }
+    else if ch == ']' { adv(c) break }
+    else { return Err("expected ',' or ']' at position " + toString(c.i)) }
+  }
+  Ok(JArr(items))
+}
+fn parseObject(mut c: Cur) -> Result[Json, String] {
+  eat(c, '{')?
+  let entries: Vec[Entry] = vec()
+  skipWs(c)
+  if peek(c) == '}' { adv(c) return Ok(JObj(entries)) }
+  loop {
+    skipWs(c)
+    if peek(c) != '"' { return Err("expected string key at position " + toString(c.i)) }
+    let key = parseString(c)?
+    skipWs(c)
+    eat(c, ':')?
+    let val = parseValue(c)?
+    push(entries, Entry { key: key, val: val })
+    skipWs(c)
+    let ch = peek(c)
+    if ch == ',' { adv(c) }
+    else if ch == '}' { adv(c) break }
+    else { return Err("expected ',' or '}' at position " + toString(c.i)) }
+  }
+  Ok(JObj(entries))
+}
+
+fn parseJson(s: String) -> Result[Json, String] {
+  let c = newCur(s)
+  let v = parseValue(c)?
+  skipWs(c)
+  if !atEnd(c) { return Err("trailing characters at position " + toString(c.i)) }
+  Ok(v)
+}
+
+// ---- rendering (compact) + typed queries ------------------------------------
+fn render(j: Json) -> String {
+  match j {
+    JNull    => "null",
+    JBool(b) => if b { "true" } else { "false" },
+    JInt(n)  => toString(n),
+    JNum(d)  => toString(d),
+    JStr(s)  => "\"" + s + "\"",
+    JArr(xs) => renderArr(xs),
+    JObj(es) => renderObj(es),
+  }
+}
+fn renderArr(xs: Vec[Json]) -> String {
+  let mut s = "["
+  let mut first = true
+  for x in xs {
+    if !first { s = s + "," }
+    s = s + render(x)
+    first = false
+  }
+  s + "]"
+}
+fn renderObj(es: Vec[Entry]) -> String {
+  let mut s = "{"
+  let mut first = true
+  for e in es {
+    if !first { s = s + "," }
+    s = s + "\"" + e.key + "\":" + render(e.val)
+    first = false
+  }
+  s + "}"
+}
+
+fn objGet(j: Json, key: String) -> Option[Json] {
+  match j {
+    JObj(es) => {
+      let mut res: Option[Json] = None
+      for e in es { if e.key == key { res = Some(e.val) } }
+      res
+    },
+    _ => None,
+  }
+}
+fn asInt(j: Json) -> Option[Int]    { match j { JInt(n) => Some(n), _ => None } }
+fn asNum(j: Json) -> Option[Double] { match j { JNum(d) => Some(d), _ => None } }
+fn asArr(j: Json) -> Option[Vec[Json]] { match j { JArr(xs) => Some(xs), _ => None } }
+
+// ---- demo -------------------------------------------------------------------
+let doc = "{ \"name\": \"Ada Lovelace\", \"age\": 36, \"member\": true, \"langs\": [\"vLang\", \"Rust\"], \"scores\": [90, 85, 77], \"gpa\": 3.85, \"tick\": \"ok \\u2713\" }"
+
+match parseJson(doc) {
+  Ok(j) => {
+    println("parsed OK, re-rendered:")
+    println(render(j))
+    // typed field extraction -- `if let` flattens the Option staircases
+    if let Some(a) = objGet(j, "age") {
+      if let Some(n) = asInt(a) { println("age (Int)    = " + toString(n)) }
+    }
+    if let Some(g) = objGet(j, "gpa") {
+      if let Some(d) = asNum(g) {
+        println("gpa (Double) = " + toString(d) + ", rounded via toInt = " + toString(toInt(d)))
+      }
+    }
+    if let Some(sc) = objGet(j, "scores") {
+      if let Some(xs) = asArr(sc) {
+        let mut sum = 0
+        let mut cnt = 0
+        for x in xs { if let JInt(n) = x { sum = sum + n cnt = cnt + 1 } }
+        if cnt > 0 { println("scores avg   = " + toString(sum / cnt)) }
+      }
+    }
+  },
+  Err(e) => println("parse error: " + e),
+}
+
+// a deliberately malformed document -> a located Err
+match parseJson("{ \"a\": }") {
+  Ok(_)  => println("unexpectedly ok"),
+  Err(e) => println("malformed input -> Err: " + e),
+}

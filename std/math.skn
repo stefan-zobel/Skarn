@@ -1,0 +1,29 @@
+// Numeric helpers. OPT-IN: reach these via `use std::math::*` (or a qualified std::math::name).
+// The rounding builtins floor/ceil/trunc/round/roundHalfToEven and the saturating toInt are ambient
+// opcode builtins (always available, not in this module). toIntChecked is the FALLIBLE narrow: it
+// truncates toward zero (like toInt) but returns Err instead of saturating when x is NaN, infinite,
+// or out of the Int range. Pure Skarn over trunc + an exact range check (both +-2^47 bounds are
+// exactly representable as Double; NaN and +-inf fail the comparison and fall to Err).
+pub fn toIntChecked(x: Double) -> Result[Int, String] {
+  let t = trunc(x)
+  let lo = -140737488355328.0   // MIN_48 = -2^47
+  let hi = 140737488355327.0    // MAX_48 =  2^47 - 1
+  if t >= lo && t <= hi { Ok(toInt(t)) }
+  else { Err("toIntChecked: value out of Int range") }
+}
+// Constants (const items, inlined at each use site). Reach them bare via `use std::math::*`.
+pub const PI: Double = 3.141592653589793
+pub const E: Double = 2.718281828459045
+// Scalar min/max/clamp -- GENERIC over Ord (type-preserving: Int/Double/String). Named minOf/maxOf
+// because the bare min/max are the Iterator terminals (arity 1 over a stream); Skarn has no overloading.
+pub fn minOf[T: Ord](a: T, b: T) -> T { if lessThan(a, b) { a } else { b } }
+pub fn maxOf[T: Ord](a: T, b: T) -> T { if lessThan(b, a) { a } else { b } }
+pub fn clamp[T: Ord](x: T, lo: T, hi: T) -> T { if lessThan(x, lo) { lo } else if lessThan(hi, x) { hi } else { x } }
+// Integer-preserving helpers (the libm `abs`/`sign` are Double natives).
+pub fn absInt(x: Int) -> Int { if x < 0 { -x } else { x } }
+pub fn sign(x: Double) -> Double { if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { x } }   // NaN -> NaN; +-0.0 preserved
+pub fn signInt(x: Int) -> Int { if x > 0 { 1 } else if x < 0 { -1 } else { 0 } }
+fn _gcdGo(a: Int, b: Int) -> Int { if b == 0 { a } else { _gcdGo(b, a % b) } }
+pub fn gcd(a: Int, b: Int) -> Int { _gcdGo(absInt(a), absInt(b)) }   // gcd(|a|,|b|); gcd(0,0)=0
+pub fn lcm(a: Int, b: Int) -> Int { if a == 0 || b == 0 { 0 } else { absInt(a / gcd(a, b) * b) } }
+

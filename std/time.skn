@@ -1,0 +1,207 @@
+// Dates and times: strict UTC, millisecond precision. Pure Skarn (no VM change, no new native) -- the
+// calendar math is Howard Hinnant's civil<->days algorithm (proleptic Gregorian, exact 48-bit integer),
+// so the whole module is deterministic and differential-testable. The ONLY impure surface is `now()` and
+// the `Stopwatch` (they read the wall-clock / monotonic natives), so they are excluded from the oracle.
+//
+// REPRESENTATION: the canonical instant is epoch MILLISECONDS as an Int. That fits the 48-bit signed Int
+// over roughly year -2490 .. 6429 (the +/-2^47 ms window around 1970); dates outside that range cannot be
+// held as an Instant (sub-millisecond precision is likewise a non-goal -- it does not fit as an absolute
+// value). The civil helpers work for any year, but you can only build an Instant inside that window.
+//
+// UTC ONLY: there is no time-zone or offset. All conversions are in UTC. Local time / fixed offsets are a
+// deferred v1.1 item.
+//
+// OPT-IN: reach these via `use std::time::*` (or a qualified std::time::name). Tree-shaken. A user of this
+// module does NOT need `use std::env` -- the wall-clock/monotonic native calls live inside `now`/Stopwatch.
+use std::env::*
+
+// A point on the timeline (UTC), as epoch milliseconds.
+pub struct Instant { ms: Int }
+// A span of time, in milliseconds. +/-2^47 ms is ~4460 years -- beyond any real span.
+pub struct Duration { ms: Int }
+// A decomposed civil date-time (UTC). Fields are public; build a validated one via `dateTime`/`dateOnly`.
+pub struct DateTime {
+  year: Int, month: Int, day: Int,
+  hour: Int, minute: Int, second: Int, milli: Int
+}
+// A monotonic stopwatch (for measuring elapsed time; unaffected by wall-clock jumps).
+pub struct Stopwatch { startNanos: Int }
+
+// --- floor division / modulo (Skarn's `/` and `%` truncate toward zero; the calendar math needs floor
+// semantics for negative epoch-ms and negative years). Divisor is always positive here. ---
+fn _floorDiv(a: Int, b: Int) -> Int {
+  if a >= 0 { a / b } else { 0 - ((0 - a + b - 1) / b) }
+}
+fn _floorMod(a: Int, b: Int) -> Int { a - _floorDiv(a, b) * b }
+
+// --- Hinnant's calendar core ---
+
+// Days since 1970-01-01 for a civil (year, month, day). `month` in 1..12, `day` in 1..31.
+fn _daysFromCivil(y: Int, m: Int, d: Int) -> Int {
+  let yy = if m <= 2 { y - 1 } else { y }
+  let era = _floorDiv(yy, 400)
+  let yoe = yy - era * 400                                   // [0, 399]
+  let mp = if m > 2 { m - 3 } else { m + 9 }                 // [0, 11]
+  let doy = (153 * mp + 2) / 5 + d - 1                       // [0, 365]
+  let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy            // [0, 146096]
+  era * 146097 + doe - 719468
+}
+
+// The civil date (as a DateTime with a zeroed time) for a day count since 1970-01-01.
+fn _civilFromDays(z: Int) -> DateTime {
+  let zz = z + 719468
+  let era = _floorDiv(zz, 146097)
+  let doe = zz - era * 146097                                // [0, 146096]
+  let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365    // [0, 399]
+  let y = yoe + era * 400
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)          // [0, 365]
+  let mp = (5 * doy + 2) / 153                               // [0, 11]
+  let d = doy - (153 * mp + 2) / 5 + 1                       // [1, 31]
+  let m = if mp < 10 { mp + 3 } else { mp - 9 }              // [1, 12]
+  let yr = if m <= 2 { y + 1 } else { y }
+  DateTime { year: yr, month: m, day: d, hour: 0, minute: 0, second: 0, milli: 0 }
+}
+
+// --- Instant <-> DateTime ---
+
+// Decompose an Instant into its civil UTC fields.
+pub fn toDateTime(t: Instant) -> DateTime {
+  let ms = t.ms
+  let days = _floorDiv(ms, 86400000)
+  let tod = ms - days * 86400000                             // ms-of-day, [0, 86399999]
+  let dp = _civilFromDays(days)
+  let h = tod / 3600000
+  let mi = (tod / 60000) % 60
+  let s = (tod / 1000) % 60
+  let milli = tod % 1000
+  DateTime { year: dp.year, month: dp.month, day: dp.day, hour: h, minute: mi, second: s, milli: milli }
+}
+
+// Recompose an Instant from civil UTC fields. Assumes `dt` is valid (build one via `dateTime`).
+pub fn fromDateTime(dt: DateTime) -> Instant {
+  let days = _daysFromCivil(dt.year, dt.month, dt.day)
+  let ms = days * 86400000 + dt.hour * 3600000 + dt.minute * 60000 + dt.second * 1000 + dt.milli
+  Instant { ms: ms }
+}
+
+// --- calendar predicates ---
+
+pub fn isLeapYear(y: Int) -> Bool {
+  (_floorMod(y, 4) == 0) && (_floorMod(y, 100) != 0 || _floorMod(y, 400) == 0)
+}
+
+pub fn daysInMonth(y: Int, mo: Int) -> Int {
+  if mo == 2 { if isLeapYear(y) { 29 } else { 28 } }
+  else if mo == 4 || mo == 6 || mo == 9 || mo == 11 { 30 }
+  else { 31 }
+}
+
+// ISO-8601 weekday: Monday = 1 .. Sunday = 7. (1970-01-01 was a Thursday.)
+pub fn weekday(dt: DateTime) -> Int {
+  let days = _daysFromCivil(dt.year, dt.month, dt.day)
+  _floorMod(days + 3, 7) + 1
+}
+
+// --- validated construction ---
+
+// Strict civil constructor: every field is range-checked (month 1..12, day 1..daysInMonth, hour 0..23,
+// minute/second 0..59, milli 0..999). Out of range -> None.
+pub fn dateTime(y: Int, mo: Int, d: Int, h: Int, mi: Int, s: Int, ms: Int) -> Option[DateTime] {
+  if mo < 1 || mo > 12 { None }
+  else if d < 1 || d > daysInMonth(y, mo) { None }
+  else if h < 0 || h > 23 { None }
+  else if mi < 0 || mi > 59 { None }
+  else if s < 0 || s > 59 { None }
+  else if ms < 0 || ms > 999 { None }
+  else { Some(DateTime { year: y, month: mo, day: d, hour: h, minute: mi, second: s, milli: ms }) }
+}
+
+// A date at midnight UTC (time zeroed). Same validation as `dateTime`.
+pub fn dateOnly(y: Int, mo: Int, d: Int) -> Option[DateTime] { dateTime(y, mo, d, 0, 0, 0, 0) }
+
+// --- Instant construction / arithmetic ---
+
+// The current wall-clock instant (UTC). IMPURE: reads the millisTime native. Excluded from the oracle.
+pub fn now() -> Instant { Instant { ms: millisTime() } }
+
+pub fn instantFromMillis(ms: Int) -> Instant { Instant { ms: ms } }
+pub fn toEpochMillis(t: Instant) -> Int { t.ms }
+pub fn addDuration(t: Instant, dur: Duration) -> Instant { Instant { ms: t.ms + dur.ms } }
+pub fn subDuration(t: Instant, dur: Duration) -> Instant { Instant { ms: t.ms - dur.ms } }
+pub fn durationBetween(a: Instant, b: Instant) -> Duration { Duration { ms: b.ms - a.ms } }   // b - a
+pub fn isBefore(a: Instant, b: Instant) -> Bool { a.ms < b.ms }
+pub fn isAfter(a: Instant, b: Instant) -> Bool { a.ms > b.ms }
+
+// --- Duration constructors / accessors / algebra ---
+
+pub fn millis(n: Int) -> Duration { Duration { ms: n } }
+pub fn seconds(n: Int) -> Duration { Duration { ms: n * 1000 } }
+pub fn minutes(n: Int) -> Duration { Duration { ms: n * 60000 } }
+pub fn hours(n: Int) -> Duration { Duration { ms: n * 3600000 } }
+pub fn days(n: Int) -> Duration { Duration { ms: n * 86400000 } }
+
+pub fn inMillis(d: Duration) -> Int { d.ms }
+pub fn inSeconds(d: Duration) -> Int { d.ms / 1000 }
+pub fn inMinutes(d: Duration) -> Int { d.ms / 60000 }
+pub fn inHours(d: Duration) -> Int { d.ms / 3600000 }
+pub fn inDays(d: Duration) -> Int { d.ms / 86400000 }
+
+pub fn addDurations(a: Duration, b: Duration) -> Duration { Duration { ms: a.ms + b.ms } }
+pub fn subDurations(a: Duration, b: Duration) -> Duration { Duration { ms: a.ms - b.ms } }
+pub fn scaleDuration(d: Duration, k: Int) -> Duration { Duration { ms: d.ms * k } }
+pub fn negateDuration(d: Duration) -> Duration { Duration { ms: 0 - d.ms } }
+
+// --- ISO-8601 formatting / parsing (UTC, `YYYY-MM-DDThh:mm:ss.sssZ`) ---
+
+// Render an ISO-8601 UTC timestamp. Assumes year 0..9999 (zero-padded to 4 digits, no expanded-year sign).
+pub fn toIso(dt: DateTime) -> String {
+  "${dt.year:04}-${dt.month:02}-${dt.day:02}T${dt.hour:02}:${dt.minute:02}:${dt.second:02}.${dt.milli:03}Z"
+}
+
+fn _isDig(c: Int) -> Bool { c >= 48 && c <= 57 }
+
+// Read exactly k digits at byte offset `off`; -1 on any non-digit. Caller guarantees off+k <= len.
+fn _rd(b: Bytes, off: Int, k: Int) -> Int {
+  let mut v = 0
+  let mut i = 0
+  let mut ok = true
+  while i < k {
+    let c = b[off + i]
+    if _isDig(c) { v = v * 10 + (c - 48) } else { ok = false }
+    i = i + 1
+  }
+  if ok { v } else { 0 - 1 }
+}
+
+// Parse a strict `YYYY-MM-DDThh:mm:ss` (with optional `.sss` fraction and optional trailing `Z`) as UTC.
+// Fields are validated via `dateTime`, so an out-of-range component is an Err.
+pub fn parseIso(s: String) -> Result[DateTime, String] {
+  let b = toBytes(s)
+  let n = len(b)
+  if n < 19 { Err("invalid ISO datetime: too short") }
+  else if b[4] != 45 || b[7] != 45 || b[10] != 84 || b[13] != 58 || b[16] != 58 {
+    Err("invalid ISO datetime: bad separators")     // '-' '-' 'T' ':' ':'
+  } else {
+    let y = _rd(b, 0, 4)
+    let mo = _rd(b, 5, 2)
+    let d = _rd(b, 8, 2)
+    let h = _rd(b, 11, 2)
+    let mi = _rd(b, 14, 2)
+    let sc = _rd(b, 17, 2)
+    let milli = if n >= 23 && b[19] == 46 { _rd(b, 20, 3) } else { 0 }     // '.'
+    if y < 0 || mo < 0 || d < 0 || h < 0 || mi < 0 || sc < 0 || milli < 0 {
+      Err("invalid ISO datetime: non-numeric field")
+    } else {
+      match dateTime(y, mo, d, h, mi, sc, milli) {
+        Some(dt) => Ok(dt),
+        None => Err("invalid ISO datetime: field out of range")
+      }
+    }
+  }
+}
+
+// --- Stopwatch (monotonic elapsed time; IMPURE -- reads nanoTime, excluded from the oracle) ---
+
+pub fn startStopwatch() -> Stopwatch { Stopwatch { startNanos: nanoTime() } }
+pub fn elapsedNanos(sw: Stopwatch) -> Int { nanoTime() - sw.startNanos }
+pub fn elapsedMillis(sw: Stopwatch) -> Int { (nanoTime() - sw.startNanos) / 1000000 }

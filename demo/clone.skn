@@ -1,0 +1,29 @@
+// clone -- shallow independent copies of containers, plus a user-defined `impl Clone`.
+// The clone shares nested heap references but has its own top-level backing, so mutating
+// the copy never touches the original. `clone` / `x |> clone` dispatch on the receiver.
+
+// Vec: clone then push onto the copy -- the original keeps its length.
+let a: Vec[Int] = vec()
+push(a, 1) push(a, 2) push(a, 3)
+let b = clone(a)
+push(b, 99)
+println("vec original len = ${len(a)}   clone len = ${len(b)}")   // 3   4
+
+// Map: clone then overwrite a key in the copy -- the original value is unchanged.
+let scores: Map[String, Int] = #{ "ada" => 10, "bob" => 7 }
+let mut edited = clone(scores)
+edited["ada"] = 100
+println("map original ada = ${getOr(scores, "ada", 0)}   clone ada = ${getOr(edited, "ada", 0)}")  // 10   100
+
+// Array: clone then mutate one slot of the copy.
+let grid = array(3, 0)
+let mut copy = clone(grid)
+copy[1] = 42
+println("array original[1] = ${grid[1]}   clone[1] = ${copy[1]}")  // 0   42
+
+// User-extensible: write your own `impl Clone` and `clone` dispatches to it.
+struct Point { x: Int, y: Int }
+impl Clone for Point { fn clone(self) -> Point { Point { ..self } } }
+let p = Point { x: 3, y: 4 }
+let q = p |> clone
+println("cloned point = (${q.x}, ${q.y})")   // (3, 4)

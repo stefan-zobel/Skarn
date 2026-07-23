@@ -1,0 +1,29 @@
+// std::math demo: libm natives, scalar helpers, and const items (PI / E).
+// Run: static_vmrun demo/math.skn
+use std::math::*
+
+// Constants (const items -- inlined at each use, no runtime cost).
+println("PI ~ " + toInt(PI * 1000000.0))          // 3141592
+println("E  ~ " + toInt(E * 1000000.0))            // 2718281
+
+// libm natives (Double -> Double; IEEE domain errors -> NaN/inf).
+println("sqrt(2) ~ " + toInt(sqrt(2.0) * 1000.0))  // 1414
+println("2^10 = " + toInt(pow(2.0, 10.0)))         // 1024
+println("hypot(3,4) = " + toInt(hypot(3.0, 4.0)))  // 5
+println("abs(-5.5) = " + toInt(abs(-5.5) * 10.0))  // 55
+
+// Scalar helpers -- minOf/maxOf/clamp are GENERIC over Ord (type-preserving).
+println("minOf(3, 7) = " + minOf(3, 7))            // 3
+println("clamp(15, 0, 10) = " + clamp(15, 0, 10))  // 10
+println("minOf(\"b\", \"a\") = " + minOf("b", "a"))  // a  (works on String too)
+println("gcd(12, 18) = " + gcd(12, 18))            // 6
+println("lcm(4, 6) = " + lcm(4, 6))                // 12
+println("absInt(-9) = " + absInt(-9))              // 9
+
+// Predicates.
+println("isNaN(sqrt(-1)) = " + isNaN(sqrt(-1.0)))  // true
+println("isInfinite(1/0) = " + isInfinite(1.0 / 0.0))  // true
+
+// A radius-2 circle area, PI inlined.
+fn circleArea(r: Double) -> Double { PI * r * r }
+println("area(2) ~ " + toInt(circleArea(2.0)))     // 12

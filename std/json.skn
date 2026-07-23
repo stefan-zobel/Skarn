@@ -1,0 +1,386 @@
+// std::json -- a JSON (RFC 8259) parser + serializer in pure Skarn. OPT-IN: reach it via
+// `use std::json::*` (or a qualified std::json::name). No native, no VM change; tree-shaken.
+//
+// Data model: a recursive enum. Objects are an ORDERED Vec[JsonEntry] (key order + duplicates
+// preserved => deterministic, round-trippable serialization). Numbers split into JInt (48-bit)
+// and JNum (Double); an integer literal that overflows 48 bits falls back to JNum.
+// Internal helpers are `_j`-prefixed so `use std::json::*` only leaks the public surface.
+
+pub enum Json { JNull, JBool(Bool), JInt(Int), JNum(Double), JStr(String), JArr(Vec[Json]), JObj(Vec[JsonEntry]) }
+pub struct JsonEntry { key: String, val: Json }
+
+// ---- cursor over the input bytes --------------------------------------------
+struct JsonCur { s: String, b: Bytes, n: Int, i: Int }
+fn _jNew(s: String) -> JsonCur { let bs = toBytes(s)  JsonCur { s: s, b: bs, n: len(bs), i: 0 } }
+fn _jPeek(c: JsonCur) -> Int { if c.i < c.n { c.b[c.i] } else { 0 - 1 } }
+fn _jAdv(mut c: JsonCur) -> () { c.i = c.i + 1 }
+fn _jAtEnd(c: JsonCur) -> Bool { c.i >= c.n }
+fn _jIsWs(b: Int) -> Bool { b == ' ' || b == '\t' || b == '\n' || b == '\r' }
+fn _jSkipWs(mut c: JsonCur) -> () { while _jIsWs(_jPeek(c)) { _jAdv(c) } }
+fn _jEat(mut c: JsonCur, ch: Int) -> Result[(), String] {
+  if _jPeek(c) == ch { _jAdv(c) Ok(()) }
+  else { Err("expected '" + charStr(ch) + "' at position " + toString(c.i)) }
+}
+
+// ---- values -----------------------------------------------------------------
+fn _jValue(mut c: JsonCur) -> Result[Json, String] {
+  _jSkipWs(c)
+  let ch = _jPeek(c)
+  if ch == '{' { _jObject(c) }
+  else if ch == '[' { _jArray(c) }
+  else if ch == '"' { let s = _jStrLit(c)?  Ok(JStr(s)) }
+  else if ch == 't' || ch == 'f' { _jBool(c) }
+  else if ch == 'n' { _jLit(c, "null")?  Ok(JNull) }
+  else if ch == '-' || (ch >= '0' && ch <= '9') { _jNumber(c) }
+  else { Err("unexpected character '" + charStr(ch) + "' at position " + toString(c.i)) }
+}
+fn _jBool(mut c: JsonCur) -> Result[Json, String] {
+  if _jPeek(c) == 't' { _jLit(c, "true")?  Ok(JBool(true)) }
+  else { _jLit(c, "false")?  Ok(JBool(false)) }
+}
+// Match a fixed keyword against the input, consuming it.
+fn _jLit(mut c: JsonCur, kw: String) -> Result[(), String] {
+  let kb = toBytes(kw)
+  let m = len(kb)
+  let mut k = 0
+  while k < m {
+    if _jPeek(c) != kb[k] { return Err("invalid literal at position " + toString(c.i)) }
+    _jAdv(c)
+    k = k + 1
+  }
+  Ok(())
+}
+fn _jIsNumByte(b: Int) -> Bool {
+  (b >= '0' && b <= '9') || b == '-' || b == '+' || b == '.' || b == 'e' || b == 'E'
+}
+fn _jNumber(mut c: JsonCur) -> Result[Json, String] {
+  let start = c.i
+  let mut isReal = false
+  while _jIsNumByte(_jPeek(c)) {
+    let ch = _jPeek(c)
+    if ch == '.' || ch == 'e' || ch == 'E' { isReal = true }
+    _jAdv(c)
+  }
+  let text = slice(c.s, start, c.i)
+  if isReal {
+    match parseDouble(text) { Ok(d) => Ok(JNum(d)), Err(e) => Err(e) }
+  } else {
+    // An integer that overflows the 48-bit range falls back to a Double.
+    match parseInt(text) {
+      Ok(n)  => Ok(JInt(n)),
+      Err(_) => match parseDouble(text) { Ok(d) => Ok(JNum(d)), Err(e) => Err(e) },
+    }
+  }
+}
+
+// ---- strings: decode escapes into a fresh byte buffer, then fromBytes --------
+fn _jHexVal(ch: Int) -> Result[Int, String] {
+  if      ch >= '0' && ch <= '9' { Ok(ch - '0') }
+  else if ch >= 'a' && ch <= 'f' { Ok(ch - 'a' + 10) }
+  else if ch >= 'A' && ch <= 'F' { Ok(ch - 'A' + 10) }
+  else { Err("bad \\u hex digit") }
+}
+fn _jHex4(mut c: JsonCur) -> Result[Int, String] {
+  let mut val = 0
+  let mut k = 0
+  while k < 4 {
+    let h = _jHexVal(_jPeek(c))?
+    val = val * 16 + h
+    _jAdv(c)
+    k = k + 1
+  }
+  Ok(val)
+}
+// Encode a Unicode code point into UTF-8 (1..4 bytes), pushing onto `buf`.
+fn _jPushUtf8(buf: Bytes, cp: Int) -> () {
+  if cp < 128 {
+    push(buf, cp)
+  } else if cp < 2048 {
+    push(buf, 192 | (cp >> 6))
+    push(buf, 128 | (cp & 63))
+  } else if cp < 65536 {
+    push(buf, 224 | (cp >> 12))
+    push(buf, 128 | ((cp >> 6) & 63))
+    push(buf, 128 | (cp & 63))
+  } else {
+    push(buf, 240 | (cp >> 18))
+    push(buf, 128 | ((cp >> 12) & 63))
+    push(buf, 128 | ((cp >> 6) & 63))
+    push(buf, 128 | (cp & 63))
+  }
+}
+// Read one \uXXXX (the leading \u already consumed); if it is a HIGH surrogate (0xD800..0xDBFF)
+// pair it with a following \uYYYY LOW surrogate (0xDC00..0xDFFF) into an astral code point.
+fn _jUnicode(mut c: JsonCur) -> Result[Int, String] {
+  let hi = _jHex4(c)?
+  if hi >= 55296 && hi <= 56319 {              // high surrogate
+    if _jPeek(c) != '\\' { return Err("expected low surrogate at position " + toString(c.i)) }
+    _jAdv(c)
+    if _jPeek(c) != 'u' { return Err("expected low surrogate at position " + toString(c.i)) }
+    _jAdv(c)
+    let lo = _jHex4(c)?
+    if lo < 56320 || lo > 57343 { return Err("invalid low surrogate at position " + toString(c.i)) }
+    Ok(65536 + ((hi - 55296) << 10) + (lo - 56320))
+  } else if hi >= 56320 && hi <= 57343 {       // lone low surrogate
+    Err("unexpected low surrogate at position " + toString(c.i))
+  } else {
+    Ok(hi)
+  }
+}
+fn _jStrLit(mut c: JsonCur) -> Result[String, String] {
+  _jEat(c, '"')?
+  let buf = bytes()
+  loop {
+    if _jAtEnd(c) { return Err("unterminated string at position " + toString(c.i)) }
+    let ch = _jPeek(c)
+    _jAdv(c)
+    if ch == '"' {
+      break
+    } else if ch == '\\' {
+      let e = _jPeek(c)
+      _jAdv(c)
+      if      e == '"'  { push(buf, '"') }
+      else if e == '\\' { push(buf, '\\') }
+      else if e == '/'  { push(buf, '/') }
+      else if e == 'n'  { push(buf, '\n') }
+      else if e == 't'  { push(buf, '\t') }
+      else if e == 'r'  { push(buf, '\r') }
+      else if e == 'b'  { push(buf, 8) }
+      else if e == 'f'  { push(buf, 12) }
+      else if e == 'u'  { let cp = _jUnicode(c)?  _jPushUtf8(buf, cp) }
+      else { return Err("invalid escape at position " + toString(c.i)) }
+    } else {
+      push(buf, ch)
+    }
+  }
+  Ok(fromBytes(buf))
+}
+
+// ---- arrays / objects (recursive) -------------------------------------------
+fn _jArray(mut c: JsonCur) -> Result[Json, String] {
+  _jEat(c, '[')?
+  let items: Vec[Json] = vec()
+  _jSkipWs(c)
+  if _jPeek(c) == ']' { _jAdv(c)  return Ok(JArr(items)) }
+  loop {
+    let v = _jValue(c)?
+    push(items, v)
+    _jSkipWs(c)
+    let ch = _jPeek(c)
+    if ch == ',' { _jAdv(c) }
+    else if ch == ']' { _jAdv(c)  break }
+    else { return Err("expected ',' or ']' at position " + toString(c.i)) }
+  }
+  Ok(JArr(items))
+}
+fn _jObject(mut c: JsonCur) -> Result[Json, String] {
+  _jEat(c, '{')?
+  let entries: Vec[JsonEntry] = vec()
+  _jSkipWs(c)
+  if _jPeek(c) == '}' { _jAdv(c)  return Ok(JObj(entries)) }
+  loop {
+    _jSkipWs(c)
+    if _jPeek(c) != '"' { return Err("expected string key at position " + toString(c.i)) }
+    let key = _jStrLit(c)?
+    _jSkipWs(c)
+    _jEat(c, ':')?
+    let val = _jValue(c)?
+    push(entries, JsonEntry { key: key, val: val })
+    _jSkipWs(c)
+    let ch = _jPeek(c)
+    if ch == ',' { _jAdv(c) }
+    else if ch == '}' { _jAdv(c)  break }
+    else { return Err("expected ',' or '}' at position " + toString(c.i)) }
+  }
+  Ok(JObj(entries))
+}
+
+// ---- public parse entry -----------------------------------------------------
+// parse(s) -> Ok(Json) | Err(message-with-position). Full value grammar; strings decode all
+// escapes incl. \uXXXX surrogate pairs; trailing non-whitespace is an error.
+pub fn parse(s: String) -> Result[Json, String] {
+  let c = _jNew(s)
+  let v = _jValue(c)?
+  _jSkipWs(c)
+  if !_jAtEnd(c) { return Err("trailing characters at position " + toString(c.i)) }
+  Ok(v)
+}
+
+// ============================================================================
+// Serialization -- all three forms thread ONE StringBuilder (O(n) via BYTES_APPEND),
+// with a single `build` at the end.
+// ============================================================================
+
+// A Double is finite iff d - d == 0.0 (finite -> 0.0; +-Inf -> Inf-Inf = NaN != 0; NaN -> NaN != 0).
+// Self-contained -- avoids a std::math dependency for the NaN/Inf check.
+fn _finite(d: Double) -> Bool { d - d == 0.0 }
+
+fn _hexNib(n: Int) -> Int { if n < 10 { '0' + n } else { 'a' + (n - 10) } }
+
+// Append `s` as a quoted, escaped JSON string. Mandatory escapes only; non-ASCII UTF-8
+// bytes pass through unchanged (valid JSON). Iterates the string's raw BYTES.
+fn _jStr(sb: StringBuilder, s: String) -> StringBuilder {
+  appendByte(sb, '"')
+  for c in s {
+    if      c == '"'  { appendByte(sb, '\\')  appendByte(sb, '"') }
+    else if c == '\\' { appendByte(sb, '\\')  appendByte(sb, '\\') }
+    else if c == '\n' { appendByte(sb, '\\')  appendByte(sb, 'n') }
+    else if c == '\r' { appendByte(sb, '\\')  appendByte(sb, 'r') }
+    else if c == '\t' { appendByte(sb, '\\')  appendByte(sb, 't') }
+    else if c == 8    { appendByte(sb, '\\')  appendByte(sb, 'b') }
+    else if c == 12   { appendByte(sb, '\\')  appendByte(sb, 'f') }
+    else if c < 32    {
+      appendByte(sb, '\\')  appendByte(sb, 'u')  appendByte(sb, '0')  appendByte(sb, '0')
+      appendByte(sb, _hexNib((c >> 4) & 15))  appendByte(sb, _hexNib(c & 15))
+    }
+    else { appendByte(sb, c) }
+  }
+  appendByte(sb, '"')
+}
+
+fn _jVal(sb: StringBuilder, j: Json) -> StringBuilder {
+  match j {
+    JNull    => append(sb, "null"),
+    JBool(b) => append(sb, if b { "true" } else { "false" }),
+    JInt(n)  => append(sb, toString(n)),
+    JNum(d)  => if _finite(d) { append(sb, toString(d)) } else { append(sb, "null") },
+    JStr(s)  => _jStr(sb, s),
+    JArr(xs) => _jArr(sb, xs),
+    JObj(es) => _jObj(sb, es),
+  }
+}
+fn _jArr(sb: StringBuilder, xs: Vec[Json]) -> StringBuilder {
+  appendByte(sb, '[')
+  let mut first = true
+  for x in xs {
+    if !first { appendByte(sb, ',') }
+    _jVal(sb, x)
+    first = false
+  }
+  appendByte(sb, ']')
+}
+fn _jObj(sb: StringBuilder, es: Vec[JsonEntry]) -> StringBuilder {
+  appendByte(sb, '{')
+  let mut first = true
+  for e in es {
+    if !first { appendByte(sb, ',') }
+    _jStr(sb, e.key)
+    appendByte(sb, ':')
+    _jVal(sb, e.val)
+    first = false
+  }
+  appendByte(sb, '}')
+}
+
+// stringify(j) -> compact JSON. A non-finite JNum (NaN/Inf) is emitted as `null`.
+pub fn stringify(j: Json) -> String { build(_jVal(stringBuilder(), j)) }
+
+// stringifyChecked(j) -> Err when the tree contains a non-finite number (which has no valid
+// JSON form); otherwise the same output as stringify.
+fn _anyNonFinite(j: Json) -> Bool {
+  match j {
+    JNum(d)  => !_finite(d),
+    JArr(xs) => _anyNonFiniteArr(xs),
+    JObj(es) => _anyNonFiniteObj(es),
+    _ => false,
+  }
+}
+fn _anyNonFiniteArr(xs: Vec[Json]) -> Bool {
+  let n = len(xs)
+  let mut i = 0
+  while i < n { if _anyNonFinite(xs[i]) { return true }  i = i + 1 }
+  false
+}
+fn _anyNonFiniteObj(es: Vec[JsonEntry]) -> Bool {
+  let n = len(es)
+  let mut i = 0
+  while i < n { if _anyNonFinite(es[i].val) { return true }  i = i + 1 }
+  false
+}
+pub fn stringifyChecked(j: Json) -> Result[String, String] {
+  if _anyNonFinite(j) { Err("cannot serialize a non-finite number") }
+  else { Ok(stringify(j)) }
+}
+
+// stringifyPretty(j, indent) -> multi-line JSON, `indent` spaces per nesting level. Empty
+// arrays/objects stay inline as [] / {}.
+fn _jIndent(sb: StringBuilder, depth: Int, indent: Int) -> () {
+  appendByte(sb, '\n')
+  let total = depth * indent
+  let mut k = 0
+  while k < total { appendByte(sb, ' ')  k = k + 1 }
+}
+fn _jPretty(sb: StringBuilder, j: Json, depth: Int, indent: Int) -> StringBuilder {
+  match j {
+    JArr(xs) => _jArrPretty(sb, xs, depth, indent),
+    JObj(es) => _jObjPretty(sb, es, depth, indent),
+    _ => _jVal(sb, j),
+  }
+}
+fn _jArrPretty(sb: StringBuilder, xs: Vec[Json], depth: Int, indent: Int) -> StringBuilder {
+  if len(xs) == 0 { append(sb, "[]") }
+  else {
+    appendByte(sb, '[')
+    let mut first = true
+    for x in xs {
+      if !first { appendByte(sb, ',') }
+      _jIndent(sb, depth + 1, indent)
+      _jPretty(sb, x, depth + 1, indent)
+      first = false
+    }
+    _jIndent(sb, depth, indent)
+    appendByte(sb, ']')
+  }
+}
+fn _jObjPretty(sb: StringBuilder, es: Vec[JsonEntry], depth: Int, indent: Int) -> StringBuilder {
+  if len(es) == 0 { append(sb, "{}") }
+  else {
+    appendByte(sb, '{')
+    let mut first = true
+    for e in es {
+      if !first { appendByte(sb, ',') }
+      _jIndent(sb, depth + 1, indent)
+      _jStr(sb, e.key)
+      append(sb, ": ")
+      _jPretty(sb, e.val, depth + 1, indent)
+      first = false
+    }
+    _jIndent(sb, depth, indent)
+    appendByte(sb, '}')
+  }
+}
+pub fn stringifyPretty(j: Json, indent: Int) -> String { build(_jPretty(stringBuilder(), j, 0, indent)) }
+
+// ============================================================================
+// Accessors -- typed extractors return Option (None on a kind mismatch / miss).
+// ============================================================================
+pub fn isNull(j: Json) -> Bool { match j { JNull => true, _ => false } }
+pub fn asInt(j: Json) -> Option[Int] { match j { JInt(n) => Some(n), _ => None } }
+// asDouble widens a JInt to Double (via the Int<:Double boundary); + 0.0 forces the promotion.
+pub fn asDouble(j: Json) -> Option[Double] { match j { JInt(n) => Some(n + 0.0), JNum(d) => Some(d), _ => None } }
+pub fn asStr(j: Json) -> Option[String] { match j { JStr(s) => Some(s), _ => None } }
+pub fn asBool(j: Json) -> Option[Bool] { match j { JBool(b) => Some(b), _ => None } }
+pub fn asArr(j: Json) -> Option[Vec[Json]] { match j { JArr(xs) => Some(xs), _ => None } }
+pub fn asObj(j: Json) -> Option[Vec[JsonEntry]] { match j { JObj(es) => Some(es), _ => None } }
+
+// getField(j, key) -> the value of the FIRST matching entry (None if not an object / absent).
+fn _jFind(es: Vec[JsonEntry], key: String, i: Int) -> Option[Json] {
+  if i >= len(es) { None }
+  else { let e = es[i]  if e.key == key { Some(e.val) } else { _jFind(es, key, i + 1) } }
+}
+pub fn getField(j: Json, key: String) -> Option[Json] {
+  match j { JObj(es) => _jFind(es, key, 0), _ => None }
+}
+// at(j, i) -> the i-th array element (None if not an array / out of bounds).
+pub fn at(j: Json, i: Int) -> Option[Json] {
+  match j { JArr(xs) => if i >= 0 && i < len(xs) { Some(xs[i]) } else { None }, _ => None }
+}
+// asMap(j) -> a Map of the object's entries (later duplicate keys overwrite earlier ones).
+// Named asMap (not toMap) to avoid the std::iter::toMap Iterator terminal.
+fn _jAsMap(es: Vec[JsonEntry], i: Int, mut m: Map[String, Json]) -> Map[String, Json] {
+  if i >= len(es) { m }
+  else { let e = es[i]  m[e.key] = e.val  _jAsMap(es, i + 1, m) }
+}
+pub fn asMap(j: Json) -> Option[Map[String, Json]] {
+  match j { JObj(es) => Some(_jAsMap(es, 0, #{})), _ => None }
+}

@@ -1,0 +1,37 @@
+// ============================================================================
+// Runtime GC introspection from Skarn: gcResetStats() / gcStats().
+//
+// gcResetStats() clears the VM's live GC counters; gcStats() reads them back as
+// a struct. Bracketing a region between the two measures its GC activity from
+// inside the language -- e.g. a benchmark harness written in Skarn, or (later)
+// the self-hosting compiler reporting its own GC load.
+//
+// The counters are uint64 in the VM but surface as Double (a Double carries a
+// 53-bit exact integer -- more than a 48-bit Int -- so byte/nanosecond counters
+// stay exact for any realistic run; the ".0" in a printed count is harmless).
+//
+// Run:  x64\Release\static_vmrun.exe demo\gc_stats.skn
+// ============================================================================
+
+// Measure a churn region: build a large retained Vec by pushing 300k elements
+// (each grow allocates a fresh backing -> collections, promotions).
+gcResetStats()
+
+let v: Vec[Int] = vec()
+let mut i = 0
+while i < 300000 {
+    push(v, i)
+    i = i + 1
+}
+
+let s = gcStats()
+println("--- GC stats over the push loop ---")
+println("collections     = " + s.collections)
+println("objectsAlloced  = " + s.objectsAlloced)
+println("bytesAlloced     = " + s.bytesAlloced)
+println("fromUsedSum      = " + s.fromUsedSum)
+println("survivorsSum     = " + s.survivorsSum)
+println("gcNanosTotal     = " + s.gcNanosTotal)
+println("gcNanosMax       = " + s.gcNanosMax)
+println("growEvents       = " + s.growEvents)
+println("len(v)           = " + len(v))

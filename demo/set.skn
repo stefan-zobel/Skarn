@@ -1,0 +1,32 @@
+// std::set -- a hash set over Map[T, Bool] (pure Skarn). Dedup, membership, and set algebra.
+use std::set::*
+
+// Deduplicate a list of numbers.
+let mut nums: Vec[Int] = vec()
+push(nums, 3) push(nums, 1) push(nums, 4) push(nums, 1) push(nums, 5) push(nums, 9) push(nums, 2) push(nums, 6) push(nums, 5) push(nums, 3)
+let a = setOf(nums)
+println("distinct: ${size(a)}")            // 7
+
+// Membership is O(1).
+println("has 4? ${isMember(a, 4)}")        // true
+println("has 7? ${isMember(a, 7)}")        // false
+
+// Build a second set and combine.
+let mut other: Vec[Int] = vec()
+push(other, 4) push(other, 5) push(other, 6) push(other, 7) push(other, 8)
+let b = setOf(other)
+
+println("union:        ${size(union(a, b))}")        // 9   {1,2,3,4,5,6,7,8,9}
+println("intersection: ${size(intersect(a, b))}")    // 3   {4,5,6}
+println("a - b:        ${size(difference(a, b))}")   // 4   {1,2,3,9}
+println("disjoint?     ${isDisjoint(a, b)}")         // false
+
+// Iterate (hash-order) and sum -- via the IntoIterator impl.
+let mut total = 0
+for x in a { total = total + x }
+println("sum of a: ${total}")              // 30  (1+2+3+4+5+6+9)
+
+// Sets of strings work just as well.
+let mut words: Vec[String] = vec()
+push(words, "red") push(words, "green") push(words, "red") push(words, "blue")
+println("colors: ${size(setOf(words))}")   // 3

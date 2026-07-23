@@ -1,0 +1,13 @@
+// Process spawn (over the rawRun native). ProcessOutput holds raw Bytes; ProcessText is the
+// UTF-8-decoded view. run/runWith take a List literal and convert it to the Vec the native wants;
+// runText decodes and keeps the exit code; sh wraps cmd.exe (Windows-only project). OPT-IN: reach
+// these (and the rawRun native they wrap) via `use std::process::*`. Same-module code (these very
+// wrappers) may use rawRun freely (the native's home module is std::process).
+pub struct ProcessOutput { stdout: Bytes, stderr: Bytes, exitCode: Int }
+pub struct ProcessText { stdout: String, stderr: String, exitCode: Int }
+fn _toArgv(argv: List[String]) -> Vec[String] { let v: Vec[String] = vec() for a in argv { push(v, a) } v }
+pub fn run(argv: List[String]) -> Result[ProcessOutput, String] { rawRun(_toArgv(argv), bytes()) }
+pub fn runWith(argv: List[String], input: Bytes) -> Result[ProcessOutput, String] { rawRun(_toArgv(argv), input) }
+pub fn runText(argv: List[String]) -> Result[ProcessText, String] { let o = run(argv)? Ok(ProcessText { stdout: fromBytes(o.stdout), stderr: fromBytes(o.stderr), exitCode: o.exitCode }) }
+pub fn sh(cmdline: String) -> Result[ProcessOutput, String] { run(["cmd", "/c", cmdline]) }
+

@@ -1,0 +1,122 @@
+// Little-endian binary reader/writer over Bytes. Pure Skarn (no native, no VM change) -- the
+// writer IS a Bytes (append-only; push mutates in place and the header stays stable, so writes are
+// caller-visible), the reader is a ByteReader cursor. Numbers are LITTLE-ENDIAN (low byte first).
+// Writes are MASKING, not trapping (writeU16LE keeps the low 16 bits) -- consistent with push's
+// `& 0xFF` byte semantics. Reads are TOTAL over Result: an underrun is Err, never a trap. A Skarn
+// Int is 48-bit signed, so u8/u16/u32 and unsigned LEB128 all fit; i32 is sign-extended on read.
+// SIGNED integers get a compact zigzag varint (writeVarI/readVarI); a String is length-prefixed
+// (writeStr/readStr = a varU byte-length then the raw bytes). OPT-IN: reach these via
+// `use std::bytes::*` (or a qualified std::bytes::name). Tree-shaken.
+//
+// Generally useful for any little-endian binary format. NOTE: the shipping SKBC bytecode container is
+// a C++ writer/reader (vmcore/BytecodeIO.h) that uses FIXED-WIDTH encoding -- fixed u32/u16 integers and
+// u32-length-prefixed strings -- and does NOT go through std::bytes at all. A future Skarn-side reader/
+// writer (North Star P1) would use these primitives; to stay SKBC-compatible it would use the fixed-width
+// u32 forms (writeU32LE/readU32LE + writeBytes/readBytes), while the compact varint/zigzag + varStr forms
+// below suit a new, compact format (protobuf-style deltas/offsets, self-describing strings).
+
+// A read cursor over an immutable Bytes buffer. `pos` is the next byte to read.
+pub struct ByteReader { buf: Bytes, pos: Int }
+pub fn reader(b: Bytes) -> ByteReader { ByteReader { buf: b, pos: 0 } }
+pub fn remaining(r: ByteReader) -> Int { len(r.buf) - r.pos }
+pub fn atEnd(r: ByteReader) -> Bool { r.pos >= len(r.buf) }
+
+// --- writer (over Bytes; each returns the buffer so writes chain with the pipe) ---
+pub fn writeU8(b: Bytes, v: Int) -> Bytes { push(b, v & 255) }
+pub fn writeU16LE(b: Bytes, v: Int) -> Bytes {
+  push(b, v & 255)
+  push(b, (v >> 8) & 255)
+}
+pub fn writeU32LE(b: Bytes, v: Int) -> Bytes {
+  push(b, v & 255)
+  push(b, (v >> 8) & 255)
+  push(b, (v >> 16) & 255)
+  push(b, (v >> 24) & 255)
+}
+pub fn writeI32LE(b: Bytes, v: Int) -> Bytes { writeU32LE(b, v & 4294967295) }   // two's-complement low 32 bits
+// Unsigned LEB128. Domain: v >= 0 (non-negative 48-bit Int); 1..7 bytes.
+pub fn writeVarU(b: Bytes, v: Int) -> Bytes {
+  let mut n = v
+  while n >= 128 {
+    push(b, (n & 127) | 128)
+    n = n >> 7
+  }
+  push(b, n & 127)
+}
+// Signed LEB128 via zigzag: maps small-magnitude signed values to small unsigned codes
+// (0->0, -1->1, 1->2, -2->3, 2->4, ...), then emits that code as an unsigned varint. Full 48-bit
+// signed domain; 1..7 bytes. `>>>` (logical shift) treats the zigzag code as unsigned, so a code
+// with bit 47 set (large magnitude) still emits and reads back correctly.
+pub fn writeVarI(b: Bytes, v: Int) -> Bytes {
+  let mut z = (v << 1) ^ (v >> 47)     // zigzag encode (48-bit)
+  loop {
+    if (z >>> 7) == 0 { break push(b, z & 127) }
+    push(b, (z & 127) | 128)
+    z = z >>> 7
+  }
+}
+pub fn writeBytes(dst: Bytes, src: Bytes) -> Bytes { appendBytes(dst, src) }   // bulk memcpy
+// Length-prefixed String: an unsigned varint BYTE-length then the raw bytes (String is byte-based).
+// Pairs with readStr. `appendBytes` blits the string bytes directly (one memcpy, no intermediate copy).
+pub fn writeStr(b: Bytes, s: String) -> Bytes {
+  writeVarU(b, len(s))
+  appendBytes(b, s)
+}
+
+// --- reader (over a mut ByteReader; underrun -> Err) ---
+pub fn readU8(mut r: ByteReader) -> Result[Int, String] {
+  if r.pos >= len(r.buf) { Err("readU8: unexpected end of bytes") }
+  else {
+    let b = r.buf[r.pos]
+    r.pos = r.pos + 1
+    Ok(b)
+  }
+}
+pub fn readU16LE(mut r: ByteReader) -> Result[Int, String] {
+  let lo = readU8(r)?
+  let hi = readU8(r)?
+  Ok(lo | (hi << 8))
+}
+pub fn readU32LE(mut r: ByteReader) -> Result[Int, String] {
+  let b0 = readU8(r)?
+  let b1 = readU8(r)?
+  let b2 = readU8(r)?
+  let b3 = readU8(r)?
+  Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+}
+pub fn readI32LE(mut r: ByteReader) -> Result[Int, String] {
+  let u = readU32LE(r)?
+  if u >= 2147483648 { Ok(u - 4294967296) } else { Ok(u) }   // sign-extend 32 -> 48
+}
+pub fn readVarU(mut r: ByteReader) -> Result[Int, String] {
+  let mut result = 0
+  let mut shift = 0
+  loop {
+    let byte = readU8(r)?
+    result = result | ((byte & 127) << shift)
+    if (byte & 128) == 0 { break Ok(result) }
+    shift = shift + 7
+    if shift >= 49 { break Err("readVarU: varint too long") }
+  }
+}
+// Signed LEB128 (zigzag). Reads the unsigned code via readVarU then decodes; underrun/too-long -> Err.
+pub fn readVarI(mut r: ByteReader) -> Result[Int, String] {
+  let u = readVarU(r)?
+  Ok((u >>> 1) ^ (0 - (u & 1)))     // zigzag decode: (u >>> 1) ^ -(u & 1)
+}
+pub fn readBytes(mut r: ByteReader, n: Int) -> Result[Bytes, String] {
+  if n < 0 { Err("readBytes: negative length") }
+  else if r.pos + n > len(r.buf) { Err("readBytes: unexpected end of bytes") }
+  else {
+    let out = bytes(n)
+    _appendBytesRange(out, r.buf, r.pos, r.pos + n)   // bulk memcpy of r.buf[pos, pos+n)
+    r.pos = r.pos + n
+    Ok(out)
+  }
+}
+// Length-prefixed String (pairs with writeStr): reads the varU byte-length, then that many bytes.
+pub fn readStr(mut r: ByteReader) -> Result[String, String] {
+  let n = readVarU(r)?
+  let bs = readBytes(r, n)?
+  Ok(fromBytes(bs))
+}

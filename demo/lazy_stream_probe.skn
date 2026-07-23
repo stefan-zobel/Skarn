@@ -1,0 +1,103 @@
+// ============================================================================
+// Lazy-stream performance probe -- the codata / pull model.
+//
+// Purpose: measure the allocation-churn cost of the closure-based codata stream
+//   enum Step[T]     { Yield(T, Stream[T]), Done }
+//   struct Stream[T] { next: fn() -> Step[T] }
+// against a raw, allocation-free loop doing the IDENTICAL work (keep evens,
+// multiply by 3, sum) over N elements. The ratio is the honest per-element
+// price of the elegant "functional + closure-as-existential" lazy stream on
+// this VM (bump-allocator + stop-the-world Cheney GC, no generational nursery).
+//
+// This is the NATURAL form -- a generic `Step[T]`/`Stream[T]` and an O(1)-stack
+// tail-recursive `match` consumer. It compiles only after the two front-end
+// fixes: the checker forward-reference generic-arity fix (Step[T] refers to the
+// later-declared Stream[T]) and the codegen 0-argument-indirect-call frame fix
+// (`s.next()` reads its result at the window base).
+//
+// Run:  x64\Release\static_vmrun.exe demo\lazy_stream_probe.skn
+// ============================================================================
+
+use std::env::*   // nanoTime (env/time natives are opt-in after the stdlib split)
+
+enum Step[T]     { Yield(T, Stream[T]), Done }
+struct Stream[T] { next: fn() -> Step[T] }
+
+// A lazy [i, n) integer source. Each next() yields one element plus the
+// rest-stream -- nothing is produced until pulled.
+fn range_stream(i: Int, n: Int) -> Stream[Int] {
+    Stream { next: fn() -> Step[Int] {
+        if i >= n { Done } else { Yield(i, range_stream(i + 1, n)) }
+    } }
+}
+
+// Lazy map: wrap the source, transform each element on demand.
+fn s_map(s: Stream[Int], f: fn(Int) -> Int) -> Stream[Int] {
+    Stream { next: fn() -> Step[Int] {
+        match s.next() {
+            Yield(x, rest) => Yield(f(x), s_map(rest, f)),
+            Done => Done
+        }
+    } }
+}
+
+// Lazy filter: skip rejected elements on demand.
+fn s_filter(s: Stream[Int], pred: fn(Int) -> Bool) -> Stream[Int] {
+    Stream { next: fn() -> Step[Int] {
+        match s.next() {
+            Yield(x, rest) => if pred(x) { Yield(x, s_filter(rest, pred)) } else { s_filter(rest, pred).next() },
+            Done => Done
+        }
+    } }
+}
+
+// Eager terminal: drive the stream to exhaustion, summing. Tail-recursive over
+// `match` -> the Yield arm TCOs -> O(1) native stack even for N in the millions.
+fn s_sum_go(s: Stream[Int], acc: Int) -> Int {
+    match s.next() {
+        Yield(x, rest) => s_sum_go(rest, acc + x),
+        Done => acc
+    }
+}
+fn s_sum(s: Stream[Int]) -> Int { s_sum_go(s, 0) }
+
+// The allocation-free floor: the exact same computation as a plain loop.
+fn raw_sum(n: Int) -> Int {
+    let mut acc: Int = 0
+    let mut j: Int = 0
+    while j < n {
+        if j % 2 == 0 { acc = acc + j * 3 }
+        j = j + 1
+    }
+    acc
+}
+
+fn is_even(x: Int) -> Bool { x % 2 == 0 }
+fn times3(x: Int) -> Int { x * 3 }
+
+// filter (keep evens) |> map (* 3) |> sum, expressed lazily.
+fn run_codata(n: Int) -> Int {
+    s_sum(s_map(s_filter(range_stream(0, n), is_even), times3))
+}
+
+let n: Int = 1000000
+
+// Warm up once (grow the semispaces, touch every code path).
+run_codata(10000)
+raw_sum(10000)
+
+let c0: Int = nanoTime()
+let cres: Int = run_codata(n)
+let c1: Int = nanoTime()
+
+let r0: Int = nanoTime()
+let rres: Int = raw_sum(n)
+let r1: Int = nanoTime()
+
+println("N                = " + toString(n))
+println("codata result    = " + toString(cres))
+println("raw result       = " + toString(rres))
+println("codata total ns  = " + toString(c1 - c0))
+println("raw    total ns  = " + toString(r1 - r0))
+println("codata ns / elem = " + toString((c1 - c0) / n))
+println("raw    ns / elem = " + toString((r1 - r0) / n))

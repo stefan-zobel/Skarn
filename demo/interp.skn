@@ -1,0 +1,28 @@
+// String interpolation demo: `"…${e}…"` -- a pure lexer/parser desugar to a `toString`/`+` chain.
+// Holes accept any type (more capable than `+`), nest recursively, and `\$` writes a literal `${`.
+
+struct Point { x: Int, y: Int }
+
+fn describe(p: Point, label: String) -> String {
+    "${label}: at (${p.x}, ${p.y}), sum=${p.x + p.y}"
+}
+
+fn main() -> () {
+    let name = "Ada"
+    let n    = 42
+    println("hello ${name}, n=${n}, n*n=${n * n}")
+
+    let p = Point { x: 3, y: 4 }
+    println(describe(p, "origin"))
+    println("struct hole: ${p}")             // any-type hole: the struct dump
+    println("option hole: ${Some(n)}")
+
+    // recursive / nested interpolation
+    let unit = "px"
+    println("nested ${ "width=${p.x}${unit}" } done")
+
+    // escapes: a literal `${...}` and a lone `$`
+    println("literal \${name} and a bare $ sign, cost $5")
+}
+
+main()

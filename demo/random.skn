@@ -1,0 +1,52 @@
+// std::random -- the xoshiro128** pseudo-random generator (pure Skarn, deterministic).
+// Seed once, then draw. NOT cryptographically secure; seed entropy is the caller's job.
+use std::random::*
+
+// A seeded generator is fully reproducible: the same seed always yields the same stream.
+let mut rng = seedRng(20260721)
+
+// Raw 32-bit draws.
+print("u32:   ")
+let mut i = 0
+while i < 5 {
+  print(nextU32(rng))
+  print(" ")
+  i = i + 1
+}
+println("")
+
+// Bounded integers -- a fair die (1..6) rolled ten times.
+print("rolls: ")
+let mut j = 0
+while j < 10 {
+  print(nextInt(rng, 1, 7))
+  print(" ")
+  j = j + 1
+}
+println("")
+
+// Doubles in [0, 1) and a scaled range.
+println("unit:  ${nextDouble(rng)}")
+println("range: ${nextDoubleRange(rng, -1.0, 1.0)}")
+
+// A coin flip.
+println("coin:  ${nextBool(rng)}")
+
+// Shuffle a deck in place, then pick one card.
+let mut deck: Vec[Int] = vec()
+let mut k = 1
+while k <= 10 {
+  push(deck, k)
+  k = k + 1
+}
+shuffle(rng, deck)
+println("deck:  ${toString(deck)}")
+match choice(rng, deck) {
+  Some(card) => println("card:  ${card}"),
+  None => println("card:  (empty)")
+}
+
+// Independent, non-overlapping streams via split.
+let other = splitRng(rng)
+let mut o = other
+println("split: ${nextU32(o)}")

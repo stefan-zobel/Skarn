@@ -1,0 +1,49 @@
+// Round-trip demo for the std::io file natives + text wrappers (Native-IO round 1).
+// Run: static_vmrun demo/file_io.skn
+use std::io::*
+
+fn dump(label: String, r: Result[(), String]) -> () {
+    match r {
+        Ok(_)  => println(label + ": ok"),
+        Err(e) => println(label + ": ERR " + e),
+    }
+}
+
+let path = "svc_file_io_demo.txt"
+
+// write -> read (text wrappers over the byte natives)
+dump("write", writeTextFile(path, "hello"))
+match readTextFile(path) {
+    Ok(s)  => println("read: " + s),
+    Err(e) => println("read: ERR " + e),
+}
+
+// append -> read again
+dump("append", appendTextFile(path, " world"))
+match readTextFile(path) {
+    Ok(s)  => println("read2: " + s),
+    Err(e) => println("read2: ERR " + e),
+}
+
+// metadata
+println("isFile: " + isFile(path))         // true
+println("isDir: " + isDir(path))           // false
+match fileSize(path) {
+    Ok(n)  => println("size: " + n),        // 11 (= "hello world")
+    Err(e) => println("size: ERR " + e),
+}
+println("isFile(missing): " + isFile("svc_no_such_zzz"))   // false
+
+// copy -> rename (round 2)
+let copyPath = "svc_file_io_demo_copy.txt"
+let movePath = "svc_file_io_demo_moved.txt"
+dump("copy", copyFile(path, copyPath))                     // copyFile default: fails if dst exists
+println("copy exists: " + isFile(copyPath))                // true
+dump("rename", rename(copyPath, movePath))
+println("moved exists: " + isFile(movePath))               // true
+println("copy gone: " + isFile(copyPath))                  // false
+
+// clean up
+dump("delete original", deleteFile(path))
+dump("delete moved", deleteFile(movePath))
+println("isFile after delete: " + isFile(path))            // false

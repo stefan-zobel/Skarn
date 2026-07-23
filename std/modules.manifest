@@ -1,0 +1,25 @@
+# Skarn stdlib module manifest -- the ordered source-of-truth for the embedded prelude.
+#
+# One `<prefix> <file>` per line, in EMBED ORDER (the pre-build gen_prelude_embed.ps1 reads this
+# and embeds each std/<file> as one { "<prefix>", <source> } entry into prelude_embed.inc, which
+# initializes svc::builtin_prelude()). Blank lines and `#` comments are ignored. `<file>` is
+# relative to this manifest's directory (static_compiler/std/).
+#
+# RING modules (std::core / std::iter / std::string) are implicitly glob-imported everywhere, so
+# their names resolve bare. OPT-IN modules (std::io / std::process / std::math, + std::env behind
+# the env natives) require an explicit `use`. All are tree-shaken when unused.
+#
+# To add a std function: edit the right file below. To add a std module: create std/<name>.skn and
+# add a line here. Natives still need a NativeId row in vmcore/NativeRegistry.h.
+
+std::core     core.skn
+std::string   string.skn
+std::iter     iter.skn
+std::io       io.skn
+std::process  process.skn
+std::math     math.skn
+std::bytes    bytes.skn
+std::json     json.skn
+std::random   random.skn
+std::set      set.skn
+std::time     time.skn

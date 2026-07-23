@@ -1,0 +1,49 @@
+// std::bytes demo: a little-endian binary reader/writer over Bytes (pure Skarn, no native).
+// Run: static_vmrun demo/bytes.skn
+use std::bytes::*
+
+// A tiny record: a 4-byte magic (u32 LE), a 2-byte version (u16 LE), a signed delta (i32 LE),
+// a varint-encoded length, and that many payload bytes.
+struct Record { magic: Int, version: Int, delta: Int, payload: Bytes }
+
+fn encode(rec: Record) -> Bytes {
+  let b = bytes()
+  writeU32LE(b, rec.magic)
+  writeU16LE(b, rec.version)
+  writeI32LE(b, rec.delta)
+  writeVarU(b, len(rec.payload))
+  writeBytes(b, rec.payload)
+  b
+}
+
+fn decode(mut r: ByteReader) -> Result[Record, String] {
+  let magic = readU32LE(r)?
+  let ver   = readU16LE(r)?
+  let delta = readI32LE(r)?
+  let n     = readVarU(r)?
+  let body  = readBytes(r, n)?
+  Ok(Record { magic: magic, version: ver, delta: delta, payload: body })
+}
+
+let rec = Record { magic: 3735928559, version: 2, delta: 0 - 1000, payload: toBytes("hello, bytes") }
+let buf = encode(rec)
+println("encoded " + len(buf) + " bytes")     // 4 + 2 + 4 + 1 (varint) + 12 = 23
+
+let mut r = reader(buf)
+match decode(r) {
+  Ok(d) => {
+    println("magic   = " + d.magic)            // 3735928559
+    println("version = " + d.version)          // 2
+    println("delta   = " + d.delta)            // -1000
+    println("payload = " + fromBytes(d.payload))   // hello, bytes
+    println("trailing bytes = " + remaining(r))    // 0
+  }
+  Err(e) => println("decode failed: " + e)
+}
+
+// Reading past the end is a clean Err, never a crash.
+let mut empty = reader(bytes())
+match readU32LE(empty) {
+  Ok(_) => println("unexpected"),
+  Err(e) => println("underrun -> " + e)        // readU8: unexpected end of bytes
+}

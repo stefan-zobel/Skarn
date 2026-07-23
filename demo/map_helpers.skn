@@ -1,0 +1,39 @@
+// std::core Map ergonomics -- getOr / getOrElse / getOrPut / upsert (ring helpers, no `use` needed).
+// Pure helpers over the `get` builtin + `m[k] = v`; the mutating pair take a `mut` map.
+
+// getOr -- lookup with an eager default (non-mutating).
+let prices: Map[String, Int] = #{ "apple" => 3, "pear" => 5 }
+println("apple: ${getOr(prices, "apple", 0)}")     // 3
+println("kiwi:  ${getOr(prices, "kiwi", 0)}")      // 0 (absent -> default)
+
+// upsert -- read-modify-write: bump an existing count, or start at 1 on a miss.
+let mut counts: Map[String, Int] = #{}
+for w in ["a", "b", "a", "c", "a", "b"] {
+  upsert(counts, w, 1, fn(c) { c + 1 })
+}
+println("a=${getOr(counts, "a", 0)} b=${getOr(counts, "b", 0)} c=${getOr(counts, "c", 0)}")  // a=3 b=2 c=1
+
+// getOrPut -- insert a default on a miss and return the stored value; a hit is left unchanged.
+let mut seen: Map[String, Int] = #{}
+println("first id : ${getOrPut(seen, "x", 10)}")   // 10 (inserted)
+println("again    : ${getOrPut(seen, "x", 99)}")   // 10 (kept -- not overwritten)
+
+// getOrElse with a MUTATING thunk -- the fallback runs only on a miss, and here it has side effects:
+// it logs the miss AND populates the cache, so getOrElse becomes a lazy memoize. The captured `cache`
+// and `computed` are heap values, so the thunk mutates the same objects the outer scope sees.
+let mut cache: Map[Int, Int] = #{}
+let mut computed: Vec[Int] = vec()
+let memoSquare = fn(n: Int) -> Int {
+  getOrElse(cache, n, fn() {
+    push(computed, n)      // record that we actually did the work
+    let v = n * n
+    cache[n] = v           // populate the cache from inside the thunk
+    v
+  })
+}
+
+println("square 4 : ${memoSquare(4)}")   // 16  (miss -> computed)
+println("square 4 : ${memoSquare(4)}")   // 16  (hit  -> thunk NOT run)
+println("square 5 : ${memoSquare(5)}")   // 25  (miss -> computed)
+println("square 4 : ${memoSquare(4)}")   // 16  (hit)
+println("computed ${len(computed)} value(s) -- one per distinct input")  // 2

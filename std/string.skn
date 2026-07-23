@@ -1,0 +1,303 @@
+// String construction from computed bytes (over the static Bytes builder: push(Bytes, Int)).
+// charStr(b) is a one-byte String; slice(s, start, end) is a byte-range substring (clamped to
+// [0, len]). The keystone that lets user code build a String without an escape hatch.
+pub fn charStr(b: Int) -> String { fromBytes(push(bytes(), b)) }
+// A byte-range substring of an ALREADY-materialized Bytes -- clamped to [0, len], bulk-memcpy'd (no
+// per-byte loop). Prefer this over slice() in a hot loop that holds ONE Bytes and slices many ranges
+// from it: slice(String,..) calls toBytes(s) on the WHOLE string every call (O(n) each), so slicing
+// per token/element is O(n^2); sliceBytes over a held Bytes is O(range). (P2 lexer finding.)
+pub fn sliceBytes(src: Bytes, start: Int, end: Int) -> String {
+  let n = len(src)
+  let mut lo = start
+  let mut hi = end
+  if lo < 0 { lo = 0 }
+  if hi > n { hi = n }
+  let buf = bytes()
+  if lo < hi { _appendBytesRange(buf, src, lo, hi) }   // bulk memcpy of src[lo, hi)
+  fromBytes(buf)
+}
+// Byte-range substring of a String (clamped to [0, len]). Convenience over sliceBytes for a one-off
+// slice; in a hot loop hold the Bytes yourself and use sliceBytes to avoid re-converting the source.
+pub fn slice(s: String, start: Int, end: Int) -> String { sliceBytes(toBytes(s), start, end) }
+// isEmpty / charAt: cheap byte-level companions. charAt returns the byte at i as an Int (0..255)
+// and traps out of bounds, exactly like b[i].
+pub fn isEmpty(s: String) -> Bool { len(s) == 0 }
+pub fn charAt(s: String, i: Int) -> Int { toBytes(s)[i] }
+// ---- substring search (BYTE-level). indexOf/lastIndexOf return the byte index or -1 on miss;
+//      indexOf(s, "") == 0 and lastIndexOf(s, "") == len(s) (the empty string matches everywhere),
+//      matching JS. `_strMatchAt`/`_strIndexOf` are module-private byte-search primitives (std::iter's
+//      SplitCursor keeps its own private copies -- a strict `pub` regime forbids cross-module use of a
+//      private helper). ----
+fn _strMatchAt(b: Bytes, sub: Bytes, at: Int, i: Int) -> Bool {
+  if i >= len(sub) { true } else if at + i >= len(b) { false }
+  else if b[at + i] != sub[i] { false } else { _strMatchAt(b, sub, at, i + 1) }
+}
+fn _strIndexOf(b: Bytes, sub: Bytes, from: Int) -> Int {
+  if from + len(sub) > len(b) { -1 } else if _strMatchAt(b, sub, from, 0) { from }
+  else { _strIndexOf(b, sub, from + 1) }
+}
+pub fn indexOf(s: String, sub: String) -> Int { _strIndexOf(toBytes(s), toBytes(sub), 0) }
+fn _strLastIndexOf(b: Bytes, sub: Bytes, from: Int) -> Int {
+  if from < 0 { -1 } else if _strMatchAt(b, sub, from, 0) { from }
+  else { _strLastIndexOf(b, sub, from - 1) }
+}
+pub fn lastIndexOf(s: String, sub: String) -> Int {
+  let b = toBytes(s)
+  let sb = toBytes(sub)
+  let start = len(b) - len(sb)
+  if start < 0 { -1 } else { _strLastIndexOf(b, sb, start) }
+}
+pub fn hasSubstr(s: String, sub: String) -> Bool { indexOf(s, sub) >= 0 }
+// startsWith/endsWith via slice + content == (no search subtleties). An empty prefix/suffix matches.
+pub fn startsWith(s: String, prefix: String) -> Bool {
+  let m = len(prefix)
+  if m > len(s) { false } else { slice(s, 0, m) == prefix }
+}
+pub fn endsWith(s: String, suffix: String) -> Bool {
+  let n = len(s)
+  let m = len(suffix)
+  if m > n { false } else { slice(s, n - m, n) == suffix }
+}
+// ---- ASCII character classification. A "character" here is an Int byte 0..255 (matching char literals
+//      like 'A'); every predicate is BYTE-level, so a byte >= 128 (any UTF-8 lead/continuation byte)
+//      answers false. Mirrors Rust's char::is_ascii_* family. NOTE: isAsciiWhitespace uses the C isspace
+//      set INCLUDING vertical tab (11) -- matching what trim strips; Rust's is_ascii_whitespace omits VT. ----
+pub fn isAsciiControl(c: Int) -> Bool { (c >= 0 && c <= 31) || c == 127 }
+pub fn isAsciiDigit(c: Int) -> Bool { c >= 48 && c <= 57 }
+pub fn isAsciiWhitespace(c: Int) -> Bool { c == 32 || c == 9 || c == 10 || c == 11 || c == 12 || c == 13 }
+pub fn isAsciiUpper(c: Int) -> Bool { c >= 65 && c <= 90 }
+pub fn isAsciiLower(c: Int) -> Bool { c >= 97 && c <= 122 }
+pub fn isAsciiAlpha(c: Int) -> Bool { isAsciiUpper(c) || isAsciiLower(c) }
+pub fn isAsciiAlphanumeric(c: Int) -> Bool { isAsciiAlpha(c) || isAsciiDigit(c) }
+pub fn isAsciiPrintable(c: Int) -> Bool { c >= 32 && c <= 126 }
+// hasControl: true if the String contains any ASCII control byte (tail-recursive scan -> O(1) stack).
+fn _hasControlGo(b: Bytes, i: Int) -> Bool {
+  if i >= len(b) { false } else if isAsciiControl(b[i]) { true } else { _hasControlGo(b, i + 1) }
+}
+pub fn hasControl(s: String) -> Bool { _hasControlGo(toBytes(s), 0) }
+// ---- trim: strip the ASCII whitespace bytes (see isAsciiWhitespace). BYTE-level; bytes >= 0x80 are
+//      never whitespace, so multibyte UTF-8 is untouched. ----
+fn _trimLo(b: Bytes, i: Int) -> Int {
+  if i < len(b) { if isAsciiWhitespace(b[i]) { _trimLo(b, i + 1) } else { i } } else { i }
+}
+fn _trimHi(b: Bytes, i: Int) -> Int {
+  if i > 0 { if isAsciiWhitespace(b[i - 1]) { _trimHi(b, i - 1) } else { i } } else { i }
+}
+pub fn trim(s: String) -> String {
+  let b = toBytes(s)
+  let lo = _trimLo(b, 0)
+  let hi = _trimHi(b, len(b))
+  if lo >= hi { "" } else { slice(s, lo, hi) }
+}
+pub fn trimStart(s: String) -> String { let b = toBytes(s)  slice(s, _trimLo(b, 0), len(b)) }
+pub fn trimEnd(s: String) -> String { let b = toBytes(s)  slice(s, 0, _trimHi(b, len(b))) }
+// ---- case: ASCII-only (a-z <-> A-Z). No locale / no Unicode case folding; bytes outside a-z/A-Z
+//      (including every UTF-8 continuation byte) pass through unchanged. ----
+fn _toUpperByte(c: Int) -> Int { if c >= 97 { if c <= 122 { c - 32 } else { c } } else { c } }
+fn _toLowerByte(c: Int) -> Int { if c >= 65 { if c <= 90 { c + 32 } else { c } } else { c } }
+fn _mapBytes(b: Bytes, f: fn(Int) -> Int) -> String {
+  let out = bytes()
+  let mut i = 0
+  while i < len(b) { push(out, f(b[i]))  i = i + 1 }
+  fromBytes(out)
+}
+pub fn toUpper(s: String) -> String { _mapBytes(toBytes(s), _toUpperByte) }
+pub fn toLower(s: String) -> String { _mapBytes(toBytes(s), _toLowerByte) }
+// ---- build helpers (append into a shared Bytes buffer; while-loops => O(1) stack) ----
+fn _appendRange(out: Bytes, b: Bytes, lo: Int, hi: Int) -> Bytes { _appendBytesRange(out, b, lo, hi) }
+fn _appendBytes(out: Bytes, src: Bytes) -> Bytes { appendBytes(out, src) }
+fn _padBytes(out: Bytes, byte: Int, n: Int) -> Bytes {
+  let mut i = 0
+  while i < n { push(out, byte)  i = i + 1 }
+  out
+}
+// ---- replace: ALL non-overlapping occurrences of `from`, left to right. An empty `from` is a no-op
+//      (returns s unchanged). BYTE-level. _replaceGo tail-recurses (one call per match) => O(1) stack. ----
+fn _replaceGo(b: Bytes, fb: Bytes, tb: Bytes, pos: Int, out: Bytes) -> Bytes {
+  let k = _strIndexOf(b, fb, pos)
+  if k < 0 { _appendRange(out, b, pos, len(b)) }
+  else {
+    _appendRange(out, b, pos, k)
+    _appendBytes(out, tb)
+    _replaceGo(b, fb, tb, k + len(fb), out)
+  }
+}
+pub fn replace(s: String, from: String, to: String) -> String {
+  if len(from) == 0 { s } else {
+    let out = bytes()
+    _replaceGo(toBytes(s), toBytes(from), toBytes(to), 0, out)
+    fromBytes(out)
+  }
+}
+// ---- pad to a BYTE `width` with a single `padByte` (an Int byte, e.g. ' ' or '0'). If s is already
+//      at least `width` bytes it is returned unchanged. ----
+pub fn padStart(s: String, width: Int, padByte: Int) -> String {
+  let n = len(s)
+  if n >= width { s } else {
+    let out = bytes()
+    _padBytes(out, padByte, width - n)
+    _appendBytes(out, toBytes(s))
+    fromBytes(out)
+  }
+}
+pub fn padEnd(s: String, width: Int, padByte: Int) -> String {
+  let n = len(s)
+  if n >= width { s } else {
+    let out = bytes()
+    _appendBytes(out, toBytes(s))
+    _padBytes(out, padByte, width - n)
+    fromBytes(out)
+  }
+}
+// repeatStr: s concatenated n times (n <= 0 -> ""). Named to avoid the Iterator source `repeat`.
+pub fn repeatStr(s: String, n: Int) -> String {
+  let b = toBytes(s)
+  let out = bytes()
+  let mut i = 0
+  while i < n { _appendBytes(out, b)  i = i + 1 }
+  fromBytes(out)
+}
+
+// ---- StringBuilder: an O(n) string accumulator over a growable Bytes buffer, for the hot loop where
+//      a `+`/interpolation chain would allocate O(n) intermediates. `append` blits via BYTES_APPEND
+//      (one memcpy) and mutates the shared buffer in place, returning the builder for chaining:
+//        stringBuilder() |> append("a") |> append("b") |> build   ==   "ab"
+pub struct StringBuilder { buf: Bytes }
+pub fn stringBuilder() -> StringBuilder { StringBuilder { buf: bytes() } }
+pub fn stringBuilderCap(cap: Int) -> StringBuilder { StringBuilder { buf: bytes(cap) } }
+pub fn append(sb: StringBuilder, s: String) -> StringBuilder { appendBytes(sb.buf, s)  sb }
+pub fn appendByte(sb: StringBuilder, c: Int) -> StringBuilder { push(sb.buf, c)  sb }
+pub fn build(sb: StringBuilder) -> String { fromBytes(sb.buf) }
+pub fn sbLen(sb: StringBuilder) -> Int { len(sb.buf) }
+
+// ---- Format specifiers: the runtime behind an interpolation hole `${e:spec}`, which desugars to
+//      `format(e, "spec")`. Also callable directly as `format(x, "spec")`. v1 grammar (a subset of
+//      Rust's): [[fill]align]['0'][width]['.'precision][type]
+//        align  '<' left / '>' right / '^' center; a char BEFORE the align is the fill (default ' ')
+//        '0'    zero-pad flag (numbers: pads AFTER the sign, so -007)
+//        width  decimal digits -- the minimum field width
+//        .prec  decimal digits -- Double fixed decimals (ignored for Int/String/Bool)
+//        type   x/X hex, b binary, o octal, d decimal, f fixed Double, s string
+//      SCALARS ONLY (Int/Double/String/Bool), matching `+`. An inapplicable field is ignored (a
+//      formatting op never aborts). Negatives in a non-decimal base are sign-magnitude ('-ff'), NOT
+//      two's-complement. All pure Skarn -- no VM/opcode change; the differential oracle runs it as-is.
+pub trait Format { fn format(self, spec: String) -> String }
+
+// A parsed spec. align: 0 none, 1 '<', 2 '>', 3 '^'. prec: -1 if absent. ty: the type char (0 if none).
+struct FmtSpec { fill: Int, align: Int, zero: Bool, width: Int, prec: Int, ty: Int }
+
+fn _fmtIsAlign(c: Int) -> Bool { c == 60 || c == 62 || c == 94 }        // '<' '>' '^'
+fn _fmtAlignOf(c: Int) -> Int { if c == 60 { 1 } else if c == 62 { 2 } else { 3 } }
+fn _fmtIsDigit(c: Int) -> Bool { c >= 48 && c <= 57 }
+
+// Lenient, total parse (never traps) -- the parser has already validated the grammar for `${e:spec}`,
+// but a direct `format(x, s)` call may pass anything, so best-effort here.
+fn _parseFmt(spec: String) -> FmtSpec {
+  let b = toBytes(spec)
+  let n = len(b)
+  let mut i = 0
+  let mut fill = 32
+  let mut align = 0
+  if n >= 2 && _fmtIsAlign(b[1]) { fill = b[0]  align = _fmtAlignOf(b[1])  i = 2 }
+  else if n >= 1 && _fmtIsAlign(b[0]) { align = _fmtAlignOf(b[0])  i = 1 }
+  let mut zero = false
+  if i < n && b[i] == 48 { zero = true  i = i + 1 }
+  let mut width = 0
+  while i < n && _fmtIsDigit(b[i]) { width = width * 10 + (b[i] - 48)  i = i + 1 }
+  let mut prec = -1
+  if i < n && b[i] == 46 {                       // '.'
+    i = i + 1
+    prec = 0
+    while i < n && _fmtIsDigit(b[i]) { prec = prec * 10 + (b[i] - 48)  i = i + 1 }
+  }
+  let mut ty = 0
+  if i < n { ty = b[i] }
+  FmtSpec { fill: fill, align: align, zero: zero, width: width, prec: prec, ty: ty }
+}
+
+// Apply width/align with the fill char (space unless overridden). Zero-padding is handled sign-aware in
+// the numeric bodies, so by the time a padded number reaches here it already meets the width (no-op).
+fn _pad(s: String, fs: FmtSpec, defaultAlign: Int) -> String {
+  let n = len(s)
+  if n >= fs.width { s } else {
+    let total = fs.width - n
+    let a = if fs.align == 0 { defaultAlign } else { fs.align }
+    if a == 1 {
+      let out = bytes()
+      _appendBytes(out, toBytes(s))
+      _padBytes(out, fs.fill, total)
+      fromBytes(out)
+    } else if a == 3 {
+      let left = total / 2
+      let out = bytes()
+      _padBytes(out, fs.fill, left)
+      _appendBytes(out, toBytes(s))
+      _padBytes(out, fs.fill, total - left)
+      fromBytes(out)
+    } else {
+      let out = bytes()
+      _padBytes(out, fs.fill, total)
+      _appendBytes(out, toBytes(s))
+      fromBytes(out)
+    }
+  }
+}
+
+fn _fmtBaseOf(ty: Int) -> Int {
+  if ty == 120 { 16 } else if ty == 88 { 16 } else if ty == 98 { 2 } else if ty == 111 { 8 } else { 10 }
+}
+fn _fmtDigitChar(d: Int, upper: Bool) -> Int {
+  if d < 10 { 48 + d } else if upper { 55 + d } else { 87 + d }
+}
+fn _digitsOf(mag: Int, base: Int, upper: Bool, acc: String) -> String {
+  if mag == 0 { acc }
+  else { _digitsOf(mag / base, base, upper, charStr(_fmtDigitChar(mag % base, upper)) + acc) }
+}
+fn _pow10(p: Int) -> Int { if p <= 0 { 1 } else { 10 * _pow10(p - 1) } }
+fn _fmtFinite(d: Double) -> Bool { d - d == 0.0 }   // NaN/inf: d - d is NaN, not 0.0
+
+// Zero-pad `sign + digits` to width, inserting the zeros AFTER the sign (so -007). No-op unless the
+// zero flag is set; otherwise `_pad` does space/fill alignment on the joined result.
+fn _zeroPadNum(sign: String, digits: String, fs: FmtSpec) -> String {
+  if fs.zero {
+    let bodyLen = len(sign) + len(digits)
+    if bodyLen < fs.width { sign + repeatStr("0", fs.width - bodyLen) + digits } else { sign + digits }
+  } else { sign + digits }
+}
+
+fn _intBody(n: Int, fs: FmtSpec) -> String {
+  let neg = n < 0
+  let mag = if neg { 0 - n } else { n }
+  let base = _fmtBaseOf(fs.ty)
+  let upper = fs.ty == 88
+  let digits = if mag == 0 { "0" } else { _digitsOf(mag, base, upper, "") }
+  _zeroPadNum(if neg { "-" } else { "" }, digits, fs)
+}
+
+fn _dblBody(d: Double, fs: FmtSpec) -> String {
+  if !_fmtFinite(d) { toString(d) }             // nan/inf: pass through, width via _pad only
+  else {
+    let neg = d < 0.0
+    let a = if neg { 0.0 - d } else { d }
+    let sign = if neg { "-" } else { "" }
+    let digits =
+      if fs.prec < 0 { toString(a) }            // default: shortest round-trip of the magnitude
+      else if fs.prec == 0 { toString(toInt(roundHalfToEven(a))) }
+      else {
+        let scale = _pow10(fs.prec)
+        let rounded = toInt(roundHalfToEven(a * (scale + 0.0)))
+        toString(rounded / scale) + "." + padStart(toString(rounded % scale), fs.prec, 48)
+      }
+    _zeroPadNum(sign, digits, fs)
+  }
+}
+
+impl Format for String { fn format(self, spec: String) -> String { _pad(self, _parseFmt(spec), 1) } }
+impl Format for Bool { fn format(self, spec: String) -> String { _pad(toString(self), _parseFmt(spec), 1) } }
+impl Format for Int {
+  fn format(self, spec: String) -> String { let fs = _parseFmt(spec)  _pad(_intBody(self, fs), fs, 2) }
+}
+impl Format for Double {
+  fn format(self, spec: String) -> String { let fs = _parseFmt(spec)  _pad(_dblBody(self, fs), fs, 2) }
+}
+

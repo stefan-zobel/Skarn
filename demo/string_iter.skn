@@ -1,0 +1,37 @@
+// `for c in s` -- direct String iteration yields raw BYTES (Int 0..255), Option B. Consistent with char
+// literals (`'A'` is the byte 65); NO UTF-8 code-point decoding. A String is also a first-class lazy source
+// (`intoIter(s)`), so it composes with the combinator surface. Implemented as one prelude line:
+//   impl IntoIterator[Int] for String { fn intoIter(self) -> dyn Iterator[Int] { intoIter(toBytes(self)) } }
+
+fn countVowels(s: String) -> Int {
+    let mut n = 0
+    for c in s {
+        if c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u' { n = n + 1 }
+    }
+    n
+}
+
+// ASCII upper-casing, byte by byte, into a fresh Bytes buffer.
+fn shout(s: String) -> String {
+    let mut out = bytes()
+    for c in s {
+        if c >= 'a' && c <= 'z' { push(out, c - 32) } else { push(out, c) }
+    }
+    fromBytes(out)
+}
+
+fn main() -> () {
+    let text = "hello world"
+    println("vowels=" + countVowels(text))     // => vowels=3
+    println(shout(text))                        // => HELLO WORLD
+
+    // byte sum via the iterator terminals (intoIter lifts the String into a dyn Iterator[Int])
+    println("byte-sum=" + sum(intoIter(text)))  // => byte-sum=1116
+
+    // count the digit characters with a combinator pipeline. The lambda needs no type annotations --
+    // its `fn(Int) -> Bool` shape is inferred from `filter`'s expected argument type (bidirectional).
+    let digits = count(filter(intoIter("a1b2c3"), fn(c) { c >= '0' && c <= '9' }))
+    println("digits=" + digits)                 // => digits=3
+}
+
+main()

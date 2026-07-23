@@ -1,0 +1,28 @@
+// std::time -- dates and times (strict UTC, millisecond precision, pure Skarn).
+use std::time::*
+
+// A fixed instant: 2026-07-21 14:30:15.123 UTC = 1784644215123 ms since the epoch.
+let t = instantFromMillis(1784644215123)
+let dt = toDateTime(t)
+
+println("iso:      ${toIso(dt)}")                    // 2026-07-21T14:30:15.123Z
+println("y/m/d:    ${dt.year}-${dt.month}-${dt.day}")   // 2026-7-21
+println("weekday:  ${weekday(dt)}")                  // 2  (ISO Mon=1..Sun=7 -> Tuesday)
+println("leap?     ${isLeapYear(dt.year)}")          // false
+
+// Arithmetic: add a duration, measure a gap.
+let later = addDuration(t, addDurations(hours(1), minutes(30)))
+println("later:    ${toIso(toDateTime(later))}")     // 2026-07-21T16:00:15.123Z
+println("gap min:  ${inMinutes(durationBetween(t, later))}")   // 90
+
+// Validated construction: bad fields yield None.
+match dateTime(2026, 2, 30, 0, 0, 0, 0) {
+  Some(_) => println("built"),
+  None    => println("Feb 30 rejected")
+}
+
+// Parse an ISO string back to a DateTime.
+match parseIso("2000-02-29T12:00:00.000Z") {
+  Ok(d)  => println("parsed:   ${d.year} (leap day, weekday ${weekday(d)})"),   // 2000 (weekday 2)
+  Err(m) => println("error: ${m}")
+}

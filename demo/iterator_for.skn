@@ -1,0 +1,73 @@
+// ============================================================================
+// Lazy `for` over the Iterator / IntoIterator protocol (the Rust model).
+//
+// `for x in e` drives whichever `e` supports: `e` itself if it is an Iterator
+// (a pull cursor -- next() mutates it in place), else `intoIter(e)` (a fresh
+// cursor). Streams, user cursors, and user collections all iterate the same way.
+// A `dyn Iterator[T]` value IS the plain cursor -- no box, no vtable pointer;
+// the dissolved combinators (range/map/filter/...) each return one.
+//
+// Run:  x64\Release\static_vmrun.exe demo\iterator_for.skn
+// ============================================================================
+
+// (1) for over a lazy stream expression -- the headline. Nothing is materialized;
+// the pipeline is pulled one element at a time. (`map` introduces a fresh output type, so in
+// this inference position the pipeline is bound to an annotated `let` -- the generic-of-generic
+// rule; `filter`/`take`/`drop`, which keep the element type, need no annotation.)
+let pipe: dyn Iterator[Int] = map(filter(range(0, 20), fn(x: Int) -> Bool { x % 2 == 0 }), fn(x: Int) -> Int { x * 3 })
+let mut total = 0
+for x in pipe { total = total + x }
+println("for over stream   = " + toString(total))       // (0+2+..+18)*3 = 270
+
+// (2) a USER type that IS an Iterator (a Fibonacci cursor): `for` drives its next().
+struct Fib { a: Int, b: Int }
+impl Iterator[Int] for Fib {
+  fn next(mut self) -> Option[Int] {
+    let x = self.a
+    self.a = self.b
+    self.b = x + self.b
+    Some(x)
+  }
+}
+let mut fibs: Vec[Int] = vec()
+for x in take(Fib { a: 0, b: 1 }, 10) { push(fibs, x) }   // take() bounds the infinite cursor
+println("first 10 fibs     = " + toString(fibs))          // [0,1,1,2,3,5,8,13,21,34]
+
+// (3) a USER COLLECTION via IntoIterator -- iterable MORE THAN ONCE (fresh cursor each `for`).
+struct Ring { xs: Vec[Int] }
+struct RingCur { xs: Vec[Int], i: Int }
+impl Iterator[Int] for RingCur {
+  fn next(mut self) -> Option[Int] {
+    if self.i < len(self.xs) { let v = self.xs[self.i]  self.i = self.i + 1  Some(v) } else { None }
+  }
+}
+impl IntoIterator[Int] for Ring {
+  fn intoIter(self) -> dyn Iterator[Int] { RingCur { xs: self.xs, i: 0 } }
+}
+let items: Vec[Int] = vec()
+push(items, 100)
+push(items, 200)
+push(items, 300)
+let r = Ring { xs: items }
+let mut passes = 0
+for x in r { passes = passes + x }
+for x in r { passes = passes + x }                        // second pass -> fresh cursor
+println("two passes        = " + toString(passes))        // (100+200+300)*2 = 1200
+
+// (4) the round-2 combinators -- all pure prelude on this same Iterator base.
+// flatMap flattens nested iterators; zip pairs two sources; enumerate indexes.
+for (i, p) in enumerate(zip(range(0, 4), map(range(0, 4), fn(x: Int) -> Int { x * x }))) {
+  println("  #" + i + " -> " + p.0 + " squared is " + p.1)
+}
+let flat = sum(flatMap(range(0, 5), fn(k: Int) -> dyn Iterator[Int] { range(0, k) }))
+println("flatMap sum       = " + toString(flat))          // 0+0+1+3+6 = 10
+
+// terminals: min / max (over Ord), product, partition, join, toMap.
+println("min / max         = " + unwrapOr(min(chain(range(5, 9), range(1, 3))), -1)
+                              + " / " + unwrapOr(max(range(3, 12)), -1))     // 1 / 11
+println("product 1..6      = " + toString(product(range(1, 6))))             // 120
+let (evens, odds) = partition(range(0, 10), fn(x: Int) -> Bool { x % 2 == 0 })
+println("evens / odds      = " + len(evens) + " / " + len(odds))             // 5 / 5
+println("joined            = " + join(map(range(0, 5), fn(x: Int) -> String { toString(x) }), ", "))
+let squares = toMap(map(range(1, 5), fn(x: Int) -> (Int, Int) { (x, x * x) }))
+println("squares[4]        = " + toString(squares[4]))    // 16

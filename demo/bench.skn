@@ -1,0 +1,47 @@
+// bench.skn -- a tiny per-op microbenchmark for the Skarn VM (run with static_vmrun).
+//
+//   static_vmrun demo/bench.skn
+//
+// Each workload times its own hot region with nanoTime() and prints the wall time plus the
+// per-unit cost (ns/iter, ns/call, ns/elem). To turn a per-unit figure into ns-per-BYTECODE-OP,
+// divide by the measured ops-per-unit noted beside each workload -- those op counts came from a
+// throwaway build of the VM with the dispatch loop instrumented to count ops (`-DVM_COUNT_OPS`,
+// which prints `[VM_OPS] N` at HALT; the shipping VM has no such counter). Because the op count is
+// deterministic, ns/op = (untampered wall from this run) / (op count from the counting build).
+//
+// Reference numbers (AMD Ryzen 5 5600H, Release x64): ~5-6 ns/op, remarkably flat across all three
+// profiles -- the interpreter is dispatch-bound. See VM-Architecture.md Part II "Measured performance".
+//
+// The sizes below take ~15 s total; shrink n / k for a quicker run.
+use std::env::*
+
+// --- 1. compute-bound: a tight integer loop.  ~9 bytecode ops / iteration ---
+let n1 = 200000000
+let t0 = nanoTime()
+let mut s = 0
+let mut i = 0
+while i < n1 {
+  s = s + i
+  i = i + 1
+}
+let e0 = nanoTime() - t0
+println("arith  n=" + toString(n1) + "  checksum=" + toString(s)
+        + "  wall_ns=" + toString(e0) + "  ns/iter=" + toString(e0 / n1))
+
+// --- 2. call-bound: naive recursive Fibonacci.  ~10 bytecode ops / call ---
+fn fib(k: Int) -> Int { if k < 2 { k } else { fib(k - 1) + fib(k - 2) } }
+let k = 36
+let t1 = nanoTime()
+let r = fib(k)
+let e1 = nanoTime() - t1
+println("fib    k=" + toString(k) + "  fib=" + toString(r) + "  wall_ns=" + toString(e1))
+
+// --- 3. lazy-pipeline (dispatch + alloc-heavy): filter -> map -> fold.  ~62 bytecode ops / elem ---
+let n3 = 5000000
+let t2 = nanoTime()
+let total = fold(map(filter(range(0, n3), fn(x: Int) -> Bool { x % 2 == 0 }),
+                     fn(x: Int) -> Int { x + 1 }),
+                 0, fn(a: Int, b: Int) -> Int { a + b })
+let e2 = nanoTime() - t2
+println("iter   n=" + toString(n3) + "  total=" + toString(total)
+        + "  wall_ns=" + toString(e2) + "  ns/elem=" + toString(e2 / n3))

@@ -1,0 +1,79 @@
+// A hash set: a thin, pure-Skarn wrapper over `Map[T, Bool]` (no native, no VM change). The set-level
+// verbs delegate to the Map builtins applied to the `.m` field (`has`/`delete`/`len`/`keys`), which take a
+// Map -- so there is no name clash with those builtins or with the Iterator `contains`/`count` terminals.
+//
+// The element type T must be a permitted Map key -- Int / Double / Bool / String / Atom. A Set of a struct /
+// tuple / other heap type COMPILES but TRAPS at runtime, exactly as a Map with such keys does (there is no
+// `Hashable` bound yet). T is monomorphic, so Map's int-vs-double SameValueZero hazard cannot arise --
+// `Set[Int]` / `Set[String]` are fully sound. Iteration is HASH-ORDER (unspecified), like Map.
+//
+// OPT-IN: reach these via `use std::set::*` (or a qualified std::set::name). Tree-shaken.
+
+pub struct Set[T] { m: Map[T, Bool] }
+
+// An empty set.
+pub fn set[T]() -> Set[T] {
+  let m0: Map[T, Bool] = #{}
+  Set { m: m0 }
+}
+
+// A set holding the distinct elements of `v`.
+pub fn setOf[T](v: Vec[T]) -> Set[T] {
+  let mut s: Set[T] = set()
+  for x in v { insert(s, x) }
+  s
+}
+
+// Membership -- O(1).
+pub fn isMember[T](s: Set[T], x: T) -> Bool { has(s.m, x) }
+
+// Cardinality -- O(1).
+pub fn size[T](s: Set[T]) -> Int { len(s.m) }
+
+// Add `x`; returns true iff it was NOT already present. O(1).
+pub fn insert[T](mut s: Set[T], x: T) -> Bool {
+  let fresh = !has(s.m, x)
+  s.m[x] = true
+  fresh
+}
+
+// Remove `x`; returns true iff it WAS present. O(1).
+pub fn remove[T](mut s: Set[T], x: T) -> Bool { delete(s.m, x) }
+
+// --- algebra (non-mutating; each returns a fresh set) ---
+
+pub fn union[T](a: Set[T], b: Set[T]) -> Set[T] {
+  let mut r: Set[T] = set()
+  for x in keys(a.m) { insert(r, x) }
+  for x in keys(b.m) { insert(r, x) }
+  r
+}
+
+pub fn intersect[T](a: Set[T], b: Set[T]) -> Set[T] {
+  let mut r: Set[T] = set()
+  for x in keys(a.m) { if isMember(b, x) { insert(r, x) } }
+  r
+}
+
+pub fn difference[T](a: Set[T], b: Set[T]) -> Set[T] {
+  let mut r: Set[T] = set()
+  for x in keys(a.m) { if !isMember(b, x) { insert(r, x) } }
+  r
+}
+
+// Every element of `a` is in `b`.
+pub fn isSubset[T](a: Set[T], b: Set[T]) -> Bool {
+  let mut ok = true
+  for x in keys(a.m) { if !isMember(b, x) { ok = false } }
+  ok
+}
+
+// `a` and `b` share no element.
+pub fn isDisjoint[T](a: Set[T], b: Set[T]) -> Bool {
+  let mut ok = true
+  for x in keys(a.m) { if isMember(b, x) { ok = false } }
+  ok
+}
+
+// `for x in s` + the whole lazy-combinator surface, over a keys() snapshot (hash-order).
+impl[T] IntoIterator[T] for Set[T] { fn intoIter(self) -> dyn Iterator[T] { intoIter(keys(self.m)) } }

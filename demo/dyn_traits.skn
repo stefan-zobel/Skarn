@@ -1,0 +1,64 @@
+// dyn_traits.skn -- trait objects (`dyn Trait`) in Skarn.
+//
+// The point of a trait object is HETEROGENEITY. A generic `fn f[T: Draw](xs: Vec[T])` is
+// UNIVERSAL ("for all T"): the caller picks one T per call, so every element of `xs` has the
+// same type. `dyn Draw` is EXISTENTIAL ("some T implementing Draw, not named here"): each
+// VALUE picks and hides its own type, so one Vec can hold several.
+//
+// At run time a `dyn` value is just the value -- no box, no vtable pointer. Every Skarn value
+// already carries its own type tag, so dispatch is the same PROTO_RESOLVE the erased `T: Draw`
+// path uses. `dyn` is a type-system feature; it costs the backend nothing.
+
+trait Draw {
+  fn draw(self) -> String
+  fn area(self) -> Int
+  // A default method -- reachable through a trait object like any other.
+  fn label(self) -> String { draw(self) + " (area " + toString(area(self)) + ")" }
+}
+
+struct Square { side: Int }
+struct Rect   { w: Int, h: Int }
+
+impl Draw for Square { fn draw(self) -> String { "square" }  fn area(self) -> Int { self.side * self.side } }
+impl Draw for Rect   { fn draw(self) -> String { "rect" }    fn area(self) -> Int { self.w * self.h } }
+
+// A builtin type can implement the trait too -- and then mix into the same collection.
+impl Draw for Int { fn draw(self) -> String { "dot" }  fn area(self) -> Int { self } }
+
+// A trait object as a PARAMETER: this accepts any Draw, and different calls may pass
+// different types. With `[T: Draw]` that would also work -- the difference shows up below.
+fn describe(x: dyn Draw) -> String { label(x) }
+
+// A trait object as a RETURN type: "some Draw", chosen at run time. A generic could not
+// express this -- the caller, not the body, would have to pick T.
+fn pick(big: Bool) -> dyn Draw {
+  if big { Rect { w: 10, h: 10 } } else { 3 }
+}
+
+// A trait object in a STRUCT FIELD: `Canvas` holds shapes without knowing their types.
+struct Canvas { shapes: Vec[dyn Draw] }
+
+fn totalArea(c: Canvas) -> Int {
+  let mut sum = 0
+  for s in c.shapes { sum = sum + area(s) }
+  sum
+}
+
+// ---- demo -------------------------------------------------------------------
+// THE headline: one Vec, three different concrete types. This is what `dyn` buys.
+let shapes: Vec[dyn Draw] = vec()
+push(shapes, Square { side: 3 })
+push(shapes, Rect { w: 4, h: 5 })
+push(shapes, 7)                      // an Int -- same collection, different type
+
+for s in shapes { println(describe(s)) }
+
+let c = Canvas { shapes: shapes }
+println("total area  = " + toString(totalArea(c)))
+println("pick(true)  = " + describe(pick(true)))
+println("pick(false) = " + describe(pick(false)))
+
+// A `dyn Draw` also satisfies a `T: Draw` bound -- it is, after all, "some T: Draw".
+fn viaGeneric[T: Draw](x: T) -> Int { area(x) }
+let one: dyn Draw = Square { side: 6 }
+println("via generic = " + toString(viaGeneric(one)))

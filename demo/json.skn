@@ -1,0 +1,38 @@
+// json.skn -- using the std::json LIBRARY (parse -> navigate -> re-serialize).
+// Contrast demo/json_parser.skn, which builds a parser FROM SCRATCH; here we just
+// `use` the shipped module. Serialization runs through the StringBuilder (O(n)) with
+// correct escaping.
+use std::json::*
+
+let src = "{\"name\":\"Ada Lovelace\",\"age\":36,\"active\":true,\"langs\":[\"Skarn\",\"Rust\"],\"note\":\"tab\\ttab\"}"
+
+let doc = match parse(src) {
+  Ok(j) => j,
+  Err(e) => { println("parse error: " + e)  JNull },
+}
+
+// ---- navigate with typed accessors ----
+match getField(doc, "name") { Some(JStr(s)) => println("name   = " + s), _ => println("name   = ?") }
+match asInt(unwrap(getField(doc, "age"))) { Some(n) => println("age    = " + toString(n)), None => println("age    = ?") }
+match getField(doc, "active") { Some(JBool(b)) => println("active = " + toString(b)), _ => println("active = ?") }
+match getField(doc, "langs") {
+  Some(JArr(xs)) => println("langs  = " + toString(len(xs)) + " item(s)"),
+  _ => println("langs  = ?"),
+}
+
+// ---- re-serialize: compact (round-trips the structure) ----
+println("")
+println("compact:")
+println(stringify(doc))
+
+// ---- re-serialize: pretty, 2-space indent ----
+println("")
+println("pretty:")
+println(stringifyPretty(doc, 2))
+
+// ---- a malformed input reports a located error ----
+println("")
+match parse("{\"a\":}") {
+  Ok(_)  => println("unexpected ok"),
+  Err(e) => println("malformed -> Err: " + e),
+}

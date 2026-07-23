@@ -1,0 +1,266 @@
+// Pseudo-random numbers: the xoshiro128** generator (Blackman & Vigna). Pure Skarn -- no native, no
+// VM change; the whole module is deterministic (fully reproducible AND fully differential-testable).
+// State is four 32-bit words held in an Rng struct; every op stays exact in the 48-bit signed Int:
+// `_m32` masks each word to 32 bits, and the `**` scrambler's `s1*5` / `*9` (and the SplitMix32 seed
+// multiplies) all stay below 2^63, so MUL_INT never loses the low 32 bits we keep.
+//
+// NOT cryptographically secure -- xoshiro is a statistical generator (BigCrush-class), not a CSPRNG.
+// Do not use for keys/tokens/secrets. Seed entropy is the caller's job (e.g. `use std::env` and
+// `seedRng(nanoTime())`); the module itself pulls no entropy, which is what keeps it native-free.
+//
+// OPT-IN: reach these via `use std::random::*` (or a qualified std::random::name). Tree-shaken.
+
+// The generator state (128 bits). Construct via `seedRng` (from an Int seed) or `rngFromState` (raw).
+pub struct Rng { s0: Int, s1: Int, s2: Int, s3: Int }
+
+// --- internal 32-bit helpers ---
+fn _m32(x: Int) -> Int { x & 0xFFFFFFFF }                          // keep the low 32 bits
+fn _rotl32(x: Int, k: Int) -> Int { _m32((x << k) | (x >> (32 - k))) }   // x is < 2^32 -> `>>` is logical
+
+// SplitMix32 finalizer (murmur-style avalanche). Constants < 2^31, so `w * c < 2^63` -> MUL_INT is
+// safe and `& 0xFFFFFFFF` yields the correct 32 bits.
+fn _smMix(z: Int) -> Int {
+  let z1 = _m32((z ^ (z >> 16)) * 0x21F0AAAD)
+  let z2 = _m32((z1 ^ (z1 >> 15)) * 0x735A2D97)
+  z2 ^ (z2 >> 15)
+}
+
+// --- construction ---
+
+// Raw-state constructor (advanced / reproducible use). The all-zero state is xoshiro's fixed point,
+// so it is nudged to a nonzero state; each word is masked to 32 bits.
+pub fn rngFromState(a: Int, b: Int, c: Int, d: Int) -> Rng {
+  let x0 = _m32(a)
+  let x1 = _m32(b)
+  let x2 = _m32(c)
+  let x3 = _m32(d)
+  let g = if (x0 | x1 | x2 | x3) == 0 { 1 } else { x0 }
+  Rng { s0: g, s1: x1, s2: x2, s3: x3 }
+}
+
+// Deterministic seeding: SplitMix32 (advanced 4x by the golden-ratio constant) fills the 128-bit
+// state from one Int seed. The full 48-bit seed is folded down to 32 bits first.
+pub fn seedRng(seed: Int) -> Rng {
+  let z0 = _m32(seed ^ (seed >> 24))
+  let z1 = _m32(z0 + 0x9E3779B9)                                   // golden-ratio increment
+  let a = _smMix(z1)
+  let z2 = _m32(z1 + 0x9E3779B9)
+  let b = _smMix(z2)
+  let z3 = _m32(z2 + 0x9E3779B9)
+  let c = _smMix(z3)
+  let z4 = _m32(z3 + 0x9E3779B9)
+  let d = _smMix(z4)
+  rngFromState(a, b, c, d)
+}
+
+// --- the core step: xoshiro128** ---
+
+// A raw 32-bit draw in [0, 2^32). Advances the state in place (mut rng).
+pub fn nextU32(mut rng: Rng) -> Int {
+  let s0 = rng.s0
+  let s1 = rng.s1
+  let s2 = rng.s2
+  let s3 = rng.s3
+  let result = _m32(_rotl32(_m32(s1 * 5), 7) * 9)                  // ** scrambler
+  let t = _m32(s1 << 9)
+  let n2 = s2 ^ s0
+  let n3 = s3 ^ s1
+  rng.s0 = s0 ^ n3
+  rng.s1 = s1 ^ n2
+  rng.s2 = n2 ^ t
+  rng.s3 = _rotl32(n3, 11)
+  result
+}
+
+// --- integers ---
+
+// smallest 2^k - 1 that is >= n (n >= 0). OR-shift ladder incl. >>32 for > 32-bit bounds.
+fn _maskGE(n: Int) -> Int {
+  let a = n | (n >> 1)
+  let b = a | (a >> 2)
+  let c = b | (b >> 4)
+  let d = c | (c >> 8)
+  let e = d | (d >> 16)
+  e | (e >> 32)
+}
+
+// draw `mask`+1 bits (mask is 2^k-1). <=32 bits -> one draw; >32 -> stitch two. `& mask` is bit-level,
+// so any transient bit-47 in the stitch is cleared and the result is a non-negative Int.
+fn _drawMasked(mut rng: Rng, mask: Int) -> Int {
+  if mask <= 0xFFFFFFFF {
+    nextU32(rng) & mask
+  } else {
+    let lo = nextU32(rng)
+    let hi = nextU32(rng) & 0xFFFF
+    ((hi << 32) | lo) & mask
+  }
+}
+
+// Uniform Int in [0, bound). Bias-free (mask-and-reject; Lemire is blocked here because a 32x32 product's
+// high 32 bits are unreachable in 48-bit arithmetic). bound must be in 1 .. 2^47-1.
+pub fn nextIntBounded(mut rng: Rng, bound: Int) -> Int {
+  if bound <= 0 { panic("nextIntBounded: bound must be positive") }
+  let mask = _maskGE(bound - 1)
+  loop {
+    let x = _drawMasked(rng, mask)
+    if x < bound { break x }
+  }
+}
+
+// Uniform Int in [lo, hi). Requires hi > lo.
+pub fn nextInt(mut rng: Rng, lo: Int, hi: Int) -> Int {
+  if hi <= lo { panic("nextInt: hi must be greater than lo") }
+  lo + nextIntBounded(rng, hi - lo)
+}
+
+// Uniform over the FULL signed Int range [-2^47, 2^47) -- CAN BE NEGATIVE (a raw 48-bit pattern read
+// as a signed Int). For a non-negative full-width value use nextIntBounded.
+pub fn nextInt48(mut rng: Rng) -> Int {
+  let lo = nextU32(rng)
+  let hi = nextU32(rng) & 0xFFFF
+  (hi << 32) | lo
+}
+
+// --- bool ---
+pub fn nextBool(mut rng: Rng) -> Bool { (nextU32(rng) & 1) == 1 }
+
+// --- doubles ---
+
+// Uniform Double in [0, 1) with full 53-bit resolution. Assembled in floating-point from two
+// NON-NEGATIVE sub-words (32 + 21 bits) -> exact (a 53-bit value fits the mantissa) and sign-safe.
+pub fn nextDouble(mut rng: Rng) -> Double {
+  let hi = nextU32(rng)                                            // 32 bits
+  let lo = nextU32(rng) & 0x1FFFFF                                 // 21 bits (2^21 - 1)
+  (hi * 2097152.0 + lo) * (1.0 / 9007199254740992.0)              // (hi*2^21 + lo) * 2^-53
+}
+
+// Uniform Double in [lo, hi).
+pub fn nextDoubleRange(mut rng: Rng, lo: Double, hi: Double) -> Double {
+  lo + (hi - lo) * nextDouble(rng)
+}
+
+// --- non-overlapping streams (jump = advance 2^64 steps) ---
+
+fn _jumpConst(i: Int) -> Int {
+  if i == 0 { 0x8764000B }                                          // the xoshiro128** JUMP polynomial
+  else if i == 1 { 0xF542D2D3 }
+  else if i == 2 { 0x6FA035C3 }
+  else { 0x77F2DB5B }
+}
+
+// Advance the stream by 2^64 calls (the official xoshiro128** jump polynomial). A cloned-then-jumped
+// generator yields a non-overlapping stream -- see splitRng.
+pub fn jump(mut rng: Rng) -> () {
+  let mut a0 = 0
+  let mut a1 = 0
+  let mut a2 = 0
+  let mut a3 = 0
+  let mut i = 0
+  while i < 4 {
+    let w = _jumpConst(i)
+    let mut b = 0
+    while b < 32 {
+      if (w & (1 << b)) != 0 {
+        a0 = a0 ^ rng.s0
+        a1 = a1 ^ rng.s1
+        a2 = a2 ^ rng.s2
+        a3 = a3 ^ rng.s3
+      }
+      nextU32(rng)
+      b = b + 1
+    }
+    i = i + 1
+  }
+  rng.s0 = a0
+  rng.s1 = a1
+  rng.s2 = a2
+  rng.s3 = a3
+}
+
+// Return a fresh generator on an independent (non-overlapping) stream, and advance `rng` past it.
+pub fn splitRng(mut rng: Rng) -> Rng {
+  let fork = Rng { s0: rng.s0, s1: rng.s1, s2: rng.s2, s3: rng.s3 }
+  jump(rng)
+  fork
+}
+
+// --- collections ---
+
+// In-place Fisher-Yates shuffle.
+pub fn shuffle[T](mut rng: Rng, mut v: Vec[T]) -> () {
+  let mut i = len(v) - 1
+  while i > 0 {
+    let j = nextIntBounded(rng, i + 1)
+    let tmp = v[i]
+    v[i] = v[j]
+    v[j] = tmp
+    i = i - 1
+  }
+}
+
+// A uniformly-random element, or None if the vector is empty.
+pub fn choice[T](mut rng: Rng, v: Vec[T]) -> Option[T] {
+  if len(v) == 0 { None } else { Some(v[nextIntBounded(rng, len(v))]) }
+}
+
+// --- bulk helpers (load/store-optimized) ---
+// These hoist the 4 state words into locals for the whole loop and write them back ONCE -- the manual
+// "register promotion" the compiler does not do, so the loop body touches no heap (no GET_PROP/SET_PROP
+// per element). Prefer these to a nextU32/nextDouble call-per-element loop in hot code.
+
+pub fn fillU32(mut rng: Rng, mut out: Vec[Int], n: Int) -> () {
+  let mut s0 = rng.s0
+  let mut s1 = rng.s1
+  let mut s2 = rng.s2
+  let mut s3 = rng.s3
+  let mut i = 0
+  while i < n {
+    let result = _m32(_rotl32(_m32(s1 * 5), 7) * 9)
+    let t = _m32(s1 << 9)
+    let n2 = s2 ^ s0
+    let n3 = s3 ^ s1
+    s0 = s0 ^ n3
+    s1 = s1 ^ n2
+    s2 = n2 ^ t
+    s3 = _rotl32(n3, 11)
+    push(out, result)
+    i = i + 1
+  }
+  rng.s0 = s0
+  rng.s1 = s1
+  rng.s2 = s2
+  rng.s3 = s3
+}
+
+pub fn fillDoubles(mut rng: Rng, mut out: Vec[Double], n: Int) -> () {
+  let recip = 1.0 / 9007199254740992.0                            // 2^-53, hoisted out of the loop
+  let mut s0 = rng.s0
+  let mut s1 = rng.s1
+  let mut s2 = rng.s2
+  let mut s3 = rng.s3
+  let mut i = 0
+  while i < n {
+    let hi = _m32(_rotl32(_m32(s1 * 5), 7) * 9)                    // step 1 -> hi (32 bits)
+    let t1 = _m32(s1 << 9)
+    let a2 = s2 ^ s0
+    let a3 = s3 ^ s1
+    s0 = s0 ^ a3
+    s1 = s1 ^ a2
+    s2 = a2 ^ t1
+    s3 = _rotl32(a3, 11)
+    let lo = _m32(_rotl32(_m32(s1 * 5), 7) * 9) & 0x1FFFFF         // step 2 -> lo (21 bits)
+    let t2 = _m32(s1 << 9)
+    let b2 = s2 ^ s0
+    let b3 = s3 ^ s1
+    s0 = s0 ^ b3
+    s1 = s1 ^ b2
+    s2 = b2 ^ t2
+    s3 = _rotl32(b3, 11)
+    push(out, (hi * 2097152.0 + lo) * recip)
+    i = i + 1
+  }
+  rng.s0 = s0
+  rng.s1 = s1
+  rng.s2 = s2
+  rng.s3 = s3
+}

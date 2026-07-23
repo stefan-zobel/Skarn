@@ -1,0 +1,8 @@
+// Text-file convenience over the byte-level readFile/writeFile/appendFile natives. A Skarn String
+// is a byte string (no transcoding), so a "text" file is just its bytes encoded/decoded verbatim.
+// OPT-IN: reach these wrappers AND the file/stdin natives via `use std::io::*`. Same-module code
+// (these wrappers) may use the io natives freely.
+pub fn readTextFile(path: String) -> Result[String, String] { match readFile(path) { Ok(b) => Ok(fromBytes(b)), Err(e) => Err(e) } }
+pub fn writeTextFile(path: String, s: String) -> Result[(), String] { writeFile(path, toBytes(s)) }
+pub fn appendTextFile(path: String, s: String) -> Result[(), String] { appendFile(path, toBytes(s)) }
+

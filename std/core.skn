@@ -1,0 +1,101 @@
+pub enum Option[T] { Some(T), None }
+pub enum Result[T, E] { Ok(T), Err(E) }
+
+// Option combinators.
+pub fn isSome[T](o: Option[T]) -> Bool { match o { Some(_) => true, None => false } }
+pub fn isNone[T](o: Option[T]) -> Bool { match o { None => true, Some(_) => false } }
+pub fn optionMap[T, U](o: Option[T], f: fn(T) -> U) -> Option[U] { match o { Some(x) => Some(f(x)), None => None } }
+pub fn optionAndThen[T, U](o: Option[T], f: fn(T) -> Option[U]) -> Option[U] { match o { Some(x) => f(x), None => None } }
+
+// Result combinators + the Option<->Result bridges.
+pub fn isOk[T, E](r: Result[T, E]) -> Bool { match r { Ok(_) => true, Err(_) => false } }
+pub fn isErr[T, E](r: Result[T, E]) -> Bool { match r { Ok(_) => false, Err(_) => true } }
+pub fn resultMap[T, U, E](r: Result[T, E], f: fn(T) -> U) -> Result[U, E] { match r { Ok(v) => Ok(f(v)), Err(e) => Err(e) } }
+pub fn mapErr[T, E, F](r: Result[T, E], f: fn(E) -> F) -> Result[T, F] { match r { Ok(v) => Ok(v), Err(e) => Err(f(e)) } }
+pub fn resultAndThen[T, U, E](r: Result[T, E], f: fn(T) -> Result[U, E]) -> Result[U, E] { match r { Ok(v) => f(v), Err(e) => Err(e) } }
+pub fn okOr[T, E](o: Option[T], e: E) -> Result[T, E] { match o { Some(v) => Ok(v), None => Err(e) } }
+pub fn ok[T, E](r: Result[T, E]) -> Option[T] { match r { Ok(v) => Some(v), Err(_) => None } }
+
+// Fallible extraction: ONE `Unwrap` trait shared by Option and Result (Skarn has no overloading, so a
+// name common to several types is a trait dispatched on the receiver). Built on `panic` (diverges -> Never).
+// `unwrapErr` stays a Result-unique free fn (Option has no error channel, so it can't join the trait).
+pub trait Unwrap[T] {
+  fn unwrap(self) -> T
+  fn expect(self, msg: String) -> T
+  fn unwrapOr(self, d: T) -> T
+}
+impl[T] Unwrap[T] for Option[T] {
+  fn unwrap(self) -> T { match self { Some(v) => v, None => panic("called unwrap on None") } }
+  fn expect(self, msg: String) -> T { match self { Some(v) => v, None => panic(msg) } }
+  fn unwrapOr(self, d: T) -> T { match self { Some(x) => x, None => d } }
+}
+impl[T, E] Unwrap[T] for Result[T, E] {
+  fn unwrap(self) -> T { match self { Ok(v) => v, Err(e) => panic("called unwrap on Err: " + toString(e)) } }
+  fn expect(self, msg: String) -> T { match self { Ok(v) => v, Err(_) => panic(msg) } }
+  fn unwrapOr(self, d: T) -> T { match self { Ok(v) => v, Err(_) => d } }
+}
+pub fn unwrapErr[T, E](r: Result[T, E]) -> E { match r { Err(e) => e, Ok(v) => panic("called unwrapErr on Ok: " + toString(v)) } }
+pub fn assert(cond: Bool, msg: String) -> () { if !cond { panic(msg) } }
+
+// Map ergonomics -- pure helpers over the `get` builtin + the `m[k] = v` index-assign. `getOr`/`getOrElse`
+// are non-mutating (a fallback for an absent key); `getOrPut`/`upsert` mutate `m` in place (caller-visible,
+// since a Map is a heap object and `mut m` is a valid assignment root). The element V must match the map's
+// value type; K its key type.
+pub fn getOr[K, V](m: Map[K, V], k: K, dflt: V) -> V {
+  match get(m, k) { Some(v) => v, None => dflt }
+}
+// Like getOr, but the default is computed by `f()` ONLY on a miss (lazy -- avoids evaluating an expensive dflt).
+pub fn getOrElse[K, V](m: Map[K, V], k: K, f: fn() -> V) -> V {
+  match get(m, k) { Some(v) => v, None => f() }
+}
+// Value at `k`; if absent, insert `dflt` and return it. Mutates `m`.
+pub fn getOrPut[K, V](mut m: Map[K, V], k: K, dflt: V) -> V {
+  match get(m, k) { Some(v) => v, None => { m[k] = dflt  dflt } }
+}
+// If `k` is present, store `f(current)`; else store `dflt`. Returns the stored value. Mutates `m`.
+pub fn upsert[K, V](mut m: Map[K, V], k: K, dflt: V, f: fn(V) -> V) -> V {
+  match get(m, k) {
+    Some(v) => { let nv = f(v)  m[k] = nv  nv },
+    None => { m[k] = dflt  dflt }
+  }
+}
+
+// Shallow clone -- an independent copy of a container (the top level's slots/bytes are copied; nested
+// heap references are SHARED, consistent with the immutable-value model). A trait so it is USER-EXTENSIBLE:
+// write `impl Clone for MyType { fn clone(self) -> MyType { ... } }` and `clone(x)` / `x |> clone` dispatch
+// on the receiver. Never used as `dyn Clone`, so the `-> Self` return is fine (object safety is only checked
+// at dyn formation). Deep clone is a later, separate story (impls that recurse via clone(element)).
+pub trait Clone { fn clone(self) -> Self }
+impl[T] Clone for Vec[T] {
+  fn clone(self) -> Vec[T] { let o: Vec[T] = vec()  for x in self { push(o, x) }  o }
+}
+impl[K, V] Clone for Map[K, V] {
+  fn clone(self) -> Map[K, V] { let mut o: Map[K, V] = #{}  for (k, v) in self { o[k] = v }  o }
+}
+impl Clone for Bytes {
+  fn clone(self) -> Bytes { let o = bytes(len(self))  appendBytes(o, self)  o }
+}
+impl[T] Clone for Array[T] {
+  fn clone(self) -> Array[T] {
+    if len(self) == 0 { emptyArray() }
+    else {
+      let mut a = array(len(self), self[0])   // init with self[0] (a real T); overwrite 1.. below
+      let mut i = 1
+      while i < len(a) { a[i] = self[i]  i = i + 1 }
+      a
+    }
+  }
+}
+
+// GC introspection. gcStats() reports the live Heap::GcStats counters as a struct; gcResetStats()
+// (a bare native) clears them, so a region can be measured: gcResetStats() ... code ... gcStats().
+// The counters are uint64 in the VM but surface as Double -- a Double carries a 53-bit exact
+// integer, more than a 48-bit Int, so bytesAlloced/gcNanosTotal stay exact for any realistic run
+// (the ".0" in a printed count is harmless). Non-deterministic (depends on heap history), so these
+// are excluded from the differential oracle, like nanoTime.
+pub struct GcStats { collections: Double, objectsAlloced: Double, bytesAlloced: Double, fromUsedSum: Double, survivorsSum: Double, gcNanosTotal: Double, gcNanosMax: Double, growEvents: Double }
+pub fn gcStats() -> GcStats {
+    let a: Array[Double] = rawGcStats()
+    GcStats { collections: a[0], objectsAlloced: a[1], bytesAlloced: a[2], fromUsedSum: a[3], survivorsSum: a[4], gcNanosTotal: a[5], gcNanosMax: a[6], growEvents: a[7] }
+}
+

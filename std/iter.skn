@@ -1,0 +1,274 @@
+// Iterable[T]: the eager iteration protocol (`iter` materializes a Vec[T]). Impls for every
+// built-in container + user types via `impl Iterable for MyType`. A generic `I: Iterable[T]`
+// dispatches `iter` dynamically; a concrete receiver devirtualizes. Baked in now that prelude
+// Trait/Impl items TREE-SHAKE (tree_shake_prelude): a program that never uses Iterable drops
+// the whole block (no dead trait rows, no forced `$List`). NOT re-iterable / single-pass here
+// -- Vec's iter returns self; the others copy into a fresh Vec.
+pub trait Iterable[T] { fn iter(self) -> Vec[T] }
+impl[X] Iterable[X] for Vec[X] { fn iter(self) -> Vec[X] { self } }
+impl[X] Iterable[X] for Array[X] { fn iter(self) -> Vec[X] { let v: Vec[X] = vec() for e in self { push(v, e) } v } }
+impl[X] Iterable[X] for List[X] { fn iter(self) -> Vec[X] { let v: Vec[X] = vec() for e in self { push(v, e) } v } }
+impl Iterable[Int] for Bytes { fn iter(self) -> Vec[Int] { let v: Vec[Int] = vec() for b in self { push(v, b) } v } }
+impl[K, V] Iterable[(K, V)] for Map[K, V] { fn iter(self) -> Vec[(K, V)] { let v: Vec[(K, V)] = vec() for kv in self { push(v, kv) } v } }
+pub fn toVec[T, I: Iterable[T]](it: I) -> Vec[T] { iter(it) }
+// The lazy iteration protocol (Rust's Iterator / IntoIterator). An `Iterator[T]` is a single-use
+// pull cursor: `next` yields one `Option[T]` and mutates the cursor in place (`mut self`). An
+// `IntoIterator[T]` produces a FRESH `dyn Iterator[T]` cursor each call, so a `for` over it can run
+// more than once. `for x in e` drives whichever `e` supports: `e` itself if it is an Iterator, else
+// `intoIter(e)`. Both are object-safe (next: no Self outside the receiver; intoIter returns
+// `dyn Iterator`, not Self), so a cursor stage can hold its upstream behind a `dyn Iterator[T]`
+// field. Declared before the container impls / stream sources that build on them.
+pub trait Iterator[T] { fn next(mut self) -> Option[T] }
+pub trait IntoIterator[T] { fn intoIter(self) -> dyn Iterator[T] }
+
+// ===== Lazy iteration: cursors, sources, stages, terminals -- all on the `Iterator` protocol.
+// A SOURCE returns a fresh `dyn Iterator[T]` (a cursor struct); a STAGE wraps its upstream behind
+// a `dyn Iterator[T]` field and transforms on demand; a TERMINAL drives `next()` tail-recursively
+// (-> TCO -> O(1) native stack even for millions of elements). Each cursor holds ALL its own state
+// (no closure, no `*_advance` helper) and impls Iterator directly. Pure tree-shakeable prelude: no
+// VM change, no opcode. (The eager `Iterable`/`toVec` bridge above is the orthogonal snapshot path.)
+
+// ---- container cursors + their IntoIterator (zero-copy index / spine walks) ----
+struct VecCursor[T] { v: Vec[T], i: Int }
+impl[T] Iterator[T] for VecCursor[T] { fn next(mut self) -> Option[T] { if self.i < len(self.v) { let x = self.v[self.i]  self.i = self.i + 1  Some(x) } else { None } } }
+impl[T] IntoIterator[T] for Vec[T] { fn intoIter(self) -> dyn Iterator[T] { VecCursor { v: self, i: 0 } } }
+struct ArrayCursor[T] { a: Array[T], i: Int }
+impl[T] Iterator[T] for ArrayCursor[T] { fn next(mut self) -> Option[T] { if self.i < len(self.a) { let x = self.a[self.i]  self.i = self.i + 1  Some(x) } else { None } } }
+impl[T] IntoIterator[T] for Array[T] { fn intoIter(self) -> dyn Iterator[T] { ArrayCursor { a: self, i: 0 } } }
+struct BytesCursor { b: Bytes, i: Int }
+impl Iterator[Int] for BytesCursor { fn next(mut self) -> Option[Int] { if self.i < len(self.b) { let x = self.b[self.i]  self.i = self.i + 1  Some(x) } else { None } } }
+impl IntoIterator[Int] for Bytes { fn intoIter(self) -> dyn Iterator[Int] { BytesCursor { b: self, i: 0 } } }
+// String iterates its raw BYTES (Int 0..255) -- Option B, consistent with char literals (`'A'` IS a byte,
+// a multibyte `'é'` is a lex error) and the whole byte-oriented string surface. Delegates to the Bytes
+// cursor over a one-copy `toBytes` snapshot; NO code-point decoding (a code-point `for c in s` is a
+// separate later item, gated on an unbuilt UTF-8 encoder). `for c in s` and `intoIter(s)` both use this.
+impl IntoIterator[Int] for String { fn intoIter(self) -> dyn Iterator[Int] { intoIter(toBytes(self)) } }
+struct ListCursor[T] { cur: List[T] }
+impl[T] Iterator[T] for ListCursor[T] { fn next(mut self) -> Option[T] { match self.cur { [h, ..t] => { self.cur = t  Some(h) }, [] => None } } }
+impl[T] IntoIterator[T] for List[T] { fn intoIter(self) -> dyn Iterator[T] { ListCursor { cur: self } } }
+// Map: a NO-COPY live cursor over the hash backing (MAP_ITER_NEXT / MAP_KEY_AT / MAP_VAL_AT,
+// behind the internal mapIterNext/mapKeyAt/mapValAt builtins). Iteration is lazy/live in hash
+// order (unspecified but memory-safe); a mid-iteration insert that grows the map is defined-
+// but-unspecified, never UB. `i` is a plain Int pair-index into the backing (GC-move-safe).
+struct MapCursor[K, V] { m: Map[K, V], i: Int }
+impl[K, V] Iterator[(K, V)] for MapCursor[K, V] { fn next(mut self) -> Option[(K, V)] { let j = mapIterNext(self.m, self.i)  if j < 0 { None } else { let k = mapKeyAt(self.m, j)  let v = mapValAt(self.m, j)  self.i = j + 1  Some((k, v)) } } }
+impl[K, V] IntoIterator[(K, V)] for Map[K, V] { fn intoIter(self) -> dyn Iterator[(K, V)] { MapCursor { m: self, i: 0 } } }
+
+// ---- bridges: streamX / toStream now just lift into a dyn Iterator ----
+pub fn streamVec[T](v: Vec[T]) -> dyn Iterator[T] { intoIter(v) }
+pub fn streamArray[T](a: Array[T]) -> dyn Iterator[T] { intoIter(a) }
+pub fn streamBytes(b: Bytes) -> dyn Iterator[Int] { intoIter(b) }
+pub fn streamList[T](l: List[T]) -> dyn Iterator[T] { intoIter(l) }
+// toStream lifts ANY eager Iterable (user types + Map) into a lazy iterator, via a Vec snapshot.
+pub fn toStream[T, I: Iterable[T]](it: I) -> dyn Iterator[T] { intoIter(iter(it)) }
+
+// ---- String line / field cursors (byte-scan + slice; pure prelude, yield String) ----
+// split(s, sep): N separators -> N+1 fields (empties kept), so join(split(s,sep),sep) == s.
+//   An empty separator panics. `sep` is a literal byte sequence (may be multi-byte). Both cursors
+//   scan bytes and slice out fields lazily; their scan helpers are tail-recursive (TCO). 10 = the
+//   newline byte, 13 = the carriage-return byte (spelled as ints to keep this mirror escape-free).
+struct SplitCursor { s: String, b: Bytes, sep: Bytes, pos: Int, done: Bool }
+fn _strMatchAt(b: Bytes, sep: Bytes, at: Int, i: Int) -> Bool {
+  if i >= len(sep) { true } else if at + i >= len(b) { false }
+  else if b[at + i] != sep[i] { false } else { _strMatchAt(b, sep, at, i + 1) }
+}
+fn _strIndexOf(b: Bytes, sep: Bytes, from: Int) -> Int {
+  if from + len(sep) > len(b) { -1 } else if _strMatchAt(b, sep, from, 0) { from }
+  else { _strIndexOf(b, sep, from + 1) }
+}
+impl Iterator[String] for SplitCursor {
+  fn next(mut self) -> Option[String] {
+    if self.done { None } else {
+      let k = _strIndexOf(self.b, self.sep, self.pos)
+      if k < 0 {
+        let field = slice(self.s, self.pos, len(self.b))  self.done = true  Some(field)
+      } else {
+        let field = slice(self.s, self.pos, k)  self.pos = k + len(self.sep)  Some(field)
+      }
+    }
+  }
+}
+pub fn split(s: String, sep: String) -> dyn Iterator[String] {
+  // An empty separator yields the whole string as a single field ([s]) -- it cannot split, so it
+  // passes the input through. This keeps join(split(s, sep), sep) == s (join([s], "") == s).
+  if len(sep) == 0 { once(s) } else {
+    let c = SplitCursor { s: s, b: toBytes(s), sep: toBytes(sep), pos: 0, done: false }
+    c
+  }
+}
+// lines(s): terminator semantics -- a trailing newline yields NO phantom empty last line; a `\r`
+//   directly before a `\n` is stripped (so CRLF text splits cleanly). lines("") is empty.
+struct LinesCursor { s: String, b: Bytes, pos: Int, done: Bool }
+fn _strIndexByte(b: Bytes, byte: Int, from: Int) -> Int {
+  if from >= len(b) { -1 } else if b[from] == byte { from } else { _strIndexByte(b, byte, from + 1) }
+}
+impl Iterator[String] for LinesCursor {
+  fn next(mut self) -> Option[String] {
+    if self.done { None } else {
+      let k = _strIndexByte(self.b, 10, self.pos)
+      if k < 0 {
+        if self.pos >= len(self.b) { self.done = true  None } else {
+          let line = slice(self.s, self.pos, len(self.b))  self.done = true  Some(line)
+        }
+      } else {
+        let e = if k > self.pos { if self.b[k - 1] == 13 { k - 1 } else { k } } else { k }
+        let line = slice(self.s, self.pos, e)  self.pos = k + 1  Some(line)
+      }
+    }
+  }
+}
+pub fn lines(s: String) -> dyn Iterator[String] {
+  LinesCursor { s: s, b: toBytes(s), pos: 0, done: false }
+}
+
+// ---- generic sources (return a fresh dyn Iterator) ----
+struct RangeCursor { i: Int, n: Int }
+impl Iterator[Int] for RangeCursor { fn next(mut self) -> Option[Int] { if self.i < self.n { let x = self.i  self.i = self.i + 1  Some(x) } else { None } } }
+pub fn range(lo: Int, hi: Int) -> dyn Iterator[Int] { RangeCursor { i: lo, n: hi } }
+struct IterCursor[T] { cur: T, f: fn(T) -> T }
+impl[T] Iterator[T] for IterCursor[T] { fn next(mut self) -> Option[T] { let x = self.cur  self.cur = (self.f)(self.cur)  Some(x) } }
+pub fn iterate[T](seed: T, f: fn(T) -> T) -> dyn Iterator[T] { IterCursor { cur: seed, f: f } }
+struct RepeatCursor[T] { x: T }
+impl[T] Iterator[T] for RepeatCursor[T] { fn next(mut self) -> Option[T] { Some(self.x) } }
+pub fn repeat[T](x: T) -> dyn Iterator[T] { RepeatCursor { x: x } }
+// empty: a cursor that always yields None. A phantom `Option[T]` field carries the element type.
+struct EmptyCursor[T] { phantom: Option[T] }
+impl[T] Iterator[T] for EmptyCursor[T] { fn next(mut self) -> Option[T] { None } }
+pub fn empty[T]() -> dyn Iterator[T] { EmptyCursor { phantom: None } }
+pub fn once[T](x: T) -> dyn Iterator[T] { take(repeat(x), 1) }
+
+// ---- stages (a stage cursor wraps its upstream `dyn Iterator` + its own state) ----
+struct MapStage[T, U] { up: dyn Iterator[T], f: fn(T) -> U }
+impl[T, U] Iterator[U] for MapStage[T, U] { fn next(mut self) -> Option[U] { match next(self.up) { Some(x) => Some((self.f)(x)), None => None } } }
+pub fn map[T, U](s: dyn Iterator[T], f: fn(T) -> U) -> dyn Iterator[U] { MapStage { up: s, f: f } }
+struct FilterStage[T] { up: dyn Iterator[T], p: fn(T) -> Bool }
+// filter skips rejects via a tail-recursive advance (TCO -> O(1) stack over a long reject run).
+fn _filterStageNext[T](mut c: FilterStage[T]) -> Option[T] { match next(c.up) { Some(x) => if (c.p)(x) { Some(x) } else { _filterStageNext(c) }, None => None } }
+impl[T] Iterator[T] for FilterStage[T] { fn next(mut self) -> Option[T] { _filterStageNext(self) } }
+pub fn filter[T](s: dyn Iterator[T], p: fn(T) -> Bool) -> dyn Iterator[T] { FilterStage { up: s, p: p } }
+struct TakeStage[T] { up: dyn Iterator[T], left: Int }
+impl[T] Iterator[T] for TakeStage[T] { fn next(mut self) -> Option[T] { if self.left <= 0 { None } else { self.left = self.left - 1  next(self.up) } } }
+pub fn take[T](s: dyn Iterator[T], n: Int) -> dyn Iterator[T] { TakeStage { up: s, left: n } }
+struct DropStage[T] { up: dyn Iterator[T], left: Int }
+// drop discards `left` upstream elements on the first pull (stopping early if the source runs dry).
+fn _dropStageNext[T](mut c: DropStage[T]) -> Option[T] { while c.left > 0 { c.left = c.left - 1  match next(c.up) { Some(_) => {}, None => { c.left = 0 } } } next(c.up) }
+impl[T] Iterator[T] for DropStage[T] { fn next(mut self) -> Option[T] { _dropStageNext(self) } }
+pub fn drop[T](s: dyn Iterator[T], n: Int) -> dyn Iterator[T] { DropStage { up: s, left: n } }
+
+// ---- terminals (drive `next()` to exhaustion; all tail-recursive -> TCO -> O(1) native stack) ----
+pub fn fold[T, U](s: dyn Iterator[T], init: U, f: fn(U, T) -> U) -> U { match next(s) { Some(x) => fold(s, f(init, x), f), None => init } }
+pub fn sum(s: dyn Iterator[Int]) -> Int { fold(s, 0, fn(a: Int, x: Int) -> Int { a + x }) }
+fn _collectGo[T](s: dyn Iterator[T], v: Vec[T]) -> Vec[T] { match next(s) { Some(x) => { push(v, x)  _collectGo(s, v) }, None => v } }
+pub fn collect[T](s: dyn Iterator[T]) -> Vec[T] { _collectGo(s, vec()) }
+fn _countGo[T](s: dyn Iterator[T], n: Int) -> Int { match next(s) { Some(_) => _countGo(s, n + 1), None => n } }
+pub fn count[T](s: dyn Iterator[T]) -> Int { _countGo(s, 0) }
+pub fn forEach[T](s: dyn Iterator[T], f: fn(T) -> ()) -> () { match next(s) { Some(x) => { f(x)  forEach(s, f) }, None => {} } }
+pub fn any[T](s: dyn Iterator[T], p: fn(T) -> Bool) -> Bool { match next(s) { Some(x) => if p(x) { true } else { any(s, p) }, None => false } }
+pub fn all[T](s: dyn Iterator[T], p: fn(T) -> Bool) -> Bool { match next(s) { Some(x) => if p(x) { all(s, p) } else { false }, None => true } }
+pub fn find[T](s: dyn Iterator[T], p: fn(T) -> Bool) -> Option[T] { match next(s) { Some(x) => if p(x) { Some(x) } else { find(s, p) }, None => None } }
+
+// ===== Combinators round 2 -- more stages + terminals on the Iterator base (pure prelude).
+// ---- extra stages ----
+// takeWhile: yield while `p` holds; latch None after the first reject (does not resume).
+struct TakeWhileStage[T] { up: dyn Iterator[T], p: fn(T) -> Bool, done: Bool }
+impl[T] Iterator[T] for TakeWhileStage[T] { fn next(mut self) -> Option[T] { if self.done { None } else { match next(self.up) { Some(x) => if (self.p)(x) { Some(x) } else { self.done = true  None }, None => { self.done = true  None } } } } }
+pub fn takeWhile[T](s: dyn Iterator[T], p: fn(T) -> Bool) -> dyn Iterator[T] { TakeWhileStage { up: s, p: p, done: false } }
+// dropWhile: skip the leading run satisfying `p` on the first pull, then pass through.
+struct DropWhileStage[T] { up: dyn Iterator[T], p: fn(T) -> Bool, dropping: Bool }
+fn _dropWhileNext[T](mut c: DropWhileStage[T]) -> Option[T] { if c.dropping { match next(c.up) { Some(x) => if (c.p)(x) { _dropWhileNext(c) } else { c.dropping = false  Some(x) }, None => { c.dropping = false  None } } } else { next(c.up) } }
+impl[T] Iterator[T] for DropWhileStage[T] { fn next(mut self) -> Option[T] { _dropWhileNext(self) } }
+pub fn dropWhile[T](s: dyn Iterator[T], p: fn(T) -> Bool) -> dyn Iterator[T] { DropWhileStage { up: s, p: p, dropping: true } }
+// enumerate: pair each element with its 0-based index -> Iterator[(Int, T)].
+struct EnumerateStage[T] { up: dyn Iterator[T], i: Int }
+impl[T] Iterator[(Int, T)] for EnumerateStage[T] { fn next(mut self) -> Option[(Int, T)] { match next(self.up) { Some(x) => { let j = self.i  self.i = self.i + 1  Some((j, x)) }, None => None } } }
+pub fn enumerate[T](s: dyn Iterator[T]) -> dyn Iterator[(Int, T)] { EnumerateStage { up: s, i: 0 } }
+// scan: yield the running accumulator AFTER folding each element (Rust `scan`; initial not emitted).
+struct ScanStage[T, S] { up: dyn Iterator[T], acc: S, f: fn(S, T) -> S }
+impl[T, S] Iterator[S] for ScanStage[T, S] { fn next(mut self) -> Option[S] { match next(self.up) { Some(x) => { self.acc = (self.f)(self.acc, x)  Some(self.acc) }, None => None } } }
+pub fn scan[T, S](s: dyn Iterator[T], init: S, f: fn(S, T) -> S) -> dyn Iterator[S] { ScanStage { up: s, acc: init, f: f } }
+// zip: pair elements from two sources, stopping at the shorter -> Iterator[(A, B)].
+struct ZipStage[A, B] { a: dyn Iterator[A], b: dyn Iterator[B] }
+impl[A, B] Iterator[(A, B)] for ZipStage[A, B] { fn next(mut self) -> Option[(A, B)] { match next(self.a) { Some(x) => match next(self.b) { Some(y) => Some((x, y)), None => None }, None => None } } }
+pub fn zip[A, B](a: dyn Iterator[A], b: dyn Iterator[B]) -> dyn Iterator[(A, B)] { ZipStage { a: a, b: b } }
+// chain: yield all of `a`, then all of `b` (same element type).
+struct ChainStage[T] { a: dyn Iterator[T], b: dyn Iterator[T], first: Bool }
+fn _chainNext[T](mut c: ChainStage[T]) -> Option[T] { if c.first { match next(c.a) { Some(x) => Some(x), None => { c.first = false  next(c.b) } } } else { next(c.b) } }
+impl[T] Iterator[T] for ChainStage[T] { fn next(mut self) -> Option[T] { _chainNext(self) } }
+pub fn chain[T](a: dyn Iterator[T], b: dyn Iterator[T]) -> dyn Iterator[T] { ChainStage { a: a, b: b, first: true } }
+// flatMap: map each element to an inner iterator and flatten. `inner` holds the current inner
+// cursor; the tail-recursive helper drains it, then advances the outer (TCO -> O(1) stack).
+struct FlatMapStage[T, U] { up: dyn Iterator[T], f: fn(T) -> dyn Iterator[U], inner: Option[dyn Iterator[U]] }
+fn _flatMapNext[T, U](mut c: FlatMapStage[T, U]) -> Option[U] { match c.inner { Some(it) => match next(it) { Some(y) => Some(y), None => { c.inner = None  _flatMapNext(c) } }, None => match next(c.up) { Some(x) => { c.inner = Some((c.f)(x))  _flatMapNext(c) }, None => None } } }
+impl[T, U] Iterator[U] for FlatMapStage[T, U] { fn next(mut self) -> Option[U] { _flatMapNext(self) } }
+pub fn flatMap[T, U](s: dyn Iterator[T], f: fn(T) -> dyn Iterator[U]) -> dyn Iterator[U] { FlatMapStage { up: s, f: f, inner: None } }
+
+// ---- Ord: total ordering for generic min/max. `Self` in a non-receiver param makes `dyn Ord`
+// non-object-safe, but a `T: Ord` BOUND is fine (object safety is only checked at `dyn` formation).
+pub trait Ord { fn lessThan(self, other: Self) -> Bool }
+impl Ord for Int    { fn lessThan(self, o: Int)    -> Bool { self < o } }
+impl Ord for Double { fn lessThan(self, o: Double) -> Bool { self < o } }
+impl Ord for String { fn lessThan(self, o: String) -> Bool { self < o } }
+
+// ---- extra terminals (drive `next()` tail-recursively -> TCO -> O(1) native stack) ----
+// reduce: fold with the first element as the seed -> Option[T].
+pub fn reduce[T](s: dyn Iterator[T], f: fn(T, T) -> T) -> Option[T] { match next(s) { Some(x) => Some(fold(s, x, f)), None => None } }
+// min / max over T: Ord (dispatch `lessThan` on the element). Empty -> None.
+fn _minFold[T: Ord](s: dyn Iterator[T], best: T) -> T { match next(s) { Some(x) => if lessThan(x, best) { _minFold(s, x) } else { _minFold(s, best) }, None => best } }
+pub fn min[T: Ord](s: dyn Iterator[T]) -> Option[T] { match next(s) { Some(x) => Some(_minFold(s, x)), None => None } }
+fn _maxFold[T: Ord](s: dyn Iterator[T], best: T) -> T { match next(s) { Some(x) => if lessThan(best, x) { _maxFold(s, x) } else { _maxFold(s, best) }, None => best } }
+pub fn max[T: Ord](s: dyn Iterator[T]) -> Option[T] { match next(s) { Some(x) => Some(_maxFold(s, x)), None => None } }
+// minBy / maxBy: comparator form (no Ord). `lt(a, b)` means a orders before b.
+fn _minByFold[T](s: dyn Iterator[T], best: T, lt: fn(T, T) -> Bool) -> T { match next(s) { Some(x) => if lt(x, best) { _minByFold(s, x, lt) } else { _minByFold(s, best, lt) }, None => best } }
+pub fn minBy[T](s: dyn Iterator[T], lt: fn(T, T) -> Bool) -> Option[T] { match next(s) { Some(x) => Some(_minByFold(s, x, lt)), None => None } }
+fn _maxByFold[T](s: dyn Iterator[T], best: T, lt: fn(T, T) -> Bool) -> T { match next(s) { Some(x) => if lt(best, x) { _maxByFold(s, x, lt) } else { _maxByFold(s, best, lt) }, None => best } }
+pub fn maxBy[T](s: dyn Iterator[T], lt: fn(T, T) -> Bool) -> Option[T] { match next(s) { Some(x) => Some(_maxByFold(s, x, lt)), None => None } }
+// product: numeric fold with identity 1.
+pub fn product(s: dyn Iterator[Int]) -> Int { fold(s, 1, fn(a: Int, x: Int) -> Int { a * x }) }
+// position: index of the first element matching `p` -> Option[Int].
+fn _posGo[T](s: dyn Iterator[T], p: fn(T) -> Bool, i: Int) -> Option[Int] { match next(s) { Some(x) => if p(x) { Some(i) } else { _posGo(s, p, i + 1) }, None => None } }
+pub fn position[T](s: dyn Iterator[T], p: fn(T) -> Bool) -> Option[Int] { _posGo(s, p, 0) }
+// contains: generic membership via `==` (no Eq trait needed -- `==` types on any equal-typed pair).
+pub fn contains[T](s: dyn Iterator[T], x: T) -> Bool { match next(s) { Some(y) => if y == x { true } else { contains(s, x) }, None => false } }
+// partition: split into (matching, non-matching) vecs.
+fn _partGo[T](s: dyn Iterator[T], p: fn(T) -> Bool, yes: Vec[T], no: Vec[T]) -> (Vec[T], Vec[T]) { match next(s) { Some(x) => { if p(x) { push(yes, x) } else { push(no, x) }  _partGo(s, p, yes, no) }, None => (yes, no) } }
+pub fn partition[T](s: dyn Iterator[T], p: fn(T) -> Bool) -> (Vec[T], Vec[T]) { let yes: Vec[T] = vec()  let no: Vec[T] = vec()  _partGo(s, p, yes, no) }
+// unzip: split a stream of pairs into two vecs.
+fn _unzipGo[A, B](s: dyn Iterator[(A, B)], xs: Vec[A], ys: Vec[B]) -> (Vec[A], Vec[B]) { match next(s) { Some(ab) => { let (a, b) = ab  push(xs, a)  push(ys, b)  _unzipGo(s, xs, ys) }, None => (xs, ys) } }
+pub fn unzip[A, B](s: dyn Iterator[(A, B)]) -> (Vec[A], Vec[B]) { let xs: Vec[A] = vec()  let ys: Vec[B] = vec()  _unzipGo(s, xs, ys) }
+// join: concatenate a stream of Strings with a separator between elements. Threads a StringBuilder
+// (O(n) via BYTES_APPEND) instead of a `+`-accumulator (O(n^2)); still tail-recursive => O(1) stack.
+fn _joinGo(s: dyn Iterator[String], sb: StringBuilder, sep: String) -> StringBuilder { match next(s) { Some(x) => _joinGo(s, append(append(sb, sep), x), sep), None => sb } }
+pub fn join(s: dyn Iterator[String], sep: String) -> String { match next(s) { Some(first) => build(_joinGo(s, append(stringBuilder(), first), sep)), None => "" } }
+// toMap: collect (K, V) pairs into a Map (later pairs overwrite earlier on a duplicate key).
+fn _toMapGo[K, V](mut m: Map[K, V], s: dyn Iterator[(K, V)]) -> Map[K, V] { match next(s) { Some(kv) => { let (k, v) = kv  m[k] = v  _toMapGo(m, s) }, None => m } }
+pub fn toMap[K, V](s: dyn Iterator[(K, V)]) -> Map[K, V] { let m: Map[K, V] = #{}  _toMapGo(m, s) }
+// Sorting -- a STABLE top-down merge sort over a Vec. `sortBy` takes a less-than comparator; `sorted`
+// uses Ord; `sort` mutates the vec in place. All return a Vec (`sort` returns the mutated vec, for chaining).
+fn _sortMerge[T](a: Vec[T], b: Vec[T], lt: fn(T, T) -> Bool) -> Vec[T] {
+    let r: Vec[T] = vec()
+    let mut i = 0
+    let mut j = 0
+    let na = len(a)
+    let nb = len(b)
+    while i < na && j < nb {
+        if lt(b[j], a[i]) { push(r, b[j])  j = j + 1 }   // take b ONLY when strictly smaller -> stable
+        else { push(r, a[i])  i = i + 1 }
+    }
+    while i < na { push(r, a[i])  i = i + 1 }
+    while j < nb { push(r, b[j])  j = j + 1 }
+    r
+}
+fn _sortRange[T](v: Vec[T], lo: Int, hi: Int, lt: fn(T, T) -> Bool) -> Vec[T] {
+    if hi - lo <= 1 {
+        let r: Vec[T] = vec()
+        if hi - lo == 1 { push(r, v[lo]) }
+        r
+    } else {
+        let mid = (lo + hi) / 2
+        _sortMerge(_sortRange(v, lo, mid, lt), _sortRange(v, mid, hi, lt), lt)
+    }
+}
+pub fn sortBy[T](v: Vec[T], lt: fn(T, T) -> Bool) -> Vec[T] { _sortRange(v, 0, len(v), lt) }
+pub fn sorted[T: Ord](v: Vec[T]) -> Vec[T] { sortBy(v, fn(a: T, b: T) -> Bool { lessThan(a, b) }) }
+pub fn sort[T: Ord](mut v: Vec[T]) -> Vec[T] { let s = sorted(v)  let mut k = 0  while k < len(s) { v[k] = s[k]  k = k + 1 }  v }
+
