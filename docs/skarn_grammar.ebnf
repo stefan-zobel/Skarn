@@ -257,7 +257,7 @@ field_pats   = { terminator } , { field_pat , [ "," ] , { terminator } } ;
 field_pat    = lident , [ ":" , pattern ] ;
 (* Range pattern `lo..hi` -- INCLUSIVE, bounds are Int/Double literals (a char literal is an Int).       *)
 (* Binds nothing; never completes a signature (the numeric types are unbounded), so a match built only   *)
-(* of ranges still needs a `_`. Codegen: `scrut >= lo && scrut <= hi` (BLT_NUM/BGT_NUM). No VM change.    *)
+(* of ranges still needs a `_`. Codegen: `scrut >= lo && scrut <= hi` (BLT_NUM/BGT_NUM). No VM change.   *)
 num_lit      = [ "-" ] , ( int | double ) ;
 range_pat    = num_lit , ".." , num_lit ;
 list_pat_items = { pattern , "," } , [ pattern | ".." , [ pattern ] ] ;
@@ -318,7 +318,7 @@ raw_string   = "r" , { "#" } , '"' , { char_verbatim } , '"' , { "#" } ;   (* op
 interp_string = '"' , text , { "${" , expr , [ ':' , fmt_spec ] , "}" , text } , '"' ;   (* >= 1 hole *)
 fmt_spec     = [ [ fill ] , align ] , [ '0' ] , [ width ] , [ '.' , precision ] , [ fmt_type ] ;
 align        = '<' | '>' | '^' ;   fill = char ;   width = digit , { digit } ;   precision = digit , { digit } ;
-fmt_type     = 'x' | 'X' | 'b' | 'o' | 'd' | 'f' | 'g' | 's' ;   (* g = shortest round-trip Double (precision ignored in v1) *)
+fmt_type     = 'x' | 'X' | 'b' | 'o' | 'd' | 'f' | 'g' | 's' ;   (* g = shortest round-trip Double *)
 char_lit     = "'" , ( char_no_squote_no_bslash | escape ) , "'" ;
              (* a single BYTE 0..255, typed Int (there is NO scalar Char type);      *)
              (* escapes \n \t \r \\ \0 \' \"; a multi-byte literal (e.g. 'é' = 2     *)

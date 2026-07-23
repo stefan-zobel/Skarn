@@ -2846,7 +2846,6 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 - The `demo/` directory has larger runnable programs — an iterator showcase (`iterator_for`), JSON both ways
   (`json_parser` from scratch and `json` over `std::json`), one demo per standard-library module (`math`,
   `random`, `set`, `time`, `bytes`, `map_helpers`), string/byte iteration (`string_iter`), trait objects
-  (`dyn_traits`), string interpolation (`interp`), and file I/O (`file_io`). Run one with
-  `static_vmrun demo/<name>.skn`.
+  (`dyn_traits`), string interpolation (`interp`), and file I/O (`file_io`).
 - A few features exist in the language's design space but are intentionally not part of this guide because they
   are not built yet (for example loop labels and a handful of extra iterator combinators like `rev` and `cycle`).
