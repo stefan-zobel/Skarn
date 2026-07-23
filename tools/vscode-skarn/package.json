@@ -1,0 +1,35 @@
+{
+  "name": "skarn-language",
+  "displayName": "Skarn",
+  "description": "Syntax highlighting for the Skarn language (.skn files).",
+  "version": "0.1.0",
+  "publisher": "vmachine",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "skarn",
+        "aliases": [
+          "Skarn",
+          "skarn"
+        ],
+        "extensions": [
+          ".skn"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "skarn",
+        "scopeName": "source.skarn",
+        "path": "./syntaxes/skarn.tmLanguage.json"
+      }
+    ]
+  }
+}

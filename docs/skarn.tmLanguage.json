@@ -1,0 +1,309 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Skarn",
+  "scopeName": "source.skarn",
+  "fileTypes": ["skn"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#raw-strings" },
+    { "include": "#strings" },
+    { "include": "#chars" },
+    { "include": "#atoms" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#declarations" },
+    { "include": "#builtin-functions" },
+    { "include": "#builtin-types" },
+    { "include": "#prelude-types" },
+    { "include": "#constructors-and-types" },
+    { "include": "#operators" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.skarn",
+          "begin": "//",
+          "end": "$"
+        },
+        {
+          "name": "comment.block.skarn",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "patterns": [
+            { "include": "#comments" }
+          ]
+        }
+      ]
+    },
+
+    "raw-strings": {
+      "comment": "Raw strings r\"...\" and r#\"...\"# ... r####\"...\"####. Verbatim bytes: no escapes, no ${} interpolation. The closing delimiter is a quote followed by exactly as many # as opened.",
+      "patterns": [
+        {
+          "name": "string.quoted.other.raw.skarn",
+          "begin": "\\br(#*)\"",
+          "end": "\"\\1",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.skarn" }
+          },
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.skarn" }
+          }
+        }
+      ]
+    },
+
+    "strings": {
+      "name": "string.quoted.double.skarn",
+      "begin": "\"",
+      "end": "\"",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.string.begin.skarn" }
+      },
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.string.end.skarn" }
+      },
+      "patterns": [
+        { "include": "#string-escapes" },
+        { "include": "#interpolation" }
+      ]
+    },
+
+    "string-escapes": {
+      "patterns": [
+        {
+          "name": "constant.character.escape.skarn",
+          "match": "\\\\[nrt0\\\\\"'$]"
+        },
+        {
+          "name": "invalid.illegal.unknown-escape.skarn",
+          "match": "\\\\."
+        }
+      ]
+    },
+
+    "interpolation": {
+      "comment": "String interpolation \"${ expr }\" (and \"${ expr :spec }\"). Switches back into the main expression context; braces are balanced by the recursive #interp-body.",
+      "name": "meta.interpolation.skarn",
+      "begin": "\\$\\{",
+      "end": "\\}",
+      "beginCaptures": {
+        "0": { "name": "punctuation.section.interpolation.begin.skarn" }
+      },
+      "endCaptures": {
+        "0": { "name": "punctuation.section.interpolation.end.skarn" }
+      },
+      "patterns": [
+        {
+          "comment": "format specifier at the tail of a hole: ${e:>08.3f}",
+          "match": "(:)\\s*([<>^]?0?\\d*(?:\\.\\d+)?[xXbodfgs]?)\\s*(?=\\})",
+          "captures": {
+            "1": { "name": "punctuation.separator.format.skarn" },
+            "2": { "name": "constant.other.format-spec.skarn" }
+          }
+        },
+        { "include": "#interp-body" }
+      ]
+    },
+
+    "interp-body": {
+      "comment": "Everything legal inside an interpolation hole, plus balanced nested braces (struct literals, blocks, and further nested strings).",
+      "patterns": [
+        {
+          "begin": "\\{",
+          "end": "\\}",
+          "patterns": [
+            { "include": "#interp-body" }
+          ]
+        },
+        { "include": "#comments" },
+        { "include": "#raw-strings" },
+        { "include": "#strings" },
+        { "include": "#chars" },
+        { "include": "#atoms" },
+        { "include": "#numbers" },
+        { "include": "#keywords" },
+        { "include": "#declarations" },
+        { "include": "#builtin-functions" },
+        { "include": "#builtin-types" },
+        { "include": "#prelude-types" },
+        { "include": "#constructors-and-types" },
+        { "include": "#operators" },
+        { "include": "#punctuation" }
+      ]
+    },
+
+    "chars": {
+      "comment": "Char literals 'A' / '\\n' -- byte-valued Ints, there is no scalar Char type.",
+      "name": "string.quoted.single.skarn",
+      "match": "'(\\\\[nrt0\\\\\"']|[^'\\\\])'",
+      "captures": {
+        "1": { "name": "constant.character.escape.skarn" }
+      }
+    },
+
+    "atoms": {
+      "comment": "Atoms :name (e.g. :ok). A lowercase-led :ident that is neither the :: qualifier nor a member-access. Type annotations are : UIdent (uppercase), so :lowercase is an atom.",
+      "name": "constant.other.atom.skarn",
+      "match": "(?<![:.\\w]):[a-z_][A-Za-z0-9_]*\\b"
+    },
+
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.skarn",
+          "match": "\\b0[xX][0-9a-fA-F]+\\b"
+        },
+        {
+          "name": "constant.numeric.octal.skarn",
+          "match": "\\b0[oO][0-7]+\\b"
+        },
+        {
+          "name": "constant.numeric.binary.skarn",
+          "match": "\\b0[bB][01]+\\b"
+        },
+        {
+          "name": "constant.numeric.float.skarn",
+          "match": "\\b\\d+(?:\\.\\d+(?:[eE][+-]?\\d+)?|[eE][+-]?\\d+)\\b"
+        },
+        {
+          "name": "constant.numeric.integer.skarn",
+          "match": "\\b\\d+\\b"
+        }
+      ]
+    },
+
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.skarn",
+          "match": "\\b(if|else|match|while|for|loop|break|continue|return|in)\\b"
+        },
+        {
+          "name": "constant.language.boolean.skarn",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "name": "variable.language.self.skarn",
+          "match": "\\bself\\b"
+        }
+      ]
+    },
+
+    "declarations": {
+      "patterns": [
+        {
+          "comment": "function definition: highlight the name after `fn`",
+          "match": "\\b(fn)\\s+([a-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.function.skarn" },
+            "2": { "name": "entity.name.function.skarn" }
+          }
+        },
+        {
+          "name": "storage.type.skarn",
+          "match": "\\b(fn|let|struct|enum|trait|impl)\\b"
+        },
+        {
+          "name": "storage.modifier.skarn",
+          "match": "\\b(mut|const|pub|dyn|import|use)\\b"
+        }
+      ]
+    },
+
+    "builtin-types": {
+      "name": "support.type.builtin.skarn",
+      "match": "\\b(Array|Bool|Bytes|Double|Int|List|Map|Self|String|Vec)\\b"
+    },
+
+    "prelude-types": {
+      "comment": "Prelude / std types, enums and constants.",
+      "name": "support.type.prelude.skarn",
+      "match": "\\b(ByteReader|E|Err|GcStats|IntoIterator|Iterable|Iterator|Json|JsonEntry|None|Ok|Option|Ord|PI|ProcessOutput|ProcessText|Result|Some|StringBuilder|Unwrap)\\b"
+    },
+
+    "builtin-functions": {
+      "comment": "Builtins, natives and prelude free functions the static compiler recognizes.",
+      "name": "support.function.builtin.skarn",
+      "match": "\\b(abs|absInt|acos|all|any|append|appendByte|appendBytes|appendFile|appendTextFile|args|array|asArr|asBool|asDouble|asInt|asMap|asObj|asStr|asin|assert|at|atEnd|atan|atan2|build|bytes|cbrt|ceil|chain|charAt|charStr|clamp|clone|collect|contains|copyFile|cos|count|delete|deleteFile|drop|dropWhile|empty|emptyArray|endsWith|enumerate|exp|expect|fileExists|fileSize|filter|find|flatMap|floor|fold|forEach|fromBytes|gcd|gcStats|get|getEnv|getField|has|hasControl|hasSubstr|hypot|indexOf|intoIter|isAsciiAlpha|isAsciiAlphanumeric|isAsciiControl|isAsciiDigit|isAsciiLower|isAsciiPrintable|isAsciiUpper|isAsciiWhitespace|isDir|isEmpty|isErr|isFile|isInfinite|isNaN|isNone|isNull|isOk|isSome|iter|iterate|join|keys|lastIndexOf|lcm|len|lessThan|lines|listDir|ln|log10|log2|map|mapErr|max|maxBy|maxOf|millisTime|min|minBy|minOf|mkdir|nanoTime|next|ok|okOr|once|optionAndThen|optionMap|padEnd|padStart|panic|parse|parseDouble|parseInt|partition|pop|position|pow|print|println|product|push|range|rawRun|readAllStdin|readBytes|readFile|readI32LE|readLine|readTextFile|readU16LE|readU32LE|readU8|readVarU|reader|reduce|remaining|rename|repeat|repeatStr|replace|resultAndThen|resultMap|round|roundHalfToEven|run|runText|runWith|sbLen|scan|sh|sign|signInt|sin|slice|sort|sortBy|sorted|split|sqrt|startsWith|streamArray|streamBytes|streamList|streamVec|stringBuilder|stringBuilderCap|stringify|stringifyChecked|stringifyPretty|sum|take|takeWhile|tan|toBytes|toInt|toIntChecked|toLower|toMap|toStream|toString|toUpper|toVec|trim|trimEnd|trimStart|trunc|unwrap|unwrapErr|unwrapOr|unzip|values|vec|writeBytes|writeFile|writeI32LE|writeTextFile|writeU16LE|writeU32LE|writeU8|writeVarU|zip)\\b(?=\\s*\\()"
+    },
+
+    "constructors-and-types": {
+      "comment": "Any other UIdent (first char A-Z): user types, enum variants, constructors, traits, type variables.",
+      "name": "entity.name.type.skarn",
+      "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+    },
+
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.arrow.skarn",
+          "match": "->|=>"
+        },
+        {
+          "name": "keyword.operator.pipe.skarn",
+          "match": "\\|>"
+        },
+        {
+          "name": "keyword.operator.logical.skarn",
+          "match": "&&|\\|\\||!"
+        },
+        {
+          "name": "keyword.operator.comparison.skarn",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.bitwise.skarn",
+          "match": ">>>|<<|>>|&|\\||\\^|~"
+        },
+        {
+          "name": "keyword.operator.assignment.skarn",
+          "match": "="
+        },
+        {
+          "name": "keyword.operator.arithmetic.skarn",
+          "match": "\\+|-|\\*|/|%"
+        },
+        {
+          "name": "keyword.operator.try.skarn",
+          "match": "\\?"
+        },
+        {
+          "name": "keyword.operator.range.skarn",
+          "match": "\\.\\."
+        }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.accessor.qualifier.skarn",
+          "match": "::"
+        },
+        {
+          "name": "punctuation.separator.type.skarn",
+          "match": ":"
+        },
+        {
+          "name": "punctuation.terminator.skarn",
+          "match": ";"
+        },
+        {
+          "name": "punctuation.separator.comma.skarn",
+          "match": ","
+        },
+        {
+          "name": "punctuation.accessor.skarn",
+          "match": "\\."
+        },
+        {
+          "name": "punctuation.definition.map.skarn",
+          "match": "#"
+        }
+      ]
+    }
+  }
+}
