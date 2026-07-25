@@ -10,6 +10,11 @@
 //
 // OPT-IN: reach these via `use std::random::*` (or a qualified std::random::name). Tree-shaken.
 
+// nextGaussian couples std::random -> std::math (sqrt/ln/cos + PI). This is a MODULE dependency, but a
+// tree-shaken one: a program that never calls nextGaussian pulls in none of std::math (mirrors how
+// std::time uses std::env only for `now`). The rest of this module stays native-free / deterministic.
+use std::math::*
+
 // The generator state (128 bits). Construct via `seedRng` (from an Int seed) or `rngFromState` (raw).
 pub struct Rng { s0: Int, s1: Int, s2: Int, s3: Int }
 
@@ -263,4 +268,65 @@ pub fn fillDoubles(mut rng: Rng, mut out: Vec[Double], n: Int) -> () {
   rng.s1 = s1
   rng.s2 = s2
   rng.s3 = s3
+}
+
+// --- v1.1: gaussian / weighted / without-replacement sampling ---
+
+// A standard-normal deviate (mean 0, stddev 1) via the Box-Muller transform. Couples to std::math
+// (sqrt/ln/cos, PI). `u1` is drawn in (0, 1] as `1 - nextDouble` so `ln(u1)` is always finite (nextDouble
+// can return 0.0). One deviate per call (the second Box-Muller output is discarded -- no caching).
+pub fn nextGaussian(mut rng: Rng) -> Double {
+  let u1 = 1.0 - nextDouble(rng)                                   // (0, 1]
+  let u2 = nextDouble(rng)                                         // [0, 1)
+  sqrt(-2.0 * ln(u1)) * cos(2.0 * PI * u2)
+}
+
+// A scaled normal deviate: mean `mu`, standard deviation `sigma`.
+pub fn nextGaussianMS(mut rng: Rng, mu: Double, sigma: Double) -> Double { mu + sigma * nextGaussian(rng) }
+
+// Pick an element with probability proportional to its weight. Returns None if `items` is empty, the two
+// vectors differ in length, or the total (positive) weight is <= 0. A negative weight is treated as 0.
+pub fn choiceWeighted[T](mut rng: Rng, items: Vec[T], weights: Vec[Double]) -> Option[T] {
+  let n = len(items)
+  if n == 0 || len(weights) != n { None }
+  else {
+    let mut total = 0.0
+    let mut i = 0
+    while i < n { let w = weights[i]  if w > 0.0 { total = total + w }  i = i + 1 }
+    if total <= 0.0 { None }
+    else {
+      let target = nextDoubleRange(rng, 0.0, total)
+      let mut acc = 0.0
+      let mut chosen = -1
+      let mut j = 0
+      while j < n {
+        let w = weights[j]
+        if w > 0.0 { acc = acc + w  if chosen < 0 && target < acc { chosen = j } }
+        j = j + 1
+      }
+      if chosen < 0 { Some(items[n - 1]) } else { Some(items[chosen]) }   // fp guard -> last positive-weight
+    }
+  }
+}
+
+// `k` DISTINCT elements chosen uniformly WITHOUT replacement (a partial Fisher-Yates over a shallow copy,
+// so `v` is untouched). `k` is clamped to [0, len(v)]; the result order is unspecified. O(k) swaps.
+pub fn sample[T](mut rng: Rng, v: Vec[T], k: Int) -> Vec[T] {
+  let n = len(v)
+  let mut m = k
+  if m < 0 { m = 0 }
+  if m > n { m = n }
+  let mut pool = clone(v)                                          // shallow copy (Clone for Vec)
+  let mut i = 0
+  while i < m {
+    let j = nextInt(rng, i, n)                                     // uniform in [i, n)  (n > i since i < m <= n)
+    let tmp = pool[i]
+    pool[i] = pool[j]
+    pool[j] = tmp
+    i = i + 1
+  }
+  let mut out: Vec[T] = vec()
+  let mut t = 0
+  while t < m { push(out, pool[t])  t = t + 1 }
+  out
 }

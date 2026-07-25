@@ -1,0 +1,76 @@
+// A small, spec-FREE command-line argument parser over a `Vec[String]` (typically `toVec(args())`).
+// Pure Skarn -- no native, no VM change; the module pulls no environment itself (it takes the
+// argv vector as a parameter), so it is fully deterministic and unit-testable.
+//
+// GRAMMAR (unambiguous WITHOUT a per-option spec -- the deliberate simplification):
+//   --                 terminates option parsing; every following token is a positional
+//   --name=value       a long OPTION with a value        -> opts["name"] = "value"
+//   --name             a long boolean FLAG               -> flags["name"] = true
+//   -abc               short boolean FLAGS (letters only) -> flags["a"], flags["b"], flags["c"]
+//   <anything else>    a POSITIONAL (incl. "-", "-5", "-.3", a bare word)
+// A space-separated option value (`--out file`) is NOT supported -- write `--out=file`. This is what
+// lets the parser stay spec-free (it never has to know which flags expect a value).
+//
+// OPT-IN: reach these via `use std::cli::*` (or a qualified std::cli::name). Tree-shaken when unused.
+
+// The parsed result. Fields are readable directly (`c.positionals`); the accessors below are friendlier.
+pub struct CliArgs { flags: Map[String, Bool], opts: Map[String, String], positionals: Vec[String] }
+
+// True iff every byte of `b` in [1, len) is an ASCII letter (so `-abc` is short flags but `-5` / `-x1`
+// / a lone `-` is not). `b` is the token's bytes; requires len(b) >= 2 (a leading '-' plus a letter).
+// (A String is not directly indexable in Skarn -- byte access goes through its Bytes.)
+fn _allShortFlags(b: Bytes) -> Bool {
+  let mut i = 1
+  let mut ok = true
+  while i < len(b) { if !isAsciiAlpha(b[i]) { ok = false }  i = i + 1 }
+  ok
+}
+
+// Parse argv into flags / options / positionals per the grammar above. Single forward pass, no lookahead.
+pub fn parseArgs(argv: Vec[String]) -> CliArgs {
+  let mut flags: Map[String, Bool] = #{}
+  let mut opts: Map[String, String] = #{}
+  let mut positionals: Vec[String] = vec()
+  let mut afterDD = false
+  for tok in argv {
+    if afterDD {
+      push(positionals, tok)
+    } else if tok == "--" {
+      afterDD = true
+    } else if startsWith(tok, "--") {
+      let body = slice(tok, 2, len(tok))                 // strip the leading "--"
+      let eq = indexOf(body, "=")
+      if eq >= 0 {
+        opts[slice(body, 0, eq)] = slice(body, eq + 1, len(body))
+      } else {
+        flags[body] = true
+      }
+    } else if len(tok) >= 2 && charAt(tok, 0) == '-' && _allShortFlags(toBytes(tok)) {
+      let tb = toBytes(tok)
+      let mut j = 1
+      while j < len(tb) { flags[charStr(tb[j])] = true  j = j + 1 }
+    } else {
+      push(positionals, tok)                             // "-", "-5", a bare word
+    }
+  }
+  CliArgs { flags: flags, opts: opts, positionals: positionals }
+}
+
+// --- accessors ---
+
+// Was the boolean flag `--name` (or short `-n`) present?
+pub fn hasFlag(c: CliArgs, name: String) -> Bool { getOr(c.flags, name, false) }
+
+// The value of option `--name=value`, or None if it was not given.
+pub fn getOpt(c: CliArgs, name: String) -> Option[String] { get(c.opts, name) }
+
+// The value of option `--name=value`, or `dflt` if it was not given.
+pub fn getOptOr(c: CliArgs, name: String, dflt: String) -> String { getOr(c.opts, name, dflt) }
+
+// The number of positional arguments.
+pub fn numPositionals(c: CliArgs) -> Int { len(c.positionals) }
+
+// The i-th positional (0-based), or None if out of range.
+pub fn positionalAt(c: CliArgs, i: Int) -> Option[String] {
+  if i >= 0 && i < len(c.positionals) { Some(c.positionals[i]) } else { None }
+}

@@ -171,20 +171,25 @@ pub fn build(sb: StringBuilder) -> String { fromBytes(sb.buf) }
 pub fn sbLen(sb: StringBuilder) -> Int { len(sb.buf) }
 
 // ---- Format specifiers: the runtime behind an interpolation hole `${e:spec}`, which desugars to
-//      `format(e, "spec")`. Also callable directly as `format(x, "spec")`. v1 grammar (a subset of
-//      Rust's): [[fill]align]['0'][width]['.'precision][type]
+//      `format(e, "spec")`. Also callable directly as `format(x, "spec")`. A subset of Rust's
+//      grammar: [[fill]align]['+']['#']['0'][width]['.'precision][type]
 //        align  '<' left / '>' right / '^' center; a char BEFORE the align is the fill (default ' ')
-//        '0'    zero-pad flag (numbers: pads AFTER the sign, so -007)
+//        '+'    sign flag -- force a leading '+' on a non-negative number
+//        '#'    alternate form -- add a base prefix (0x/0X/0b/0o) for the x/X/b/o types (Int)
+//        '0'    zero-pad flag (numbers: pads AFTER the sign and any base prefix, so -007 / 0x00ff)
 //        width  decimal digits -- the minimum field width
-//        .prec  decimal digits -- Double fixed decimals (ignored for Int/String/Bool)
-//        type   x/X hex, b binary, o octal, d decimal, f fixed Double, s string
+//        .prec  decimal digits -- Double fixed decimals (f) / mantissa digits (e/E); ignored for Int/String/Bool
+//        type   x/X hex, b binary, o octal, d decimal, f fixed Double, g shortest Double,
+//               e/E scientific Double, s string
 //      SCALARS ONLY (Int/Double/String/Bool), matching `+`. An inapplicable field is ignored (a
 //      formatting op never aborts). Negatives in a non-decimal base are sign-magnitude ('-ff'), NOT
-//      two's-complement. All pure Skarn -- no VM/opcode change
+//      two's-complement. Scientific ('e'/'E') defaults to precision 6 (C-style) and prints a minimal
+//      exponent ('1.234500e3', 'e-5'). All pure Skarn -- no VM/opcode change
 pub trait Format { fn format(self, spec: String) -> String }
 
 // A parsed spec. align: 0 none, 1 '<', 2 '>', 3 '^'. prec: -1 if absent. ty: the type char (0 if none).
-struct FmtSpec { fill: Int, align: Int, zero: Bool, width: Int, prec: Int, ty: Int }
+// plus: force a leading '+'. alt: alternate form (base prefix for x/X/b/o).
+struct FmtSpec { fill: Int, align: Int, plus: Bool, alt: Bool, zero: Bool, width: Int, prec: Int, ty: Int }
 
 fn _fmtIsAlign(c: Int) -> Bool { c == 60 || c == 62 || c == 94 }        // '<' '>' '^'
 fn _fmtAlignOf(c: Int) -> Int { if c == 60 { 1 } else if c == 62 { 2 } else { 3 } }
@@ -200,6 +205,10 @@ fn _parseFmt(spec: String) -> FmtSpec {
   let mut align = 0
   if n >= 2 && _fmtIsAlign(b[1]) { fill = b[0]  align = _fmtAlignOf(b[1])  i = 2 }
   else if n >= 1 && _fmtIsAlign(b[0]) { align = _fmtAlignOf(b[0])  i = 1 }
+  let mut plus = false
+  if i < n && b[i] == 43 { plus = true  i = i + 1 }        // '+'
+  let mut alt = false
+  if i < n && b[i] == 35 { alt = true  i = i + 1 }         // '#'
   let mut zero = false
   if i < n && b[i] == 48 { zero = true  i = i + 1 }
   let mut width = 0
@@ -212,7 +221,7 @@ fn _parseFmt(spec: String) -> FmtSpec {
   }
   let mut ty = 0
   if i < n { ty = b[i] }
-  FmtSpec { fill: fill, align: align, zero: zero, width: width, prec: prec, ty: ty }
+  FmtSpec { fill: fill, align: align, plus: plus, alt: alt, zero: zero, width: width, prec: prec, ty: ty }
 }
 
 // Apply width/align with the fill char (space unless overridden). Zero-padding is handled sign-aware in
@@ -265,21 +274,62 @@ fn _zeroPadNum(sign: String, digits: String, fs: FmtSpec) -> String {
   } else { sign + digits }
 }
 
+// The sign string of a number: '-' if negative, else '+' when the sign flag is set, else empty.
+fn _fmtSign(neg: Bool, fs: FmtSpec) -> String { if neg { "-" } else if fs.plus { "+" } else { "" } }
+
+// The alternate-form base prefix (0x/0X/0b/0o) for x/X/b/o, empty unless the '#' flag is set. It sits in
+// the "sign" region so a following zero-pad inserts zeros AFTER it (Rust `{:#08x}` of 255 -> 0x0000ff).
+fn _fmtPrefix(fs: FmtSpec) -> String {
+  if !fs.alt { "" }
+  else if fs.ty == 120 { "0x" } else if fs.ty == 88 { "0X" }
+  else if fs.ty == 98 { "0b" } else if fs.ty == 111 { "0o" }
+  else { "" }
+}
+
 fn _intBody(n: Int, fs: FmtSpec) -> String {
   let neg = n < 0
   let mag = if neg { 0 - n } else { n }
   let base = _fmtBaseOf(fs.ty)
   let upper = fs.ty == 88
   let digits = if mag == 0 { "0" } else { _digitsOf(mag, base, upper, "") }
-  _zeroPadNum(if neg { "-" } else { "" }, digits, fs)
+  _zeroPadNum(_fmtSign(neg, fs) + _fmtPrefix(fs), digits, fs)
+}
+
+// Scientific notation for 'e'/'E': mantissa (1 <= m < 10) + the exponent letter + a minimal signed
+// exponent (Rust-style: no '+', no leading zeros). Default precision is 6 (C-style) since a
+// shortest-round-trip mantissa is intractable in pure Skarn. The mantissa is rounded half-to-even; a
+// carry to 10.0 (e.g. 9.9996 at .3e) bumps the exponent. Non-finite is passed through by the caller.
+fn _sciBody(d: Double, fs: FmtSpec) -> String {
+  let neg = d < 0.0
+  let sign = _fmtSign(neg, fs)
+  let eChar = if fs.ty == 69 { "E" } else { "e" }
+  let a = if neg { 0.0 - d } else { d }
+  let p = if fs.prec < 0 { 6 } else { fs.prec }
+  if a == 0.0 {
+    let mant = if p == 0 { "0" } else { "0." + repeatStr("0", p) }
+    _zeroPadNum(sign, mant + eChar + "0", fs)
+  } else {
+    let mut m = a
+    let mut exp = 0
+    while m >= 10.0 { m = m / 10.0  exp = exp + 1 }
+    while m < 1.0 { m = m * 10.0  exp = exp - 1 }
+    let scale = _pow10(p)
+    let mut r = toInt(roundHalfToEven(m * (scale + 0.0)))
+    if r >= 10 * scale { r = r / 10  exp = exp + 1 }        // mantissa rounded up to 10.0 -> carry
+    let mant = if p == 0 { toString(r / scale) }
+               else { toString(r / scale) + "." + padStart(toString(r % scale), p, 48) }
+    let expStr = if exp < 0 { "-" + toString(0 - exp) } else { toString(exp) }
+    _zeroPadNum(sign, mant + eChar + expStr, fs)
+  }
 }
 
 fn _dblBody(d: Double, fs: FmtSpec) -> String {
   if !_fmtFinite(d) { toString(d) }             // nan/inf: pass through, width via _pad only
+  else if fs.ty == 101 || fs.ty == 69 { _sciBody(d, fs) }   // 'e' / 'E' -- scientific
   else {
     let neg = d < 0.0
     let a = if neg { 0.0 - d } else { d }
-    let sign = if neg { "-" } else { "" }
+    let sign = _fmtSign(neg, fs)
     let digits =
       if fs.ty == 103 { toString(a) }            // 'g' -- shortest round-trip
       else if fs.prec < 0 { toString(a) }        // default: shortest round-trip of the magnitude

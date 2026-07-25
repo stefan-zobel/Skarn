@@ -200,6 +200,25 @@ fn attempts() -> Int { MAX_RETRIES * 2 }   // => 10
 A `const` is **inlined** at each use site (it has no runtime storage), so referencing one is exactly as cheap
 as writing the literal. `std::math`'s `PI` and `E` are consts of this kind.
 
+#### Constant lookup tables — `const NAME: Array[T] = [...]`
+
+A `const` whose type is `Array[T]` is a compile-time **lookup table**, built once at startup and shared — the
+idiomatic way to write table-driven code (CRC/hash tables, S-boxes, char-class maps). Elements are scalar
+literals (`Int`, `Double`, or `Bool`):
+
+```rust
+const SQUARES: Array[Int] = [0, 1, 4, 9, 16, 25]
+
+fn square(i: Int) -> Int { SQUARES[i] }   // one array read, no per-call rebuild
+```
+
+Because the table is a single shared instance, it is deliberately **read-only and non-escaping**: you may only
+read it directly — index it (`SQUARES[i]`), iterate it (`for x in SQUARES`), or take its `len(SQUARES)`. It
+cannot be bound to a variable, passed to a function, returned, stored in a field, or mutated (`SQUARES[i] = v`
+is an error). A constant table is also **module-private** — `pub` is not allowed on it; to share one, expose a
+`pub fn` accessor that reads it. (The `std::hash` `crc32` is implemented exactly this way, over a private
+256-entry table.)
+
 ---
 
 ## 5. Operators
@@ -484,24 +503,29 @@ A hole may carry a **format specifier** after a colon — `${value:spec}` — to
 precision, and numeric base. The specifier grammar is a subset of Rust's:
 
 ```
-[[fill]align] ['0'] [width] ['.'precision] [type]
+[[fill]align] ['+'] ['#'] ['0'] [width] ['.'precision] [type]
 ```
 
 - **align** — `<` left, `>` right, `^` center; a character *before* the align is the fill (default space).
-- **`0`** — zero-pad flag (for a number the zeros go after the sign).
+- **`+`** — sign flag: force a leading `+` on a non-negative number.
+- **`#`** — alternate form: add a base prefix (`0x`/`0X`/`0b`/`0o`) for the `x`/`X`/`b`/`o` types.
+- **`0`** — zero-pad flag (for a number the zeros go after the sign and any base prefix).
 - **width** — the minimum field width.
-- **`.`precision** — the number of decimals (for a `Double`).
+- **`.`precision** — the number of decimals (`f`) or mantissa digits (`e`/`E`) for a `Double`.
 - **type** — `x`/`X` hex, `b` binary, `o` octal, `d` decimal, `f` fixed-point `Double`, `g` shortest
-  round-trip `Double`, `s` string.
+  round-trip `Double`, `e`/`E` scientific `Double`, `s` string.
 
 ```rust
 let n = 255
 println("hex ${n:x}, bin ${n:b}")            // => hex ff, bin 11111111
 println("[${42:>6}] [${42:<6}] [${42:^6}]")  // => [    42] [42    ] [  42  ]
 println("[${42:06}] [${-42:06}]")            // => [000042] [-00042]
+println("${n:#x} ${n:#b} ${n:+} ${-7:+}")    // => 0xff 0b11111111 +255 -7
+println("[${255:#08x}]")                     // => [0x0000ff]   (zeros after the prefix)
 let pi = 3.14159
 println("pi=${pi:.2f}")                      // => pi=3.14
 println("g=${1000000.5:g}")                  // => g=1000000.5   (shortest round-trip)
+println("${1234.5:e} ${1234.5:.2e}")         // => 1.234500e3 1.23e3   (scientific, default precision 6)
 println("[${"hi":*^8}]")                     // => [***hi***]
 ```
 
@@ -509,16 +533,18 @@ Specifiers apply to **scalars only** (`Int`, `Double`, `String`, `Bool`) — the
 a compound value is a type error (`… does not implement Format`); use a plain `${value}` hole for those. An
 inapplicable field is ignored (e.g. a precision on an `Int`), and the specifier grammar is checked at compile
 time, so a malformed `${x:zq}` is a compile error. A negative number in a non-decimal base prints
-sign-magnitude (`${-255:x}` => `-ff`).
+sign-magnitude (`${-255:x}` => `-ff`, `${-255:#x}` => `-0xff`). Scientific `e`/`E` defaults to precision 6
+(like C's `%e`) and prints a minimal signed exponent (`1.234500e3`, `${x:e}` of a small value like
+`${0.05:e}` => `5.000000e-2`).
 
 Under the hood `${value:spec}` desugars to `format(value, "spec")` — an ordinary function you can also call
 directly — so, like the rest of interpolation, specifiers add nothing to the runtime.
 
-> **Not yet supported (reserved for v2):** a sign flag (`+`), the `#` alternate form (a `0x`/`0b` prefix),
-> scientific notation (`e`/`E`), significant-digit precision for `g` (`${x:.3g}` currently ignores the
-> precision), digit grouping, dynamic width/precision (`${x:>{w}}`), named arguments, string precision
-> (truncation), and two's-complement negative bases. To assemble a large string efficiently in a loop, use
-> the `StringBuilder` helper (below) rather than a long `+` chain.
+> **Not yet supported:** significant-digit precision for `g` (`${x:.3g}` currently ignores the precision),
+> a shortest-round-trip mantissa for `e`/`E` (it uses a fixed default precision instead), digit grouping,
+> dynamic width/precision (`${x:>{w}}`), named arguments, string precision (truncation), and two's-complement
+> negative bases. To assemble a large string efficiently in a loop, use the `StringBuilder` helper (below)
+> rather than a long `+` chain.
 
 ### Raw strings
 
@@ -951,6 +977,36 @@ let red = Rgb(255, 0, 0)
 let Rgb(r, g, b) = red          // destructure to name the fields
 println("r=" + r + " g=" + g + " b=" + b)   // => r=255 g=0 b=0
 ```
+
+### Transparent newtypes
+
+A `transparent struct` with a single `Int`, `Double`, or `Bool` field is a **zero-cost wrapper**: it is a
+distinct type to the compiler, but at run time it *is* the wrapped value — no object is allocated, and
+construction, the `.0` projection, and pattern matching all compile to nothing. Use it to give a bare number a
+meaningful, misuse-proof type (`UserId` is not interchangeable with a plain `Int`):
+
+```rust
+transparent struct UserId(Int)
+
+let a = UserId(41)
+let b = UserId(a.0 + 1)                 // `.0` reads the wrapped value (unique to transparent structs)
+println(b.0)                            // => 42
+match b { UserId(n) => println(n) }     // => 42  -- patterns work too
+
+let mut seen: Map[UserId, Bool] = #{}   // a transparent newtype is a valid map / set key
+seen[b] = true
+println(getOr(seen, UserId(42), false)) // => true
+```
+
+Notes and limits (this is an intentionally small first version):
+
+- Exactly **one field**, of type `Int`, `Double`, or `Bool`; written in the tuple form `Name(T)`. (A regular
+  tuple struct like `Rgb` above has no `.0` — you read it by destructuring; `.0` is unique to `transparent`.)
+- `toString`, `print`, and `"${…}"` interpolation print the **name** at the top level: `toString(UserId(42))`
+  is `"UserId(42)"` (and `Meters(3.0)`, `Flag(true)` likewise). A transparent value **nested inside a container**
+  still shows the bare value (`toString([UserId(1), UserId(2)])` is `"[1, 2]"`) — a container dump has no type
+  information to recover the name.
+- You **cannot implement a trait** for a transparent struct (it shares its underlying type's runtime identity).
 
 ### Anonymous tuples
 
@@ -2240,9 +2296,12 @@ The **opt-in** modules must be brought in with a `use` before their functions re
 - `std::random` — a pseudo-random generator (the xoshiro128\*\* algorithm). Seed once with `seedRng(seed) -> Rng`,
   then draw: `nextU32`, `nextInt(lo, hi)` / `nextIntBounded(bound)`, `nextInt48`, `nextBool`, `nextDouble` (in
   `[0, 1)`) / `nextDoubleRange(lo, hi)`; plus `shuffle`/`choice` for `Vec`s, `jump`/`splitRng` for independent
-  streams, and the bulk `fillU32`/`fillDoubles`. It is **deterministic** (same seed → same stream, so it is fully
-  reproducible) and **not cryptographically secure** — do not use it for keys or secrets. It pulls no entropy on
-  its own; for an unpredictable seed pass one in yourself (e.g. `use std::env` and `seedRng(nanoTime())`).
+  streams, and the bulk `fillU32`/`fillDoubles`. It also offers `nextGaussian` / `nextGaussianMS(mu, sigma)` (a
+  normal deviate, via Box–Muller), `choiceWeighted(items, weights) -> Option[T]` (weighted pick), and
+  `sample(v, k) -> Vec[T]` (k distinct elements without replacement). It is **deterministic** (same seed → same
+  stream, so it is fully reproducible) and **not cryptographically secure** — do not use it for keys or secrets.
+  It pulls no entropy on its own; for an unpredictable seed pass one in yourself (e.g. `use std::env` and
+  `seedRng(nanoTime())`).
 - `std::set` — a hash **`Set[T]`** (over `Map[T, Bool]`): `set()` / `setOf(vec)`, `insert`/`remove` (each returns
   a `Bool`), `isMember`, `size`, the algebra `union`/`intersect`/`difference`/`isSubset`/`isDisjoint`, and
   `for x in s` (plus the lazy combinators) via `IntoIterator`. The element type `T` must be `Hashable`
@@ -2256,6 +2315,23 @@ The **opt-in** modules must be brought in with a `use` before their functions re
   `Duration` constructors `millis`/`seconds`/`minutes`/`hours`/`days` with `in*` accessors and arithmetic. An
   `Instant` spans roughly year -2490..6429 (the ±2⁴⁷-ms window); sub-millisecond precision and time zones are
   out of scope for v1.
+- `std::cli` — a small, spec-free command-line argument parser over a `Vec[String]` (typically
+  `parseArgs(toVec(args()))`). The grammar needs no per-option spec: `--name=value` is an **option**, a bare
+  `--name` or `-abc` (letters) are boolean **flags**, `--` terminates option parsing, and anything else is a
+  **positional**. Read the result with `hasFlag(c, name)`, `getOpt(c, name) -> Option[String]` /
+  `getOptOr(c, name, dflt)`, `numPositionals(c)`, and `positionalAt(c, i) -> Option[String]`. A space-separated
+  option value (`--out file`) is not supported — write `--out=file`.
+- `std::hash` — hashing. **CRC-32** (IEEE/zlib): `crc32(bytes) -> Int` / `crc32Str(s) -> Int` return a
+  non-negative 32-bit checksum — an **error-detection** checksum, not secure. **MurmurHash3** (x86_32):
+  `murmur3(bytes, seed) -> Int` / `murmur3Str(s, seed) -> Int` return a non-negative 32-bit hash with good
+  distribution — a fast general-purpose (non-cryptographic) hash for hash tables and fingerprinting.
+  **SHA-256** (FIPS 180-4): `sha256(bytes) -> Bytes` is the raw 32-byte cryptographic digest; `sha256Hex(bytes)`
+  / `sha256HexStr(s)` give the 64-char lowercase hex string, and `toHex(bytes)` hex-encodes any buffer.
+- `std::net` — **TCP networking** (blocking sockets). Client: `connect(host, port) -> Result[TcpConn, String]`,
+  then `send`/`sendStr`/`recv`/`recvLine`/`recvAll`/`close`; server: `listen(port)`, `accept(l)`, `closeListener`.
+  Both IPv4 and IPv6; `setTimeout(c, ms)` sets recv/send timeouts. A minimal HTTP/1.0 `httpGet(host, port, path) ->
+  Result[HttpResponse, String]` sits on top (REST = `httpGet` + `std::json::parse`). **Limits:** blocking only (one
+  connection at a time), plaintext only (no TLS, so `http://` not `https://`), close sockets explicitly.
 
 For example, `std::json` round-trips a document through its `Json` value tree:
 
@@ -2285,6 +2361,26 @@ while i <= 5 {
 }
 shuffle(rng, deck)             // a uniformly-random permutation, in place
 println(toString(deck))
+```
+
+`std::cli` turns a raw argument vector into flags, options, and positionals; `std::hash` checksums bytes:
+
+```rust
+use std::cli::*
+use std::hash::*
+
+let mut argv: Vec[String] = vec()
+push(argv, "build")
+push(argv, "--opt=O2")
+push(argv, "-v")
+push(argv, "main.skn")
+
+let c = parseArgs(argv)                    // real programs: parseArgs(toVec(args()))
+println(getOptOr(c, "opt", "O0"))          // => O2
+println(toString(hasFlag(c, "v")))         // => true
+println(toString(numPositionals(c)))       // => 2   ("build", "main.skn")
+
+println(toString(crc32Str("123456789")))   // => 3421780262
 ```
 
 And `std::set` deduplicates and answers membership / set-algebra questions:
@@ -2320,6 +2416,37 @@ println(inMinutes(durationBetween(t, later)))   // => 120
 match parseIso("2000-02-29T12:00:00.000Z") {
   Ok(d)  => println(d.year),                // => 2000
   Err(m) => println(m)
+}
+```
+
+And `std::net` opens a TCP connection. Here a server and a client talk over loopback in one program (the VM is
+single-threaded, so this works because `connect` queues into the listen backlog and `accept` then picks it up):
+
+```rust
+use std::net::*
+
+fn echo() -> Result[(), String] {
+  let lst = listen(48080)?                    // dual-stack listener (IPv4 + IPv6)
+  let mut cli = connect("127.0.0.1", 48080)?  // client connects
+  let mut srv = accept(lst)?                  // server side of the connection
+
+  sendStr(cli, "ping\n")?
+  let got = recvLine(srv)?                     // => Some("ping")
+  println(match got { Some(s) => s, None => "<eof>" })
+
+  close(cli)?  close(srv)?  closeListener(lst)?
+  Ok(())
+}
+match echo() { Ok(_) => println("done"), Err(e) => println(e) }
+```
+
+A one-line HTTP GET (plain `http://`, no TLS) fetches a page; a JSON body would feed `std::json::parse`:
+
+```rust
+use std::net::*
+match httpGet("example.com", 80, "/") {
+  Ok(r)  => println("status " + toString(r.status)),   // => status 200
+  Err(e) => println(e)
 }
 ```
 
@@ -2710,8 +2837,30 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `nextBool(r)` | a random `Bool` |
 | `nextDouble(r)` / `nextDoubleRange(r, lo, hi)` | a uniform `Double` in `[0, 1)` / `[lo, hi)` |
 | `shuffle(r, v)` / `choice(r, v)` | shuffle a `Vec` in place / a random element → `Option[T]` |
+| `nextGaussian(r)` / `nextGaussianMS(r, mu, sigma)` | a normal deviate (mean 0, sd 1) / scaled to `mu`, `sigma` |
+| `choiceWeighted(r, items, weights)` | a weighted pick → `Option[T]` (`None` if empty / mismatched / total ≤ 0) |
+| `sample(r, v, k)` | `k` distinct elements without replacement → `Vec[T]` (`k` clamped to `[0, len]`) |
 | `jump(r)` / `splitRng(r)` | advance one stream / return a fresh non-overlapping stream |
 | `fillU32(r, out, n)` / `fillDoubles(r, out, n)` | append `n` draws to a `Vec` (bulk, load/store-optimized) |
+
+**Command-line arguments** *(all `std::cli` — `use std::cli::*`)*
+
+| Function | Purpose |
+|----------|---------|
+| `parseArgs(argv)` | parse a `Vec[String]` (e.g. `toVec(args())`) → `CliArgs` |
+| `hasFlag(c, name)` | was `--name` / short `-n` present? → `Bool` |
+| `getOpt(c, name)` / `getOptOr(c, name, dflt)` | the value of `--name=value` → `Option[String]` / with a default |
+| `numPositionals(c)` / `positionalAt(c, i)` | positional count → `Int` / the i-th positional → `Option[String]` |
+
+**Hashing** *(all `std::hash` — `use std::hash::*`)*
+
+| Function | Purpose |
+|----------|---------|
+| `crc32(bytes)` / `crc32Str(s)` | CRC-32 (IEEE/zlib) checksum of a `Bytes` / `String` → non-negative 32-bit `Int` (not secure) |
+| `murmur3(bytes, seed)` / `murmur3Str(s, seed)` | MurmurHash3 x86_32 of a `Bytes` / `String` with a 32-bit `seed` → non-negative 32-bit `Int` (fast, non-cryptographic) |
+| `sha256(bytes)` / `sha256Str(s)` | SHA-256 (FIPS 180-4) → the raw 32-byte digest as `Bytes` |
+| `sha256Hex(bytes)` / `sha256HexStr(s)` | SHA-256 as a 64-char lowercase hex `String` |
+| `toHex(bytes)` | lowercase hex encoding of any `Bytes` (2 chars/byte) |
 
 **Sets** *(all `std::set` — `use std::set::*`; `T` must be `Hashable`)*
 
@@ -2741,6 +2890,18 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `isBefore(a, b)` / `isAfter(a, b)` | order two `Instant`s → `Bool` |
 | `startStopwatch()` / `elapsedNanos(sw)` / `elapsedMillis(sw)` | a monotonic stopwatch |
 
+**TCP networking** *(all `std::net` — `use std::net::*`; blocking, plaintext only)*
+
+| Function | Purpose |
+|----------|---------|
+| `connect(host, port)` | open a client connection → `Result[TcpConn, String]` (IPv4/IPv6, name or literal) |
+| `send(c, bytes)` / `sendStr(c, s)` | send a whole buffer / string → `Result[(), String]` |
+| `recv(c, n)` | receive up to `n` bytes → `Result[Bytes, String]` (an **empty `Bytes` means EOF**) |
+| `recvLine(c)` / `recvAll(c)` | read one `\n`-line → `Result[Option[String], String]` / drain to EOF → `Result[Bytes, String]` (both need `mut c`) |
+| `setTimeout(c, ms)` / `close(c)` | recv/send timeout (0 = block) / close the connection → `Result[(), String]` |
+| `listen(port)` / `accept(l)` / `closeListener(l)` | server: bind+listen → `TcpListener`; block for a client → `TcpConn`; stop listening |
+| `httpGet(host, port, path)` | a minimal HTTP/1.0 GET → `Result[HttpResponse, String]` (`.status: Int`, `.body: String`) |
+
 **Strings and bytes**
 
 | Function | Purpose |
@@ -2764,7 +2925,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `stringBuilder()` / `stringBuilderCap(n)` | a `StringBuilder` accumulator over `Bytes` (empty / pre-sized to `n`) |
 | `append(sb, s)` / `appendByte(sb, c)` | append a `String` / one byte to a `StringBuilder` (mutates in place; returns `sb`) |
 | `build(sb)` / `sbLen(sb)` | the accumulated `String` / its current byte length |
-| `format(x, spec)` | format a scalar per a `${x:spec}` specifier (width/align/precision/base) → `String` |
+| `format(x, spec)` | format a scalar per a `${x:spec}` specifier (width/align/precision/base, sign `+`, `#` prefix, scientific `e`/`E`) → `String` |
 
 **Collections**
 

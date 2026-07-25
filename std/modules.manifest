@@ -23,3 +23,6 @@ std::json     json.skn
 std::random   random.skn
 std::set      set.skn
 std::time     time.skn
+std::cli      cli.skn
+std::hash     hash.skn
+std::net      net.skn

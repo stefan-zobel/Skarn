@@ -29,7 +29,10 @@
 program      = { terminator } , { item , { terminator } } ;
 (* `pub` (visibility) may precede only an exported item: fn / struct / enum / trait / const.       *)
 (* Default is module-private; `pub` exports it cross-module (fields + enum variants inherit).      *)
-item         = [ "pub" ] , ( fn_item | struct_item | enum_item | trait_item | const_item )
+(* `transparent` is legal ONLY before a struct_item (the parser rejects it elsewhere): it marks a  *)
+(* single-field tuple struct over an Int/Double/Bool field that ERASES to its underlying immediate *)
+(* at runtime -- a zero-cost newtype (no heap object; construction/`.0`/pattern are no-ops).       *)
+item         = [ "pub" ] , [ "transparent" ] , ( fn_item | struct_item | enum_item | trait_item | const_item )
              | impl_item | import_item | use_item | statement ;
 
 (* A compile-time module constant, inlined at each use site. The initializer is restricted to a
@@ -306,19 +309,21 @@ string       = '"' , { char } , '"' ;             (* a plain string literal (no 
 (* `${...}` hole of a normal string, and patterns). Only a lowercase `r` abutting `"`/`#"` triggers   *)
 (* it; `range` / a bare `r` are ordinary identifiers. Never interpolated.                             *)
 raw_string   = "r" , { "#" } , '"' , { char_verbatim } , '"' , { "#" } ;   (* opening/closing `#` counts match *)
-(* String interpolation: a `"..."` containing one or more `${ expr }` holes. A pure lexer/parser    *)
-(* DESUGAR to `text0 + toString(e0) + text1 + ... ` (empty text pieces dropped), so it inherits     *)
-(* `toString` (any-type holes) and `+` (String concat) with no new AST/checker/codegen. Holes       *)
-(* nest (an `expr` may be another interp_string). `$` is literal unless immediately before `{`; a   *)
-(* literal `${` is written `\$` + `{`. Rejected in pattern / const-initializer position.            *)
-(* A hole may carry a `:spec` format specifier: `${e:spec}` desugars to `format(e, "spec")` (the    *)
-(* `Format` trait; scalars only). The spec is scanned as raw text up to the hole-closing `}` (only  *)
-(* a top-level `:` -- all of ()/[]/{} balanced -- starts it, so an atom `:x` or a lambda-param `:`  *)
-(* is untouched); its grammar (below) is validated at parse time.                                   *)
+(* String interpolation: a `"..."` containing one or more `${ expr }` holes. A pure lexer/parser      *)
+(* DESUGAR to `text0 + toString(e0) + text1 + ... ` (empty text pieces dropped), so it inherits       *)
+(* `toString` (any-type holes) and `+` (String concat) with no new AST/checker/codegen. Holes         *)
+(* nest (an `expr` may be another interp_string). `$` is literal unless immediately before `{`; a     *)
+(* literal `${` is written `\$` + `{`. Rejected in pattern / const-initializer position.              *)
+(* A hole may carry a `:spec` format specifier: `${e:spec}` desugars to `format(e, "spec")` (the      *)
+(* `Format` trait; scalars only). The spec is scanned as raw text up to the hole-closing `}` (only    *)
+(* a top-level `:` -- all of ()/[]/{} balanced -- starts it, so an atom `:x` or a lambda-param `:`    *)
+(* is untouched); its grammar (below) is validated at parse time.                                     *)
 interp_string = '"' , text , { "${" , expr , [ ':' , fmt_spec ] , "}" , text } , '"' ;   (* >= 1 hole *)
-fmt_spec     = [ [ fill ] , align ] , [ '0' ] , [ width ] , [ '.' , precision ] , [ fmt_type ] ;
+fmt_spec     = [ [ fill ] , align ] , [ '+' ] , [ '#' ] , [ '0' ] , [ width ] , [ '.' , precision ] , [ fmt_type ] ;
 align        = '<' | '>' | '^' ;   fill = char ;   width = digit , { digit } ;   precision = digit , { digit } ;
-fmt_type     = 'x' | 'X' | 'b' | 'o' | 'd' | 'f' | 'g' | 's' ;   (* g = shortest round-trip Double *)
+fmt_type     = 'x' | 'X' | 'b' | 'o' | 'd' | 'f' | 'g' | 'e' | 'E' | 's' ;
+             (* '+' force-sign; '#' alternate form (0x/0X/0b/0o base prefix, x/X/b/o); g = shortest   *)
+             (* round-trip Double; e/E = scientific Double (default precision 6, minimal exponent)    *)
 char_lit     = "'" , ( char_no_squote_no_bslash | escape ) , "'" ;
              (* a single BYTE 0..255, typed Int (there is NO scalar Char type);      *)
              (* escapes \n \t \r \\ \0 \' \"; a multi-byte literal (e.g. 'é' = 2     *)

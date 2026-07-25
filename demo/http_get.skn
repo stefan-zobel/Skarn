@@ -1,0 +1,9 @@
+// A real HTTP/1.0 GET over plain TCP (no TLS -> http:// only). NETWORK-DEPENDENT: prints the status
+// code and body length when online, or the error when offline -- either way it exits 0 (a demo must
+// not fail the gate without a network).
+use std::net::*
+
+match httpGet("example.com", 80, "/") {
+  Ok(resp) => println("status=" + toString(resp.status) + " bodyBytes=" + toString(len(resp.body))),
+  Err(e)   => println("http error (offline?): " + e)
+}
