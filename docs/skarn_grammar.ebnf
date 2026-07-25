@@ -60,15 +60,15 @@ use_rest     = ident                                         (* single: the impo
              | "{" , ident , { "," , ident } , [ "," ] , "}" (* name list *)
              | "*" ;                                         (* glob (weak shadowing) *)
 
-(* -- generic parameters (shared); type vars + bounds are UPPERCASE -- *)
+(* -- generic parameters (shared); type vars + bounds are UPPERCASE --           *)
 generic_params = "[" , generic_param , { "," , generic_param } , [ "," ] , "]" ;
-generic_param  = uident , [ ":" , bound ] ;       (* optional trait bound(s) *)
-bound          = named_bound , { "+" , named_bound } ; (* e.g. Display + Clone *)
+generic_param  = uident , [ ":" , bound ] ;       (* optional trait bound(s)     *)
+bound          = named_bound , { "+" , named_bound } ; (* e.g. Display + Clone   *)
 named_bound    = uident , [ "[" , type , { "," , type } , "]" ] ; (* Iterable[T] *)
 
 (* -- definitions -- *)
-(* fn name is lident; params mandatorily typed; return type mandatory.         *)
-(* (Relax return to Gleam-style inference by using `[ "->" , type ]`.)         *)
+(* fn name is lident; params mandatorily typed; return type mandatory.           *)
+(* (Relax return to Gleam-style inference by using `[ "->" , type ]`.)           *)
 fn_item      = "fn" , lident , [ generic_params ] ,
                "(" , [ param_list ] , ")" , "->" , type , block ;
 
@@ -96,11 +96,16 @@ tuple_fields = type , { "," , type } , [ "," ] ;
 (* A tuple/nullary variant is built + matched as `V(..)` / `V`; a RECORD      *)
 (* variant `V { f: T }` is built + matched with brace (struct) syntax         *)
 (* `V { f: v }` -- same forms as a record struct, but its type is the enum.   *)
-enum_item    = "enum" , uident , [ generic_params ] ,
+(* A `: Int` repr annotation makes the enum INT-BACKED: every variant must be *)
+(* nullary; the value ERASES to a bare Int discriminant at runtime (no heap   *)
+(* object). A nullary variant may pin its discriminant with `= <intlit>`      *)
+(* (declaration-order auto-increment otherwise). Both are checker-validated.  *)
+enum_item    = "enum" , uident , [ generic_params ] , [ ":" , uident ] ,
                "{" , { terminator } ,
                { enum_variant , [ "," ] , { terminator } } , "}" ;
 enum_variant = uident , [ "(" , type , { "," , type } , [ "," ] , ")"
-                        | "{" , field_defs , "}" ] ;
+                        | "{" , field_defs , "}"
+                        | "=" , [ "-" ] , int_literal ] ;
 
 (* -- traits / protocols (dynamic single-dispatch on arg 0 `self`; call is a   *)
 (* plain function / pipe, never method-dot). Trait + supertrait names UPPER.   *)
@@ -152,13 +157,13 @@ shift        = additive , { ( "<<" | ">>" | ">>>" ) , additive } ;
 additive     = multiplicative , { ( "+" | "-" ) , multiplicative } ;
 multiplicative = unary , { ( "*" | "/" | "%" ) , unary } ;
 unary        = ( "-" | "!" | "~" ) , unary | postfix ;
-(* Only one index form (a[i]); no separate map-index suffix.                  *)
+(* Only one index form (a[i]); no separate map-index suffix.                   *)
 postfix      = primary , { call_suffix | index_suffix | field_suffix | try_suffix } ;
 call_suffix  = "(" , [ arg_list ] , ")" ;
 index_suffix = "[" , expr , "]" ;                (* a[i] -- bounds-checked, total-ish *)
 field_suffix = "." , ( lident | int ) ;   (* `.name` struct field | `.N` tuple index (t.0) *)
-(* `e?` -- try: unwrap Ok/Some, or early-return Err/None from the enclosing   *)
-(* function. Desugars to `match` + `return`; works on Result and Option.      *)
+(* `e?` -- try: unwrap Ok/Some, or early-return Err/None from the enclosing    *)
+(* function. Desugars to `match` + `return`; works on Result and Option.       *)
 try_suffix   = "?" ;
 arg_list     = expr , { "," , expr } , [ "," ] ;
 
@@ -169,19 +174,19 @@ primary      = literal
              | path
              | struct_lit
              | "(" , [ expr , { "," , expr } , [ "," ] ] , ")"   (* group / tuple / `()` = unit *)
-             | "[" , [ expr , { "," , expr } , [ "," ] ] , "]"   (* sequence (list) literal *)
+             | "[" , [ expr , { "," , expr } , [ "," ] ] , "]"   (* sequence (list) literal     *)
              | map_lit
              | if_expr | match_expr | while_expr | for_expr | loop_expr | lambda | block
              | break_expr | "continue" | return_expr ;
 
 literal      = int | double | string | raw_string | char_lit | atom | "true" | "false" ;
 
-(* Value path: lident = variable / function; uident = a nullary constructor    *)
-(* or a constructor used as a value/function (applied via call_suffix, e.g.    *)
-(* `Some(x)`); `Trait::method` = qualified trait-method call / pipe target.    *)
-(* A module qualifier (`mod::name` fn/value, `mod::Ctor` constructor, or the   *)
-(* virtual `std::name`) is an lident head + `::` + `ident` -- distinguished    *)
-(* from `Trait::method` (uident head) purely by case.                          *)
+(* Value path: lident = variable / function; uident = a nullary constructor     *)
+(* or a constructor used as a value/function (applied via call_suffix, e.g.     *)
+(* `Some(x)`); `Trait::method` = qualified trait-method call / pipe target.     *)
+(* A module qualifier (`mod::name` fn/value, `mod::Ctor` constructor, or the    *)
+(* virtual `std::name`) is an lident head + `::` + `ident` -- distinguished     *)
+(* from `Trait::method` (uident head) purely by case.                           *)
 path         = lident , [ "::" , ident ]
              | uident , [ "::" , lident ] ;
 
@@ -264,8 +269,8 @@ field_pat    = lident , [ ":" , pattern ] ;
 num_lit      = [ "-" ] , ( int | double ) ;
 range_pat    = num_lit , ".." , num_lit ;
 list_pat_items = { pattern , "," } , [ pattern | ".." , [ pattern ] ] ;
-(* Partial map pattern; key is a literal expr (enforced in codegen), value    *)
-(* side is a sub-pattern (`_` = presence-only).                               *)
+(* Partial map pattern; key is a literal expr (enforced in codegen), value      *)
+(* side is a sub-pattern (`_` = presence-only).                                 *)
 map_pat_entry = expr , "=>" , pattern ;
 
 (* -- types; type names + type variables are UPPERCASE (uident) -- *)

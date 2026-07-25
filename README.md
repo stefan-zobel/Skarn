@@ -1109,6 +1109,83 @@ println("leaves=" + countLeaves(tree))   // => leaves=3
 
 The built-in `Option` and `Result` types are themselves enums; see [§18](#18-option-result-and-the--operator).
 
+### Integer-backed enums
+
+An enum whose variants are **all nullary** (no payload) can opt into an **Int-backed** representation with a
+`: Int` annotation. At runtime such a value **is** a plain integer — zero heap allocation per value — while
+staying a distinct type you match on by name (like the mirror of a `transparent struct`, §11):
+
+```rust
+enum Direction : Int { North, East, South, West }        // discriminants 0, 1, 2, 3
+
+let d: Direction = South
+println(d)                                     // => South   (prints the NAME, not 2)
+println(match d { North => "up", East => "right", South => "down", West => "left" })  // => down
+
+let mut seen: Map[Direction, Int] = #{}        // usable as a map key (it is an Int underneath)
+seen[South] = 1
+println(getOr(seen, South, 0))                 // => 1
+```
+
+Discriminants are the declaration order (`0, 1, 2, …`) unless you **pin** one with `= value`; the counter then
+resumes from there:
+
+```rust
+enum Status : Int { Ok = 200, Created = 201, NotFound = 404, Teapot = 418 }
+```
+
+Notes and limits:
+
+- Every variant must be nullary — a payload variant (`V(Int)` / `V { x: Int }`) under `: Int` is an error (it
+  can't fit in a single integer). The repr must be `Int`.
+- `toString`, `print`, and `"${…}"` print the variant **name** at the top level (`South`). A value **nested in a
+  container** prints as the bare integer (`println([North, South])` => `[0, 2]`) — the dump has no type
+  information to recover the name.
+- You **cannot implement a trait** for an Int-backed enum (it shares its integer representation at runtime).
+- There is no built-in `Direction`↔`Int` conversion yet; you match on the variants by name.
+
+### Char and UTF-8 code points
+
+A `String` is a sequence of **bytes** by default: `for c in s` yields byte values, `len(s)` is a byte count,
+and a char literal `'A'` is an `Int` byte (0..255). When you want Unicode **code points**, use the opt-in
+**`Char`** type — a zero-cost wrapper over the code point (it *is* the bare integer at runtime, no allocation)
+that keeps code points distinct from plain integers:
+
+```rust
+let c: Char = 'A'                  // a byte char literal is a Char in Char context
+let euro = Char(0x20AC)            // build a Char from any code point
+println(c)                         // => A        (prints the GLYPH)
+println(euro)                      // => €
+println(codePoint(euro))           // => 8364     (unwrap to the Int code point)
+
+println(c == 'A')                  // => true
+println('a' <= Char('m') && Char('m') <= 'z')   // => true   (Chars are ordered)
+
+let mut counts: Map[Char, Int] = #{}             // a Char is a valid map key
+counts[c] = 1
+println(getOr(counts, c, 0))       // => 1
+```
+
+Note that a *bare* char literal has no `Char` context, so it stays an `Int` byte — `println('A')` prints `65`,
+and `b[i] == 'A'` compares bytes. The glyph appears only for `Char`-typed values.
+
+The UTF-8 codec is a small pure-Skarn library (no import needed):
+
+```rust
+println(codePointToStr(0x1F600))   // => 😀      (encode a code point to its UTF-8 String)
+let s = "héllo€"
+println(len(s))                    // => 9       (bytes)
+println(charCount(s))              // => 6       (code points)
+match nthChar(s, 5) { Some(ch) => println(ch), None => {} }   // => €   (the 6th code point)
+println(fromChars(chars(s)) == s)  // => true    (decode + re-encode round-trips)
+```
+
+`chars(s)` is a lazy iterator of the `Char`s in `s` (a malformed byte decodes to U+FFFD, the replacement
+character, so it never fails); `charCount`/`nthChar` count/index code points (O(n) — a String is not directly
+indexable). `for c in s` is unchanged and still walks **bytes**. As with transparent newtypes, you cannot
+`impl` a trait for `Char`, and a `Char` **nested in a container** prints as its bare code-point integer
+(`println([c, euro])` => `[65, 8364]`).
+
 ---
 
 ## 13. Pattern matching
@@ -2926,6 +3003,18 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `append(sb, s)` / `appendByte(sb, c)` | append a `String` / one byte to a `StringBuilder` (mutates in place; returns `sb`) |
 | `build(sb)` / `sbLen(sb)` | the accumulated `String` / its current byte length |
 | `format(x, spec)` | format a scalar per a `${x:spec}` specifier (width/align/precision/base, sign `+`, `#` prefix, scientific `e`/`E`) → `String` |
+
+**Unicode code points** *(`std::string` / `std::iter`; the opt-in code-point layer over the default byte model — `for c in s` still iterates bytes)*
+
+| Function | Purpose |
+|----------|---------|
+| `chars(s)` | lazily iterate the UTF-8 code points of `s` as `Char`s (a malformed byte decodes to U+FFFD, so it never fails) |
+| `charCount(s)` | number of code points (O(n); note `len(s)` is the byte count) |
+| `nthChar(s, i)` | the i-th code point → `Option[Char]` (O(n) — a `String` is not directly indexable) |
+| `codePoint(c)` | a `Char`'s `Int` code point |
+| `codePointToStr(cp)` | encode an `Int` code point → its UTF-8 `String` (invalid/surrogate → U+FFFD) |
+| `fromChars(it)` | build a `String` from an iterator of `Char` (`fromChars(chars(s)) == s` for valid UTF-8) |
+| `appendCodePoint(sb, cp)` | append a code point's UTF-8 to a `StringBuilder` (mutates in place; returns `sb`) |
 
 **Collections**
 

@@ -170,6 +170,47 @@ pub fn appendByte(sb: StringBuilder, c: Int) -> StringBuilder { push(sb.buf, c) 
 pub fn build(sb: StringBuilder) -> String { fromBytes(sb.buf) }
 pub fn sbLen(sb: StringBuilder) -> Int { len(sb.buf) }
 
+// ---- Char + UTF-8 code points (the OPT-IN code-point layer over the default BYTE model). A `Char`
+//      is a Unicode SCALAR VALUE (code point). `Char` is a ZERO-COST transparent newtype over Int --
+//      a DISTINCT type in the checker that IS the bare code-point Int at runtime (no allocation). A
+//      byte char literal `'A'` (0..255) is a `Char` in Char context; `Char(cp)` builds one from a
+//      computed code point; `c.0` projects the code point Int; `==`/`<` and Map/Set-key work; and
+//      `toString`/`print`/`"${}"` render the GLYPH (the UTF-8 bytes of the code point). The default
+//      byte world (`for c in s`, `s`-bytes, `'A'`-in-Int-context, ASCII classifiers) is UNCHANGED --
+//      code points are the explicitly-named opt-in track. `chars`/`charCount`/`nthChar` live in
+//      std::iter beside `split`/`lines`. Pure Skarn -- no native, no VM/opcode change.
+pub transparent struct Char(Int)
+// codePoint: project a Char to its code-point Int (a readable alias for `c.0`).
+pub fn codePoint(c: Char) -> Int { c.0 }
+// _encodeCp: append the 1..4 UTF-8 bytes of a code point to a Bytes buffer. LOSSY-TOTAL: an
+// out-of-range or surrogate code point encodes U+FFFD (the replacement character, EF BF BD). All
+// byte-math over 48-bit Int (a code point is <= 21 bits); `push` masks each byte to 0..255.
+fn _encodeCp(out: Bytes, cp: Int) -> Bytes {
+  if cp < 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) {
+    push(out, 0xEF)  push(out, 0xBF)  push(out, 0xBD)          // U+FFFD
+  } else if cp <= 0x7F {
+    push(out, cp)
+  } else if cp <= 0x7FF {
+    push(out, 0xC0 | (cp >> 6))
+    push(out, 0x80 | (cp & 0x3F))
+  } else if cp <= 0xFFFF {
+    push(out, 0xE0 | (cp >> 12))
+    push(out, 0x80 | ((cp >> 6) & 0x3F))
+    push(out, 0x80 | (cp & 0x3F))
+  } else {
+    push(out, 0xF0 | (cp >> 18))
+    push(out, 0x80 | ((cp >> 12) & 0x3F))
+    push(out, 0x80 | ((cp >> 6) & 0x3F))
+    push(out, 0x80 | (cp & 0x3F))
+  }
+}
+// codePointToStr: encode ONE code-point Int to its (1..4-byte) UTF-8 String. The "missing encoder"
+// that makes a code-point Int no longer a one-way street. An invalid code point yields U+FFFD.
+pub fn codePointToStr(cp: Int) -> String { let out = bytes()  _encodeCp(out, cp)  fromBytes(out) }
+// appendCodePoint: the multi-byte sibling of appendByte -- append a code point's UTF-8 bytes to a
+// StringBuilder, mutating in place and returning it for chaining.
+pub fn appendCodePoint(sb: StringBuilder, cp: Int) -> StringBuilder { _encodeCp(sb.buf, cp)  sb }
+
 // ---- Format specifiers: the runtime behind an interpolation hole `${e:spec}`, which desugars to
 //      `format(e, "spec")`. Also callable directly as `format(x, "spec")`. A subset of Rust's
 //      grammar: [[fill]align]['+']['#']['0'][width]['.'precision][type]

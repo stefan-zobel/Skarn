@@ -120,6 +120,61 @@ impl Iterator[String] for LinesCursor {
 pub fn lines(s: String) -> dyn Iterator[String] {
   LinesCursor { s: s, b: toBytes(s), pos: 0, done: false }
 }
+// ---- UTF-8 code-point decode: `chars(s)` lazily yields the Unicode scalar values of s as `Char`s
+// (a zero-cost transparent newtype over the code-point Int; see std::string). This is the opt-in
+// code-point track; `for c in s` still iterates BYTES (unchanged). LOSSY-TOTAL: a malformed lead or
+// truncated/overlong/surrogate sequence yields U+FFFD (Char(0xFFFD)) and advances ONE byte, so a
+// decode never traps and always makes progress. `_decodeCp` returns (code point, bytes consumed).
+fn _isCont(byte: Int) -> Bool { byte >= 0x80 && byte < 0xC0 }
+fn _decodeCp(b: Bytes, pos: Int) -> (Int, Int) {
+  let n = len(b)
+  let b0 = b[pos]
+  if b0 < 0x80 { (b0, 1) }
+  else if b0 < 0xC0 { (0xFFFD, 1) }                                 // stray continuation byte
+  else if b0 < 0xE0 {
+    if pos + 1 < n && _isCont(b[pos + 1]) {
+      let cp = ((b0 & 0x1F) << 6) | (b[pos + 1] & 0x3F)
+      if cp < 0x80 { (0xFFFD, 1) } else { (cp, 2) }                 // reject overlong
+    } else { (0xFFFD, 1) }
+  }
+  else if b0 < 0xF0 {
+    if pos + 2 < n && _isCont(b[pos + 1]) && _isCont(b[pos + 2]) {
+      let cp = ((b0 & 0x0F) << 12) | ((b[pos + 1] & 0x3F) << 6) | (b[pos + 2] & 0x3F)
+      if cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF) { (0xFFFD, 1) } else { (cp, 3) }
+    } else { (0xFFFD, 1) }
+  }
+  else if b0 < 0xF8 {
+    if pos + 3 < n && _isCont(b[pos + 1]) && _isCont(b[pos + 2]) && _isCont(b[pos + 3]) {
+      let cp = ((b0 & 0x07) << 18) | ((b[pos + 1] & 0x3F) << 12) | ((b[pos + 2] & 0x3F) << 6) | (b[pos + 3] & 0x3F)
+      if cp < 0x10000 || cp > 0x10FFFF { (0xFFFD, 1) } else { (cp, 4) }
+    } else { (0xFFFD, 1) }
+  }
+  else { (0xFFFD, 1) }
+}
+struct CharsCursor { b: Bytes, pos: Int }
+impl Iterator[Char] for CharsCursor {
+  fn next(mut self) -> Option[Char] {
+    if self.pos >= len(self.b) { None } else {
+      let (cp, adv) = _decodeCp(self.b, self.pos)
+      self.pos = self.pos + adv
+      Some(Char(cp))
+    }
+  }
+}
+pub fn chars(s: String) -> dyn Iterator[Char] { CharsCursor { b: toBytes(s), pos: 0 } }
+// charCount: the number of code points (NOT bytes -- `len(s)` is bytes). O(n).
+pub fn charCount(s: String) -> Int { count(chars(s)) }
+// nthChar: the i-th code point (0-based) -> Option[Char]. O(n), EXPLICIT -- never `s[i]` (which is a
+// byte and, for String, a type error anyway).
+fn _nthCharGo(it: dyn Iterator[Char], i: Int) -> Option[Char] {
+  match next(it) { Some(c) => if i <= 0 { Some(c) } else { _nthCharGo(it, i - 1) }, None => None }
+}
+pub fn nthChar(s: String, i: Int) -> Option[Char] { if i < 0 { None } else { _nthCharGo(chars(s), i) } }
+// fromChars: encode a stream of Chars back to a UTF-8 String (the inverse of `chars`).
+fn _fromCharsGo(it: dyn Iterator[Char], sb: StringBuilder) -> StringBuilder {
+  match next(it) { Some(c) => _fromCharsGo(it, appendCodePoint(sb, c.0)), None => sb }
+}
+pub fn fromChars(it: dyn Iterator[Char]) -> String { build(_fromCharsGo(it, stringBuilder())) }
 
 // ---- generic sources (return a fresh dyn Iterator) ----
 struct RangeCursor { i: Int, n: Int }
