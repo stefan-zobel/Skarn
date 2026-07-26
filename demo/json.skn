@@ -8,27 +8,27 @@ let src = "{\"name\":\"Ada Lovelace\",\"age\":36,\"active\":true,\"langs\":[\"Sk
 
 let doc = match parse(src) {
   Ok(j) => j,
-  Err(e) => { println("parse error: " + e)  JNull },
+  Err(e) => { println("parse error: " + e)  Null },
 }
 
 // ---- navigate with typed accessors ----
-match getField(doc, "name") { Some(JStr(s)) => println("name   = " + s), _ => println("name   = ?") }
-match asInt(unwrap(getField(doc, "age"))) { Some(n) => println("age    = " + toString(n)), None => println("age    = ?") }
-match getField(doc, "active") { Some(JBool(b)) => println("active = " + toString(b)), _ => println("active = ?") }
-match getField(doc, "langs") {
-  Some(JArr(xs)) => println("langs  = " + toString(len(xs)) + " item(s)"),
+match doc.getField("name") { Some(Text(s)) => println("name   = " + s), _ => println("name   = ?") }
+match unwrap(doc.getField("age")).asInt() { Some(n) => println("age    = " + toString(n)), None => println("age    = ?") }
+match doc.getField("active") { Some(Boolean(b)) => println("active = " + toString(b)), _ => println("active = ?") }
+match doc.getField("langs") {
+  Some(Arr(xs)) => println("langs  = " + toString(len(xs)) + " item(s)"),
   _ => println("langs  = ?"),
 }
 
 // ---- re-serialize: compact (round-trips the structure) ----
 println("")
 println("compact:")
-println(stringify(doc))
+println(doc.stringify())
 
 // ---- re-serialize: pretty, 2-space indent ----
 println("")
 println("pretty:")
-println(stringifyPretty(doc, 2))
+println(doc.stringifyPretty(2))
 
 // ---- a malformed input reports a located error ----
 println("")

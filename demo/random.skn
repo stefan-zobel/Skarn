@@ -9,7 +9,7 @@ let mut rng = seedRng(20260721)
 print("u32:   ")
 let mut i = 0
 while i < 5 {
-  print(nextU32(rng))
+  print(rng.nextU32())
   print(" ")
   i = i + 1
 }
@@ -19,18 +19,18 @@ println("")
 print("rolls: ")
 let mut j = 0
 while j < 10 {
-  print(nextInt(rng, 1, 7))
+  print(rng.nextInt(1, 7))
   print(" ")
   j = j + 1
 }
 println("")
 
 // Doubles in [0, 1) and a scaled range.
-println("unit:  ${nextDouble(rng)}")
-println("range: ${nextDoubleRange(rng, -1.0, 1.0)}")
+println("unit:  ${rng.nextDouble()}")
+println("range: ${rng.nextDoubleRange(-1.0, 1.0)}")
 
 // A coin flip.
-println("coin:  ${nextBool(rng)}")
+println("coin:  ${rng.nextBool()}")
 
 // Shuffle a deck in place, then pick one card.
 let mut deck: Vec[Int] = vec()
@@ -39,14 +39,14 @@ while k <= 10 {
   push(deck, k)
   k = k + 1
 }
-shuffle(rng, deck)
+rng.shuffle(deck)
 println("deck:  ${toString(deck)}")
-match choice(rng, deck) {
+match rng.choice(deck) {
   Some(card) => println("card:  ${card}"),
   None => println("card:  (empty)")
 }
 
 // Independent, non-overlapping streams via split.
-let other = splitRng(rng)
+let other = rng.splitRng()
 let mut o = other
-println("split: ${nextU32(o)}")
+println("split: ${o.nextU32()}")

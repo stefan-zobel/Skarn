@@ -12,13 +12,13 @@
 // Result + `?` for error propagation, `match`, generics-free. NO escape hatch.
 
 enum Json {
-  JNull,
-  JBool(Bool),
-  JInt(Int),
-  JNum(Double),
-  JStr(String),
-  JArr(Vec[Json]),
-  JObj(Vec[Entry]),
+  Null,
+  Boolean(Bool),
+  Integer(Int),
+  Number(Double),
+  Text(String),
+  Arr(Vec[Json]),
+  Obj(Vec[Entry]),
 }
 
 struct Entry { key: String, val: Json }
@@ -48,16 +48,16 @@ fn parseValue(mut c: Cur) -> Result[Json, String] {
   let ch = peek(c)
   if ch == '{' { parseObject(c) }
   else if ch == '[' { parseArray(c) }
-  else if ch == '"' { let s = parseString(c)? Ok(JStr(s)) }
+  else if ch == '"' { let s = parseString(c)? Ok(Text(s)) }
   else if ch == 't' || ch == 'f' { parseBool(c) }
-  else if ch == 'n' { parseLit(c, "null")? Ok(JNull) }
+  else if ch == 'n' { parseLit(c, "null")? Ok(Null) }
   else if ch == '-' || (ch >= '0' && ch <= '9') { parseNumber(c) }
   else { Err("unexpected character '" + charStr(ch) + "' at position " + toString(c.i)) }
 }
 
 fn parseBool(mut c: Cur) -> Result[Json, String] {
-  if peek(c) == 't' { parseLit(c, "true")? Ok(JBool(true)) }
-  else { parseLit(c, "false")? Ok(JBool(false)) }
+  if peek(c) == 't' { parseLit(c, "true")? Ok(Boolean(true)) }
+  else { parseLit(c, "false")? Ok(Boolean(false)) }
 }
 
 // Match a fixed keyword against the input, consuming it.
@@ -87,12 +87,12 @@ fn parseNumber(mut c: Cur) -> Result[Json, String] {
   }
   let text = slice(c.s, start, c.i)
   if isReal {
-    match parseDouble(text) { Ok(d) => Ok(JNum(d)), Err(e) => Err(e) }
+    match parseDouble(text) { Ok(d) => Ok(Number(d)), Err(e) => Err(e) }
   } else {
     // An integer that overflows the 48-bit range falls back to a Double.
     match parseInt(text) {
-      Ok(n)  => Ok(JInt(n)),
-      Err(_) => match parseDouble(text) { Ok(d) => Ok(JNum(d)), Err(e) => Err(e) },
+      Ok(n)  => Ok(Integer(n)),
+      Err(_) => match parseDouble(text) { Ok(d) => Ok(Number(d)), Err(e) => Err(e) },
     }
   }
 }
@@ -163,7 +163,7 @@ fn parseArray(mut c: Cur) -> Result[Json, String] {
   eat(c, '[')?
   let items: Vec[Json] = vec()
   skipWs(c)
-  if peek(c) == ']' { adv(c) return Ok(JArr(items)) }
+  if peek(c) == ']' { adv(c) return Ok(Arr(items)) }
   loop {
     let v = parseValue(c)?
     push(items, v)
@@ -173,13 +173,13 @@ fn parseArray(mut c: Cur) -> Result[Json, String] {
     else if ch == ']' { adv(c) break }
     else { return Err("expected ',' or ']' at position " + toString(c.i)) }
   }
-  Ok(JArr(items))
+  Ok(Arr(items))
 }
 fn parseObject(mut c: Cur) -> Result[Json, String] {
   eat(c, '{')?
   let entries: Vec[Entry] = vec()
   skipWs(c)
-  if peek(c) == '}' { adv(c) return Ok(JObj(entries)) }
+  if peek(c) == '}' { adv(c) return Ok(Obj(entries)) }
   loop {
     skipWs(c)
     if peek(c) != '"' { return Err("expected string key at position " + toString(c.i)) }
@@ -194,7 +194,7 @@ fn parseObject(mut c: Cur) -> Result[Json, String] {
     else if ch == '}' { adv(c) break }
     else { return Err("expected ',' or '}' at position " + toString(c.i)) }
   }
-  Ok(JObj(entries))
+  Ok(Obj(entries))
 }
 
 fn parseJson(s: String) -> Result[Json, String] {
@@ -208,13 +208,13 @@ fn parseJson(s: String) -> Result[Json, String] {
 // ---- rendering (compact) + typed queries ------------------------------------
 fn render(j: Json) -> String {
   match j {
-    JNull    => "null",
-    JBool(b) => if b { "true" } else { "false" },
-    JInt(n)  => toString(n),
-    JNum(d)  => toString(d),
-    JStr(s)  => "\"" + s + "\"",
-    JArr(xs) => renderArr(xs),
-    JObj(es) => renderObj(es),
+    Null    => "null",
+    Boolean(b) => if b { "true" } else { "false" },
+    Integer(n)  => toString(n),
+    Number(d)  => toString(d),
+    Text(s)  => "\"" + s + "\"",
+    Arr(xs) => renderArr(xs),
+    Obj(es) => renderObj(es),
   }
 }
 fn renderArr(xs: Vec[Json]) -> String {
@@ -240,7 +240,7 @@ fn renderObj(es: Vec[Entry]) -> String {
 
 fn objGet(j: Json, key: String) -> Option[Json] {
   match j {
-    JObj(es) => {
+    Obj(es) => {
       let mut res: Option[Json] = None
       for e in es { if e.key == key { res = Some(e.val) } }
       res
@@ -248,9 +248,9 @@ fn objGet(j: Json, key: String) -> Option[Json] {
     _ => None,
   }
 }
-fn asInt(j: Json) -> Option[Int]    { match j { JInt(n) => Some(n), _ => None } }
-fn asNum(j: Json) -> Option[Double] { match j { JNum(d) => Some(d), _ => None } }
-fn asArr(j: Json) -> Option[Vec[Json]] { match j { JArr(xs) => Some(xs), _ => None } }
+fn asInt(j: Json) -> Option[Int]    { match j { Integer(n) => Some(n), _ => None } }
+fn asNum(j: Json) -> Option[Double] { match j { Number(d) => Some(d), _ => None } }
+fn asArr(j: Json) -> Option[Vec[Json]] { match j { Arr(xs) => Some(xs), _ => None } }
 
 // ---- demo -------------------------------------------------------------------
 let doc = "{ \"name\": \"Ada Lovelace\", \"age\": 36, \"member\": true, \"langs\": [\"vLang\", \"Rust\"], \"scores\": [90, 85, 77], \"gpa\": 3.85, \"tick\": \"ok \\u2713\" }"
@@ -272,7 +272,7 @@ match parseJson(doc) {
       if let Some(xs) = asArr(sc) {
         let mut sum = 0
         let mut cnt = 0
-        for x in xs { if let JInt(n) = x { sum = sum + n cnt = cnt + 1 } }
+        for x in xs { if let Integer(n) = x { sum = sum + n cnt = cnt + 1 } }
         if cnt > 0 { println("scores avg   = " + toString(sum / cnt)) }
       }
     }

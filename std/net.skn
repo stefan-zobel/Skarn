@@ -3,6 +3,10 @@
 // helpers (sendStr / recvLine / recvAll) sit on top. A socket is a small Int descriptor inside the
 // TcpConn / TcpListener wrappers.
 //
+// The per-connection operations are inherent methods -- call them with dot syntax: `c.send(data)?`,
+// `c.recvLine()?`, `l.accept()?`. The constructors (`connect` / `listen` / `httpGet`) have no receiver,
+// so they stay free.
+//
 // OPT-IN: reach these wrappers AND the tcp* natives via `use std::net::*`. Same-module code (these
 // wrappers) may call the natives freely.
 //
@@ -15,10 +19,10 @@
 // boundary by recvLine (it stays empty for a purely byte-oriented user of send/recv).
 pub struct TcpConn { fd: Int, buf: Bytes }
 
-// A listening socket (the server side). Accept incoming connections with `accept`.
+// A listening socket (the server side). Accept incoming connections with `l.accept()`.
 pub struct TcpListener { fd: Int }
 
-// --- client ---
+// --- client / server constructors (no receiver -> free functions) ---
 
 // Connect to host:port. `host` may be a name or an IPv4/IPv6 literal; both address families are tried.
 pub fn connect(host: String, port: Int) -> Result[TcpConn, String] {
@@ -26,39 +30,13 @@ pub fn connect(host: String, port: Int) -> Result[TcpConn, String] {
   Ok(TcpConn { fd: fd, buf: bytes() })
 }
 
-// Send a whole byte buffer (loops until every byte is flushed).
-pub fn send(c: TcpConn, data: Bytes) -> Result[(), String] { tcpSend(c.fd, data) }
-
-// Send a whole string's bytes.
-pub fn sendStr(c: TcpConn, s: String) -> Result[(), String] { tcpSend(c.fd, toBytes(s)) }
-
-// Receive up to `n` bytes. An EMPTY result means the peer closed the connection (EOF).
-pub fn recv(c: TcpConn, n: Int) -> Result[Bytes, String] { tcpRecv(c.fd, n) }
-
-// Set the recv/send timeout in milliseconds (<= 0 means block indefinitely, the default).
-pub fn setTimeout(c: TcpConn, ms: Int) -> Result[(), String] { tcpSetTimeout(c.fd, ms) }
-
-// Close the connection. A second close of the same socket returns an "invalid socket" Err.
-pub fn close(c: TcpConn) -> Result[(), String] { tcpClose(c.fd) }
-
-// --- server ---
-
 // Bind + listen on `port` (dual-stack: accepts both IPv6 and IPv4-mapped clients).
 pub fn listen(port: Int) -> Result[TcpListener, String] {
   let fd = tcpListen(port)?
   Ok(TcpListener { fd: fd })
 }
 
-// Block until a client connects; return the accepted connection.
-pub fn accept(l: TcpListener) -> Result[TcpConn, String] {
-  let fd = tcpAccept(l.fd)?
-  Ok(TcpConn { fd: fd, buf: bytes() })
-}
-
-// Stop listening (server self-shutdown).
-pub fn closeListener(l: TcpListener) -> Result[(), String] { tcpClose(l.fd) }
-
-// --- buffered text helpers (built on the byte core) ---
+// --- buffered-text helper internals (built on the byte core) ---
 
 // Index of the first byte == `target` at or after `from` in `b`, or -1 if none.
 fn _indexOfByte(b: Bytes, target: Int, from: Int) -> Int {
@@ -77,38 +55,68 @@ fn _sub(b: Bytes, lo: Int, hi: Int) -> Bytes {
   out
 }
 
-// Read all remaining bytes until EOF, INCLUDING any bytes buffered by a prior recvLine.
-pub fn recvAll(mut c: TcpConn) -> Result[Bytes, String] {
-  let out = bytes()
-  appendBytes(out, c.buf)
-  c.buf = bytes()
-  loop {
-    let chunk = tcpRecv(c.fd, 65536)?
-    if len(chunk) == 0 { return Ok(out) }
-    appendBytes(out, chunk)
+// --- a connection's own API (dot syntax: c.send(data), c.recvLine(), ...) ---
+impl TcpConn {
+  // Send a whole byte buffer (loops until every byte is flushed).
+  fn send(self, data: Bytes) -> Result[(), String] { tcpSend(self.fd, data) }
+
+  // Send a whole string's bytes.
+  fn sendStr(self, s: String) -> Result[(), String] { tcpSend(self.fd, toBytes(s)) }
+
+  // Receive up to `n` bytes. An EMPTY result means the peer closed the connection (EOF).
+  fn recv(self, n: Int) -> Result[Bytes, String] { tcpRecv(self.fd, n) }
+
+  // Set the recv/send timeout in milliseconds (<= 0 means block indefinitely, the default).
+  fn setTimeout(self, ms: Int) -> Result[(), String] { tcpSetTimeout(self.fd, ms) }
+
+  // Close the connection. A second close of the same socket returns an "invalid socket" Err.
+  fn close(self) -> Result[(), String] { tcpClose(self.fd) }
+
+  // Read all remaining bytes until EOF, INCLUDING any bytes buffered by a prior recvLine.
+  fn recvAll(mut self) -> Result[Bytes, String] {
+    let out = bytes()
+    appendBytes(out, self.buf)
+    self.buf = bytes()
+    loop {
+      let chunk = tcpRecv(self.fd, 65536)?
+      if len(chunk) == 0 { return Ok(out) }
+      appendBytes(out, chunk)
+    }
+  }
+
+  // Read one '\n'-terminated line (the '\n' and a preceding '\r' are stripped). Returns None at EOF
+  // with nothing buffered; a final unterminated line is returned once, then None.
+  fn recvLine(mut self) -> Result[Option[String], String] {
+    loop {
+      let idx = _indexOfByte(self.buf, 10, 0)
+      if idx >= 0 {
+        let end = if idx > 0 && self.buf[idx - 1] == 13 { idx - 1 } else { idx }
+        let line = sliceBytes(self.buf, 0, end)
+        self.buf = _sub(self.buf, idx + 1, len(self.buf))
+        return Ok(Some(line))
+      }
+      let chunk = tcpRecv(self.fd, 4096)?
+      if len(chunk) == 0 {
+        if len(self.buf) == 0 { return Ok(None) }
+        let last = sliceBytes(self.buf, 0, len(self.buf))
+        self.buf = bytes()
+        return Ok(Some(last))
+      }
+      appendBytes(self.buf, chunk)
+    }
   }
 }
 
-// Read one '\n'-terminated line (the '\n' and a preceding '\r' are stripped). Returns None at EOF
-// with nothing buffered; a final unterminated line is returned once, then None.
-pub fn recvLine(mut c: TcpConn) -> Result[Option[String], String] {
-  loop {
-    let idx = _indexOfByte(c.buf, 10, 0)
-    if idx >= 0 {
-      let end = if idx > 0 && c.buf[idx - 1] == 13 { idx - 1 } else { idx }
-      let line = sliceBytes(c.buf, 0, end)
-      c.buf = _sub(c.buf, idx + 1, len(c.buf))
-      return Ok(Some(line))
-    }
-    let chunk = tcpRecv(c.fd, 4096)?
-    if len(chunk) == 0 {
-      if len(c.buf) == 0 { return Ok(None) }
-      let last = sliceBytes(c.buf, 0, len(c.buf))
-      c.buf = bytes()
-      return Ok(Some(last))
-    }
-    appendBytes(c.buf, chunk)
+// --- a listener's own API ---
+impl TcpListener {
+  // Block until a client connects; return the accepted connection.
+  fn accept(self) -> Result[TcpConn, String] {
+    let fd = tcpAccept(self.fd)?
+    Ok(TcpConn { fd: fd, buf: bytes() })
   }
+
+  // Stop listening (server self-shutdown).
+  fn closeListener(self) -> Result[(), String] { tcpClose(self.fd) }
 }
 
 // --- a minimal HTTP/1.0 client (the optional text layer; REST = this + std::json) ---
@@ -137,9 +145,9 @@ fn _httpStatus(head: String) -> Int {
 pub fn httpGet(host: String, port: Int, path: String) -> Result[HttpResponse, String] {
   let mut c = connect(host, port)?
   let req = "GET " + path + " HTTP/1.0\r\nHost: " + host + "\r\nConnection: close\r\n\r\n"
-  sendStr(c, req)?
-  let raw = recvAll(c)?
-  close(c)?
+  c.sendStr(req)?
+  let raw = c.recvAll()?
+  c.close()?
   let text = fromBytes(raw)
   let sep = indexOf(text, "\r\n\r\n")
   let headEnd = if sep >= 0 { sep } else { len(text) }

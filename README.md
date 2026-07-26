@@ -1,6 +1,6 @@
 # An Introduction to Skarn
 
-Skarn is a small, statically typed scripting language that runs on the vMachine bytecode interpreter.
+Skarn is a statically typed scripting language that runs on the vMachine bytecode interpreter.
 This guide is a complete, example-driven tour of the language for working programmers. It assumes you are
 comfortable with a mainstream statically typed language and have seen a few functional-programming ideas
 (closures, pattern matching, immutable-by-default values), but it does **not** assume you know any particular
@@ -8,6 +8,58 @@ functional language — every construct is explained on its own terms.
 
 Every code block in this guide is a real program (or fragment) that compiles and runs. Where it helps, the
 expected output is shown in a trailing comment (`// => ...`).
+
+## Why Skarn?
+
+Skarn is a statically-typed language with a **Rust-flavored surface** — enums with exhaustive `match`,
+`Option`/`Result` with `?`, traits with bounds, immutability by default, everything an expression — but it runs
+on a garbage-collected bytecode VM, so it **drops the parts of Rust that make Rust hard**.
+
+> **In a hurry?** [Skarn in 15 minutes](SkarnIn15Minutes.md) is the small core — bindings, functions, `struct`,
+> `enum`/`match`, `Option`/`Result`/`?`, and the everyday collections — enough to write real programs. Come back
+> here for traits, generics, iterators, and the standard library.
+
+The one-sentence pitch: *the safety and expressiveness of Rust's type system, without the borrow checker.*
+
+Concretely:
+
+- **No borrow checker, no lifetimes, no ownership/move semantics.** A GC manages memory, so you never write
+  `&`, `&mut`, or `'a`, never fight the borrow checker, and never track who "owns" a value — you just pass
+  values around.
+- **No `null`.** Absence is `Option[T]`; the null-dereference bug class is gone by construction.
+- **No exceptions.** Recoverable failure is a `Result[T, E]` value threaded with `?`; unrecoverable failure is
+  `panic`, which aborts. No invisible control flow.
+- **No classes or inheritance.** Data is plain `struct`s and `enum`s; behavior is `trait`s. Composition over
+  hierarchy.
+- **Sound, then erased.** The type checker is the single guarantee; at runtime all generics, traits, and `dyn`
+  are erased — no reflection, no runtime type tags, no boxing. Types cost nothing once the program runs.
+
+### Compared to the languages it borrows from
+
+| | Shares with Skarn | What Skarn does differently |
+|---|---|---|
+| **Rust** | enums + `match`, `Option`/`Result` + `?`, traits + bounds, immutability, no null | **GC instead of a borrow checker** — no lifetimes/ownership/`&mut`; generics are *erased* (one body), not monomorphized |
+| **Kotlin / Java** | GC, pragmatic, quick to learn | sum types + exhaustive matching; `Result` not exceptions; `Option` not nullable types; no inheritance |
+| **Go** | GC, small language, fast to pick up | real sum types + generics-with-traits + `?`; expression-oriented, no `if err != nil` boilerplate |
+
+### Deliberate scope (what Skarn is *not*)
+
+Skarn keeps its type system **first-order and simple on purpose**: generics are rank-1 with trait bounds — no
+higher-kinded types, no lifetimes, no higher-rank polymorphism. Strings are **byte strings** by default (code
+points are an opt-in layer). It targets a compact interpreter, not native code, so it is an
+**application/scripting** language, not a systems language: you trade Rust's zero-overhead-at-any-cost for a GC
+that removes Rust's single hardest concept. Where Rust asks "who owns this, and for how long?", Skarn's answer
+is "the GC does — write the obvious code."
+
+Let's be honest about the rest, though: what Skarn removes is Rust's **difficulty** (ownership, lifetimes, the borrow
+checker), not Rust's **feature count**. The surface is Rust-family-sized — traits, generics, `dyn`, exhaustive
+pattern matching, lazy iterators — so this is not a tiny language you learn in an afternoon. What it *is* is a
+**layered** one. The core you need to be productive — `let`/`fn`/`struct`/`enum`/`match`/`Option`/`Result` and
+the everyday collections — is small and quick to hold in your head (that is exactly
+[Skarn in 15 minutes](SkarnIn15Minutes.md)). The heavier machinery — blanket and parametric `impl`s, `dyn`,
+the erasure types, the full call-form and module surface — is mostly there for **reading** the standard library
+and growing into, not for everyday **writing**. You can go a long way on the core and reach for the rest only
+when a problem asks for it.
 
 ## How to read this guide
 
@@ -46,7 +98,8 @@ static_vmrun.exe myprogram.skn
 22. [Programming styles: imperative, functional, streaming](#22-programming-styles-imperative-functional-streaming)
 23. [The type system in one page](#23-the-type-system-in-one-page)
 24. [A complete little program](#24-a-complete-little-program)
-25. [Quick reference: the standard library](#25-quick-reference-the-standard-library)
+25. [The memory & cost model](#25-the-memory--cost-model)
+26. [Quick reference: the standard library](#26-quick-reference-the-standard-library)
 
 ---
 
@@ -298,6 +351,10 @@ fn plus(n: Int, k: Int) -> Int { n + k }
 let piped = 5 |> twice |> plus(1)   // plus(twice(5), 1) => 11
 println("piped=" + piped)
 ```
+
+The pipe is one of a small handful of call forms — there is also method syntax `x.method()` for a type's own
+operations. All the forms are laid out together in *Calling things — the forms at a glance* (§16); the short
+version is that `|>` threads a value into any free function, while `.` reaches a type's methods.
 
 ---
 
@@ -1144,6 +1201,43 @@ Notes and limits:
 - You **cannot implement a trait** for an Int-backed enum (it shares its integer representation at runtime).
 - There is no built-in `Direction`↔`Int` conversion yet; you match on the variants by name.
 
+### Namespacing variants under their enum
+
+Variant constructors belong to their enum. You can always write the **qualified path** `Enum::Variant` — as
+a value, a call, a pattern, or a record-variant literal:
+
+```rust
+enum Color { Red, Green, Blue }
+enum Shape { Dot, Rect { w: Int, h: Int } }
+
+let c = Color::Green                        // qualified value
+let s = Shape::Rect { w: 3, h: 4 }          // qualified record-variant literal
+match c { Color::Red => 0, Color::Green => 1, Color::Blue => 2 }
+```
+
+Within the module that **defines** an enum, its variants are also usable **bare** (`Green`, `Rect { … }`),
+so most code needs no qualifier. The qualified form matters when two enums in the **same module** share a
+variant name — they now coexist, and you disambiguate with the enum:
+
+```rust
+enum Token { Number, Ident }
+enum Node  { Number, List }                 // `Number` also here -- no longer an error
+
+let t = Token::Number
+let n = Node::Number
+```
+
+A **bare** `Number` in that module is a compile error ("ambiguous variant 'Number'; qualify it") — write
+`Token::Number` or `Node::Number`. (The prelude's `Option`/`Result` variants — `Some`/`None`/`Ok`/`Err` —
+are always available bare, everywhere.)
+
+To bring another module's variants in bare, import them from the enum:
+
+```rust
+use std::json::Json::*                       // all of Json's variants, bare
+use std::json::Json::{ Null, Text }          // or just some
+```
+
 ### Char and UTF-8 code points
 
 A `String` is a sequence of **bytes** by default: `for c in s` yields byte values, `len(s)` is a byte count,
@@ -1676,6 +1770,35 @@ A **trait** is a named set of operations that a type can implement. This is Skar
 polymorphism, and it deserves a careful look because it works differently from the interfaces you may be used
 to.
 
+### Calling things — the forms at a glance
+
+By this point you have seen a value passed to a function in a few different ways. Before traits add one more,
+here is the whole picture in one place — there are **four** call forms, and which ones apply depends on
+*what* you are calling:
+
+| Form | Example | What it can call |
+|------|---------|------------------|
+| **free function** | `area(shape)`, `len(xs)` | any free function or builtin |
+| **pipe** | `shape \|> area`, `xs \|> map(f) \|> sum` | threads a value into *any* free function, left-to-right |
+| **method** | `shape.area()`, `rng.nextInt(1, 7)` | a type's own methods — an **inherent** method or a **trait** method |
+| **qualified trait** | `Shape::area(x)` | one specific trait's method, when you need to name it explicitly |
+
+The rule of thumb is short:
+
+- **free-function and pipe forms reach *free functions*.** `f(x)` and `x |> f` are the same call; the pipe just
+  reads left-to-right and chains. Standalone operations like `map`/`filter`/`sum`/`len` are free functions, so
+  you write `xs |> map(f)`, never `xs.map(f)`.
+- **the `.` form reaches a *type's methods*.** Those come from an `impl` block — either a **trait** `impl`
+  (a shared contract, this section) or an **inherent** `impl` (a type's own API, later in this section).
+- **a trait method accepts all three of free / pipe / `.`** — `area(s)`, `s |> area`, and `s.area()` are the
+  exact same call. An **inherent** method is **`.`-only**. `Trait::method(x)` is the escape hatch for naming a
+  specific trait when a plain call would be ambiguous.
+
+So the receiver-centric std types read as methods (`rng.nextInt(1, 7)`, `dt.toIso()`, `conn.send(bytes)?`,
+`json.getField("id")`), while pipelines of standalone verbs stay pipes (`xs |> filter(even) |> toVec`). The rest
+of this section fills in the two `impl` kinds behind the method form; the details of resolution order and the
+`.`-vs-`|>` split are collected under *Method-call syntax and inherent methods* below.
+
 ### Defining and implementing a trait
 
 You declare a trait with the operations it requires, then provide an `impl` block for each type that supports
@@ -1843,6 +1966,58 @@ If your mental model of polymorphism comes from classes and interfaces, a few po
 The practical upshot: traits let you describe *capabilities* ("this type can be measured", "this type can be
 shown as text") and attach them to types independently, rather than baking a fixed interface list into a class
 definition.
+
+### Method-call syntax and inherent methods
+
+Any method can be called with **dot syntax** on its receiver — `x.method(args)` — as an alternative to the
+free-function / pipe forms. This works for trait methods:
+
+```rust
+let a = area(shape)      // free-function form
+let a = shape |> area    // pipe form
+let a = shape.area()     // method form -- all three call the same trait method
+```
+
+For a type's **own** operations that are not a shared contract, write a traitless **inherent `impl`** block —
+it introduces the type parameters once and gives the type a first-class API:
+
+```rust
+struct Rect { w: Int, h: Int }
+
+impl Rect {
+    fn area(self) -> Int { self.w * self.h }
+    fn scaled(self, k: Int) -> Rect { Rect { w: self.w * k, h: self.h * k } }
+}
+
+let r = Rect { w: 3, h: 4 }
+println(r.area())                 // => 12
+println(r.scaled(2).area())       // => 48   (methods chain left-to-right)
+```
+
+Generic types and `mut self` work as expected:
+
+```rust
+struct Stack[T] { items: Vec[T] }
+
+impl[T] Stack[T] {
+    fn push(mut self, x: T) -> () { push(self.items, x) }   // mut self -> caller-visible
+    fn size(self) -> Int { len(self.items) }
+}
+```
+
+Rules and boundaries:
+
+- **Inherent methods are called with `.` only** — `r.area()`, not `area(r)` or `r |> area`. (Trait methods keep
+  all three forms.) An inherent method may only be added to a type defined in the same module.
+- **Resolution order for `x.name(...)`** is: a struct **field** named `name` (so a function-valued field stays
+  callable), then an **inherent** method, then a **trait** method. An inherent method therefore shadows a
+  same-named trait method for `.`; the trait method is still reachable as `Trait::name(x)`.
+- **`.` and `|>` are complements, not rivals.** `.method()` reaches a type's methods; the pipe threads a value
+  into *any* free function or builtin, which is what the lazy-iterator pipelines use:
+  `xs |> map(f) |> filter(p) |> sum`. There is no `xs.map(f)` — `map`/`filter`/… are free functions.
+- **Inherent methods are dot-only today.** There is no qualified `Type::method(x)` call form yet (unlike
+  `Trait::method(x)`, which exists); it is a possible later addition. Turning *every* free function into a
+  `x.f()` call (full UFCS) is a deliberate non-goal — it would make `|>` redundant.
 
 ---
 
@@ -2367,29 +2542,35 @@ The **opt-in** modules must be brought in with a `use` before their functions re
   `reader(b)` cursor (`ByteReader`) with `readU8`/`readU16LE`/`readU32LE`/`readI32LE`/`readVarU`/`readVarI`/`readStr`/
   `readBytes(n)` (each returns `Result[…, String]` — an underrun is `Err`, never a trap), plus `remaining`/`atEnd`.
   `writeVarI`/`readVarI` are a compact zigzag varint for signed `Int`s; `writeStr`/`readStr` length-prefix a `String`.
-- `std::json` — a JSON parser and serializer over a `Json` value tree: `parse(s) -> Result[Json, String]`,
-  `stringify(j)` / `stringifyChecked(j) -> Result[String, String]` / `stringifyPretty(j, indent)`, and the
-  accessors `getField`/`at`/`asInt`/`asDouble`/`asStr`/`asBool`/`asArr`/`asObj`/`asMap`/`isNull`.
-- `std::random` — a pseudo-random generator (the xoshiro128\*\* algorithm). Seed once with `seedRng(seed) -> Rng`,
-  then draw: `nextU32`, `nextInt(lo, hi)` / `nextIntBounded(bound)`, `nextInt48`, `nextBool`, `nextDouble` (in
-  `[0, 1)`) / `nextDoubleRange(lo, hi)`; plus `shuffle`/`choice` for `Vec`s, `jump`/`splitRng` for independent
-  streams, and the bulk `fillU32`/`fillDoubles`. It also offers `nextGaussian` / `nextGaussianMS(mu, sigma)` (a
-  normal deviate, via Box–Muller), `choiceWeighted(items, weights) -> Option[T]` (weighted pick), and
-  `sample(v, k) -> Vec[T]` (k distinct elements without replacement). It is **deterministic** (same seed → same
+- `std::json` — a JSON parser and serializer over a `Json` value tree: the free `parse(s) -> Result[Json, String]`
+  constructor, plus **methods on a `Json`** — the serializers `j.stringify()` / `j.stringifyChecked() ->
+  Result[String, String]` / `j.stringifyPretty(indent)`, and the accessors `j.getField(key)`/`j.at(i)`/`j.asInt()`/
+  `j.asDouble()`/`j.asStr()`/`j.asBool()`/`j.asArr()`/`j.asObj()`/`j.asMap()`/`j.isNull()`.
+- `std::random` — a pseudo-random generator (the xoshiro128\*\* algorithm). Seed once with the free `seedRng(seed)
+  -> Rng` (or `rngFromState`), then draw with **methods on the `Rng`**: `rng.nextU32()`, `rng.nextInt(lo, hi)` /
+  `rng.nextIntBounded(bound)`, `rng.nextInt48()`, `rng.nextBool()`, `rng.nextDouble()` (in `[0, 1)`) /
+  `rng.nextDoubleRange(lo, hi)`; plus `rng.shuffle(v)`/`rng.choice(v)` for `Vec`s, `rng.jump()`/`rng.splitRng()` for
+  independent streams, and the bulk `rng.fillU32(out, n)`/`rng.fillDoubles(out, n)`. It also offers
+  `rng.nextGaussian()` / `rng.nextGaussianMS(mu, sigma)` (a normal deviate, via Box–Muller),
+  `rng.choiceWeighted(items, weights) -> Option[T]` (weighted pick), and `rng.sample(v, k) -> Vec[T]` (k distinct
+  elements without replacement). It is **deterministic** (same seed → same
   stream, so it is fully reproducible) and **not cryptographically secure** — do not use it for keys or secrets.
   It pulls no entropy on its own; for an unpredictable seed pass one in yourself (e.g. `use std::env` and
   `seedRng(nanoTime())`).
-- `std::set` — a hash **`Set[T]`** (over `Map[T, Bool]`): `set()` / `setOf(vec)`, `insert`/`remove` (each returns
-  a `Bool`), `isMember`, `size`, the algebra `union`/`intersect`/`difference`/`isSubset`/`isDisjoint`, and
+- `std::set` — a hash **`Set[T]`** (over `Map[T, Bool]`): the free constructors `set()` / `setOf(vec)`, then
+  **methods on the `Set`** — `s.insert(x)`/`s.remove(x)` (each returns a `Bool`), `s.isMember(x)`, `s.size()`, the
+  algebra `a.union(b)`/`a.intersect(b)`/`a.difference(b)`/`a.isSubset(b)`/`a.isDisjoint(b)`, and
   `for x in s` (plus the lazy combinators) via `IntoIterator`. The element type `T` must be `Hashable`
   (`Int`/`Double`/`Bool`/`String`) — a `Set` of any other type is a **compile error** (see below);
   iteration is hash-order (unspecified), like `Map`.
 - `std::time` — dates and times, **strict UTC** at **millisecond** precision. Three value types plus a
   `Stopwatch`: an `Instant` (a point on the timeline, epoch milliseconds), a `Duration` (a span), and a
-  `DateTime` (the decomposed civil fields). `now() -> Instant` reads the wall clock; `toDateTime`/`fromDateTime`
-  convert; `dateTime(y, mo, d, h, mi, s, ms) -> Option[DateTime]` validates strictly (bad fields → `None`);
-  `toIso`/`parseIso` round-trip an ISO-8601 string; `weekday` (ISO Mon=1..Sun=7), `isLeapYear`, `daysInMonth`;
-  `Duration` constructors `millis`/`seconds`/`minutes`/`hours`/`days` with `in*` accessors and arithmetic. An
+  `DateTime` (the decomposed civil fields). The free constructors `now() -> Instant` (wall clock),
+  `instantFromMillis`, `fromDateTime`, `dateTime(y, mo, d, h, mi, s, ms) -> Option[DateTime]` (strict validation,
+  bad fields → `None`), `parseIso`, and the `Duration` builders `millis`/`seconds`/`minutes`/`hours`/`days`; then
+  **methods on the value** — `t.toDateTime()`, `t.addDuration(d)`/`t.subDuration(d)`/`a.durationBetween(b)`,
+  `dt.toIso()`, `dt.weekday()` (ISO Mon=1..Sun=7), and a `Duration`'s `d.inSeconds()` etc. + arithmetic
+  (`isLeapYear`/`daysInMonth` take a year, so they stay free). An
   `Instant` spans roughly year -2490..6429 (the ±2⁴⁷-ms window); sub-millisecond precision and time zones are
   out of scope for v1.
 - `std::cli` — a small, spec-free command-line argument parser over a `Vec[String]` (typically
@@ -2404,11 +2585,22 @@ The **opt-in** modules must be brought in with a `use` before their functions re
   distribution — a fast general-purpose (non-cryptographic) hash for hash tables and fingerprinting.
   **SHA-256** (FIPS 180-4): `sha256(bytes) -> Bytes` is the raw 32-byte cryptographic digest; `sha256Hex(bytes)`
   / `sha256HexStr(s)` give the 64-char lowercase hex string, and `toHex(bytes)` hex-encodes any buffer.
-- `std::net` — **TCP networking** (blocking sockets). Client: `connect(host, port) -> Result[TcpConn, String]`,
-  then `send`/`sendStr`/`recv`/`recvLine`/`recvAll`/`close`; server: `listen(port)`, `accept(l)`, `closeListener`.
-  Both IPv4 and IPv6; `setTimeout(c, ms)` sets recv/send timeouts. A minimal HTTP/1.0 `httpGet(host, port, path) ->
+- `std::net` — **TCP networking** (blocking sockets). The free constructors `connect(host, port) ->
+  Result[TcpConn, String]` and `listen(port) -> Result[TcpListener, String]`, then **methods** on the connection —
+  `c.send(b)`/`c.sendStr(s)`/`c.recv(n)`/`c.recvLine()`/`c.recvAll()`/`c.close()`/`c.setTimeout(ms)` — and on the
+  listener — `l.accept()`/`l.closeListener()`. Both IPv4 and IPv6. A minimal HTTP/1.0 `httpGet(host, port, path) ->
   Result[HttpResponse, String]` sits on top (REST = `httpGet` + `std::json::parse`). **Limits:** blocking only (one
   connection at a time), plaintext only (no TLS, so `http://` not `https://`), close sockets explicitly.
+- `std::regex` — **regular expressions**, a linear-time byte-level engine (Thompson NFA / Pike VM — no
+  catastrophic backtracking). `compile(pattern) -> Result[Regex, RegexError]` (or `compileWith(pattern, "ims")`);
+  then `isMatch`, `search`/`searchFrom -> Option[Match]`, `captures -> Option[Captures]` with `group(c, i)` /
+  `groupNamed(c, name)`, the lazy `searchAll` / `capturesAll` / `splitRe` (each a `dyn Iterator`), and
+  `replaceRe` (first) / `replaceAllRe` (all) with `$0`..`$N` / `${name}` templates. Syntax: `. * + ? | ( ) (?:)
+  (?<name>) [...] ^ $`, non-greedy `*?`, counts `{n}`/`{n,}`/`{n,m}`, shorthands `\d \w \s` (+ negated), word
+  boundary `\b`, and flags `i` (ASCII case), `m` (multiline), `s` (dotall). **Byte-level** (`.` matches one byte;
+  ASCII-correct); **no** backreferences or lookaround (they'd break the linear guarantee). Match anywhere is
+  `search` (not `find`) and replacement is `replaceRe` (not `replace`) — those names belong to `std::iter` /
+  `std::string`.
 
 For example, `std::json` round-trips a document through its `Json` value tree:
 
@@ -2416,9 +2608,31 @@ For example, `std::json` round-trips a document through its `Json` value tree:
 use std::json::*
 
 let doc = unwrap(parse("{\"name\": \"Ada\", \"age\": 36}"))
-let name = unwrap(asStr(unwrap(getField(doc, "name"))))
+let name = unwrap(unwrap(doc.getField("name")).asStr())
 println(name)                  // => Ada
-println(stringify(doc))        // => {"name":"Ada","age":36}
+println(doc.stringify())       // => {"name":"Ada","age":36}
+```
+
+The `as*` accessors are the convenient path, but a `Json` is an ordinary enum — you can also `match` a value
+directly against its cases, qualified as `Json::Case` (the cases are `Null`, `Boolean`, `Integer`, `Number`,
+`Text`, `Arr`, `Obj`):
+
+```rust
+use std::json::*
+
+fn describe(j: Json) -> String {
+  match j {
+    Json::Null       => "null",
+    Json::Boolean(b) => if b { "yes" } else { "no" },
+    Json::Integer(n) => "int " + toString(n),
+    Json::Number(d)  => "num " + toString(d),
+    Json::Text(s)    => "str " + s,
+    Json::Arr(xs)    => "array of " + toString(len(xs)),
+    Json::Obj(es)    => "object of " + toString(len(es)),
+  }
+}
+println(describe(unwrap(parse("42"))))          // => int 42
+println(describe(unwrap(parse("[1,2,3]"))))     // => array of 3
 ```
 
 And `std::random`, seeded for reproducibility, rolls a die and shuffles a deck:
@@ -2427,8 +2641,8 @@ And `std::random`, seeded for reproducibility, rolls a die and shuffles a deck:
 use std::random::*
 
 let mut rng = seedRng(42)
-println(nextInt(rng, 1, 7))    // a fair die: an Int in [1, 6]
-println(nextDouble(rng))       // a Double in [0, 1)
+println(rng.nextInt(1, 7))     // a fair die: an Int in [1, 6]
+println(rng.nextDouble())      // a Double in [0, 1)
 
 let mut deck: Vec[Int] = vec()
 let mut i = 1
@@ -2436,7 +2650,7 @@ while i <= 5 {
   push(deck, i)
   i = i + 1
 }
-shuffle(rng, deck)             // a uniformly-random permutation, in place
+rng.shuffle(deck)              // a uniformly-random permutation, in place
 println(toString(deck))
 ```
 
@@ -2468,13 +2682,13 @@ use std::set::*
 let mut v: Vec[Int] = vec()
 push(v, 1) push(v, 2) push(v, 2) push(v, 3)
 let a = setOf(v)               // {1, 2, 3}
-println(size(a))               // 3
-println(isMember(a, 2))        // true
+println(a.size())              // 3
+println(a.isMember(2))         // true
 
 let mut w: Vec[Int] = vec()
 push(w, 2) push(w, 3) push(w, 4)
 let b = setOf(w)
-println(size(intersect(a, b))) // 2   ({2, 3})
+println(a.intersect(b).size()) // 2   ({2, 3})
 ```
 
 And `std::time` decomposes an instant, does duration arithmetic, and round-trips ISO-8601:
@@ -2482,13 +2696,13 @@ And `std::time` decomposes an instant, does duration arithmetic, and round-trips
 ```rust
 use std::time::*
 
-let t = instantFromMillis(1784644215123)   // 2026-07-21 14:30:15.123 UTC
-let dt = toDateTime(t)
-println(toIso(dt))                          // => 2026-07-21T14:30:15.123Z
-println(weekday(dt))                        // => 2   (ISO Mon=1..Sun=7 -> Tuesday)
+let t = instantFromMillis(1784644215123)    // 2026-07-21 14:30:15.123 UTC
+let dt = t.toDateTime()
+println(dt.toIso())                         // => 2026-07-21T14:30:15.123Z
+println(dt.weekday())                       // => 2   (ISO Mon=1..Sun=7 -> Tuesday)
 
-let later = addDuration(t, hours(2))
-println(inMinutes(durationBetween(t, later)))   // => 120
+let later = t.addDuration(hours(2))
+println(t.durationBetween(later).inMinutes())   // => 120
 
 match parseIso("2000-02-29T12:00:00.000Z") {
   Ok(d)  => println(d.year),                // => 2000
@@ -2505,13 +2719,13 @@ use std::net::*
 fn echo() -> Result[(), String] {
   let lst = listen(48080)?                    // dual-stack listener (IPv4 + IPv6)
   let mut cli = connect("127.0.0.1", 48080)?  // client connects
-  let mut srv = accept(lst)?                  // server side of the connection
+  let mut srv = lst.accept()?                 // server side of the connection
 
-  sendStr(cli, "ping\n")?
-  let got = recvLine(srv)?                     // => Some("ping")
+  cli.sendStr("ping\n")?
+  let got = srv.recvLine()?                   // => Some("ping")
   println(match got { Some(s) => s, None => "<eof>" })
 
-  close(cli)?  close(srv)?  closeListener(lst)?
+  cli.close()?  srv.close()?  lst.closeListener()?
   Ok(())
 }
 match echo() { Ok(_) => println("done"), Err(e) => println(e) }
@@ -2525,6 +2739,24 @@ match httpGet("example.com", 80, "/") {
   Ok(r)  => println("status " + toString(r.status)),   // => status 200
   Err(e) => println(e)
 }
+```
+
+And `std::regex` matches, captures, and rewrites text with a linear-time engine (compile once, reuse):
+
+```rust
+use std::regex::*
+let re = match compile("(?<key>[a-z]+)=([0-9]+)") { Ok(r) => r, Err(e) => panic(e.message) }
+
+match captures(re, "  port=8080;") {           // capture groups (0 = whole match)
+  Some(c) => {
+    match groupNamed(c, "key") { Some(m) => println(m.text), None => () }   // => port
+    match group(c, 2)          { Some(m) => println(m.text), None => () }   // => 8080
+  },
+  None => println("no match"),
+}
+
+println(toString(count(searchAll(re, "a=1 b=22 c=333"))))   // lazy: => 3
+println(replaceAllRe(re, "a=1 b=22", "$1:$2"))              // templates: => a:1 b:22
 ```
 
 Any prelude name can also be reached explicitly as `std::name` (useful when a local definition shadows it).
@@ -2837,7 +3069,94 @@ match eval(broken, env) {
 
 ---
 
-## 25. Quick reference: the standard library
+## 25. The memory & cost model
+
+Skarn has no manual memory management — no `free`, no reference counting, no borrow checker. A **garbage
+collector** reclaims values once they are unreachable. To write efficient code (and to understand what `clone`
+does), it helps to know which values live where.
+
+### Two kinds of value
+
+- **Immediates** live directly in a slot — 8 bytes, copied by value, never heap-allocated: `Int`, `Double`,
+  `Bool`, `()`, `Char`, and the erased types (`transparent struct`s, integer-backed `enum`s). Copying one is
+  free; two bindings to `42` are fully independent.
+- **Heap objects** are everything with internal structure: `struct`s and `enum` variants with fields, `Array`,
+  `Vec`, `Map`, `Bytes`, `String`, and capturing closures. A variable or field does **not** hold the object —
+  it holds a **reference** to it. (A plain function or a non-capturing lambda is itself an immediate.)
+
+The single most important fact about the cost model:
+
+> Assigning, passing, or returning a heap value copies the **reference**, not the contents. It is always O(1),
+> and there are **no hidden deep copies anywhere** in the language.
+
+### Sharing and aliasing
+
+Because assignment shares the reference, two bindings can refer to the *same* object, and a mutation through one
+is visible through the other:
+
+```rust
+let a: Vec[Int] = vec()
+push(a, 1)  push(a, 2)
+let b = a              // b and a are the SAME vector
+push(b, 3)
+println(toString(len(a)))   // => 3  -- a sees the push made through b
+```
+
+When you want an independent copy, ask for one explicitly with `clone`:
+
+```rust
+let c = clone(a)      // a fresh vector with the same elements
+push(c, 4)
+println(toString(len(a)))   // => 3  -- a is untouched
+```
+
+### `clone` is shallow — on purpose
+
+`clone` copies **one level**: the outer container is new, but its elements are the *same* references. If the
+elements are themselves heap objects, both copies share them:
+
+```rust
+let inner: Vec[Int] = vec()
+push(inner, 1)
+let outer: Vec[Vec[Int]] = vec()
+push(outer, inner)          // outer[0] is a reference to `inner`
+
+let dup = clone(outer)      // dup is new, but dup[0] is STILL `inner`
+let shared = dup[0]
+push(shared, 2)
+println(toString(len(inner)))   // => 2  -- the shared inner vector changed
+```
+
+There is no built-in deep clone; if you need one, clone each level yourself. Shallow-by-default keeps `clone`
+honest — it never silently walks and copies an arbitrarily large object graph.
+
+### When do you allocate?
+
+You allocate on the heap exactly when you **build or grow** something: constructing a `struct` / `enum` variant;
+creating an `array` / `vec` / `map` / `bytes` / `String`; pushing past a container's capacity; building a
+capturing closure; or producing a new `String` (concatenation, `toString`, interpolation — strings are
+immutable, so each makes a new one). Reading, indexing, pattern-matching, and passing values around allocate
+nothing.
+
+Everything else is free — the "you pay nothing" side of the design:
+
+- **Immediates** (numbers, bools, `Char`, transparent newtypes, int-backed enums) never touch the heap.
+- **Generics, traits, and `dyn Trait` are erased**: no runtime type tags, no boxing, no vtables. A `dyn Show`
+  value *is* the plain value — using a concrete type where a `dyn` is expected is a no-op. Abstraction has no
+  runtime price.
+- **Passing a large structure** is a pointer copy, not a `memcpy`.
+
+### The collector
+
+The GC is a **moving, compacting, stop-the-world collector**: live objects are relocated and packed together, so
+the heap never fragments and allocation is a fast bump-pointer. Collection cost is proportional to the amount of
+*live* data, not to how much garbage you produced — short-lived temporaries (a `Vec` built and dropped inside a
+loop, the per-element `Option`s of a lazy iterator) are cheap to reclaim. You never trigger or tune it; it runs
+automatically when the heap needs room.
+
+---
+
+## 26. Quick reference: the standard library
 
 The functions below are always in scope (no import needed). They are ordinary functions — remember that a
 trait method or a library function is called as `f(x)`, and `x |> f` is the same thing written left to right.
@@ -2896,29 +3215,28 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 
 | Function | Purpose |
 |----------|---------|
-| `parse(s)` | parse JSON text → `Result[Json, String]` |
-| `stringify(j)` / `stringifyPretty(j, indent)` | serialize a `Json` to compact / indented text |
-| `stringifyChecked(j)` | serialize → `Result[String, String]` (`Err` on a non-finite number) |
-| `getField(j, key)` / `at(j, i)` | look up an object field / array element → `Option[Json]` |
-| `asInt`/`asDouble`/`asStr`/`asBool`/`asArr`/`asObj`/`asMap`/`isNull` | extract a `Json` case (each `Option`, except `isNull` → `Bool`) |
+| `parse(s)` | parse JSON text → `Result[Json, String]` (a free function) |
+| `j.stringify()` / `j.stringifyPretty(indent)` | serialize a `Json` to compact / indented text |
+| `j.stringifyChecked()` | serialize → `Result[String, String]` (`Err` on a non-finite number) |
+| `j.getField(key)` / `j.at(i)` | look up an object field / array element → `Option[Json]` |
+| `j.asInt()`/`j.asDouble()`/`j.asStr()`/`j.asBool()`/`j.asArr()`/`j.asObj()`/`j.asMap()`/`j.isNull()` | extract a `Json` case (each `Option`, except `isNull` → `Bool`) |
 
 **Randomness** *(all `std::random` — `use std::random::*`; deterministic, NOT cryptographic)*
 
 | Function | Purpose |
 |----------|---------|
-| `seedRng(seed)` | a new `Rng` from an `Int` seed (reproducible) |
-| `rngFromState(a,b,c,d)` | a new `Rng` from raw 32-bit state words (advanced) |
-| `nextU32(r)` | a raw 32-bit draw in `[0, 2³²)` |
-| `nextIntBounded(r, bound)` / `nextInt(r, lo, hi)` | a uniform `Int` in `[0, bound)` / `[lo, hi)` (bias-free) |
-| `nextInt48(r)` | a uniform `Int` over the full signed range (can be negative) |
-| `nextBool(r)` | a random `Bool` |
-| `nextDouble(r)` / `nextDoubleRange(r, lo, hi)` | a uniform `Double` in `[0, 1)` / `[lo, hi)` |
-| `shuffle(r, v)` / `choice(r, v)` | shuffle a `Vec` in place / a random element → `Option[T]` |
-| `nextGaussian(r)` / `nextGaussianMS(r, mu, sigma)` | a normal deviate (mean 0, sd 1) / scaled to `mu`, `sigma` |
-| `choiceWeighted(r, items, weights)` | a weighted pick → `Option[T]` (`None` if empty / mismatched / total ≤ 0) |
-| `sample(r, v, k)` | `k` distinct elements without replacement → `Vec[T]` (`k` clamped to `[0, len]`) |
-| `jump(r)` / `splitRng(r)` | advance one stream / return a fresh non-overlapping stream |
-| `fillU32(r, out, n)` / `fillDoubles(r, out, n)` | append `n` draws to a `Vec` (bulk, load/store-optimized) |
+| `seedRng(seed)` / `rngFromState(a,b,c,d)` | a new `Rng` from an `Int` seed (reproducible) / raw state words (free constructors) |
+| `r.nextU32()` | a raw 32-bit draw in `[0, 2³²)` |
+| `r.nextIntBounded(bound)` / `r.nextInt(lo, hi)` | a uniform `Int` in `[0, bound)` / `[lo, hi)` (bias-free) |
+| `r.nextInt48()` | a uniform `Int` over the full signed range (can be negative) |
+| `r.nextBool()` | a random `Bool` |
+| `r.nextDouble()` / `r.nextDoubleRange(lo, hi)` | a uniform `Double` in `[0, 1)` / `[lo, hi)` |
+| `r.shuffle(v)` / `r.choice(v)` | shuffle a `Vec` in place / a random element → `Option[T]` |
+| `r.nextGaussian()` / `r.nextGaussianMS(mu, sigma)` | a normal deviate (mean 0, sd 1) / scaled to `mu`, `sigma` |
+| `r.choiceWeighted(items, weights)` | a weighted pick → `Option[T]` (`None` if empty / mismatched / total ≤ 0) |
+| `r.sample(v, k)` | `k` distinct elements without replacement → `Vec[T]` (`k` clamped to `[0, len]`) |
+| `r.jump()` / `r.splitRng()` | advance one stream / return a fresh non-overlapping stream |
+| `r.fillU32(out, n)` / `r.fillDoubles(out, n)` | append `n` draws to a `Vec` (bulk, load/store-optimized) |
 
 **Command-line arguments** *(all `std::cli` — `use std::cli::*`)*
 
@@ -2943,41 +3261,54 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 
 | Function | Purpose |
 |----------|---------|
-| `set()` / `setOf(v)` | an empty `Set[T]` / a set of the distinct elements of a `Vec` |
-| `insert(s, x)` / `remove(s, x)` | add / delete `x` → `Bool` (was-new / was-present); `s` must be `mut` |
-| `isMember(s, x)` / `size(s)` | membership → `Bool` / cardinality → `Int` (both O(1)) |
-| `union` / `intersect` / `difference` `(a, b)` | the combined / common / left-only set |
-| `isSubset(a, b)` / `isDisjoint(a, b)` | `a ⊆ b` / `a ∩ b = ∅` → `Bool` |
+| `set()` / `setOf(v)` | an empty `Set[T]` / a set of the distinct elements of a `Vec` (free constructors) |
+| `s.insert(x)` / `s.remove(x)` | add / delete `x` → `Bool` (was-new / was-present); `s` must be `mut` |
+| `s.isMember(x)` / `s.size()` | membership → `Bool` / cardinality → `Int` (both O(1)) |
+| `a.union(b)` / `a.intersect(b)` / `a.difference(b)` | the combined / common / left-only set |
+| `a.isSubset(b)` / `a.isDisjoint(b)` | `a ⊆ b` / `a ∩ b = ∅` → `Bool` |
 
 **Dates and times** *(all `std::time` — `use std::time::*`; strict UTC, millisecond precision)*
 
 | Function | Purpose |
 |----------|---------|
-| `now()` | the current wall-clock `Instant` (UTC) |
-| `instantFromMillis(ms)` / `toEpochMillis(t)` | build / unwrap an `Instant` ↔ epoch milliseconds |
-| `toDateTime(t)` / `fromDateTime(dt)` | `Instant` ↔ decomposed civil `DateTime` (UTC) |
-| `dateTime(y,mo,d,h,mi,s,ms)` / `dateOnly(y,mo,d)` | a strictly-validated `DateTime` → `Option` (bad fields → `None`) |
-| `toIso(dt)` / `parseIso(s)` | ISO-8601 `YYYY-MM-DDThh:mm:ss.sssZ` ↔ `DateTime` (`parseIso` → `Result`) |
-| `weekday(dt)` | ISO weekday, Monday=1 .. Sunday=7 |
-| `isLeapYear(y)` / `daysInMonth(y, mo)` | calendar predicates |
-| `millis`/`seconds`/`minutes`/`hours`/`days` `(n)` | build a `Duration` |
-| `inMillis`/`inSeconds`/`inMinutes`/`inHours`/`inDays` `(d)` | a `Duration` as an `Int` (truncating) |
-| `addDuration(t,d)` / `subDuration(t,d)` / `durationBetween(a,b)` | `Instant` arithmetic |
-| `addDurations` / `subDurations` / `scaleDuration` / `negateDuration` | `Duration` algebra |
-| `isBefore(a, b)` / `isAfter(a, b)` | order two `Instant`s → `Bool` |
-| `startStopwatch()` / `elapsedNanos(sw)` / `elapsedMillis(sw)` | a monotonic stopwatch |
+| `now()` / `instantFromMillis(ms)` / `fromDateTime(dt)` | build an `Instant` (free constructors) |
+| `t.toEpochMillis()` | the `Instant` as epoch milliseconds |
+| `t.toDateTime()` | `Instant` → decomposed civil `DateTime` (UTC) |
+| `dateTime(y,mo,d,h,mi,s,ms)` / `dateOnly(y,mo,d)` | a strictly-validated `DateTime` → `Option` (free; bad fields → `None`) |
+| `dt.toIso()` / `parseIso(s)` | ISO-8601 `YYYY-MM-DDThh:mm:ss.sssZ` ↔ `DateTime` (`dt.toIso()` method, `parseIso` free → `Result`) |
+| `dt.weekday()` | ISO weekday, Monday=1 .. Sunday=7 |
+| `isLeapYear(y)` / `daysInMonth(y, mo)` | calendar predicates (year-based → free) |
+| `millis`/`seconds`/`minutes`/`hours`/`days` `(n)` | build a `Duration` (free constructors) |
+| `d.inMillis()`/`d.inSeconds()`/`d.inMinutes()`/`d.inHours()`/`d.inDays()` | a `Duration` as an `Int` (truncating) |
+| `t.addDuration(d)` / `t.subDuration(d)` / `a.durationBetween(b)` | `Instant` arithmetic |
+| `a.addDurations(b)` / `a.subDurations(b)` / `d.scaleDuration(k)` / `d.negateDuration()` | `Duration` algebra |
+| `a.isBefore(b)` / `a.isAfter(b)` | order two `Instant`s → `Bool` |
+| `startStopwatch()` / `sw.elapsedNanos()` / `sw.elapsedMillis()` | a monotonic stopwatch (`startStopwatch` free) |
 
 **TCP networking** *(all `std::net` — `use std::net::*`; blocking, plaintext only)*
 
 | Function | Purpose |
 |----------|---------|
-| `connect(host, port)` | open a client connection → `Result[TcpConn, String]` (IPv4/IPv6, name or literal) |
-| `send(c, bytes)` / `sendStr(c, s)` | send a whole buffer / string → `Result[(), String]` |
-| `recv(c, n)` | receive up to `n` bytes → `Result[Bytes, String]` (an **empty `Bytes` means EOF**) |
-| `recvLine(c)` / `recvAll(c)` | read one `\n`-line → `Result[Option[String], String]` / drain to EOF → `Result[Bytes, String]` (both need `mut c`) |
-| `setTimeout(c, ms)` / `close(c)` | recv/send timeout (0 = block) / close the connection → `Result[(), String]` |
-| `listen(port)` / `accept(l)` / `closeListener(l)` | server: bind+listen → `TcpListener`; block for a client → `TcpConn`; stop listening |
-| `httpGet(host, port, path)` | a minimal HTTP/1.0 GET → `Result[HttpResponse, String]` (`.status: Int`, `.body: String`) |
+| `connect(host, port)` | open a client connection → `Result[TcpConn, String]` (IPv4/IPv6, name or literal; free) |
+| `c.send(bytes)` / `c.sendStr(s)` | send a whole buffer / string → `Result[(), String]` |
+| `c.recv(n)` | receive up to `n` bytes → `Result[Bytes, String]` (an **empty `Bytes` means EOF**) |
+| `c.recvLine()` / `c.recvAll()` | read one `\n`-line → `Result[Option[String], String]` / drain to EOF → `Result[Bytes, String]` (both need `mut c`) |
+| `c.setTimeout(ms)` / `c.close()` | recv/send timeout (0 = block) / close the connection → `Result[(), String]` |
+| `listen(port)` (free) / `l.accept()` / `l.closeListener()` | server: bind+listen → `TcpListener`; block for a client → `TcpConn`; stop listening |
+| `httpGet(host, port, path)` | a minimal HTTP/1.0 GET → `Result[HttpResponse, String]` (`.status: Int`, `.body: String`; free) |
+
+**Regex** *(all `std::regex` — `use std::regex::*`; byte-level, linear-time Pike VM; no backrefs/lookaround)*
+
+| Function | Purpose |
+|----------|---------|
+| `compile(pattern)` / `compileWith(pattern, flags)` | build a `Regex` → `Result[Regex, RegexError]`; `flags` ⊆ `"ims"` (also inline `(?ims)`) |
+| `isMatch(re, s)` | does the pattern match anywhere in `s` → `Bool` |
+| `search(re, s)` / `searchFrom(re, s, from)` | leftmost match → `Option[Match]` (`.start`, `.end`, `.text`) |
+| `captures(re, s)` / `capturesFrom(re, s, from)` | leftmost match with groups → `Option[Captures]` |
+| `group(c, i)` / `groupNamed(c, name)` | the i-th / named capture → `Option[Match]` (group 0 = whole match) |
+| `searchAll(re, s)` / `capturesAll(re, s)` | every non-overlapping match / its captures → a lazy `dyn Iterator` |
+| `splitRe(re, s)` | the substrings between matches → a lazy `dyn Iterator[String]` |
+| `replaceRe(re, s, repl)` / `replaceAllRe(re, s, repl)` | replace the first / all matches; template `$0`..`$N`, `${name}`, `$$` |
 
 **Strings and bytes**
 

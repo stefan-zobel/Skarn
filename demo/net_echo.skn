@@ -1,26 +1,26 @@
 // A self-contained TCP loopback echo -- no external server, no network required. Single process,
 // single thread: listen -> connect -> accept, then a ping/pong exchange over 127.0.0.1. Deterministic
-// output, always exits 0. Shows the std::net wrapper (connect/listen/accept/sendStr/recvLine/close).
+// output, always exits 0. Shows the std::net wrapper (connect/listen + c.accept()/sendStr/recvLine/close).
 use std::net::*
 
 fn echo() -> Result[(), String] {
   let lst = listen(48080)?                       // dual-stack listener on a high port
   let mut cli = connect("127.0.0.1", 48080)?     // client connects (IPv4 -> v4-mapped)
-  let mut srv = accept(lst)?                     // server side of the same connection
+  let mut srv = lst.accept()?                    // server side of the same connection
 
-  sendStr(cli, "ping\n")?                        // client -> server
-  let got = recvLine(srv)?
+  cli.sendStr("ping\n")?                         // client -> server
+  let got = srv.recvLine()?
   let req = match got { Some(s) => s, None => "<eof>" }
   println("server got: " + req)
 
-  sendStr(srv, "pong\n")?                        // server -> client
-  let back = recvLine(cli)?
+  srv.sendStr("pong\n")?                         // server -> client
+  let back = cli.recvLine()?
   let rep = match back { Some(s) => s, None => "<eof>" }
   println("client got: " + rep)
 
-  close(cli)?
-  close(srv)?
-  closeListener(lst)?
+  cli.close()?
+  srv.close()?
+  lst.closeListener()?
   Ok(())
 }
 

@@ -1,0 +1,664 @@
+// std::regex -- a byte-level regular-expression engine in pure Skarn (no native, no VM change;
+// tree-shaken). OPT-IN: reach it via `use std::regex::*` (or a qualified std::regex::name).
+//
+// Engine: a Thompson-NFA / Pike VM -- LINEAR O(n*m) time, no catastrophic backtracking (no ReDoS),
+// submatch captures via Save slots, and NO backreferences / lookaround (they would force
+// backtracking). This is the RE2 posture.
+//
+// BYTE-LEVEL: patterns and inputs are matched over raw BYTES (`.` matches one byte; `[a-z]` is a byte
+// range). ASCII is fully correct; a UTF-8 literal in the pattern matches its byte sequence. Code-point
+// matching is a separate (deferred) layer over the existing `chars`/`codePoint` codec.
+//
+// A malformed pattern never panics -- `compile` returns `Result[Regex, RegexError]`.
+//
+// Grammar: literals + escapes; `.`; greedy `* + ?` and NON-GREEDY `*? +? ??`; counted repetition
+// `{n} {n,} {n,m}` (+ non-greedy `?`, expanded, capped at 1000); `|`; groups `( )` (capturing) /
+// `(?:)` (non-capturing) / `(?<name>)` (named); classes `[...]` (ranges, negation, shorthands);
+// shorthands `\d \w \s \D \W \S`; word boundaries `\b \B`; anchors `^ $`. FLAGS via
+// `compileWith(pattern, "ims")` or a leading `(?ims)`: `i` = ASCII case-insensitive, `m` = multiline
+// (`^`/`$` at line boundaries), `s` = dotall (`.` matches '\n' too).
+//
+// `search` (not `find`) and `replaceRe`/`replaceAllRe` (not `replace`) avoid the std::iter::find /
+// std::string::replace ring names (Skarn has no overloading). NOTE: to put a literal `${name}` in a
+// replacement template, write it as `"\${name}"` in Skarn source (a bare `${...}` is string
+// interpolation). Internal names are `_rx`/`Rx`-prefixed so `use std::regex::*` leaks only the API.
+
+// ---- AST + compiled program -------------------------------------------------
+// The Bool on Star/Plus/Opt is the GREEDY flag; on WordB it is positive (`\b`) vs negated (`\B`).
+enum RxAst {
+  Empty,
+  Lit(Int),
+  Any,
+  Cls(Bytes),
+  Cat(RxAst, RxAst),
+  Alt(RxAst, RxAst),
+  Star(RxAst, Bool),
+  Plus(RxAst, Bool),
+  Opt(RxAst, Bool),
+  Grp(Int, RxAst),        // capture index (>=1), or -1 for non-capturing
+  AStart,
+  AEnd,
+  WordB(Bool),            // true = \b, false = \B
+}
+
+enum RxInst {
+  Byte(Int),
+  Cls(Bytes),
+  Any,
+  Accept,
+  Jmp(Int),
+  Split(Int, Int),        // (high-priority, low-priority) target pcs
+  Save(Int),              // record the current input position into capture slot #n
+  AStart,
+  AEnd,
+  WordB(Bool),
+}
+
+pub struct Regex { prog: Vec[RxInst], ngroups: Int, names: Map[String, Int], multiline: Bool }
+pub struct Match { start: Int, end: Int, text: String }
+pub struct Captures { groups: Vec[Option[Match]], names: Map[String, Int] }
+pub struct RegexError { message: String, pos: Int }
+
+struct RxThread { pc: Int, saves: Vec[Int] }
+
+// ---- bit sets (char classes = 256 bits; the per-step `seen` set) ------------
+fn _rxBmpNew(nbits: Int) -> Bytes {
+  let nbytes = (nbits + 7) >> 3
+  let mut b = bytes()
+  let mut i = 0
+  while i < nbytes { push(b, 0)  i = i + 1 }
+  b
+}
+fn _rxBmpTest(b: Bytes, i: Int) -> Bool { (b[i >> 3] & (1 << (i & 7))) != 0 }
+fn _rxBmpSet(mut b: Bytes, i: Int) -> () { let k = i >> 3  b[k] = b[k] | (1 << (i & 7)) }
+fn _rxBmpSetRange(mut b: Bytes, lo: Int, hi: Int) -> () { let mut v = lo  while v <= hi { _rxBmpSet(b, v)  v = v + 1 } }
+fn _rxBmpInvert(mut b: Bytes) -> () { let m = len(b)  let mut i = 0  while i < m { b[i] = b[i] ^ 255  i = i + 1 } }
+fn _rxBmpCopy(src: Bytes) -> Bytes { let m = len(src)  let mut b = bytes()  let mut i = 0  while i < m { push(b, src[i])  i = i + 1 }  b }
+fn _rxBmpOr(mut dst: Bytes, src: Bytes) -> () { let m = len(dst)  let mut i = 0  while i < m { dst[i] = dst[i] | src[i]  i = i + 1 } }
+fn _rxAllOnes() -> Bytes { let mut b = bytes()  let mut i = 0  while i < 32 { push(b, 255)  i = i + 1 }  b }
+
+fn _rxCopy(v: Vec[Int]) -> Vec[Int] { let mut c = vec()  let n = len(v)  let mut i = 0  while i < n { push(c, v[i])  i = i + 1 }  c }
+
+fn _rxIsLetter(c: Int) -> Bool { (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
+fn _rxIsWord(c: Int) -> Bool { (c >= '0' && c <= '9') || _rxIsLetter(c) || c == '_' }
+
+// A 2-element (both cases) class for a letter byte (used under the `i` flag).
+fn _rxCaseFoldByte(c: Int) -> Bytes {
+  let mut b = _rxBmpNew(256)
+  _rxBmpSet(b, c)
+  if c >= 'a' && c <= 'z' { _rxBmpSet(b, c - 32) } else if c >= 'A' && c <= 'Z' { _rxBmpSet(b, c + 32) }
+  b
+}
+// Copy a class bitmap, adding the opposite case for every letter already present (the `i` flag).
+fn _rxCaseFold(bm: Bytes) -> Bytes {
+  let mut b = _rxBmpCopy(bm)
+  let mut c = 'a'
+  while c <= 'z' { if _rxBmpTest(bm, c) { _rxBmpSet(b, c - 32) }  c = c + 1 }
+  c = 'A'
+  while c <= 'Z' { if _rxBmpTest(bm, c) { _rxBmpSet(b, c + 32) }  c = c + 1 }
+  b
+}
+// The bitmap for a `\d \w \s \D \W \S` shorthand (uppercase = negated).
+fn _rxShorthand(e: Int) -> Bytes {
+  let mut b = _rxBmpNew(256)
+  let lower = if e >= 'A' && e <= 'Z' { e + 32 } else { e }
+  if lower == 'd' { _rxBmpSetRange(b, '0', '9') }
+  else if lower == 'w' { _rxBmpSetRange(b, '0', '9')  _rxBmpSetRange(b, 'a', 'z')  _rxBmpSetRange(b, 'A', 'Z')  _rxBmpSet(b, '_') }
+  else if lower == 's' { _rxBmpSet(b, 9)  _rxBmpSet(b, 10)  _rxBmpSet(b, 11)  _rxBmpSet(b, 12)  _rxBmpSet(b, 13)  _rxBmpSet(b, 32) }
+  if e >= 'A' && e <= 'Z' { _rxBmpInvert(b) }
+  b
+}
+
+// ---- parser cursor ----------------------------------------------------------
+struct RxCur { b: Bytes, n: Int, i: Int, depth: Int, ngroups: Int, names: Map[String, Int] }
+fn _rxPeek(p: RxCur) -> Int { if p.i < p.n { p.b[p.i] } else { -1 } }
+fn _rxPeek2(p: RxCur) -> Int { if p.i + 1 < p.n { p.b[p.i + 1] } else { -1 } }
+fn _rxAdv(mut p: RxCur) -> () { p.i = p.i + 1 }
+fn _rxAtEnd(p: RxCur) -> Bool { p.i >= p.n }
+fn _rxPutName(mut m: Map[String, Int], nm: String, idx: Int) -> () { m[nm] = idx }
+fn _rxIsShorthandLetter(c: Int) -> Bool { c == 'd' || c == 'D' || c == 'w' || c == 'W' || c == 's' || c == 'S' }
+fn _rxTakeGreedy(mut p: RxCur) -> Bool { if _rxPeek(p) == '?' { _rxAdv(p)  false } else { true } }
+
+// Single-char escape byte (`\n` etc). `\b` = backspace 8 (class context; atom-level `\b` is a word
+// boundary, intercepted earlier). An unknown escape is the literal char.
+fn _rxEscByte(e: Int) -> Int {
+  if      e == 'n' { 10 }
+  else if e == 't' { 9 }
+  else if e == 'r' { 13 }
+  else if e == 'f' { 12 }
+  else if e == 'v' { 11 }
+  else if e == 'b' { 8 }
+  else if e == '0' { 0 }
+  else { e }
+}
+
+fn _rxParseAlt(mut p: RxCur) -> Result[RxAst, RegexError] {
+  let mut left = _rxParseCat(p)?
+  while _rxPeek(p) == '|' { _rxAdv(p)  let right = _rxParseCat(p)?  left = Alt(left, right) }
+  Ok(left)
+}
+
+fn _rxParseCat(mut p: RxCur) -> Result[RxAst, RegexError] {
+  let mut acc = Empty
+  let mut any = false
+  loop {
+    let c = _rxPeek(p)
+    if c == -1 || c == '|' || c == ')' { break }
+    let r = _rxParseRep(p)?
+    if any { acc = Cat(acc, r) } else { acc = r  any = true }
+  }
+  Ok(acc)
+}
+
+// rep := atom ( '*' | '+' | '?' | '{n[,m]}' ) '?'? ...
+fn _rxParseRep(mut p: RxCur) -> Result[RxAst, RegexError] {
+  let mut a = _rxParseAtom(p)?
+  loop {
+    let c = _rxPeek(p)
+    if      c == '*' { _rxAdv(p)  a = Star(a, _rxTakeGreedy(p)) }
+    else if c == '+' { _rxAdv(p)  a = Plus(a, _rxTakeGreedy(p)) }
+    else if c == '?' { _rxAdv(p)  a = Opt(a, _rxTakeGreedy(p)) }
+    else if c == '{' && _rxPeek2(p) >= '0' && _rxPeek2(p) <= '9' { a = _rxParseRepeat(p, a)? }
+    else { break }
+  }
+  Ok(a)
+}
+
+fn _rxParseInt(mut p: RxCur) -> Int {
+  let mut v = 0
+  while _rxPeek(p) >= '0' && _rxPeek(p) <= '9' {
+    v = v * 10 + (_rxPeek(p) - '0')
+    if v > 1000000 { v = 1000000 }
+    _rxAdv(p)
+  }
+  v
+}
+fn _rxRepeatExact(a: RxAst, n: Int) -> RxAst {
+  if n <= 0 { Empty } else { let mut acc = a  let mut i = 1  while i < n { acc = Cat(acc, a)  i = i + 1 }  acc }
+}
+fn _rxRepeatOpt(a: RxAst, k: Int, greedy: Bool) -> RxAst {
+  if k <= 0 { Empty } else { let mut acc = Opt(a, greedy)  let mut i = 1  while i < k { acc = Cat(acc, Opt(a, greedy))  i = i + 1 }  acc }
+}
+// `{lo}` / `{lo,}` / `{lo,hi}` (the leading '{' + digit already confirmed) -> an expansion.
+fn _rxParseRepeat(mut p: RxCur, a: RxAst) -> Result[RxAst, RegexError] {
+  _rxAdv(p)                          // '{'
+  let lo = _rxParseInt(p)
+  let mut hi = lo
+  let mut open = false
+  if _rxPeek(p) == ',' {
+    _rxAdv(p)
+    if _rxPeek(p) == '}' { open = true } else { hi = _rxParseInt(p) }
+  }
+  if _rxPeek(p) != '}' { return Err(RegexError { message: "expected '}' in repetition", pos: p.i }) }
+  _rxAdv(p)
+  let greedy = _rxTakeGreedy(p)
+  if lo > 1000 || hi > 1000 { return Err(RegexError { message: "repetition count too large", pos: p.i }) }
+  if !open && hi < lo { return Err(RegexError { message: "repetition range out of order", pos: p.i }) }
+  if open {
+    let tail = Star(a, greedy)
+    if lo <= 0 { Ok(tail) } else { Ok(Cat(_rxRepeatExact(a, lo), tail)) }
+  } else {
+    let opts = _rxRepeatOpt(a, hi - lo, greedy)
+    if lo <= 0 { Ok(opts) } else if hi - lo <= 0 { Ok(_rxRepeatExact(a, lo)) } else { Ok(Cat(_rxRepeatExact(a, lo), opts)) }
+  }
+}
+
+fn _rxGroupName(mut p: RxCur) -> Result[String, RegexError] {
+  let mut nm = bytes()
+  loop {
+    let c = _rxPeek(p)
+    if c == -1 { return Err(RegexError { message: "unterminated group name", pos: p.i }) }
+    if c == '>' { _rxAdv(p)  break }
+    push(nm, c)
+    _rxAdv(p)
+  }
+  if len(nm) == 0 { return Err(RegexError { message: "empty group name", pos: p.i }) }
+  Ok(fromBytes(nm))
+}
+
+fn _rxParseAtom(mut p: RxCur) -> Result[RxAst, RegexError] {
+  let c = _rxPeek(p)
+  if c == -1 { return Err(RegexError { message: "unexpected end of pattern", pos: p.i }) }
+  if c == '(' {
+    _rxAdv(p)
+    let mut capIdx = -1
+    if _rxPeek(p) == '?' {
+      if _rxPeek2(p) == ':' { _rxAdv(p)  _rxAdv(p) }
+      else if _rxPeek2(p) == '<' {
+        _rxAdv(p)  _rxAdv(p)
+        let nm = _rxGroupName(p)?
+        p.ngroups = p.ngroups + 1
+        capIdx = p.ngroups
+        _rxPutName(p.names, nm, capIdx)
+      }
+      else { return Err(RegexError { message: "unsupported group syntax", pos: p.i }) }
+    } else {
+      p.ngroups = p.ngroups + 1
+      capIdx = p.ngroups
+    }
+    p.depth = p.depth + 1
+    if p.depth > 200 { return Err(RegexError { message: "pattern too deeply nested", pos: p.i }) }
+    let inner = _rxParseAlt(p)?
+    if _rxPeek(p) != ')' { return Err(RegexError { message: "expected ')'", pos: p.i }) }
+    _rxAdv(p)
+    p.depth = p.depth - 1
+    Ok(Grp(capIdx, inner))
+  }
+  else if c == '[' { _rxAdv(p)  _rxParseClass(p) }
+  else if c == '.' { _rxAdv(p)  Ok(RxAst::Any) }
+  else if c == '^' { _rxAdv(p)  Ok(RxAst::AStart) }
+  else if c == '$' { _rxAdv(p)  Ok(RxAst::AEnd) }
+  else if c == '\\' {
+    _rxAdv(p)
+    let e = _rxPeek(p)
+    if e == -1 { return Err(RegexError { message: "trailing backslash", pos: p.i }) }
+    _rxAdv(p)
+    if _rxIsShorthandLetter(e) { Ok(RxAst::Cls(_rxShorthand(e))) }
+    else if e == 'b' { Ok(RxAst::WordB(true)) }
+    else if e == 'B' { Ok(RxAst::WordB(false)) }
+    else { Ok(Lit(_rxEscByte(e))) }
+  }
+  else if c == '*' || c == '+' || c == '?' { Err(RegexError { message: "nothing to repeat", pos: p.i }) }
+  else if c == ')' { Err(RegexError { message: "unmatched ')'", pos: p.i }) }
+  else { _rxAdv(p)  Ok(Lit(c)) }
+}
+
+fn _rxClassByte(mut p: RxCur) -> Result[Int, RegexError] {
+  let c = _rxPeek(p)
+  if c == -1 { return Err(RegexError { message: "unterminated character class", pos: p.i }) }
+  _rxAdv(p)
+  if c == '\\' {
+    let e = _rxPeek(p)
+    if e == -1 { return Err(RegexError { message: "trailing backslash in class", pos: p.i }) }
+    _rxAdv(p)
+    Ok(_rxEscByte(e))
+  } else { Ok(c) }
+}
+
+fn _rxParseClass(mut p: RxCur) -> Result[RxAst, RegexError] {
+  let mut neg = false
+  if _rxPeek(p) == '^' { neg = true  _rxAdv(p) }
+  let mut cls = _rxBmpNew(256)
+  let mut count = 0
+  loop {
+    let c = _rxPeek(p)
+    if c == -1 { return Err(RegexError { message: "unterminated character class", pos: p.i }) }
+    if c == ']' && count > 0 { _rxAdv(p)  break }
+    if c == '\\' && _rxIsShorthandLetter(_rxPeek2(p)) {
+      _rxAdv(p)
+      let e = _rxPeek(p)
+      _rxAdv(p)
+      _rxBmpOr(cls, _rxShorthand(e))
+      count = count + 1
+    } else {
+      let lo = _rxClassByte(p)?
+      if _rxPeek(p) == '-' && _rxPeek2(p) != ']' && _rxPeek2(p) != -1 {
+        _rxAdv(p)
+        let hi = _rxClassByte(p)?
+        if hi < lo { return Err(RegexError { message: "character range out of order", pos: p.i }) }
+        _rxBmpSetRange(cls, lo, hi)
+      } else {
+        _rxBmpSet(cls, lo)
+      }
+      count = count + 1
+    }
+  }
+  if neg { _rxBmpInvert(cls) }
+  Ok(RxAst::Cls(cls))
+}
+
+// ---- compiler: RxAst -> Vec[RxInst] (Thompson construction) ------------------
+// `flags` bit0 = i (case-insensitive), bit2 = s (dotall). Non-greedy = swapped split priority.
+fn _rxEmit(mut prog: Vec[RxInst], inst: RxInst) -> Int { push(prog, inst)  len(prog) - 1 }
+
+fn _rxCompile(mut prog: Vec[RxInst], a: RxAst, flags: Int) -> () {
+  match a {
+    Empty       => (),
+    Lit(c)      => { if (flags & 1) != 0 && _rxIsLetter(c) { push(prog, RxInst::Cls(_rxCaseFoldByte(c))) } else { push(prog, Byte(c)) } },
+    RxAst::Any         => { if (flags & 4) != 0 { push(prog, RxInst::Cls(_rxAllOnes())) } else { push(prog, RxInst::Any) } },
+    RxAst::Cls(bm)     => { if (flags & 1) != 0 { push(prog, RxInst::Cls(_rxCaseFold(bm))) } else { push(prog, RxInst::Cls(bm)) } },
+    RxAst::AStart      => push(prog, RxInst::AStart),
+    RxAst::AEnd        => push(prog, RxInst::AEnd),
+    RxAst::WordB(pos)  => push(prog, RxInst::WordB(pos)),
+    Cat(x, y)   => { _rxCompile(prog, x, flags)  _rxCompile(prog, y, flags) },
+    Grp(idx, x) => {
+      if idx >= 0 { push(prog, Save(2 * idx)) }
+      _rxCompile(prog, x, flags)
+      if idx >= 0 { push(prog, Save(2 * idx + 1)) }
+    },
+    Alt(x, y)   => {
+      let sp = _rxEmit(prog, Split(0, 0))
+      let ax = len(prog)
+      _rxCompile(prog, x, flags)
+      let jm = _rxEmit(prog, Jmp(0))
+      let bx = len(prog)
+      _rxCompile(prog, y, flags)
+      let en = len(prog)
+      prog[sp] = Split(ax, bx)
+      prog[jm] = Jmp(en)
+    },
+    Star(x, g)  => {
+      let sp = _rxEmit(prog, Split(0, 0))
+      let bx = len(prog)
+      _rxCompile(prog, x, flags)
+      push(prog, Jmp(sp))
+      let en = len(prog)
+      if g { prog[sp] = Split(bx, en) } else { prog[sp] = Split(en, bx) }
+    },
+    Plus(x, g)  => {
+      let bx = len(prog)
+      _rxCompile(prog, x, flags)
+      let sp = _rxEmit(prog, Split(0, 0))
+      let en = len(prog)
+      if g { prog[sp] = Split(bx, en) } else { prog[sp] = Split(en, bx) }
+    },
+    Opt(x, g)   => {
+      let sp = _rxEmit(prog, Split(0, 0))
+      let bx = len(prog)
+      _rxCompile(prog, x, flags)
+      let en = len(prog)
+      if g { prog[sp] = Split(bx, en) } else { prog[sp] = Split(en, bx) }
+    },
+  }
+}
+
+// ---- Pike VM ---------------------------------------------------------------
+fn _rxWordBoundary(inp: Bytes, n: Int, pos: Int) -> Bool {
+  let pw = if pos > 0 { _rxIsWord(inp[pos - 1]) } else { false }
+  let cw = if pos < n { _rxIsWord(inp[pos]) } else { false }
+  pw != cw
+}
+
+fn _rxAddThread(prog: Vec[RxInst], mut list: Vec[RxThread], mut seen: Bytes,
+                pc0: Int, saves0: Vec[Int], inp: Bytes, n: Int, pos: Int, multiline: Bool) -> () {
+  let mut stack: Vec[RxThread] = vec()
+  push(stack, RxThread { pc: pc0, saves: saves0 })
+  loop {
+    match pop(stack) {
+      None => break,
+      Some(t) => {
+        if !_rxBmpTest(seen, t.pc) {
+          _rxBmpSet(seen, t.pc)
+          match prog[t.pc] {
+            Jmp(x)      => push(stack, RxThread { pc: x, saves: t.saves }),
+            Split(x, y) => { push(stack, RxThread { pc: y, saves: t.saves })  push(stack, RxThread { pc: x, saves: t.saves }) },
+            Save(slot)  => { let mut cp = _rxCopy(t.saves)  cp[slot] = pos  push(stack, RxThread { pc: t.pc + 1, saves: cp }) },
+            RxInst::AStart      => if pos == 0 || (multiline && pos > 0 && inp[pos - 1] == 10) { push(stack, RxThread { pc: t.pc + 1, saves: t.saves }) },
+            RxInst::AEnd        => if pos == n || (multiline && pos < n && inp[pos] == 10) { push(stack, RxThread { pc: t.pc + 1, saves: t.saves }) },
+            RxInst::WordB(good) => if _rxWordBoundary(inp, n, pos) == good { push(stack, RxThread { pc: t.pc + 1, saves: t.saves }) },
+            _             => push(list, t),
+          }
+        }
+      }
+    }
+  }
+}
+
+fn _rxSearch(prog: Vec[RxInst], inp: Bytes, n: Int, from: Int, nslots: Int, multiline: Bool) -> Option[Vec[Int]] {
+  let np = len(prog)
+  let mut init: Vec[Int] = vec()
+  let mut k = 0
+  while k < nslots { push(init, -1)  k = k + 1 }
+  let mut clist: Vec[RxThread] = vec()
+  let mut cseen = _rxBmpNew(np)
+  _rxAddThread(prog, clist, cseen, 0, init, inp, n, from, multiline)
+  let mut matched = false
+  let mut msaves: Vec[Int] = vec()
+  let mut sp = from
+  loop {
+    let mut nlist: Vec[RxThread] = vec()
+    let mut nseen = _rxBmpNew(np)
+    let mut ti = 0
+    let mut cut = false
+    while ti < len(clist) && !cut {
+      let th = clist[ti]
+      match prog[th.pc] {
+        Byte(c) => if sp < n && inp[sp] == c { _rxAddThread(prog, nlist, nseen, th.pc + 1, th.saves, inp, n, sp + 1, multiline) },
+        RxInst::Cls(bm) => if sp < n && _rxBmpTest(bm, inp[sp]) { _rxAddThread(prog, nlist, nseen, th.pc + 1, th.saves, inp, n, sp + 1, multiline) },
+        RxInst::Any     => if sp < n && inp[sp] != 10 { _rxAddThread(prog, nlist, nseen, th.pc + 1, th.saves, inp, n, sp + 1, multiline) },
+        Accept   => { msaves = th.saves  matched = true  cut = true },
+        _         => (),
+      }
+      ti = ti + 1
+    }
+    clist = nlist
+    cseen = nseen
+    if !matched && sp < n {
+      let mut fresh: Vec[Int] = vec()
+      let mut j = 0
+      while j < nslots { push(fresh, -1)  j = j + 1 }
+      _rxAddThread(prog, clist, cseen, 0, fresh, inp, n, sp + 1, multiline)
+    }
+    if sp >= n { break }
+    sp = sp + 1
+  }
+  if matched { Some(msaves) } else { None }
+}
+
+fn _rxMkOpt(s: String, saves: Vec[Int], g: Int) -> Option[Match] {
+  let a = saves[2 * g]
+  let b = saves[2 * g + 1]
+  if a < 0 || b < 0 { None } else { Some(Match { start: a, end: b, text: slice(s, a, b) }) }
+}
+
+// ---- flags ------------------------------------------------------------------
+fn _rxParseFlags(flags: String) -> Result[Int, RegexError] {
+  let b = toBytes(flags)
+  let m = len(b)
+  let mut fl = 0
+  let mut i = 0
+  while i < m {
+    let c = b[i]
+    if      c == 'i' { fl = fl | 1 }
+    else if c == 'm' { fl = fl | 2 }
+    else if c == 's' { fl = fl | 4 }
+    else { return Err(RegexError { message: "unknown flag", pos: i }) }
+    i = i + 1
+  }
+  Ok(fl)
+}
+// A leading inline `(?ims)` -> (bytes-to-skip, flag-bits); (0, 0) if the pattern has none.
+fn _rxLeadingFlags(bs: Bytes, n: Int) -> (Int, Int) {
+  if n >= 3 && bs[0] == '(' && bs[1] == '?' {
+    let mut j = 2
+    let mut fl = 0
+    let mut okAny = false
+    let mut valid = true
+    while j < n && bs[j] != ')' {
+      let c = bs[j]
+      if      c == 'i' { fl = fl | 1  okAny = true }
+      else if c == 'm' { fl = fl | 2  okAny = true }
+      else if c == 's' { fl = fl | 4  okAny = true }
+      else { valid = false  break }
+      j = j + 1
+    }
+    if valid && okAny && j < n && bs[j] == ')' { (j + 1, fl) } else { (0, 0) }
+  } else { (0, 0) }
+}
+
+// ---- public API -------------------------------------------------------------
+pub fn compile(pattern: String) -> Result[Regex, RegexError] { compileWith(pattern, "") }
+
+// compileWith(pattern, flags) -> Ok(Regex) | Err(RegexError). flags is any of "ims". A leading
+// inline `(?ims)` in the pattern is also honored.
+pub fn compileWith(pattern: String, flags: String) -> Result[Regex, RegexError] {
+  let mut fl = _rxParseFlags(flags)?
+  let bs = toBytes(pattern)
+  let ntot = len(bs)
+  let (start, extra) = _rxLeadingFlags(bs, ntot)
+  fl = fl | extra
+  let p = RxCur { b: bs, n: ntot, i: start, depth: 0, ngroups: 0, names: #{} }
+  let ast = _rxParseAlt(p)?
+  if !_rxAtEnd(p) { return Err(RegexError { message: "unexpected '" + charStr(_rxPeek(p)) + "'", pos: p.i }) }
+  let mut prog: Vec[RxInst] = vec()
+  push(prog, Save(0))
+  _rxCompile(prog, ast, fl)
+  push(prog, Save(1))
+  push(prog, Accept)
+  Ok(Regex { prog: prog, ngroups: p.ngroups, names: p.names, multiline: (fl & 2) != 0 })
+}
+
+pub fn isMatch(re: Regex, s: String) -> Bool { match search(re, s) { Some(_) => true, None => false } }
+
+// search(re, s) -> the leftmost match, or None. (Named `search`, not `find` -- std::iter owns `find`.)
+pub fn search(re: Regex, s: String) -> Option[Match] { searchFrom(re, s, 0) }
+pub fn searchFrom(re: Regex, s: String, from: Int) -> Option[Match] {
+  let inp = toBytes(s)
+  let n = len(inp)
+  let start = if from < 0 { 0 } else { from }
+  if start > n { return None }
+  match _rxSearch(re.prog, inp, n, start, 2 * (re.ngroups + 1), re.multiline) {
+    Some(sv) => _rxMkOpt(s, sv, 0),
+    None => None,
+  }
+}
+
+pub fn captures(re: Regex, s: String) -> Option[Captures] { capturesFrom(re, s, 0) }
+pub fn capturesFrom(re: Regex, s: String, from: Int) -> Option[Captures] {
+  let inp = toBytes(s)
+  let n = len(inp)
+  let start = if from < 0 { 0 } else { from }
+  if start > n { return None }
+  match _rxSearch(re.prog, inp, n, start, 2 * (re.ngroups + 1), re.multiline) {
+    None => None,
+    Some(sv) => {
+      let mut gs: Vec[Option[Match]] = vec()
+      let mut g = 0
+      while g <= re.ngroups { push(gs, _rxMkOpt(s, sv, g))  g = g + 1 }
+      Some(Captures { groups: gs, names: re.names })
+    },
+  }
+}
+
+pub fn group(c: Captures, i: Int) -> Option[Match] { if i < 0 || i >= len(c.groups) { None } else { c.groups[i] } }
+pub fn groupNamed(c: Captures, name: String) -> Option[Match] {
+  match get(c.names, name) { Some(i) => group(c, i), None => None }
+}
+
+// ---- lazy iterators (dyn Iterator) -----------------------------------------
+struct RxMatchIter { re: Regex, s: String, n: Int, pos: Int, done: Bool }
+impl Iterator[Match] for RxMatchIter {
+  fn next(mut self) -> Option[Match] {
+    if self.done { return None }
+    if self.pos > self.n { self.done = true  return None }
+    match searchFrom(self.re, self.s, self.pos) {
+      None => { self.done = true  None },
+      Some(m) => { self.pos = if m.end > m.start { m.end } else { m.end + 1 }  Some(m) },
+    }
+  }
+}
+pub fn searchAll(re: Regex, s: String) -> dyn Iterator[Match] {
+  RxMatchIter { re: re, s: s, n: len(toBytes(s)), pos: 0, done: false }
+}
+
+struct RxCapIter { re: Regex, s: String, n: Int, pos: Int, done: Bool }
+impl Iterator[Captures] for RxCapIter {
+  fn next(mut self) -> Option[Captures] {
+    if self.done { return None }
+    if self.pos > self.n { self.done = true  return None }
+    match capturesFrom(self.re, self.s, self.pos) {
+      None => { self.done = true  None },
+      Some(c) => match group(c, 0) {
+        None => { self.done = true  None },
+        Some(m0) => { self.pos = if m0.end > m0.start { m0.end } else { m0.end + 1 }  Some(c) },
+      },
+    }
+  }
+}
+pub fn capturesAll(re: Regex, s: String) -> dyn Iterator[Captures] {
+  RxCapIter { re: re, s: s, n: len(toBytes(s)), pos: 0, done: false }
+}
+
+struct RxSplitIter { re: Regex, s: String, n: Int, pos: Int, last: Int, done: Bool }
+impl Iterator[String] for RxSplitIter {
+  fn next(mut self) -> Option[String] {
+    if self.done { return None }
+    match searchFrom(self.re, self.s, self.pos) {
+      None => { let seg = slice(self.s, self.last, self.n)  self.done = true  Some(seg) },
+      Some(m) => {
+        let seg = slice(self.s, self.last, m.start)
+        self.last = m.end
+        self.pos = if m.end > m.start { m.end } else { m.end + 1 }
+        Some(seg)
+      },
+    }
+  }
+}
+pub fn splitRe(re: Regex, s: String) -> dyn Iterator[String] {
+  RxSplitIter { re: re, s: s, n: len(toBytes(s)), pos: 0, last: 0, done: false }
+}
+
+// ---- replacement -----------------------------------------------------------
+fn _rxExpand(sb: StringBuilder, repl: String, cap: Captures) -> () {
+  let rb = toBytes(repl)
+  let m = len(rb)
+  let mut i = 0
+  while i < m {
+    let c = rb[i]
+    if c == '$' && i + 1 < m {
+      let d = rb[i + 1]
+      if d == '$' { appendByte(sb, '$')  i = i + 2 }
+      else if d == '{' {
+        let mut j = i + 2
+        let mut nm = bytes()
+        while j < m && rb[j] != '}' { push(nm, rb[j])  j = j + 1 }
+        if j < m {
+          match groupNamed(cap, fromBytes(nm)) { Some(mt) => append(sb, mt.text), None => () }
+          i = j + 1
+        } else { appendByte(sb, '$')  i = i + 1 }
+      }
+      else if d >= '0' && d <= '9' {
+        let mut j = i + 1
+        let mut num = 0
+        while j < m && rb[j] >= '0' && rb[j] <= '9' { num = num * 10 + (rb[j] - '0')  j = j + 1 }
+        match group(cap, num) { Some(mt) => append(sb, mt.text), None => () }
+        i = j
+      }
+      else { appendByte(sb, '$')  i = i + 1 }
+    } else {
+      appendByte(sb, c)
+      i = i + 1
+    }
+  }
+}
+
+pub fn replaceRe(re: Regex, s: String, repl: String) -> String {
+  let n = len(toBytes(s))
+  match captures(re, s) {
+    None => s,
+    Some(c) => match group(c, 0) {
+      None => s,
+      Some(m0) => {
+        let sb = stringBuilder()
+        append(sb, slice(s, 0, m0.start))
+        _rxExpand(sb, repl, c)
+        append(sb, slice(s, m0.end, n))
+        build(sb)
+      },
+    },
+  }
+}
+
+pub fn replaceAllRe(re: Regex, s: String, repl: String) -> String {
+  let sb = stringBuilder()
+  let n = len(toBytes(s))
+  let mut last = 0
+  let mut pos = 0
+  loop {
+    if pos > n { break }
+    match capturesFrom(re, s, pos) {
+      None => break,
+      Some(c) => match group(c, 0) {
+        None => break,
+        Some(m0) => {
+          append(sb, slice(s, last, m0.start))
+          _rxExpand(sb, repl, c)
+          last = m0.end
+          pos = if m0.end > m0.start { m0.end } else { m0.end + 1 }
+        },
+      },
+    }
+  }
+  append(sb, slice(s, last, n))
+  build(sb)
+}

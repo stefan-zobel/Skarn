@@ -11,6 +11,11 @@
 // UTC ONLY: there is no time-zone or offset. All conversions are in UTC. Local time / fixed offsets are a
 // deferred v1.1 item.
 //
+// The per-type operations are inherent methods -- call them with dot syntax: `t.toDateTime()`,
+// `d.inSeconds()`, `dt.toIso()`, `sw.elapsedMillis()`. The constructors (`now` / `instantFromMillis` /
+// `fromDateTime` / `dateTime` / `dateOnly` / `millis`..`days` / `startStopwatch` / `parseIso`) and the
+// year-based calendar predicates (`isLeapYear` / `daysInMonth`) have no such receiver, so they stay free.
+//
 // OPT-IN: reach these via `use std::time::*` (or a qualified std::time::name). Tree-shaken. A user of this
 // module does NOT need `use std::env` -- the wall-clock/monotonic native calls live inside `now`/Stopwatch.
 use std::env::*
@@ -62,29 +67,7 @@ fn _civilFromDays(z: Int) -> DateTime {
   DateTime { year: yr, month: m, day: d, hour: 0, minute: 0, second: 0, milli: 0 }
 }
 
-// --- Instant <-> DateTime ---
-
-// Decompose an Instant into its civil UTC fields.
-pub fn toDateTime(t: Instant) -> DateTime {
-  let ms = t.ms
-  let days = _floorDiv(ms, 86400000)
-  let tod = ms - days * 86400000                             // ms-of-day, [0, 86399999]
-  let dp = _civilFromDays(days)
-  let h = tod / 3600000
-  let mi = (tod / 60000) % 60
-  let s = (tod / 1000) % 60
-  let milli = tod % 1000
-  DateTime { year: dp.year, month: dp.month, day: dp.day, hour: h, minute: mi, second: s, milli: milli }
-}
-
-// Recompose an Instant from civil UTC fields. Assumes `dt` is valid (build one via `dateTime`).
-pub fn fromDateTime(dt: DateTime) -> Instant {
-  let days = _daysFromCivil(dt.year, dt.month, dt.day)
-  let ms = days * 86400000 + dt.hour * 3600000 + dt.minute * 60000 + dt.second * 1000 + dt.milli
-  Instant { ms: ms }
-}
-
-// --- calendar predicates ---
+// --- calendar predicates (year-based -> free functions) ---
 
 pub fn isLeapYear(y: Int) -> Bool {
   (_floorMod(y, 4) == 0) && (_floorMod(y, 100) != 0 || _floorMod(y, 400) == 0)
@@ -96,13 +79,7 @@ pub fn daysInMonth(y: Int, mo: Int) -> Int {
   else { 31 }
 }
 
-// ISO-8601 weekday: Monday = 1 .. Sunday = 7. (1970-01-01 was a Thursday.)
-pub fn weekday(dt: DateTime) -> Int {
-  let days = _daysFromCivil(dt.year, dt.month, dt.day)
-  _floorMod(days + 3, 7) + 1
-}
-
-// --- validated construction ---
+// --- validated construction (no receiver -> free functions) ---
 
 // Strict civil constructor: every field is range-checked (month 1..12, day 1..daysInMonth, hour 0..23,
 // minute/second 0..59, milli 0..999). Out of range -> None.
@@ -119,20 +96,21 @@ pub fn dateTime(y: Int, mo: Int, d: Int, h: Int, mi: Int, s: Int, ms: Int) -> Op
 // A date at midnight UTC (time zeroed). Same validation as `dateTime`.
 pub fn dateOnly(y: Int, mo: Int, d: Int) -> Option[DateTime] { dateTime(y, mo, d, 0, 0, 0, 0) }
 
-// --- Instant construction / arithmetic ---
+// --- Instant construction (no receiver -> free functions) ---
 
 // The current wall-clock instant (UTC). IMPURE: reads the millisTime native. Excluded from the oracle.
 pub fn now() -> Instant { Instant { ms: millisTime() } }
 
 pub fn instantFromMillis(ms: Int) -> Instant { Instant { ms: ms } }
-pub fn toEpochMillis(t: Instant) -> Int { t.ms }
-pub fn addDuration(t: Instant, dur: Duration) -> Instant { Instant { ms: t.ms + dur.ms } }
-pub fn subDuration(t: Instant, dur: Duration) -> Instant { Instant { ms: t.ms - dur.ms } }
-pub fn durationBetween(a: Instant, b: Instant) -> Duration { Duration { ms: b.ms - a.ms } }   // b - a
-pub fn isBefore(a: Instant, b: Instant) -> Bool { a.ms < b.ms }
-pub fn isAfter(a: Instant, b: Instant) -> Bool { a.ms > b.ms }
 
-// --- Duration constructors / accessors / algebra ---
+// Recompose an Instant from civil UTC fields. Assumes `dt` is valid (build one via `dateTime`).
+pub fn fromDateTime(dt: DateTime) -> Instant {
+  let days = _daysFromCivil(dt.year, dt.month, dt.day)
+  let ms = days * 86400000 + dt.hour * 3600000 + dt.minute * 60000 + dt.second * 1000 + dt.milli
+  Instant { ms: ms }
+}
+
+// --- Duration constructors (no receiver -> free functions) ---
 
 pub fn millis(n: Int) -> Duration { Duration { ms: n } }
 pub fn seconds(n: Int) -> Duration { Duration { ms: n * 1000 } }
@@ -140,23 +118,7 @@ pub fn minutes(n: Int) -> Duration { Duration { ms: n * 60000 } }
 pub fn hours(n: Int) -> Duration { Duration { ms: n * 3600000 } }
 pub fn days(n: Int) -> Duration { Duration { ms: n * 86400000 } }
 
-pub fn inMillis(d: Duration) -> Int { d.ms }
-pub fn inSeconds(d: Duration) -> Int { d.ms / 1000 }
-pub fn inMinutes(d: Duration) -> Int { d.ms / 60000 }
-pub fn inHours(d: Duration) -> Int { d.ms / 3600000 }
-pub fn inDays(d: Duration) -> Int { d.ms / 86400000 }
-
-pub fn addDurations(a: Duration, b: Duration) -> Duration { Duration { ms: a.ms + b.ms } }
-pub fn subDurations(a: Duration, b: Duration) -> Duration { Duration { ms: a.ms - b.ms } }
-pub fn scaleDuration(d: Duration, k: Int) -> Duration { Duration { ms: d.ms * k } }
-pub fn negateDuration(d: Duration) -> Duration { Duration { ms: 0 - d.ms } }
-
-// --- ISO-8601 formatting / parsing (UTC, `YYYY-MM-DDThh:mm:ss.sssZ`) ---
-
-// Render an ISO-8601 UTC timestamp. Assumes year 0..9999 (zero-padded to 4 digits, no expanded-year sign).
-pub fn toIso(dt: DateTime) -> String {
-  "${dt.year:04}-${dt.month:02}-${dt.day:02}T${dt.hour:02}:${dt.minute:02}:${dt.second:02}.${dt.milli:03}Z"
-}
+// --- ISO-8601 parsing (a String -> DateTime constructor; free function) ---
 
 fn _isDig(c: Int) -> Bool { c >= 48 && c <= 57 }
 
@@ -200,8 +162,63 @@ pub fn parseIso(s: String) -> Result[DateTime, String] {
   }
 }
 
-// --- Stopwatch (monotonic elapsed time; IMPURE -- reads nanoTime, excluded from the oracle) ---
+// --- Stopwatch construction (no receiver -> free function) ---
 
 pub fn startStopwatch() -> Stopwatch { Stopwatch { startNanos: nanoTime() } }
-pub fn elapsedNanos(sw: Stopwatch) -> Int { nanoTime() - sw.startNanos }
-pub fn elapsedMillis(sw: Stopwatch) -> Int { (nanoTime() - sw.startNanos) / 1000000 }
+
+// --- Instant's own API (dot syntax: t.toDateTime(), t.addDuration(d), ...) ---
+impl Instant {
+  // Decompose this Instant into its civil UTC fields.
+  fn toDateTime(self) -> DateTime {
+    let ms = self.ms
+    let days = _floorDiv(ms, 86400000)
+    let tod = ms - days * 86400000                             // ms-of-day, [0, 86399999]
+    let dp = _civilFromDays(days)
+    let h = tod / 3600000
+    let mi = (tod / 60000) % 60
+    let s = (tod / 1000) % 60
+    let milli = tod % 1000
+    DateTime { year: dp.year, month: dp.month, day: dp.day, hour: h, minute: mi, second: s, milli: milli }
+  }
+
+  fn toEpochMillis(self) -> Int { self.ms }
+  fn addDuration(self, dur: Duration) -> Instant { Instant { ms: self.ms + dur.ms } }
+  fn subDuration(self, dur: Duration) -> Instant { Instant { ms: self.ms - dur.ms } }
+  fn durationBetween(self, other: Instant) -> Duration { Duration { ms: other.ms - self.ms } }   // other - self
+  fn isBefore(self, other: Instant) -> Bool { self.ms < other.ms }
+  fn isAfter(self, other: Instant) -> Bool { self.ms > other.ms }
+}
+
+// --- Duration's own API (accessors + algebra) ---
+impl Duration {
+  fn inMillis(self) -> Int { self.ms }
+  fn inSeconds(self) -> Int { self.ms / 1000 }
+  fn inMinutes(self) -> Int { self.ms / 60000 }
+  fn inHours(self) -> Int { self.ms / 3600000 }
+  fn inDays(self) -> Int { self.ms / 86400000 }
+
+  fn addDurations(self, other: Duration) -> Duration { Duration { ms: self.ms + other.ms } }
+  fn subDurations(self, other: Duration) -> Duration { Duration { ms: self.ms - other.ms } }
+  fn scaleDuration(self, k: Int) -> Duration { Duration { ms: self.ms * k } }
+  fn negateDuration(self) -> Duration { Duration { ms: 0 - self.ms } }
+}
+
+// --- DateTime's own API ---
+impl DateTime {
+  // ISO-8601 weekday: Monday = 1 .. Sunday = 7. (1970-01-01 was a Thursday.)
+  fn weekday(self) -> Int {
+    let days = _daysFromCivil(self.year, self.month, self.day)
+    _floorMod(days + 3, 7) + 1
+  }
+
+  // Render an ISO-8601 UTC timestamp. Assumes year 0..9999 (zero-padded to 4 digits, no expanded-year sign).
+  fn toIso(self) -> String {
+    "${self.year:04}-${self.month:02}-${self.day:02}T${self.hour:02}:${self.minute:02}:${self.second:02}.${self.milli:03}Z"
+  }
+}
+
+// --- Stopwatch's own API (IMPURE -- reads nanoTime, excluded from the oracle) ---
+impl Stopwatch {
+  fn elapsedNanos(self) -> Int { nanoTime() - self.startNanos }
+  fn elapsedMillis(self) -> Int { (nanoTime() - self.startNanos) / 1000000 }
+}
