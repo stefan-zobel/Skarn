@@ -989,8 +989,13 @@ println("p.x="  + p.x)             // => p.x=3
 println("dist=" + manhattan(p))    // => dist=7
 ```
 
-Structs are values; there is no separate "mutate a field" statement unless the binding is `mut` (see
-[§23](#23-the-type-system-in-one-page)). The idiomatic "change" is to build a new struct:
+A struct is a **reference value**, exactly like a collection: a binding or parameter holds a *reference* to it,
+not the struct itself, so assigning it to another name or passing it to a function shares one object rather than
+copying it. What "immutable by default" gives you is that a plain binding cannot be mutated — there is no
+"mutate a field" statement unless the binding is `mut`. So structs *feel* value-like as long as you don't
+mutate, but that is a property of the default, not of copying: two `mut` names for the same struct see each
+other's changes. This matters enough that [§25](#25-the-memory--cost-model) treats it in full. The idiomatic
+"change" is therefore not to mutate in place but to build a new struct:
 
 ```rust
 let moved = Point { x: p.x + 1, y: p.y }
@@ -1519,7 +1524,9 @@ match get(arr, 9) {
 ### Growable vectors: `Vec[T]`
 
 `vec()` creates an empty, growable vector. `push(v, x)` appends and `pop(v)` removes the last element
-(returning an `Option`, since the vector might be empty).
+(returning an `Option`, since the vector might be empty). A vector is a reference value, so `push`/`pop` mutate
+the *shared* object in place — every name bound to it, and every function it was passed to, sees the change
+(see [§25](#25-the-memory--cost-model)).
 
 ```rust
 let v: Vec[Int] = vec()
@@ -3101,6 +3108,23 @@ let b = a              // b and a are the SAME vector
 push(b, 3)
 println(toString(len(a)))   // => 3  -- a sees the push made through b
 ```
+
+This is the one place Skarn's "immutable by default" promise can mislead, so it is worth being precise: `mut`
+controls the **binding** — which *name* you are allowed to mutate through — not the object. It is not ownership,
+and it does not prevent aliasing. In particular, an immutable binding is **not** a private snapshot: if any
+`mut` name refers to the same object, that object can still change under it.
+
+```rust
+let mut xs: Vec[Int] = vec()
+push(xs, 1)  push(xs, 2)  push(xs, 3)
+let snapshot = xs       // NOT a snapshot -- just another name for the same vector
+push(xs, 99)
+println(toString(len(snapshot)))   // => 4  -- the "snapshot" grew too
+```
+
+If you came from a language with value-typed structs (C#, Swift, C++), note that Skarn structs behave like the
+reference types of Java/C#/Python here, not like values — the difference from those languages is only that
+mutation is opt-in via `mut`, not that assignment copies.
 
 When you want an independent copy, ask for one explicitly with `clone`:
 

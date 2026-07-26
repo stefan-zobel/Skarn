@@ -2,7 +2,7 @@
 
 This is the **small core** of Skarn — the subset you need to write real programs. It is deliberately not the
 whole language: traits beyond the basics, generics, `dyn`, iterators, the erasure types, and the full standard
-library are all covered in the complete [LanguageIntroduction.md](LanguageIntroduction.md). Start here, reach for
+library are all covered in the complete [README.md](LanguageIntroduction.md). Start here, reach for
 that when you hit something this page does not mention.
 
 If you know Java, C#, Kotlin, or a bit of Rust, almost everything below will look familiar. Run any snippet by
@@ -159,6 +159,12 @@ match get(ages, "Ada") { Some(a) => println(a), None => println("?") }   // => 3
 ```
 
 Fixed-size arrays (`array(n)`, `a[i]`) and byte buffers (`Bytes`) exist too; see the full guide.
+
+One thing to internalize early: collections and structs are **reference values**. Binding one to a new name or
+passing it to a function shares the *same* object, not a copy — so a `push` (or any `mut` mutation) is seen
+through every name that refers to it. `mut` controls which *name* may mutate, not who else can see the change;
+an immutable binding is not a private snapshot. Ask for `clone(x)` when you want an independent copy. The full
+guide's memory model section spells this out.
 
 ## 9. Two ways to call things
 
