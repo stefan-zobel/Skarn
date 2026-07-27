@@ -17,9 +17,8 @@
 
     Note: a bare char literal ('A', '\n') is a byte-valued Int; in a Char-expected context it becomes
     the zero-cost `Char` type (a code point). Char literals are highlighted as a delimited literal.
-    Skarn HAS atoms (":name", e.g. ":ok"), lexed as a
-    literal token; this UDL does not highlight them specially. ":" also serves as the
-    type-annotation operator and, doubled, the "::" module/trait qualifier.
+    Skarn has no atoms. ":" serves as the type-annotation operator and the "${e:spec}" format-specifier
+    separator; doubled, "::" is the module/trait qualifier.
 -->
 <NotepadPlus>
     <UserLang name="Skarn" ext="skn" udlVersion="2.1">

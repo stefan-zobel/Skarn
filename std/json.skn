@@ -92,7 +92,7 @@ fn _jHex4(mut c: JsonCur) -> Result[Int, String] {
   Ok(val)
 }
 // Encode a Unicode code point into UTF-8 (1..4 bytes), pushing onto `buf`.
-fn _jPushUtf8(buf: Bytes, cp: Int) -> () {
+fn _jPushUtf8(mut buf: Bytes, cp: Int) -> () {
   if cp < 128 {
     push(buf, cp)
   } else if cp < 2048 {
@@ -129,7 +129,7 @@ fn _jUnicode(mut c: JsonCur) -> Result[Int, String] {
 }
 fn _jStrLit(mut c: JsonCur) -> Result[String, String] {
   _jEat(c, '"')?
-  let buf = bytes()
+  let mut buf = bytes()
   loop {
     if _jAtEnd(c) { return Err("unterminated string at position " + toString(c.i)) }
     let ch = _jPeek(c)
@@ -159,7 +159,7 @@ fn _jStrLit(mut c: JsonCur) -> Result[String, String] {
 // ---- arrays / objects (recursive) -------------------------------------------
 fn _jArray(mut c: JsonCur) -> Result[Json, String] {
   _jEat(c, '[')?
-  let items: Vec[Json] = vec()
+  let mut items: Vec[Json] = vec()
   _jSkipWs(c)
   if _jPeek(c) == ']' { _jAdv(c)  return Ok(Arr(items)) }
   loop {
@@ -175,7 +175,7 @@ fn _jArray(mut c: JsonCur) -> Result[Json, String] {
 }
 fn _jObject(mut c: JsonCur) -> Result[Json, String] {
   _jEat(c, '{')?
-  let entries: Vec[JsonEntry] = vec()
+  let mut entries: Vec[JsonEntry] = vec()
   _jSkipWs(c)
   if _jPeek(c) == '}' { _jAdv(c)  return Ok(Obj(entries)) }
   loop {
@@ -199,7 +199,7 @@ fn _jObject(mut c: JsonCur) -> Result[Json, String] {
 // parse(s) -> Ok(Json) | Err(message-with-position). Full value grammar; strings decode all
 // escapes incl. \uXXXX surrogate pairs; trailing non-whitespace is an error.
 pub fn parse(s: String) -> Result[Json, String] {
-  let c = _jNew(s)
+  let mut c = _jNew(s)
   let v = _jValue(c)?
   _jSkipWs(c)
   if !_jAtEnd(c) { return Err("trailing characters at position " + toString(c.i)) }
@@ -219,7 +219,7 @@ fn _hexNib(n: Int) -> Int { if n < 10 { '0' + n } else { 'a' + (n - 10) } }
 
 // Append `s` as a quoted, escaped JSON string. Mandatory escapes only; non-ASCII UTF-8
 // bytes pass through unchanged (valid JSON). Iterates the string's raw BYTES.
-fn _jStr(sb: StringBuilder, s: String) -> StringBuilder {
+fn _jStr(mut sb: StringBuilder, s: String) -> StringBuilder {
   appendByte(sb, '"')
   for c in s {
     if      c == '"'  { appendByte(sb, '\\')  appendByte(sb, '"') }
@@ -238,7 +238,7 @@ fn _jStr(sb: StringBuilder, s: String) -> StringBuilder {
   appendByte(sb, '"')
 }
 
-fn _jVal(sb: StringBuilder, j: Json) -> StringBuilder {
+fn _jVal(mut sb: StringBuilder, j: Json) -> StringBuilder {
   match j {
     Null    => append(sb, "null"),
     Boolean(b) => append(sb, if b { "true" } else { "false" }),
@@ -249,7 +249,7 @@ fn _jVal(sb: StringBuilder, j: Json) -> StringBuilder {
     Obj(es) => _jObj(sb, es),
   }
 }
-fn _jArr(sb: StringBuilder, xs: Vec[Json]) -> StringBuilder {
+fn _jArr(mut sb: StringBuilder, xs: Vec[Json]) -> StringBuilder {
   appendByte(sb, '[')
   let mut first = true
   for x in xs {
@@ -259,7 +259,7 @@ fn _jArr(sb: StringBuilder, xs: Vec[Json]) -> StringBuilder {
   }
   appendByte(sb, ']')
 }
-fn _jObj(sb: StringBuilder, es: Vec[JsonEntry]) -> StringBuilder {
+fn _jObj(mut sb: StringBuilder, es: Vec[JsonEntry]) -> StringBuilder {
   appendByte(sb, '{')
   let mut first = true
   for e in es {
@@ -300,20 +300,20 @@ fn _anyNonFiniteObj(es: Vec[JsonEntry]) -> Bool {
 
 // stringifyPretty(j, indent) -> multi-line JSON, `indent` spaces per nesting level. Empty
 // arrays/objects stay inline as [] / {}.
-fn _jIndent(sb: StringBuilder, depth: Int, indent: Int) -> () {
+fn _jIndent(mut sb: StringBuilder, depth: Int, indent: Int) -> () {
   appendByte(sb, '\n')
   let total = depth * indent
   let mut k = 0
   while k < total { appendByte(sb, ' ')  k = k + 1 }
 }
-fn _jPretty(sb: StringBuilder, j: Json, depth: Int, indent: Int) -> StringBuilder {
+fn _jPretty(mut sb: StringBuilder, j: Json, depth: Int, indent: Int) -> StringBuilder {
   match j {
     Arr(xs) => _jArrPretty(sb, xs, depth, indent),
     Obj(es) => _jObjPretty(sb, es, depth, indent),
     _ => _jVal(sb, j),
   }
 }
-fn _jArrPretty(sb: StringBuilder, xs: Vec[Json], depth: Int, indent: Int) -> StringBuilder {
+fn _jArrPretty(mut sb: StringBuilder, xs: Vec[Json], depth: Int, indent: Int) -> StringBuilder {
   if len(xs) == 0 { append(sb, "[]") }
   else {
     appendByte(sb, '[')
@@ -328,7 +328,7 @@ fn _jArrPretty(sb: StringBuilder, xs: Vec[Json], depth: Int, indent: Int) -> Str
     appendByte(sb, ']')
   }
 }
-fn _jObjPretty(sb: StringBuilder, es: Vec[JsonEntry], depth: Int, indent: Int) -> StringBuilder {
+fn _jObjPretty(mut sb: StringBuilder, es: Vec[JsonEntry], depth: Int, indent: Int) -> StringBuilder {
   if len(es) == 0 { append(sb, "{}") }
   else {
     appendByte(sb, '{')

@@ -179,7 +179,7 @@ primary      = literal
              | if_expr | match_expr | while_expr | for_expr | loop_expr | lambda | block
              | break_expr | "continue" | return_expr ;
 
-literal      = int | double | string | raw_string | char_lit | atom | "true" | "false" ;
+literal      = int | double | string | raw_string | char_lit | "true" | "false" ;
 
 (* Value path: lident = variable / function; uident = a nullary constructor     *)
 (* or a constructor used as a value/function (applied via call_suffix, e.g.     *)
@@ -294,7 +294,7 @@ dyn_type     = "dyn" , [ lident , "::" ] , uident ,
 (* -- lexical -- *)
 uident       = uppercase_letter , { letter | digit | "_" } ;          (* types / constructors *)
 lident       = ( lowercase_letter | "_" ) , { letter | digit | "_" } ; (* values / functions; a lone `_` is the wildcard, not lident *)
-ident        = lident | uident ;                 (* case-agnostic union; used only where case is irrelevant (atoms) *)
+ident        = lident | uident ;                 (* case-agnostic union; used where case is irrelevant (e.g. imported names) *)
 int          = hex_int | octal_int | binary_int | ( digit , { digit } ) ;
 (* Radix literals are a BIT PATTERN up to 48 bits, sign-extended from bit 47 (Option B): so             *)
 (* 0xFFFFFFFFFFFF == -1, 0x800000000000 == MIN_48. A plain decimal int stays a signed magnitude < 2^47. *)
@@ -321,8 +321,8 @@ raw_string   = "r" , { "#" } , '"' , { char_verbatim } , '"' , { "#" } ;   (* op
 (* literal `${` is written `\$` + `{`. Rejected in pattern / const-initializer position.              *)
 (* A hole may carry a `:spec` format specifier: `${e:spec}` desugars to `format(e, "spec")` (the      *)
 (* `Format` trait; scalars only). The spec is scanned as raw text up to the hole-closing `}` (only    *)
-(* a top-level `:` -- all of ()/[]/{} balanced -- starts it, so an atom `:x` or a lambda-param `:`    *)
-(* is untouched); its grammar (below) is validated at parse time.                                     *)
+(* a top-level `:` -- all of ()/[]/{} balanced -- starts it; a struct/map/block `:` or a lambda-param *)
+(* `:` is nested (untouched)); its grammar (below) is validated at parse time.                        *)
 interp_string = '"' , text , { "${" , expr , [ ':' , fmt_spec ] , "}" , text } , '"' ;   (* >= 1 hole *)
 fmt_spec     = [ [ fill ] , align ] , [ '+' ] , [ '#' ] , [ '0' ] , [ width ] , [ '.' , precision ] , [ fmt_type ] ;
 align        = '<' | '>' | '^' ;   fill = char ;   width = digit , { digit } ;   precision = digit , { digit } ;
@@ -334,5 +334,4 @@ char_lit     = "'" , ( char_no_squote_no_bslash | escape ) , "'" ;
              (* escapes \n \t \r \\ \0 \' \"; a multi-byte literal (e.g. 'é' = 2     *)
              (* UTF-8 bytes), '' (empty), or 'ab' is a lexer error. Lexes to an Int  *)
              (* token, so it is usable anywhere `literal` is -- incl. patterns.      *)
-atom         = ":" , ident ;                     (* only where `:` cannot be a label *)
 terminator   = ";" | NEWLINE ;                   (* StmtEnd, via ASI or explicit ";" *)

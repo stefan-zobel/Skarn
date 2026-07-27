@@ -46,7 +46,7 @@ fn totalArea(c: Canvas) -> Int {
 
 // ---- demo -------------------------------------------------------------------
 // THE headline: one Vec, three different concrete types. This is what `dyn` buys.
-let shapes: Vec[dyn Draw] = vec()
+let mut shapes: Vec[dyn Draw] = vec()
 push(shapes, Square { side: 3 })
 push(shapes, Rect { w: 4, h: 5 })
 push(shapes, 7)                      // an Int -- same collection, different type

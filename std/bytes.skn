@@ -16,20 +16,20 @@ pub fn remaining(r: ByteReader) -> Int { len(r.buf) - r.pos }
 pub fn atEnd(r: ByteReader) -> Bool { r.pos >= len(r.buf) }
 
 // --- writer (over Bytes; each returns the buffer so writes chain with the pipe) ---
-pub fn writeU8(b: Bytes, v: Int) -> Bytes { push(b, v & 255) }
-pub fn writeU16LE(b: Bytes, v: Int) -> Bytes {
+pub fn writeU8(mut b: Bytes, v: Int) -> Bytes { push(b, v & 255) }
+pub fn writeU16LE(mut b: Bytes, v: Int) -> Bytes {
   push(b, v & 255)
   push(b, (v >> 8) & 255)
 }
-pub fn writeU32LE(b: Bytes, v: Int) -> Bytes {
+pub fn writeU32LE(mut b: Bytes, v: Int) -> Bytes {
   push(b, v & 255)
   push(b, (v >> 8) & 255)
   push(b, (v >> 16) & 255)
   push(b, (v >> 24) & 255)
 }
-pub fn writeI32LE(b: Bytes, v: Int) -> Bytes { writeU32LE(b, v & 4294967295) }   // two's-complement low 32 bits
+pub fn writeI32LE(mut b: Bytes, v: Int) -> Bytes { writeU32LE(b, v & 4294967295) }   // two's-complement low 32 bits
 // Unsigned LEB128. Domain: v >= 0 (non-negative 48-bit Int); 1..7 bytes.
-pub fn writeVarU(b: Bytes, v: Int) -> Bytes {
+pub fn writeVarU(mut b: Bytes, v: Int) -> Bytes {
   let mut n = v
   while n >= 128 {
     push(b, (n & 127) | 128)
@@ -41,7 +41,7 @@ pub fn writeVarU(b: Bytes, v: Int) -> Bytes {
 // (0->0, -1->1, 1->2, -2->3, 2->4, ...), then emits that code as an unsigned varint. Full 48-bit
 // signed domain; 1..7 bytes. `>>>` (logical shift) treats the zigzag code as unsigned, so a code
 // with bit 47 set (large magnitude) still emits and reads back correctly.
-pub fn writeVarI(b: Bytes, v: Int) -> Bytes {
+pub fn writeVarI(mut b: Bytes, v: Int) -> Bytes {
   let mut z = (v << 1) ^ (v >> 47)     // zigzag encode (48-bit)
   loop {
     if (z >>> 7) == 0 { break push(b, z & 127) }
@@ -49,10 +49,10 @@ pub fn writeVarI(b: Bytes, v: Int) -> Bytes {
     z = z >>> 7
   }
 }
-pub fn writeBytes(dst: Bytes, src: Bytes) -> Bytes { appendBytes(dst, src) }   // bulk memcpy
+pub fn writeBytes(mut dst: Bytes, src: Bytes) -> Bytes { appendBytes(dst, src) }   // bulk memcpy
 // Length-prefixed String: an unsigned varint BYTE-length then the raw bytes (String is byte-based).
 // Pairs with readStr. `appendBytes` blits the string bytes directly (one memcpy, no intermediate copy).
-pub fn writeStr(b: Bytes, s: String) -> Bytes {
+pub fn writeStr(mut b: Bytes, s: String) -> Bytes {
   writeVarU(b, len(s))
   appendBytes(b, s)
 }
@@ -102,7 +102,7 @@ pub fn readBytes(mut r: ByteReader, n: Int) -> Result[Bytes, String] {
   if n < 0 { Err("readBytes: negative length") }
   else if r.pos + n > len(r.buf) { Err("readBytes: unexpected end of bytes") }
   else {
-    let out = bytes(n)
+    let mut out = bytes(n)
     _appendBytesRange(out, r.buf, r.pos, r.pos + n)   // bulk memcpy of r.buf[pos, pos+n)
     r.pos = r.pos + n
     Ok(out)

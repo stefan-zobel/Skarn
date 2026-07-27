@@ -14,7 +14,7 @@ language server would add those on top.
 - Strings with escapes and `"${ … }"` interpolation (holes switch back to the
   expression context; `${e:spec}` format specifiers are colored separately)
 - Raw strings `r"…"`, `r#"…"#`, `r##"…"##`, … (verbatim, no escapes/interpolation)
-- Char literals `'A'` / `'\n'`, atoms `:name`
+- Char literals `'A'` / `'\n'`
 - Numbers: decimal, float, `0x` / `0o` / `0b`
 - Keywords, storage modifiers, built-in and prelude types, ~230 built-in / prelude
   functions

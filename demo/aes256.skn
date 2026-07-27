@@ -217,7 +217,7 @@ fn getu32(b: Bytes, off: Int) -> Int {
   ((b[off] << 24) | (b[off+1] << 16) | (b[off+2] << 8) | b[off+3])
 }
 
-fn putWord(out: Bytes, w: Int) -> () {
+fn putWord(mut out: Bytes, w: Int) -> () {
   push(out, (w >> 24) & 0xFF)
   push(out, (w >> 16) & 0xFF)
   push(out, (w >> 8) & 0xFF)
@@ -296,7 +296,7 @@ fn aesEncBlock(rk: Array[Int], inb: Bytes, off: Int) -> Bytes {
   let o1 = ((SBOX[(s1 >> 24) & 0xFF] << 24) | (SBOX[(s2 >> 16) & 0xFF] << 16) | (SBOX[(s3 >> 8) & 0xFF] << 8) | SBOX[s0 & 0xFF]) ^ rk[rki+1]
   let o2 = ((SBOX[(s2 >> 24) & 0xFF] << 24) | (SBOX[(s3 >> 16) & 0xFF] << 16) | (SBOX[(s0 >> 8) & 0xFF] << 8) | SBOX[s1 & 0xFF]) ^ rk[rki+2]
   let o3 = ((SBOX[(s3 >> 24) & 0xFF] << 24) | (SBOX[(s0 >> 16) & 0xFF] << 16) | (SBOX[(s1 >> 8) & 0xFF] << 8) | SBOX[s2 & 0xFF]) ^ rk[rki+3]
-  let out = bytes()
+  let mut out = bytes()
   putWord(out, o0)  putWord(out, o1)  putWord(out, o2)  putWord(out, o3)
   out
 }
@@ -318,7 +318,7 @@ fn addRoundKeyB(mut st: Bytes, rk: Array[Int], round: Int) -> () {
   }
 }
 fn shiftRowsB(st: Bytes) -> Bytes {
-  let out = bytes()
+  let mut out = bytes()
   let mut c = 0
   while c < 4 {
     let mut r = 0
@@ -331,7 +331,7 @@ fn shiftRowsB(st: Bytes) -> Bytes {
   out
 }
 fn mixColumnsB(st: Bytes) -> Bytes {
-  let out = bytes()
+  let mut out = bytes()
   let mut c = 0
   while c < 4 {
     let a0 = st[c*4+0]  let a1 = st[c*4+1]  let a2 = st[c*4+2]  let a3 = st[c*4+3]
@@ -368,7 +368,7 @@ fn invSubBytesB(mut st: Bytes) -> () {
   while i < 16 { st[i] = INV_SBOX[st[i]]  i = i + 1 }
 }
 fn invShiftRowsB(st: Bytes) -> Bytes {
-  let out = bytes()
+  let mut out = bytes()
   let mut c = 0
   while c < 4 {
     let mut r = 0
@@ -381,7 +381,7 @@ fn invShiftRowsB(st: Bytes) -> Bytes {
   out
 }
 fn invMixColumnsB(st: Bytes) -> Bytes {
-  let out = bytes()
+  let mut out = bytes()
   let mut c = 0
   while c < 4 {
     let a0 = st[c*4+0]  let a1 = st[c*4+1]  let a2 = st[c*4+2]  let a3 = st[c*4+3]
@@ -414,7 +414,7 @@ fn aesDecBlockBytes(rk: Array[Int], inb: Bytes, off: Int) -> Bytes {
 
 // ---------- ECB / CBC drivers ----------
 fn ecbEncryptT(rk: Array[Int], data: Bytes) -> Bytes {
-  let out = bytes()
+  let mut out = bytes()
   let n = len(data) / 16
   let mut i = 0
   while i < n {
@@ -426,7 +426,7 @@ fn ecbEncryptT(rk: Array[Int], data: Bytes) -> Bytes {
   out
 }
 fn ecbEncryptBytes(rk: Array[Int], data: Bytes) -> Bytes {
-  let out = bytes()
+  let mut out = bytes()
   let n = len(data) / 16
   let mut i = 0
   while i < n {
@@ -438,12 +438,12 @@ fn ecbEncryptBytes(rk: Array[Int], data: Bytes) -> Bytes {
   out
 }
 fn cbcEncryptT(rk: Array[Int], iv: Bytes, data: Bytes) -> Bytes {
-  let out = bytes()
+  let mut out = bytes()
   let mut prev = iv
   let n = len(data) / 16
   let mut i = 0
   while i < n {
-    let blk = bytes()
+    let mut blk = bytes()
     let mut j = 0
     while j < 16 { push(blk, data[i*16+j] ^ prev[j])  j = j + 1 }
     let enc = aesEncBlock(rk, blk, 0)
@@ -464,7 +464,7 @@ fn hexVal(c: Int) -> Int {
 }
 fn hexToBytes(s: String) -> Bytes {
   let src = toBytes(s)
-  let out = bytes()
+  let mut out = bytes()
   let n = len(src) / 2
   let mut i = 0
   while i < n {
@@ -474,7 +474,7 @@ fn hexToBytes(s: String) -> Bytes {
   out
 }
 fn bytesToHex(b: Bytes) -> String {
-  let out = bytes()
+  let mut out = bytes()
   for x in b {
     push(out, HEXD[(x >> 4) & 0xF])
     push(out, HEXD[x & 0xF])
@@ -531,7 +531,7 @@ println("")
 
 // --- A/B throughput: T-table vs byte-oriented ECB encrypt ---
 let nblocks = 1024
-let buf = bytes()
+let mut buf = bytes()
 let mut bi = 0
 while bi < nblocks * 16 { push(buf, (bi * 31 + 7) & 0xFF)  bi = bi + 1 }
 let reps = 24

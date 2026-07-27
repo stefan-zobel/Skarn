@@ -2,7 +2,7 @@
 // verbs delegate to the Map builtins applied to the `.m` field (`has`/`delete`/`len`/`keys`), which take a
 // Map -- so there is no name clash with those builtins or with the Iterator `contains`/`count` terminals.
 //
-// The element type T must be `Hashable` -- a permitted Map key: Int / Double / Bool / String / Atom.
+// The element type T must be `Hashable` -- a permitted Map key: Int / Double / Bool / String.
 // The `T: Hashable` bound makes `Set[SomeStruct]` a COMPILE error (it would build a `Map[SomeStruct, Bool]`,
 // which the checker now rejects at construction) rather than a runtime "Invalid map key type" trap. The struct
 // bound applies to every method, so the inherent `impl[T: Hashable] Set[T]` block carries it once.

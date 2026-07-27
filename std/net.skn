@@ -49,7 +49,7 @@ fn _indexOfByte(b: Bytes, target: Int, from: Int) -> Int {
 
 // The sub-range b[lo, hi) copied into a fresh buffer.
 fn _sub(b: Bytes, lo: Int, hi: Int) -> Bytes {
-  let out = bytes()
+  let mut out = bytes()
   let mut i = lo
   while i < hi { push(out, b[i])  i = i + 1 }
   out
@@ -74,7 +74,7 @@ impl TcpConn {
 
   // Read all remaining bytes until EOF, INCLUDING any bytes buffered by a prior recvLine.
   fn recvAll(mut self) -> Result[Bytes, String] {
-    let out = bytes()
+    let mut out = bytes()
     appendBytes(out, self.buf)
     self.buf = bytes()
     loop {

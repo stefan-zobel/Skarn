@@ -12,7 +12,7 @@ pub fn sliceBytes(src: Bytes, start: Int, end: Int) -> String {
   let mut hi = end
   if lo < 0 { lo = 0 }
   if hi > n { hi = n }
-  let buf = bytes()
+  let mut buf = bytes()
   if lo < hi { _appendBytesRange(buf, src, lo, hi) }   // bulk memcpy of src[lo, hi)
   fromBytes(buf)
 }
@@ -96,7 +96,7 @@ pub fn trimEnd(s: String) -> String { let b = toBytes(s)  slice(s, 0, _trimHi(b,
 fn _toUpperByte(c: Int) -> Int { if c >= 97 { if c <= 122 { c - 32 } else { c } } else { c } }
 fn _toLowerByte(c: Int) -> Int { if c >= 65 { if c <= 90 { c + 32 } else { c } } else { c } }
 fn _mapBytes(b: Bytes, f: fn(Int) -> Int) -> String {
-  let out = bytes()
+  let mut out = bytes()
   let mut i = 0
   while i < len(b) { push(out, f(b[i]))  i = i + 1 }
   fromBytes(out)
@@ -104,16 +104,16 @@ fn _mapBytes(b: Bytes, f: fn(Int) -> Int) -> String {
 pub fn toUpper(s: String) -> String { _mapBytes(toBytes(s), _toUpperByte) }
 pub fn toLower(s: String) -> String { _mapBytes(toBytes(s), _toLowerByte) }
 // ---- build helpers (append into a shared Bytes buffer; while-loops => O(1) stack) ----
-fn _appendRange(out: Bytes, b: Bytes, lo: Int, hi: Int) -> Bytes { _appendBytesRange(out, b, lo, hi) }
-fn _appendBytes(out: Bytes, src: Bytes) -> Bytes { appendBytes(out, src) }
-fn _padBytes(out: Bytes, byte: Int, n: Int) -> Bytes {
+fn _appendRange(mut out: Bytes, b: Bytes, lo: Int, hi: Int) -> Bytes { _appendBytesRange(out, b, lo, hi) }
+fn _appendBytes(mut out: Bytes, src: Bytes) -> Bytes { appendBytes(out, src) }
+fn _padBytes(mut out: Bytes, byte: Int, n: Int) -> Bytes {
   let mut i = 0
   while i < n { push(out, byte)  i = i + 1 }
   out
 }
 // ---- replace: ALL non-overlapping occurrences of `from`, left to right. An empty `from` is a no-op
 //      (returns s unchanged). BYTE-level. _replaceGo tail-recurses (one call per match) => O(1) stack. ----
-fn _replaceGo(b: Bytes, fb: Bytes, tb: Bytes, pos: Int, out: Bytes) -> Bytes {
+fn _replaceGo(b: Bytes, fb: Bytes, tb: Bytes, pos: Int, mut out: Bytes) -> Bytes {
   let k = _strIndexOf(b, fb, pos)
   if k < 0 { _appendRange(out, b, pos, len(b)) }
   else {
@@ -124,7 +124,7 @@ fn _replaceGo(b: Bytes, fb: Bytes, tb: Bytes, pos: Int, out: Bytes) -> Bytes {
 }
 pub fn replace(s: String, from: String, to: String) -> String {
   if len(from) == 0 { s } else {
-    let out = bytes()
+    let mut out = bytes()
     _replaceGo(toBytes(s), toBytes(from), toBytes(to), 0, out)
     fromBytes(out)
   }
@@ -134,7 +134,7 @@ pub fn replace(s: String, from: String, to: String) -> String {
 pub fn padStart(s: String, width: Int, padByte: Int) -> String {
   let n = len(s)
   if n >= width { s } else {
-    let out = bytes()
+    let mut out = bytes()
     _padBytes(out, padByte, width - n)
     _appendBytes(out, toBytes(s))
     fromBytes(out)
@@ -143,7 +143,7 @@ pub fn padStart(s: String, width: Int, padByte: Int) -> String {
 pub fn padEnd(s: String, width: Int, padByte: Int) -> String {
   let n = len(s)
   if n >= width { s } else {
-    let out = bytes()
+    let mut out = bytes()
     _appendBytes(out, toBytes(s))
     _padBytes(out, padByte, width - n)
     fromBytes(out)
@@ -152,7 +152,7 @@ pub fn padEnd(s: String, width: Int, padByte: Int) -> String {
 // repeatStr: s concatenated n times (n <= 0 -> ""). Named to avoid the Iterator source `repeat`.
 pub fn repeatStr(s: String, n: Int) -> String {
   let b = toBytes(s)
-  let out = bytes()
+  let mut out = bytes()
   let mut i = 0
   while i < n { _appendBytes(out, b)  i = i + 1 }
   fromBytes(out)
@@ -165,8 +165,8 @@ pub fn repeatStr(s: String, n: Int) -> String {
 pub struct StringBuilder { buf: Bytes }
 pub fn stringBuilder() -> StringBuilder { StringBuilder { buf: bytes() } }
 pub fn stringBuilderCap(cap: Int) -> StringBuilder { StringBuilder { buf: bytes(cap) } }
-pub fn append(sb: StringBuilder, s: String) -> StringBuilder { appendBytes(sb.buf, s)  sb }
-pub fn appendByte(sb: StringBuilder, c: Int) -> StringBuilder { push(sb.buf, c)  sb }
+pub fn append(mut sb: StringBuilder, s: String) -> StringBuilder { appendBytes(sb.buf, s)  sb }
+pub fn appendByte(mut sb: StringBuilder, c: Int) -> StringBuilder { push(sb.buf, c)  sb }
 pub fn build(sb: StringBuilder) -> String { fromBytes(sb.buf) }
 pub fn sbLen(sb: StringBuilder) -> Int { len(sb.buf) }
 
@@ -185,7 +185,7 @@ pub fn codePoint(c: Char) -> Int { c.0 }
 // _encodeCp: append the 1..4 UTF-8 bytes of a code point to a Bytes buffer. LOSSY-TOTAL: an
 // out-of-range or surrogate code point encodes U+FFFD (the replacement character, EF BF BD). All
 // byte-math over 48-bit Int (a code point is <= 21 bits); `push` masks each byte to 0..255.
-fn _encodeCp(out: Bytes, cp: Int) -> Bytes {
+fn _encodeCp(mut out: Bytes, cp: Int) -> Bytes {
   if cp < 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) {
     push(out, 0xEF)  push(out, 0xBF)  push(out, 0xBD)          // U+FFFD
   } else if cp <= 0x7F {
@@ -206,10 +206,10 @@ fn _encodeCp(out: Bytes, cp: Int) -> Bytes {
 }
 // codePointToStr: encode ONE code-point Int to its (1..4-byte) UTF-8 String. The "missing encoder"
 // that makes a code-point Int no longer a one-way street. An invalid code point yields U+FFFD.
-pub fn codePointToStr(cp: Int) -> String { let out = bytes()  _encodeCp(out, cp)  fromBytes(out) }
+pub fn codePointToStr(cp: Int) -> String { let mut out = bytes()  _encodeCp(out, cp)  fromBytes(out) }
 // appendCodePoint: the multi-byte sibling of appendByte -- append a code point's UTF-8 bytes to a
 // StringBuilder, mutating in place and returning it for chaining.
-pub fn appendCodePoint(sb: StringBuilder, cp: Int) -> StringBuilder { _encodeCp(sb.buf, cp)  sb }
+pub fn appendCodePoint(mut sb: StringBuilder, cp: Int) -> StringBuilder { _encodeCp(sb.buf, cp)  sb }
 
 // ---- Format specifiers: the runtime behind an interpolation hole `${e:spec}`, which desugars to
 //      `format(e, "spec")`. Also callable directly as `format(x, "spec")`. A subset of Rust's
@@ -273,19 +273,19 @@ fn _pad(s: String, fs: FmtSpec, defaultAlign: Int) -> String {
     let total = fs.width - n
     let a = if fs.align == 0 { defaultAlign } else { fs.align }
     if a == 1 {
-      let out = bytes()
+      let mut out = bytes()
       _appendBytes(out, toBytes(s))
       _padBytes(out, fs.fill, total)
       fromBytes(out)
     } else if a == 3 {
       let left = total / 2
-      let out = bytes()
+      let mut out = bytes()
       _padBytes(out, fs.fill, left)
       _appendBytes(out, toBytes(s))
       _padBytes(out, fs.fill, total - left)
       fromBytes(out)
     } else {
-      let out = bytes()
+      let mut out = bytes()
       _padBytes(out, fs.fill, total)
       _appendBytes(out, toBytes(s))
       fromBytes(out)

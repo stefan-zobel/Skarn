@@ -1,6 +1,8 @@
 # An Introduction to Skarn
 
-Skarn is a statically typed scripting language that runs on the vMachine bytecode interpreter.
+Skarn is a sound, statically typed language in the ML/Rust tradition — checked ahead of time and *erased* at
+compile time (generics compile to one shared body, not a copy per type) — that happens to target a compact
+bytecode VM (the vMachine interpreter).
 This guide is a complete, example-driven tour of the language for working programmers. It assumes you are
 comfortable with a mainstream statically typed language and have seen a few functional-programming ideas
 (closures, pattern matching, immutable-by-default values), but it does **not** assume you know any particular
@@ -31,16 +33,21 @@ Concretely:
   `panic`, which aborts. No invisible control flow.
 - **No classes or inheritance.** Data is plain `struct`s and `enum`s; behavior is `trait`s. Composition over
   hierarchy.
-- **Sound, then erased.** The type checker is the single guarantee; at runtime all generics, traits, and `dyn`
-  are erased — no reflection, no runtime type tags, no boxing. Types cost nothing once the program runs.
+- **Sound, then erased.** The type checker is the single guarantee. At run time, generic *type parameters*
+  carry no witness — no dictionaries, no per-type specialization — and there is no reflection, no boxing, and
+  no vtables. Trait dispatch instead reads the coarse type tag every value already carries (the one the GC and
+  the value representation need anyway), so it too costs nothing extra. See [§16](#16-traits)
+  for how "erased" and "dispatch on the runtime type" fit together without contradiction.
 
 ### Compared to the languages it borrows from
 
 | | Shares with Skarn | What Skarn does differently |
 |---|---|---|
 | **Rust** | enums + `match`, `Option`/`Result` + `?`, traits + bounds, immutability, no null | **GC instead of a borrow checker** — no lifetimes/ownership/`&mut`; generics are *erased* (one body), not monomorphized |
-| **Kotlin / Java** | GC, pragmatic, quick to learn | sum types + exhaustive matching; `Result` not exceptions; `Option` not nullable types; no inheritance |
-| **Go** | GC, small language, fast to pick up | real sum types + generics-with-traits + `?`; expression-oriented, no `if err != nil` boilerplate |
+| **Gleam / OCaml / Elm (the ML family)** | sound static typing, sum types + exhaustive `match`, *erased* generics (one body), immutability by default | Rust-style traits + bounds + `dyn`; a C-family curly-brace surface with method syntax; inference for locals only (signatures are annotated); targets a compact bytecode VM |
+| **Kotlin** | GC on a bytecode VM, *erased* generics, sealed types + exhaustive `when`, expression-oriented (`if`/`when`) | `Option` instead of nullable types (`T?`); `Result` + `?` instead of exceptions; no classes or subclassing (structs + traits only) |
+| **Swift** | enums with associated values + exhaustive `switch`, `Optional` as a real sum type (≈ `Option`), protocols + constraints (≈ traits + bounds), value-type structs | runs on a GC bytecode VM (Swift is native + ARC); errors as `Result`/`?` values rather than `throws`; no classes or subclassing |
+| **Go** | GC, an application / CLI focus, errors as values (not exceptions) | real sum types + generics-with-traits + exhaustive `match` + `?` — deliberately *not* Go's minimal surface / `if err != nil` |
 
 ### Deliberate scope (what Skarn is *not*)
 
@@ -65,7 +72,10 @@ when a problem asks for it.
 
 - Sections build on each other, but each is self-contained enough to skim.
 - Code is shown in normal, multi-line style. In real files you may write several small statements on one line
-  separated by spaces; the compiler uses newlines and blank lines only as hints, not as required separators.
+  separated by spaces; the compiler mostly treats newlines and blank lines as formatting rather than required
+  separators. The one place a newline *is* significant: a value given to `return` or carried out by `break`
+  must start on the **same line** as the keyword — `return\n  x` reads as a bare `return` followed by a
+  separate statement `x`, not as returning `x`.
 - Run any example by saving it to a `.skn` file and passing it to the runner:
 
 ```
@@ -111,9 +121,10 @@ function", and no silent type coercions that produce a wrong answer.
 
 Three properties are worth stating up front, because they shape everything else:
 
-- **The types are checked and then erased.** Types exist only at compile time. At run time there are just
-  values; no type information is carried around for the sake of the type system. This keeps the language fast
-  and means generics cost nothing at run time.
+- **The types are checked and then erased.** Types exist only at compile time; generics carry no witness and
+  cost nothing at run time. Every value does still carry a coarse runtime tag (is-it-an-Int, which struct,
+  which enum variant) — that is what `match` and trait dispatch read — but *nothing the type system needed*
+  survives compilation. (See [§16](#16-traits) for how dispatch uses that tag.)
 - **There is no escape hatch.** There is no `any` type and no `unsafe`. The type checker is the only thing
   standing between you and a bad program, so it is strict: it never lets an ill-typed program through.
 - **Values are immutable by default.** A binding does not change unless you explicitly ask for it with `mut`.
@@ -161,9 +172,11 @@ write them out.
 | `()`     | the "unit" value — the single value of no interest | `()`            |
 
 There is one more literal form worth knowing: a **character literal** written with single quotes, such as
-`'A'`. Skarn does **not** have a separate character type — a character literal is simply an `Int` holding the
-byte value of that one character (`'A'` is `65`). This pairs naturally with the fact that strings are byte
-sequences.
+`'A'`. A *bare* character literal is simply an `Int` holding the byte value of that one character (`'A'` is
+`65`) — which pairs naturally with the fact that strings are byte sequences. Skarn *does* also have an opt-in
+`Char` type for Unicode **code points** (a zero-cost wrapper over an `Int`), but a character literal becomes a
+`Char` only in a `Char`-typed context; a bare `'A'` stays an `Int`. See
+[Char and UTF-8 code points](#char-and-utf-8-code-points).
 
 ```rust
 let anInt: Int = 42
@@ -220,6 +233,14 @@ counter = counter + 5
 counter = counter + 5
 println("counter=" + counter)   // => counter=10
 ```
+
+`mut` governs **all** mutation through a binding, under one rule (Rust's): the *root* binding must be `mut` to
+reassign it (`x = ..`), to assign through a place path (`p.x = ..`, `a[i] = ..`), **or** to pass it to a
+function that mutates it in place (`push(v, x)`, `sort(v)`, `append(sb, s)` — anything whose parameter is
+`mut`). A plain `let v = vec()` followed by `push(v, 1)` is therefore a compile error — write `let mut v`. (A
+fresh temporary you never bind, like `push(vec(), 1)`, needs no `mut`.) `mut` is meaningful only for the
+mutable aggregates — `struct`/tuple/`Array`/`Vec`/`Bytes`/`Map` and trait objects; a scalar, `enum`, or `List`
+has no in-place mutation surface, so `mut` on one is rejected.
 
 **Type inference is local.** Inside a function body the compiler infers the types of your `let` bindings from
 their initializers, so you rarely annotate them. But function parameters and return types must always be
@@ -289,12 +310,63 @@ let c = 3 + 0.5         // => 3.5 (Int promoted to Double)
 
 ### Comparison and equality
 
-`== !=` compare any two values of the same type by value (structural equality). `< <= > >=` compare **numbers
-or strings**.
+`== !=` are **structural (deep value) equality**: two values are equal when they have the *same shape and
+equal components*, all the way down — never by object identity. A `struct` equals another with equal fields,
+a tuple equals a tuple with equal elements, an `enum` value equals one of the same variant with equal
+payloads, and a `Vec` / `Array` / `Bytes` / `Map` equals another with equal elements (a `Map` compares
+**regardless of insertion order**). `Int` / `Double` / `Bool` / `Char` / `transparent struct` newtypes /
+integer-backed `enum`s compare by value; `String` by content. This agrees with **pattern matching**, which
+is also structural — so `p == Point { x: 1, y: 2 }` is `true` exactly when `match p { Point { x: 1, y: 2 } => … }`
+matches.
+
+```rust
+struct Point { x: Int, y: Int }
+let e5 = (Point { x: 1, y: 2 } == Point { x: 1, y: 2 })  // => true
+let e6 = (Some(1) == Some(1))                            // => true
+let e7 = (None == None)                                  // => true
+let e8 = (Some(1) == None)                               // => false
+let e9 = (toVec([1, 2, 3]) == toVec([1, 2, 3]))          // => true
+```
+
+A type supports `==` only when **all of its components do**. The things that have no structural equality are a
+**function / closure** value, a **trait object** (`dyn T` — its concrete type is hidden), and an **unbounded
+type parameter**; a type that stores one of these is not comparable, and `==` on it is a **compile error** (not
+a silent wrong answer) — compare the other fields instead. In a generic function, compare a type parameter with
+`==` only under a **`T: Eq`** bound, which requests exactly this: `fn allEq[T: Eq](xs: Vec[T], v: T) -> Bool
+{ … a == v … }`. `Eq` is a built-in, automatically-derived marker — you never `impl` it and there is no `dyn Eq`.
+
+Each of these is rejected at compile time (never a silent wrong answer):
+
+```rust
+struct Box { f: fn(Int) -> Int }
+let a = Box { f: fn(x: Int) -> Int { x } }
+a == a                            // error: type Box does not support '==' (it contains a function value)
+
+fn same2[T](a: T, b: T) -> Bool { a == b }   // error: T does not support '==' — add a 'T: Eq' bound
+
+struct P { x: Int }
+impl Eq for P {}                  // error: cannot implement the built-in 'Eq' marker (it is derived)
+
+fn f(x: dyn Eq) -> Int { 0 }      // error: 'Eq' is a compile-time marker, not usable as 'dyn Eq'
+```
+
+> **`NaN` and equality.** `Double` compares by IEEE rules, so **`NaN` is never equal to `NaN`** — and a
+> composite that *contains* a `NaN` inherits that: `P { x: 0.0/0.0 } == P { x: 0.0/0.0 }` is `false` (two
+> distinct values), exactly as `0.0/0.0 == 0.0/0.0` is `false`. A value is still equal to *itself*
+> (`p == p` is `true` — same object), but not to a structurally-equal copy once a `NaN` is involved. Note this
+> is a *different* rule from **map keys**, which canonicalize `NaN` (so a `NaN` key is findable); `==` stays
+> IEEE, key-equality does not — a deliberate split. One consequence of the self-equality short-circuit: for a
+> `NaN`-containing value, `contains(v, x)` answers differently depending on whether `v` holds `x` *itself* or a
+> structural copy of it — the only case where that distinction is observable.
+
+`< <= > >=` compare **two numbers, two strings, or two `Char`s** (there is no ordering on composites). Note the
+`Ord` *trait* — what `sort` / `sorted` / `minOf` / `maxOf` require — is narrower: only `Int` / `Double` /
+`String` (see [§19](#19-iterators)). So a `Char` can be compared with `<` but a `Vec[Char]` cannot be `sort`ed —
+use the comparator form, which needs no `Ord`: `sortBy(chars, fn(a: Char, b: Char) -> Bool { a < b })`.
 
 ```rust
 let e1 = (2 + 2 == 4)         // => true
-let e2 = ("abc" == "abc")     // => true (compares the text, not identity)
+let e2 = ("abc" == "abc")     // => true (String compares its text)
 let e3 = (5 > 3 && 2 <= 2)    // => true
 let e4 = ("apple" < "banana") // => true (lexicographic, byte order)
 ```
@@ -317,13 +389,14 @@ println("short=" + short)          // => short=false
 
 ### Bitwise and shift
 
-`& | ^ << >> >>>` operate on `Int` only (`>>` is an arithmetic/sign-preserving shift, `>>>` is logical). There
-is no bitwise-not operator; use `x ^ (0 - 1)` to flip all bits.
+`& | ^ ~ << >> >>>` operate on `Int` only (`>>` is an arithmetic/sign-preserving shift, `>>>` is logical).
+`~x` is bitwise-not — it flips every bit, equivalent to `x ^ (0 - 1)`.
 
 ```rust
 let bits = (6 & 3) | (1 << 4)   // (2) | (16) => 18
 println("bits=" + bits)         // => bits=18
 
+println("not="  + (~5))              // => not=-6   (~x flips every bit)
 println("shr="  + ((0 - 8) >> 1))   // => shr=-4   (arithmetic: sign preserved)
 println("ushr=" + (8 >>> 1))        // => ushr=4   (logical: zero-filled)
 ```
@@ -343,6 +416,12 @@ println(label)
 
 `x |> f` is just another way to write `f(x)`, and `x |> f(a, b)` means `f(x, a, b)`. It reads left to right,
 which is convenient for chains of transformations.
+
+The pipe is **syntactic**: `|>` is rewritten to an ordinary call at compile time, so its right-hand side must
+be a *call target* — a function name or a function call with its remaining arguments — not an arbitrary
+expression that happens to produce a function. `x |> f` and `x |> g(a)` are fine; `x |> (pickFn())` or
+`x |> table[0]` are not. It also binds more loosely than the other operators, so `a + b |> f` means
+`f(a + b)`; parenthesize if you mean something else.
 
 ```rust
 fn twice(n: Int) -> Int { n * 2 }
@@ -450,8 +529,10 @@ println("bad="   + parseOr("xyz", 0 - 1))   // => bad=-1
 ## 7. Strings
 
 A `String` is a sequence of bytes. If your source file is UTF-8, string literals keep their bytes exactly, so
-text round-trips faithfully — but the language treats a string as bytes, not as Unicode code points. In
-particular, `len` returns the number of **bytes**.
+text round-trips faithfully — but *by default* the language treats a string as bytes, not as Unicode code
+points. In particular, `len` returns the number of **bytes**. When you do need code points, there is an opt-in
+layer (`chars`/`charCount`/`nthChar` and the `Char` type) — see
+[Char and UTF-8 code points](#char-and-utf-8-code-points).
 
 String literals support the escapes `\n \t \r \\ \" \' \0` and `\$` for escaping a literal `${` (the string
 interpolation symbol).
@@ -471,8 +552,10 @@ println("less=" + ("apple" < "banana"))  // => less=true
 ```
 
 Because a string is a sequence of bytes, `for c in s` iterates its **bytes** — each `c` is an `Int` in the
-range `0..255`, exactly like a char literal (`'A'` is the byte `65`). This is the natural fit for ASCII
-scanning; it does **not** decode UTF-8 into code points (that is a separate, future capability).
+range `0..255`, exactly like a bare char literal (`'A'` is the byte `65`). This is the natural fit for ASCII
+scanning. Byte iteration does **not** decode UTF-8 into code points — when you want **code points**, use the
+opt-in `chars(s)` iterator (it yields `Char`s), covered in
+[Char and UTF-8 code points](#char-and-utf-8-code-points).
 
 ```rust
 let mut sum = 0
@@ -672,7 +755,7 @@ you assemble a string piece by piece, reach for `StringBuilder` instead: it accu
 (one bulk copy per append) and hands you the finished `String` with `build`.
 
 ```rust
-let sb = stringBuilder()      // or stringBuilderCap(64) to pre-size the buffer
+let mut sb = stringBuilder()  // or stringBuilderCap(64) to pre-size the buffer
 append(sb, "items: ")
 let mut i = 0
 while i < 3 {
@@ -684,8 +767,9 @@ while i < 3 {
 println(build(sb))            // => items: [0][1][2]
 ```
 
-`append`/`appendByte` mutate the builder in place (and also return it, so calls can chain); `sbLen(sb)` is the
-number of bytes accumulated so far. `StringBuilder` lives in the always-available `std::string` ring.
+`append`/`appendByte` mutate the builder in place (and also return it, so calls can chain), so the builder
+binding must be `mut`; `sbLen(sb)` is the number of bytes accumulated so far. `StringBuilder` lives in the
+always-available `std::string` ring.
 
 ### String helpers
 
@@ -1258,7 +1342,9 @@ println(euro)                      // => €
 println(codePoint(euro))           // => 8364     (unwrap to the Int code point)
 
 println(c == 'A')                  // => true
-println('a' <= Char('m') && Char('m') <= 'z')   // => true   (Chars are ordered)
+println('a' <= Char('m') && Char('m') <= 'z')   // => true   (Chars compare with < <= > >=)
+// note: a Char is comparable with `<`, but not `Ord` — `sort(Vec[Char])` / `minOf(Char, …)` are rejected
+// (an erasure type cannot implement the method trait `Ord`; see §16 and §19).
 
 let mut counts: Map[Char, Int] = #{}             // a Char is a valid map key
 counts[c] = 1
@@ -1526,10 +1612,11 @@ match get(arr, 9) {
 `vec()` creates an empty, growable vector. `push(v, x)` appends and `pop(v)` removes the last element
 (returning an `Option`, since the vector might be empty). A vector is a reference value, so `push`/`pop` mutate
 the *shared* object in place — every name bound to it, and every function it was passed to, sees the change
-(see [§25](#25-the-memory--cost-model)).
+(see [§25](#25-the-memory--cost-model)). Because they mutate, the binding you push/pop through must be `mut`
+(Skarn's one mutation rule — see below).
 
 ```rust
-let v: Vec[Int] = vec()
+let mut v: Vec[Int] = vec()
 push(v, 1)
 push(v, 2)
 push(v, 3)
@@ -1539,9 +1626,12 @@ println("last=" + toString(last))    // => last=Some(3)
 ```
 
 A vector also supports random access with `v[i]`, exactly like an array: reading is bounds-checked (aborts on
-an out-of-range index), and `get(v, i)` is the safe `Option` form. Assigning to an element (`v[i] = x`) needs a
-`mut` binding — note that `push`/`pop` mutate in place *without* `mut` (they go through a mutable parameter),
-but an index **assignment** is a mutation of the binding itself, so it requires `mut`:
+an out-of-range index), and `get(v, i)` is the safe `Option` form. **One consistent rule governs all in-place
+mutation:** whether you push/pop, or assign to an element (`v[i] = x`), or assign to a field (`p.x = v`), the
+*root binding* must be declared `mut`. A mutating function like `push` takes its target through a `mut`
+parameter, so passing a plain (non-`mut`) binding to it is a compile error — exactly as Rust requires `let mut`
+before `v.push(..)`. (A fresh temporary, e.g. `push(vec(), 1)`, is trivially yours to mutate and needs no
+binding.)
 
 ```rust
 let mut v: Vec[Int] = vec()
@@ -1635,8 +1725,11 @@ println("square 5 = " + memoSquare(5))          // => square 5 = 25   (miss — 
 println("computed " + len(computed) + " time(s)") // => computed 2 time(s)
 ```
 
-A map's **key type must be `Hashable`** — one of `Int`, `Double`, `Bool`, or `String`. Using any other
-type as a key (a struct, tuple, `Vec`, enum, …) is a **compile error**, not a runtime surprise:
+A map's **key type must be `Hashable`** — the primitives `Int`, `Double`, `Bool`, and `String`, plus the
+erasure types that wrap one of them: `Char`, integer-backed `enum`s (`enum … : Int`), and `transparent struct`
+newtypes (each of which *is* its underlying primitive at run time — see [§7](#7-strings) and [§12](#12-enums-sum-types)).
+A composite or mutable type — a plain `struct`, a tuple, a `Vec`, or an ordinary payload-carrying `enum` — is
+**not** `Hashable`, so using one as a key is a **compile error**, not a runtime surprise:
 
 ```rust
 struct Point { x: Int, y: Int }
@@ -1645,6 +1738,11 @@ let m: Map[Point, Int] = #{}   // error: type Point cannot be a map key (does no
 
 If you write a generic function that builds a map, give its key parameter the bound: `fn index[K: Hashable](…)`.
 (The same rule powers `std::set`, since a `Set[T]` is a `Map[T, Bool]` under the hood.)
+
+Key identity follows *SameValueZero* (the same rule JavaScript's `Map` uses), which tidies up the two floating
+-point edge cases so they are not footguns: `-0.0` and `0.0` are the **same** key, and — despite `NaN != NaN`
+under `==` — every `NaN` is the **same** key, so a value stored under a `NaN` key is found again with any `NaN`.
+`String` keys compare by their bytes (contents), so a key you built by concatenation matches an equal literal.
 
 ### Cons lists: `List[T]`
 
@@ -1829,16 +1927,19 @@ impl Shape for Square {
 
 ### Calling a trait method
 
-Here is the first thing that differs from a typical object-oriented language: **a trait method is called like
-an ordinary function, and dispatch is on the first argument.** You write `area(shape)`, not `shape.area()`.
-At run time, Skarn looks at the actual type of the first argument and calls the matching implementation.
+A trait method can be called two **equivalent** ways: as an ordinary function with the receiver as the first
+argument — `area(shape)` — or with method syntax — `shape.area()`. Either way, **dispatch is on the receiver
+(the first argument)**: at run time Skarn looks at its actual type and calls the matching implementation. Here
+is one thing that sets Skarn apart from a typical object-oriented language: the free-function form is
+first-class, not an afterthought — so it also composes with the pipe, `shape |> area`. (The full story on
+`.`-syntax, and on *inherent* methods a type defines for itself, is under
+[Method-call syntax and inherent methods](#method-call-syntax-and-inherent-methods).)
 
 ```rust
-println("circle=" + area(Circle { r: 2.0 }))   // => circle=12.56636
-println("square=" + area(Square { s: 3.0 }))   // => square=9.0
+println("circle=" + area(Circle { r: 2.0 }))   // free-function form => circle=12.56636
+let sq = Square { s: 3.0 }
+println("square=" + sq.area())                 // method form (equivalent) => square=9.0
 ```
-
-(The pipe operator makes this read like a method chain when you want it to: `Circle { r: 2.0 } |> area`.)
 
 The receiver parameter is named `self`, and its type is the type being implemented. Inside the method you read
 its fields as `self.field`.
@@ -1974,6 +2075,39 @@ The practical upshot: traits let you describe *capabilities* ("this type can be 
 shown as text") and attach them to types independently, rather than baking a fixed interface list into a class
 definition.
 
+### How "erased" and "dispatch on the runtime type" fit together
+
+These two phrases sound contradictory — the overview says types are *erased*, this section says dispatch picks
+an implementation *by the runtime type of the receiver*. Both are true, because they talk about different
+things:
+
+- **What is erased** are the *generic type parameters*. A generic function like `fn largest[T: Ord](xs: …)` is
+  compiled to **one** body, shared by every `T`. That body carries no hidden dictionary, no witness table, and
+  no per-`T` copy; `T` simply does not exist at run time, and there is no reflection to ask "what is `T`?".
+- **What dispatch uses** is not `T` but the *value's own type*, which every value carries intrinsically anyway
+  (an integer, a string, and a `Point` are distinguishable at run time regardless of any generic). A trait call
+  reads that coarse tag and looks the implementation up in a global, compile-time-built table. When the
+  concrete type is already known at the call site, the compiler skips the lookup and calls the implementation
+  directly.
+
+So there is no boxing and no vtable pointer travelling alongside your values — dispatch is a table lookup keyed
+on a tag the value already has. This is also **why `dyn Trait` is free** (a `dyn Show` *is* the plain value;
+see [§17](#17-trait-objects-dyn-trait)).
+
+The same mechanism explains one real limitation. The **erasure types** — `transparent struct`s, integer-backed
+`enum`s, and `Char` — deliberately *share their runtime representation* with the primitive they wrap (a
+`UserId(Int)` is an `Int` at run time, carrying `Int`'s tag). Dispatch keys on that tag, so it cannot tell a
+`UserId` from an `Int` — which is exactly why **erasure types may not implement traits, and cannot be used
+through a bound on a method-carrying trait** (`Show`, `Ord`, …) in generic code — a deliberate trade for their
+zero-cost representation. If you need a wrapper type that participates in dispatched traits, use a normal
+`struct` with a single field instead of a `transparent` one.
+
+The exception is the **compile-time marker traits** `Eq` and `Hashable` (see [§5](#5-operators) and
+[§14](#14-maps)): these carry no methods and dispatch *nothing* — the bound is discharged statically by the
+checker — so an erasure type satisfies them like any other value. `UserId` *is* `Eq` and `Hashable`
+(`fn index[K: Hashable](…)` and `fn allEq[T: Eq](…)` accept it), it just cannot implement a *method* trait.
+`Ord` is a method trait (`lessThan`), so it is **not** among the exceptions — an erasure type is not `Ord`.
+
 ### Method-call syntax and inherent methods
 
 Any method can be called with **dot syntax** on its receiver — `x.method(args)` — as an alternative to the
@@ -2022,9 +2156,61 @@ Rules and boundaries:
 - **`.` and `|>` are complements, not rivals.** `.method()` reaches a type's methods; the pipe threads a value
   into *any* free function or builtin, which is what the lazy-iterator pipelines use:
   `xs |> map(f) |> filter(p) |> sum`. There is no `xs.map(f)` — `map`/`filter`/… are free functions.
+- **This is exactly why the standard library reads in two styles, and the split is principled, not drift.** The
+  built-in collections — `Vec`, `Map`, `String`, `Bytes` — are not defined in any user module, and the orphan
+  rule forbids adding an inherent `impl` to a type you do not own, so their verbs *must* be free functions:
+  `len(xs)`, `push(xs, v)`, `map`/`filter`/`sum`, all used with `|>`. The library types that Skarn *does* define
+  — `Json`, `Rng`, `Set`, `DateTime`, a network `Conn` — own their behavior, so they carry it as `.` methods:
+  `j.stringify()`, `rng.nextInt(1, 6)`, `s.insert(x)`, `conn.send(bytes)`. So "collections use free functions"
+  and "`std::json`/`std::random`/… use methods" are the same rule seen from both sides — free functions for
+  types the library cannot extend, methods for the ones it defines.
 - **Inherent methods are dot-only today.** There is no qualified `Type::method(x)` call form yet (unlike
   `Trait::method(x)`, which exists); it is a possible later addition. Turning *every* free function into a
   `x.f()` call (full UFCS) is a deliberate non-goal — it would make `|>` redundant.
+
+### Blanket and parametric impls
+
+Two heavier forms of `impl` round out the trait system.
+
+A **blanket impl** implements a trait for *every* type that already satisfies some bound — write the impl over
+a type parameter instead of a concrete head. Here everything that is `Named` gets `Greet` for free:
+
+```rust
+trait Named { fn name(self) -> String }
+struct Dog {}
+impl Named for Dog { fn name(self) -> String { "Rex" } }
+
+trait Greet { fn greet(self) -> String }
+impl[T: Named] Greet for T {                 // blanket: for all T: Named
+    fn greet(self) -> String { "Hi, " + self.name() }
+}
+
+println(Dog {}.greet())     // => Hi, Rex
+```
+
+A concrete `impl` always wins over a blanket one for the same trait; there is at most one blanket impl per
+trait.
+
+A **parametric trait** carries its own type parameter, and the implementing type supplies it — the parameter is
+an *output* of the impl, solved from the head:
+
+```rust
+trait FirstOf[T] { fn firstOf(self) -> Option[T] }
+
+impl[T] FirstOf[T] for Vec[T] {
+    fn firstOf(self) -> Option[T] {
+        if len(self) > 0 { Some(self[0]) } else { None }
+    }
+}
+
+let mut xs: Vec[Int] = vec()
+push(xs, 10)  push(xs, 20)
+println(toString(xs.firstOf()))   // => Some(10)
+```
+
+This is how `Iterator[T]` / `IntoIterator[T]` (see [§19](#19-iterators)) are defined: the element type is
+determined by the impl, one impl per (trait, implementing type). There is at most one impl of a given
+parametric trait per type; overlapping or multi-parameter dispatch is not supported.
 
 ---
 
@@ -2083,6 +2269,9 @@ Not every trait can be used as `dyn Trait`. The rule is simple and has one impor
   values may hide two different concrete types, so a method like `fn equals(self, other: Self) -> Bool` could be
   handed a wrong-typed second argument. Traits that compare two values of the same type therefore cannot be used
   as trait objects.
+- No method may **return `Self`**, and no method may be **generic** (have its own type parameters) — both are v1
+  restrictions, not fundamental. So `Clone` (`fn clone(self) -> Self`) is *not* object-safe: `dyn Clone` is
+  rejected (what concrete type would `clone` on it return?).
 
 ### When to use which
 
@@ -2190,6 +2379,12 @@ because the whole point of returning one is to make you handle it.
 When a situation is genuinely unrecoverable, `panic(msg)` aborts with a located error message. `assert(cond,
 msg)` panics if `cond` is false. These are for programmer errors and broken invariants — not for expected
 failures, which belong in a `Result`.
+
+Because `panic` never returns, its type is **`Never`** — the type with no values, which the checker treats as
+compatible with every type. That is what lets a `panic` sit in a `match` arm beside arms that produce a real
+value (`match … { Some(v) => v, None => panic("missing") }`): the panicking arm contributes no type of its own.
+A `loop` with no `break` has type `Never` for the same reason. You rarely write `Never` yourself; it is mostly
+something the checker infers.
 
 ```rust
 fn mustBePositive(n: Int) -> Int {
@@ -2305,8 +2500,8 @@ let squares = toMap(map(range(1, 4), fn(x: Int) -> (Int, Int) { (x, x * x) }))
 println("sq[3]=" + squares[3])   // => sq[3]=9
 ```
 
-`min` and `max` work on any type that can be ordered (numbers and strings out of the box), returning an
-`Option` because the sequence might be empty. When you want to order by a custom rule, `minBy`/`maxBy` take a
+`min` and `max` work on an `Ord` element type — `Int` / `Double` / `String` — returning an
+`Option` because the sequence might be empty. When you want to order by a custom rule (or order a `Char`), `minBy`/`maxBy` take a
 comparison function:
 
 ```rust
@@ -2319,7 +2514,10 @@ println("maxBy=" + toString(biggest))   // => maxBy=Some(4)
 
 To order a whole collection, `sorted(v)` returns a **new**, sorted `Vec` (leaving `v` untouched), `sort(v)`
 sorts a `mut` vector **in place**, and `sortBy(v, less)` orders by a custom comparator. All three are a
-**stable** merge sort; `sorted`/`sort` use `Ord` (numbers and strings), so they work on any ordered element:
+**stable** merge sort; `sorted`/`sort` require the element type to be `Ord` — which is **only** `Int` /
+`Double` / `String` (not `Char`, and not the erasure types, even though a `Char` *can* be compared with `<`;
+see the `Ord` note in [§5](#5-operators)). For anything else, `sortBy` with an explicit comparator needs no
+`Ord`, so it sorts `Char`s (or by any key) today:
 
 ```rust
 let names = sorted(toVec(["cherry", "apple", "banana"]))
@@ -2527,7 +2725,8 @@ visibility only matters across module boundaries. A `use m::*` glob silently bri
 The prelude is organized into `std` modules. The **ring** modules are auto-imported everywhere, so their
 names are available **unqualified** with no `use`:
 
-- `std::core` — `Option`, `Result`, `Some`/`None`/`Ok`/`Err`, and their combinators.
+- `std::core` — `Option`, `Result`, `Some`/`None`/`Ok`/`Err`, and their combinators, plus the built-in marker
+  traits `Eq` and `Hashable`.
 - `std::iter` — the `Iterator`/`IntoIterator`/`Iterable` traits, `Ord`, all the stream sources, stages,
   and terminals from [§19](#19-iterators), and the `Vec` sorts `sort`/`sorted`/`sortBy`.
 - `std::string` — string helpers: `slice`/`charStr`/`charAt`/`isEmpty`, search (`indexOf`/`lastIndexOf`/
@@ -2993,6 +3192,46 @@ vector. So container types are **invariant** in their element type: `Vec[A]` and
 `A` and `B` are the same. (Building a `Vec[dyn Show]` directly and pushing different implementers into it is
 fine — each element is converted at the point you add it.)
 
+### Built-in traits at a glance
+
+Four traits are built into the standard library and treated specially. Three are **compile-time markers** you
+never implement — the checker decides membership and discharges the bound statically (no dispatch); one,
+`Clone`, is an ordinary dispatched trait you *can* implement.
+
+| Trait | What it gates | Members | You `impl` it? | `dyn T`? |
+|-------|---------------|---------|----------------|----------|
+| `Eq` | `==` / `!=` (see [§5](#5-operators)) | derived structurally: any type whose components are all `Eq` (immediates + `String` + erasure types are the leaves; a function-carrying type is **not** `Eq`) | no (auto-derived) | no |
+| `Hashable` | map keys / set elements (see [§14](#14-maps)) | `Int`, `Double`, `Bool`, `String`, and erasure types that wrap one of those (`Char`, integer-backed `enum`s, `transparent` newtypes over these) | no (fixed marker) | no |
+| `Ord` | `sort` / `sorted` / `minOf` / `maxOf` (see [§19](#19-iterators)) | `Int`, `Double`, `String` only (a method trait — erasure types cannot join it; a `Char` compares with `<` but is not `Ord`) | no (fixed instances) | no |
+| `Clone` | `clone(x)` (see [§14](#14-maps)) | built-in for the containers; **user-extensible** — write `impl Clone for MyType` | **yes** | no (returns `Self`) |
+
+The three markers cost nothing at run time; `==` on a leaf is a single instruction and on a composite a
+structural walk. None of the four is usable as `dyn T`, but for two different reasons: `Eq` and `Hashable` are
+**compile-time markers** — there is nothing to dispatch, so a `dyn` of them is meaningless and rejected; `Ord`
+and `Clone` fail **object safety** (`Ord` takes `Self` as a second parameter, `Clone` returns `Self` — see
+[§17](#17-trait-objects-dyn-trait)).
+
+The same information, seen per *type* — four capabilities with four different membership sets. `==` and map-key
+reach the erasure types (marker traits, statically discharged); the built-in `<` reaches `Char` (the compiler
+knows the static type at the site); only the `Ord` *trait* — which dispatches a real comparison in an erased
+body — is limited to `Int`/`Double`/`String`:
+
+| Type | `==` (`Eq`) | map key (`Hashable`) | `<` `<=` `>` `>=` | `Ord` (`sort`/`minOf`) |
+|------|:-----------:|:--------------------:|:-----------------:|:----------------------:|
+| `Int` / `Double` | ✓ | ✓ | ✓ | ✓ |
+| `String` | ✓ | ✓ | ✓ | ✓ |
+| `Bool` | ✓ | ✓ | — | — |
+| `Char` | ✓ | ✓ | ✓ | **—** (use `sortBy` with a comparator) |
+| `transparent` newtype / int-backed `enum` | ✓ | ✓ | — | — |
+| `struct` / tuple / payload `enum` / `Vec` / `Array` / `Map` / `Bytes` | ✓ (if components are `Eq`) | — | — | — |
+| `()` (unit) | ✓ | — | — | — |
+| a function / closure value | — | — | — | — |
+| `dyn T` (a trait object) | — | — | — | — |
+
+An empty cell is a real limitation, not an omission — the `Char` row's `<`-yes / `Ord`-no split is the one to
+know. Lifting `Ord` (and `<`) to the erasure types is a possible future step (it needs monomorphizing an erased
+body per erasure instantiation, already noted as a deferred idea).
+
 ### Advisory warnings
 
 Beyond type errors (which stop compilation), the checker emits **advisory warnings** for two easy-to-miss
@@ -3096,6 +3335,11 @@ The single most important fact about the cost model:
 > Assigning, passing, or returning a heap value copies the **reference**, not the contents. It is always O(1),
 > and there are **no hidden deep copies anywhere** in the language.
 
+The one operation that *does* walk a heap value's contents is **structural `==` / `!=`** (see [§5](#5-operators)):
+comparing two composites is O(the size of the value graph), not O(1). Comparing two large `Vec`s or `Map`s in a
+loop is a real cost — compare a cheaper key or an early length check when it matters. (Equality is the only such
+walk; it still allocates nothing. Comparing a value against *itself* is O(1) — a same-object short-circuit.)
+
 ### Sharing and aliasing
 
 Because assignment shares the reference, two bindings can refer to the *same* object, and a mutation through one
@@ -3165,9 +3409,10 @@ nothing.
 Everything else is free — the "you pay nothing" side of the design:
 
 - **Immediates** (numbers, bools, `Char`, transparent newtypes, int-backed enums) never touch the heap.
-- **Generics, traits, and `dyn Trait` are erased**: no runtime type tags, no boxing, no vtables. A `dyn Show`
-  value *is* the plain value — using a concrete type where a `dyn` is expected is a no-op. Abstraction has no
-  runtime price.
+- **Generics, traits, and `dyn Trait` are erased**: no generic type witnesses (dictionaries), no boxing, no
+  vtables. A `dyn Show` value *is* the plain value — using a concrete type where a `dyn` is expected is a no-op.
+  Trait dispatch is a table lookup on the coarse type tag a value already carries, not a pointer riding
+  alongside it, so abstraction has no runtime price. (See [§16](#16-traits) for the full picture.)
 - **Passing a large structure** is a pointer copy, not a `memcpy`.
 
 ### The collector

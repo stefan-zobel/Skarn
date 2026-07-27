@@ -154,7 +154,7 @@ fn _hexDigit(n: Int) -> Int { if n < 10 { 48 + n } else { 87 + n } }
 
 // Lowercase hex encoding of a byte buffer (2 chars per byte, no separators).
 pub fn toHex(data: Bytes) -> String {
-  let out = bytes()
+  let mut out = bytes()
   for b in data { push(out, _hexDigit((b >> 4) & 15))  push(out, _hexDigit(b & 15)) }
   fromBytes(out)
 }

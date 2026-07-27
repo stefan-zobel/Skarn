@@ -17,7 +17,7 @@
 // (each grow allocates a fresh backing -> collections, promotions).
 gcResetStats()
 
-let v: Vec[Int] = vec()
+let mut v: Vec[Int] = vec()
 let mut i = 0
 while i < 300000 {
     push(v, i)

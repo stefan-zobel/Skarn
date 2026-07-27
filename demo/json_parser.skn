@@ -117,7 +117,7 @@ fn parseHex4(mut c: Cur) -> Result[Int, String] {
 }
 // Encode a Unicode code point (BMP only -- no surrogate pairs in v1) into UTF-8,
 // pushing 1..3 bytes onto `buf`. Dogfoods the Bytes builder + bitwise ops.
-fn pushUtf8(buf: Bytes, cp: Int) -> () {
+fn pushUtf8(mut buf: Bytes, cp: Int) -> () {
   if cp < 128 {
     push(buf, cp)
   } else if cp < 2048 {
@@ -131,7 +131,7 @@ fn pushUtf8(buf: Bytes, cp: Int) -> () {
 }
 fn parseString(mut c: Cur) -> Result[String, String] {
   eat(c, '"')?
-  let buf = bytes()
+  let mut buf = bytes()
   loop {
     if atEnd(c) { return Err("unterminated string at position " + toString(c.i)) }
     let ch = peek(c)
@@ -161,7 +161,7 @@ fn parseString(mut c: Cur) -> Result[String, String] {
 // ---- arrays / objects (recursive) -------------------------------------------
 fn parseArray(mut c: Cur) -> Result[Json, String] {
   eat(c, '[')?
-  let items: Vec[Json] = vec()
+  let mut items: Vec[Json] = vec()
   skipWs(c)
   if peek(c) == ']' { adv(c) return Ok(Arr(items)) }
   loop {
@@ -177,7 +177,7 @@ fn parseArray(mut c: Cur) -> Result[Json, String] {
 }
 fn parseObject(mut c: Cur) -> Result[Json, String] {
   eat(c, '{')?
-  let entries: Vec[Entry] = vec()
+  let mut entries: Vec[Entry] = vec()
   skipWs(c)
   if peek(c) == '}' { adv(c) return Ok(Obj(entries)) }
   loop {
@@ -198,7 +198,7 @@ fn parseObject(mut c: Cur) -> Result[Json, String] {
 }
 
 fn parseJson(s: String) -> Result[Json, String] {
-  let c = newCur(s)
+  let mut c = newCur(s)
   let v = parseValue(c)?
   skipWs(c)
   if !atEnd(c) { return Err("trailing characters at position " + toString(c.i)) }

@@ -44,7 +44,7 @@ impl Iterator[Int] for RingCur {
 impl IntoIterator[Int] for Ring {
   fn intoIter(self) -> dyn Iterator[Int] { RingCur { xs: self.xs, i: 0 } }
 }
-let items: Vec[Int] = vec()
+let mut items: Vec[Int] = vec()
 push(items, 100)
 push(items, 200)
 push(items, 300)

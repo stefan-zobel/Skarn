@@ -487,7 +487,7 @@ pub fn compileWith(pattern: String, flags: String) -> Result[Regex, RegexError] 
   let ntot = len(bs)
   let (start, extra) = _rxLeadingFlags(bs, ntot)
   fl = fl | extra
-  let p = RxCur { b: bs, n: ntot, i: start, depth: 0, ngroups: 0, names: #{} }
+  let mut p = RxCur { b: bs, n: ntot, i: start, depth: 0, ngroups: 0, names: #{} }
   let ast = _rxParseAlt(p)?
   if !_rxAtEnd(p) { return Err(RegexError { message: "unexpected '" + charStr(_rxPeek(p)) + "'", pos: p.i }) }
   let mut prog: Vec[RxInst] = vec()
@@ -589,7 +589,7 @@ pub fn splitRe(re: Regex, s: String) -> dyn Iterator[String] {
 }
 
 // ---- replacement -----------------------------------------------------------
-fn _rxExpand(sb: StringBuilder, repl: String, cap: Captures) -> () {
+fn _rxExpand(mut sb: StringBuilder, repl: String, cap: Captures) -> () {
   let rb = toBytes(repl)
   let m = len(rb)
   let mut i = 0
@@ -629,7 +629,7 @@ pub fn replaceRe(re: Regex, s: String, repl: String) -> String {
     Some(c) => match group(c, 0) {
       None => s,
       Some(m0) => {
-        let sb = stringBuilder()
+        let mut sb = stringBuilder()
         append(sb, slice(s, 0, m0.start))
         _rxExpand(sb, repl, c)
         append(sb, slice(s, m0.end, n))
@@ -640,7 +640,7 @@ pub fn replaceRe(re: Regex, s: String, repl: String) -> String {
 }
 
 pub fn replaceAllRe(re: Regex, s: String, repl: String) -> String {
-  let sb = stringBuilder()
+  let mut sb = stringBuilder()
   let n = len(toBytes(s))
   let mut last = 0
   let mut pos = 0

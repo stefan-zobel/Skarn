@@ -7,7 +7,7 @@ use std::bytes::*
 struct Record { magic: Int, version: Int, delta: Int, payload: Bytes }
 
 fn encode(rec: Record) -> Bytes {
-  let b = bytes()
+  let mut b = bytes()
   writeU32LE(b, rec.magic)
   writeU16LE(b, rec.version)
   writeI32LE(b, rec.delta)

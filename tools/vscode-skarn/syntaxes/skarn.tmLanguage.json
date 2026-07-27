@@ -8,7 +8,6 @@
     { "include": "#raw-strings" },
     { "include": "#strings" },
     { "include": "#chars" },
-    { "include": "#atoms" },
     { "include": "#numbers" },
     { "include": "#keywords" },
     { "include": "#declarations" },
@@ -122,8 +121,7 @@
         { "include": "#raw-strings" },
         { "include": "#strings" },
         { "include": "#chars" },
-        { "include": "#atoms" },
-        { "include": "#numbers" },
+            { "include": "#numbers" },
         { "include": "#keywords" },
         { "include": "#declarations" },
         { "include": "#builtin-functions" },
@@ -142,12 +140,6 @@
       "captures": {
         "1": { "name": "constant.character.escape.skarn" }
       }
-    },
-
-    "atoms": {
-      "comment": "Atoms :name (e.g. :ok). A lowercase-led :ident that is neither the :: qualifier nor a member-access. Type annotations are : UIdent (uppercase), so :lowercase is an atom.",
-      "name": "constant.other.atom.skarn",
-      "match": "(?<![:.\\w]):[a-z_][A-Za-z0-9_]*\\b"
     },
 
     "numbers": {

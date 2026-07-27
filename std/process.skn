@@ -5,7 +5,7 @@
 // wrappers) may use rawRun freely (the native's home module is std::process).
 pub struct ProcessOutput { stdout: Bytes, stderr: Bytes, exitCode: Int }
 pub struct ProcessText { stdout: String, stderr: String, exitCode: Int }
-fn _toArgv(argv: List[String]) -> Vec[String] { let v: Vec[String] = vec() for a in argv { push(v, a) } v }
+fn _toArgv(argv: List[String]) -> Vec[String] { let mut v: Vec[String] = vec() for a in argv { push(v, a) } v }
 pub fn run(argv: List[String]) -> Result[ProcessOutput, String] { rawRun(_toArgv(argv), bytes()) }
 pub fn runWith(argv: List[String], input: Bytes) -> Result[ProcessOutput, String] { rawRun(_toArgv(argv), input) }
 pub fn runText(argv: List[String]) -> Result[ProcessText, String] { let o = run(argv)? Ok(ProcessText { stdout: fromBytes(o.stdout), stderr: fromBytes(o.stderr), exitCode: o.exitCode }) }

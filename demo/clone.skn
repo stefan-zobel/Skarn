@@ -3,9 +3,9 @@
 // the copy never touches the original. `clone` / `x |> clone` dispatch on the receiver.
 
 // Vec: clone then push onto the copy -- the original keeps its length.
-let a: Vec[Int] = vec()
+let mut a: Vec[Int] = vec()
 push(a, 1) push(a, 2) push(a, 3)
-let b = clone(a)
+let mut b = clone(a)
 push(b, 99)
 println("vec original len = ${len(a)}   clone len = ${len(b)}")   // 3   4
 
