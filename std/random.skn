@@ -6,11 +6,11 @@
 //
 // NOT cryptographically secure -- xoshiro is a statistical generator (BigCrush-class), not a CSPRNG.
 // Do not use for keys/tokens/secrets. Seed entropy is the caller's job (e.g. `use std::env` and
-// `seedRng(nanoTime())`); the module itself pulls no entropy, which is what keeps it native-free.
+// `Rng::fromSeed(nanoTime())`); the module itself pulls no entropy, which keeps it native-free.
 //
 // The generator's operations are inherent methods on Rng -- call them with dot syntax:
-// `rng.nextInt(1, 7)`, `rng.shuffle(v)`, `rng.nextGaussian()`. The two constructors (`seedRng` /
-// `rngFromState`) have no receiver, so they stay free functions.
+// `rng.nextInt(1, 7)`, `rng.shuffle(v)`, `rng.nextGaussian()`. The two constructors take no
+// receiver, so they are ASSOCIATED functions on the type: `Rng::fromSeed(s)` / `Rng::fromState(...)`.
 //
 // OPT-IN: reach these via `use std::random::*` (or a qualified std::random::name). Tree-shaken.
 
@@ -19,7 +19,7 @@
 // std::time uses std::env only for `now`). The rest of this module stays native-free / deterministic.
 use std::math::*
 
-// The generator state (128 bits). Construct via `seedRng` (from an Int seed) or `rngFromState` (raw).
+// The generator state (128 bits). Build with `Rng::fromSeed(seed)` or `Rng::fromState(a,b,c,d)`.
 pub struct Rng { s0: Int, s1: Int, s2: Int, s3: Int }
 
 // --- internal 32-bit helpers ---
@@ -63,36 +63,36 @@ fn _jumpConst(i: Int) -> Int {
   else { 0x77F2DB5B }
 }
 
-// --- construction (no receiver -> free functions) ---
-
-// Raw-state constructor (advanced / reproducible use). The all-zero state is xoshiro's fixed point,
-// so it is nudged to a nonzero state; each word is masked to 32 bits.
-pub fn rngFromState(a: Int, b: Int, c: Int, d: Int) -> Rng {
-  let x0 = _m32(a)
-  let x1 = _m32(b)
-  let x2 = _m32(c)
-  let x3 = _m32(d)
-  let g = if (x0 | x1 | x2 | x3) == 0 { 1 } else { x0 }
-  Rng { s0: g, s1: x1, s2: x2, s3: x3 }
-}
-
-// Deterministic seeding: SplitMix32 (advanced 4x by the golden-ratio constant) fills the 128-bit
-// state from one Int seed. The full 48-bit seed is folded down to 32 bits first.
-pub fn seedRng(seed: Int) -> Rng {
-  let z0 = _m32(seed ^ (seed >> 24))
-  let z1 = _m32(z0 + 0x9E3779B9)                                   // golden-ratio increment
-  let a = _smMix(z1)
-  let z2 = _m32(z1 + 0x9E3779B9)
-  let b = _smMix(z2)
-  let z3 = _m32(z2 + 0x9E3779B9)
-  let c = _smMix(z3)
-  let z4 = _m32(z3 + 0x9E3779B9)
-  let d = _smMix(z4)
-  rngFromState(a, b, c, d)
-}
-
 // --- the generator's own API (dot syntax: rng.nextU32(), rng.shuffle(v), ...) ---
 impl Rng {
+
+  // --- construction (associated functions: no `self`, so `Rng::fromSeed(...)` only) ---
+
+  // Raw-state constructor (advanced / reproducible use). The all-zero state is xoshiro's fixed point,
+  // so it is nudged to a nonzero state; each word is masked to 32 bits.
+  fn fromState(a: Int, b: Int, c: Int, d: Int) -> Rng {
+    let x0 = _m32(a)
+    let x1 = _m32(b)
+    let x2 = _m32(c)
+    let x3 = _m32(d)
+    let g = if (x0 | x1 | x2 | x3) == 0 { 1 } else { x0 }
+    Rng { s0: g, s1: x1, s2: x2, s3: x3 }
+  }
+
+  // Deterministic seeding: SplitMix32 (advanced 4x by the golden-ratio constant) fills the 128-bit
+  // state from one Int seed. The full 48-bit seed is folded down to 32 bits first.
+  fn fromSeed(seed: Int) -> Rng {
+    let z0 = _m32(seed ^ (seed >> 24))
+    let z1 = _m32(z0 + 0x9E3779B9)                                 // golden-ratio increment
+    let a = _smMix(z1)
+    let z2 = _m32(z1 + 0x9E3779B9)
+    let b = _smMix(z2)
+    let z3 = _m32(z2 + 0x9E3779B9)
+    let c = _smMix(z3)
+    let z4 = _m32(z3 + 0x9E3779B9)
+    let d = _smMix(z4)
+    Rng::fromState(a, b, c, d)
+  }
 
   // --- the core step: xoshiro128** ---
 
@@ -311,7 +311,10 @@ impl Rng {
           if w > 0.0 { acc = acc + w  if chosen < 0 && target < acc { chosen = j } }
           j = j + 1
         }
-        if chosen < 0 { Some(items[n - 1]) } else { Some(items[chosen]) }   // fp guard -> last positive-weight
+        // Defensive fallback only: `target` is drawn from [0, total) and `acc` accumulates the same
+        // weights in the same order, so acc always ends at `total` > target and `chosen` is set.
+        // Unreachable in practice; kept so a future change to the accumulation cannot fall through.
+        if chosen < 0 { Some(items[n - 1]) } else { Some(items[chosen]) }
       }
     }
   }

@@ -1,6 +1,6 @@
 # Skarn for VS Code
 
-Syntax highlighting for the [Skarn](../../LanguageIntroduction.md) language (`.skn`
+Syntax highlighting for the [Skarn](../../SkarnGuide.md) language (`.skn`
 files, run by `static_vmrun`).
 
 This is a **grammar-only** extension: it provides TextMate-based syntax highlighting

@@ -19,8 +19,11 @@ pub fn sliceBytes(src: Bytes, start: Int, end: Int) -> String {
 // Byte-range substring of a String (clamped to [0, len]). Convenience over sliceBytes for a one-off
 // slice; in a hot loop hold the Bytes yourself and use sliceBytes to avoid re-converting the source.
 pub fn slice(s: String, start: Int, end: Int) -> String { sliceBytes(toBytes(s), start, end) }
-// isEmpty / charAt: cheap byte-level companions. charAt returns the byte at i as an Int (0..255)
-// and traps out of bounds, exactly like b[i].
+// isEmpty / charAt: byte-level companions. charAt returns the byte at i as an Int (0..255) and
+// traps out of bounds, exactly like b[i].
+// COST: charAt is O(len(s)), not O(1) -- it materializes the string's bytes on EVERY call, so
+// scanning with it is O(n^2). In a loop hoist the conversion once (`let b = toBytes(s)`) and index
+// `b[i]` directly; charAt is for the occasional single probe.
 pub fn isEmpty(s: String) -> Bool { len(s) == 0 }
 pub fn charAt(s: String, i: Int) -> Int { toBytes(s)[i] }
 // ---- substring search (BYTE-level). indexOf/lastIndexOf return the byte index or -1 on miss;
@@ -83,14 +86,16 @@ fn _trimLo(b: Bytes, i: Int) -> Int {
 fn _trimHi(b: Bytes, i: Int) -> Int {
   if i > 0 { if isAsciiWhitespace(b[i - 1]) { _trimHi(b, i - 1) } else { i } } else { i }
 }
+// Each slices out of the ALREADY-materialized `b` (sliceBytes), not out of `s` (slice) -- the
+// latter would run toBytes over the whole string a second time.
 pub fn trim(s: String) -> String {
   let b = toBytes(s)
   let lo = _trimLo(b, 0)
   let hi = _trimHi(b, len(b))
-  if lo >= hi { "" } else { slice(s, lo, hi) }
+  if lo >= hi { "" } else { sliceBytes(b, lo, hi) }
 }
-pub fn trimStart(s: String) -> String { let b = toBytes(s)  slice(s, _trimLo(b, 0), len(b)) }
-pub fn trimEnd(s: String) -> String { let b = toBytes(s)  slice(s, 0, _trimHi(b, len(b))) }
+pub fn trimStart(s: String) -> String { let b = toBytes(s)  sliceBytes(b, _trimLo(b, 0), len(b)) }
+pub fn trimEnd(s: String) -> String { let b = toBytes(s)  sliceBytes(b, 0, _trimHi(b, len(b))) }
 // ---- case: ASCII-only (a-z <-> A-Z). No locale / no Unicode case folding; bytes outside a-z/A-Z
 //      (including every UTF-8 continuation byte) pass through unchanged. ----
 fn _toUpperByte(c: Int) -> Int { if c >= 97 { if c <= 122 { c - 32 } else { c } } else { c } }
@@ -165,10 +170,17 @@ pub fn repeatStr(s: String, n: Int) -> String {
 pub struct StringBuilder { buf: Bytes }
 pub fn stringBuilder() -> StringBuilder { StringBuilder { buf: bytes() } }
 pub fn stringBuilderCap(cap: Int) -> StringBuilder { StringBuilder { buf: bytes(cap) } }
-pub fn append(mut sb: StringBuilder, s: String) -> StringBuilder { appendBytes(sb.buf, s)  sb }
-pub fn appendByte(mut sb: StringBuilder, c: Int) -> StringBuilder { push(sb.buf, c)  sb }
-pub fn build(sb: StringBuilder) -> String { fromBytes(sb.buf) }
-pub fn sbLen(sb: StringBuilder) -> Int { len(sb.buf) }
+// The accumulation verbs are inherent methods; chain them with `.`:
+//   stringBuilder().append("a").append("b").build()   ==   "ab"
+impl StringBuilder {
+  fn append(mut self, s: String) -> StringBuilder { appendBytes(self.buf, s)  self }
+  fn appendByte(mut self, c: Int) -> StringBuilder { push(self.buf, c)  self }
+  fn build(self) -> String { fromBytes(self.buf) }
+  fn len(self) -> Int { len(self.buf) }
+  // appendCodePoint: the multi-byte sibling of appendByte -- append a code point's UTF-8 bytes,
+  // mutating in place and returning the builder for chaining.
+  fn appendCodePoint(mut self, cp: Int) -> StringBuilder { _encodeCp(self.buf, cp)  self }
+}
 
 // ---- Char + UTF-8 code points (the OPT-IN code-point layer over the default BYTE model). A `Char`
 //      is a Unicode SCALAR VALUE (code point). `Char` is a ZERO-COST transparent newtype over Int --
@@ -207,9 +219,7 @@ fn _encodeCp(mut out: Bytes, cp: Int) -> Bytes {
 // codePointToStr: encode ONE code-point Int to its (1..4-byte) UTF-8 String. The "missing encoder"
 // that makes a code-point Int no longer a one-way street. An invalid code point yields U+FFFD.
 pub fn codePointToStr(cp: Int) -> String { let mut out = bytes()  _encodeCp(out, cp)  fromBytes(out) }
-// appendCodePoint: the multi-byte sibling of appendByte -- append a code point's UTF-8 bytes to a
-// StringBuilder, mutating in place and returning it for chaining.
-pub fn appendCodePoint(mut sb: StringBuilder, cp: Int) -> StringBuilder { _encodeCp(sb.buf, cp)  sb }
+// (appendCodePoint is an inherent StringBuilder method, defined in the impl block above.)
 
 // ---- Format specifiers: the runtime behind an interpolation hole `${e:spec}`, which desugars to
 //      `format(e, "spec")`. Also callable directly as `format(x, "spec")`. A subset of Rust's
@@ -252,13 +262,25 @@ fn _parseFmt(spec: String) -> FmtSpec {
   if i < n && b[i] == 35 { alt = true  i = i + 1 }         // '#'
   let mut zero = false
   if i < n && b[i] == 48 { zero = true  i = i + 1 }
+  // Width and precision are CLAMPED to the same caps the `${e:spec}` parser enforces. A direct
+  // format(x, spec) call is not parser-validated, so without this an absurd spec would either
+  // overflow the accumulator (48-bit wrap -> nonsense) or ask _pad / _pow10 for a gigantic
+  // allocation. Clamping keeps this parse total, as its contract promises.
   let mut width = 0
-  while i < n && _fmtIsDigit(b[i]) { width = width * 10 + (b[i] - 48)  i = i + 1 }
+  while i < n && _fmtIsDigit(b[i]) {
+    if width <= 100000 { width = width * 10 + (b[i] - 48) }
+    i = i + 1
+  }
+  if width > 100000 { width = 100000 }
   let mut prec = -1
   if i < n && b[i] == 46 {                       // '.'
     i = i + 1
     prec = 0
-    while i < n && _fmtIsDigit(b[i]) { prec = prec * 10 + (b[i] - 48)  i = i + 1 }
+    while i < n && _fmtIsDigit(b[i]) {
+      if prec <= 10 { prec = prec * 10 + (b[i] - 48) }
+      i = i + 1
+    }
+    if prec > 10 { prec = 10 }
   }
   let mut ty = 0
   if i < n { ty = b[i] }
@@ -299,9 +321,13 @@ fn _fmtBaseOf(ty: Int) -> Int {
 fn _fmtDigitChar(d: Int, upper: Bool) -> Int {
   if d < 10 { 48 + d } else if upper { 55 + d } else { 87 + d }
 }
-fn _digitsOf(mag: Int, base: Int, upper: Bool, acc: String) -> String {
-  if mag == 0 { acc }
-  else { _digitsOf(mag / base, base, upper, charStr(_fmtDigitChar(mag % base, upper)) + acc) }
+// Digits of a NEGATIVE magnitude. Working on the negative side is what makes MIN_48 (-2^47)
+// representable: its positive magnitude 2^47 does NOT fit a 48-bit signed Int, so negating it
+// wraps straight back to MIN_48 and every later `%`/`/` then yields negative digits. `m` is
+// <= 0 here, so `m % base` is <= 0 (sign of dividend) and `0 - (m % base)` is the real digit.
+fn _digitsOfNeg(m: Int, base: Int, upper: Bool, acc: String) -> String {
+  if m == 0 { acc }
+  else { _digitsOfNeg(m / base, base, upper, charStr(_fmtDigitChar(0 - (m % base), upper)) + acc) }
 }
 fn _pow10(p: Int) -> Int { if p <= 0 { 1 } else { 10 * _pow10(p - 1) } }
 fn _fmtFinite(d: Double) -> Bool { d - d == 0.0 }   // NaN/inf: d - d is NaN, not 0.0
@@ -329,10 +355,12 @@ fn _fmtPrefix(fs: FmtSpec) -> String {
 
 fn _intBody(n: Int, fs: FmtSpec) -> String {
   let neg = n < 0
-  let mag = if neg { 0 - n } else { n }
+  // Fold to the NEGATIVE magnitude (see _digitsOfNeg): negating a positive n is always safe,
+  // whereas negating MIN_48 is not -- so the whole Int range, boundary included, is covered.
+  let m = if neg { n } else { 0 - n }
   let base = _fmtBaseOf(fs.ty)
   let upper = fs.ty == 88
-  let digits = if mag == 0 { "0" } else { _digitsOf(mag, base, upper, "") }
+  let digits = if m == 0 { "0" } else { _digitsOfNeg(m, base, upper, "") }
   _zeroPadNum(_fmtSign(neg, fs) + _fmtPrefix(fs), digits, fs)
 }
 

@@ -20,6 +20,11 @@ pub fn minOf[T: Ord](a: T, b: T) -> T { if lessThan(a, b) { a } else { b } }
 pub fn maxOf[T: Ord](a: T, b: T) -> T { if lessThan(b, a) { a } else { b } }
 pub fn clamp[T: Ord](x: T, lo: T, hi: T) -> T { if lessThan(x, lo) { lo } else if lessThan(hi, x) { hi } else { x } }
 // Integer-preserving helpers (the libm `abs`/`sign` are Double natives).
+// BOUNDARY CASE: absInt(MIN_48) is MIN_48 -- still NEGATIVE. The positive magnitude 2^47 does not
+// fit a 48-bit signed Int, so negating the minimum wraps back to itself. This is exactly Java's
+// Math.abs(Integer.MIN_VALUE) and follows from the language's unchecked two's-complement model;
+// it is NOT special-cased. `gcd`/`lcm` inherit it (they normalize via absInt), so a MIN_48 operand
+// makes them return a negative result. Guard the input yourself if that matters.
 pub fn absInt(x: Int) -> Int { if x < 0 { -x } else { x } }
 pub fn sign(x: Double) -> Double { if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { x } }   // NaN -> NaN; +-0.0 preserved
 pub fn signInt(x: Int) -> Int { if x > 0 { 1 } else if x < 0 { -1 } else { 0 } }

@@ -10,8 +10,14 @@ pub enum Json { Null, Boolean(Bool), Integer(Int), Number(Double), Text(String),
 pub struct JsonEntry { key: String, val: Json }
 
 // ---- cursor over the input bytes --------------------------------------------
-struct JsonCur { s: String, b: Bytes, n: Int, i: Int }
-fn _jNew(s: String) -> JsonCur { let bs = toBytes(s)  JsonCur { s: s, b: bs, n: len(bs), i: 0 } }
+// The cursor holds ONLY the materialized bytes. Slicing a token out via slice(s, ..) would
+// re-run toBytes over the WHOLE document for every token -- quadratic on a number-heavy input.
+// `depth` bounds array/object nesting: _jValue recurses, so without a cap a deeply nested input
+// is a resource question rather than a parse error (RFC 8259 explicitly permits such a limit).
+struct JsonCur { b: Bytes, n: Int, i: Int, depth: Int }
+fn _jNew(s: String) -> JsonCur { let bs = toBytes(s)  JsonCur { b: bs, n: len(bs), i: 0, depth: 0 } }
+// Maximum array/object nesting depth (matches std::regex's parser nesting cap).
+fn _jMaxDepth() -> Int { 200 }
 fn _jPeek(c: JsonCur) -> Int { if c.i < c.n { c.b[c.i] } else { 0 - 1 } }
 fn _jAdv(mut c: JsonCur) -> () { c.i = c.i + 1 }
 fn _jAtEnd(c: JsonCur) -> Bool { c.i >= c.n }
@@ -61,7 +67,7 @@ fn _jNumber(mut c: JsonCur) -> Result[Json, String] {
     if ch == '.' || ch == 'e' || ch == 'E' { isReal = true }
     _jAdv(c)
   }
-  let text = slice(c.s, start, c.i)
+  let text = sliceBytes(c.b, start, c.i)
   if isReal {
     match parseDouble(text) { Ok(d) => Ok(Number(d)), Err(e) => Err(e) }
   } else {
@@ -159,9 +165,11 @@ fn _jStrLit(mut c: JsonCur) -> Result[String, String] {
 // ---- arrays / objects (recursive) -------------------------------------------
 fn _jArray(mut c: JsonCur) -> Result[Json, String] {
   _jEat(c, '[')?
+  c.depth = c.depth + 1
+  if c.depth > _jMaxDepth() { return Err("nesting too deep at position " + toString(c.i)) }
   let mut items: Vec[Json] = vec()
   _jSkipWs(c)
-  if _jPeek(c) == ']' { _jAdv(c)  return Ok(Arr(items)) }
+  if _jPeek(c) == ']' { _jAdv(c)  c.depth = c.depth - 1  return Ok(Arr(items)) }
   loop {
     let v = _jValue(c)?
     push(items, v)
@@ -171,13 +179,16 @@ fn _jArray(mut c: JsonCur) -> Result[Json, String] {
     else if ch == ']' { _jAdv(c)  break }
     else { return Err("expected ',' or ']' at position " + toString(c.i)) }
   }
+  c.depth = c.depth - 1
   Ok(Arr(items))
 }
 fn _jObject(mut c: JsonCur) -> Result[Json, String] {
   _jEat(c, '{')?
+  c.depth = c.depth + 1
+  if c.depth > _jMaxDepth() { return Err("nesting too deep at position " + toString(c.i)) }
   let mut entries: Vec[JsonEntry] = vec()
   _jSkipWs(c)
-  if _jPeek(c) == '}' { _jAdv(c)  return Ok(Obj(entries)) }
+  if _jPeek(c) == '}' { _jAdv(c)  c.depth = c.depth - 1  return Ok(Obj(entries)) }
   loop {
     _jSkipWs(c)
     if _jPeek(c) != '"' { return Err("expected string key at position " + toString(c.i)) }
@@ -192,18 +203,8 @@ fn _jObject(mut c: JsonCur) -> Result[Json, String] {
     else if ch == '}' { _jAdv(c)  break }
     else { return Err("expected ',' or '}' at position " + toString(c.i)) }
   }
+  c.depth = c.depth - 1
   Ok(Obj(entries))
-}
-
-// ---- public parse entry -----------------------------------------------------
-// parse(s) -> Ok(Json) | Err(message-with-position). Full value grammar; strings decode all
-// escapes incl. \uXXXX surrogate pairs; trailing non-whitespace is an error.
-pub fn parse(s: String) -> Result[Json, String] {
-  let mut c = _jNew(s)
-  let v = _jValue(c)?
-  _jSkipWs(c)
-  if !_jAtEnd(c) { return Err("trailing characters at position " + toString(c.i)) }
-  Ok(v)
 }
 
 // ============================================================================
@@ -220,56 +221,56 @@ fn _hexNib(n: Int) -> Int { if n < 10 { '0' + n } else { 'a' + (n - 10) } }
 // Append `s` as a quoted, escaped JSON string. Mandatory escapes only; non-ASCII UTF-8
 // bytes pass through unchanged (valid JSON). Iterates the string's raw BYTES.
 fn _jStr(mut sb: StringBuilder, s: String) -> StringBuilder {
-  appendByte(sb, '"')
+  sb.appendByte('"')
   for c in s {
-    if      c == '"'  { appendByte(sb, '\\')  appendByte(sb, '"') }
-    else if c == '\\' { appendByte(sb, '\\')  appendByte(sb, '\\') }
-    else if c == '\n' { appendByte(sb, '\\')  appendByte(sb, 'n') }
-    else if c == '\r' { appendByte(sb, '\\')  appendByte(sb, 'r') }
-    else if c == '\t' { appendByte(sb, '\\')  appendByte(sb, 't') }
-    else if c == 8    { appendByte(sb, '\\')  appendByte(sb, 'b') }
-    else if c == 12   { appendByte(sb, '\\')  appendByte(sb, 'f') }
+    if      c == '"'  { sb.appendByte('\\')  sb.appendByte('"') }
+    else if c == '\\' { sb.appendByte('\\')  sb.appendByte('\\') }
+    else if c == '\n' { sb.appendByte('\\')  sb.appendByte('n') }
+    else if c == '\r' { sb.appendByte('\\')  sb.appendByte('r') }
+    else if c == '\t' { sb.appendByte('\\')  sb.appendByte('t') }
+    else if c == 8    { sb.appendByte('\\')  sb.appendByte('b') }
+    else if c == 12   { sb.appendByte('\\')  sb.appendByte('f') }
     else if c < 32    {
-      appendByte(sb, '\\')  appendByte(sb, 'u')  appendByte(sb, '0')  appendByte(sb, '0')
-      appendByte(sb, _hexNib((c >> 4) & 15))  appendByte(sb, _hexNib(c & 15))
+      sb.appendByte('\\')  sb.appendByte('u')  sb.appendByte('0')  sb.appendByte('0')
+      sb.appendByte(_hexNib((c >> 4) & 15))  sb.appendByte(_hexNib(c & 15))
     }
-    else { appendByte(sb, c) }
+    else { sb.appendByte(c) }
   }
-  appendByte(sb, '"')
+  sb.appendByte('"')
 }
 
 fn _jVal(mut sb: StringBuilder, j: Json) -> StringBuilder {
   match j {
-    Null    => append(sb, "null"),
-    Boolean(b) => append(sb, if b { "true" } else { "false" }),
-    Integer(n)  => append(sb, toString(n)),
-    Number(d)  => if _finite(d) { append(sb, toString(d)) } else { append(sb, "null") },
+    Null    => sb.append("null"),
+    Boolean(b) => sb.append(if b { "true" } else { "false" }),
+    Integer(n)  => sb.append(toString(n)),
+    Number(d)  => if _finite(d) { sb.append(toString(d)) } else { sb.append("null") },
     Text(s)  => _jStr(sb, s),
     Arr(xs) => _jArr(sb, xs),
     Obj(es) => _jObj(sb, es),
   }
 }
 fn _jArr(mut sb: StringBuilder, xs: Vec[Json]) -> StringBuilder {
-  appendByte(sb, '[')
+  sb.appendByte('[')
   let mut first = true
   for x in xs {
-    if !first { appendByte(sb, ',') }
+    if !first { sb.appendByte(',') }
     _jVal(sb, x)
     first = false
   }
-  appendByte(sb, ']')
+  sb.appendByte(']')
 }
 fn _jObj(mut sb: StringBuilder, es: Vec[JsonEntry]) -> StringBuilder {
-  appendByte(sb, '{')
+  sb.appendByte('{')
   let mut first = true
   for e in es {
-    if !first { appendByte(sb, ',') }
+    if !first { sb.appendByte(',') }
     _jStr(sb, e.key)
-    appendByte(sb, ':')
+    sb.appendByte(':')
     _jVal(sb, e.val)
     first = false
   }
-  appendByte(sb, '}')
+  sb.appendByte('}')
 }
 
 // stringify / stringifyChecked / stringifyPretty are inherent methods on Json (see `impl Json` at the
@@ -301,10 +302,10 @@ fn _anyNonFiniteObj(es: Vec[JsonEntry]) -> Bool {
 // stringifyPretty(j, indent) -> multi-line JSON, `indent` spaces per nesting level. Empty
 // arrays/objects stay inline as [] / {}.
 fn _jIndent(mut sb: StringBuilder, depth: Int, indent: Int) -> () {
-  appendByte(sb, '\n')
+  sb.appendByte('\n')
   let total = depth * indent
   let mut k = 0
-  while k < total { appendByte(sb, ' ')  k = k + 1 }
+  while k < total { sb.appendByte(' ')  k = k + 1 }
 }
 fn _jPretty(mut sb: StringBuilder, j: Json, depth: Int, indent: Int) -> StringBuilder {
   match j {
@@ -314,35 +315,35 @@ fn _jPretty(mut sb: StringBuilder, j: Json, depth: Int, indent: Int) -> StringBu
   }
 }
 fn _jArrPretty(mut sb: StringBuilder, xs: Vec[Json], depth: Int, indent: Int) -> StringBuilder {
-  if len(xs) == 0 { append(sb, "[]") }
+  if len(xs) == 0 { sb.append("[]") }
   else {
-    appendByte(sb, '[')
+    sb.appendByte('[')
     let mut first = true
     for x in xs {
-      if !first { appendByte(sb, ',') }
+      if !first { sb.appendByte(',') }
       _jIndent(sb, depth + 1, indent)
       _jPretty(sb, x, depth + 1, indent)
       first = false
     }
     _jIndent(sb, depth, indent)
-    appendByte(sb, ']')
+    sb.appendByte(']')
   }
 }
 fn _jObjPretty(mut sb: StringBuilder, es: Vec[JsonEntry], depth: Int, indent: Int) -> StringBuilder {
-  if len(es) == 0 { append(sb, "{}") }
+  if len(es) == 0 { sb.append("{}") }
   else {
-    appendByte(sb, '{')
+    sb.appendByte('{')
     let mut first = true
     for e in es {
-      if !first { appendByte(sb, ',') }
+      if !first { sb.appendByte(',') }
       _jIndent(sb, depth + 1, indent)
       _jStr(sb, e.key)
-      append(sb, ": ")
+      sb.append(": ")
       _jPretty(sb, e.val, depth + 1, indent)
       first = false
     }
     _jIndent(sb, depth, indent)
-    appendByte(sb, '}')
+    sb.appendByte('}')
   }
 }
 // --- private accessor helpers (drive the methods in `impl Json` below) ---
@@ -365,16 +366,28 @@ fn _jAsMap(es: Vec[JsonEntry], i: Int, mut m: Map[String, Json]) -> Map[String, 
 // (not toMap) to avoid the std::iter::toMap Iterator terminal.
 // ============================================================================
 impl Json {
+  // --- parsing (an ASSOCIATED function: no `self`, so `Json::parse(s)` only) ---
+  // Ok(Json) | Err(message-with-position). Full value grammar; strings decode all escapes incl.
+  // \uXXXX surrogate pairs; trailing non-whitespace is an error. Namespacing it here is what lets
+  // it be called `parse` at all -- as a free fn the bare name was claimed for every importer.
+  fn parse(s: String) -> Result[Json, String] {
+    let mut c = _jNew(s)
+    let v = _jValue(c)?
+    _jSkipWs(c)
+    if !_jAtEnd(c) { return Err("trailing characters at position " + toString(c.i)) }
+    Ok(v)
+  }
+
   // --- serialization (drives the private _j* walkers above) ---
   // Compact JSON. A non-finite Number (NaN/Inf) is emitted as `null`.
-  fn stringify(self) -> String { build(_jVal(stringBuilder(), self)) }
+  fn stringify(self) -> String { _jVal(stringBuilder(), self).build() }
   // Err when the tree contains a non-finite number (no valid JSON form); else same as stringify.
   fn stringifyChecked(self) -> Result[String, String] {
     if _anyNonFinite(self) { Err("cannot serialize a non-finite number") }
     else { Ok(self.stringify()) }
   }
   // Multi-line JSON, `indent` spaces per nesting level. Empty arrays/objects stay inline as [] / {}.
-  fn stringifyPretty(self, indent: Int) -> String { build(_jPretty(stringBuilder(), self, 0, indent)) }
+  fn stringifyPretty(self, indent: Int) -> String { _jPretty(stringBuilder(), self, 0, indent).build() }
 
   // --- typed accessors ---
   fn isNull(self) -> Bool { match self { Null => true, _ => false } }

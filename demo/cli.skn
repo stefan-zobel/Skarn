@@ -5,25 +5,25 @@ use std::env::*
 use std::cli::*
 
 // args() is everything after the script path (an Array[String]); toVec lifts it into the
-// Vec[String] that parseArgs expects. The parser needs no per-option spec.
-let c = parseArgs(toVec(args()))
+// Vec[String] that CliArgs::parse expects. The parser needs no per-option spec.
+let c = CliArgs::parse(toVec(args()))
 
 // Options are `--name=value`; read them with a default or as an Option.
-println("opt --opt    : ${getOptOr(c, "opt", "(none)")}")
-match getOpt(c, "output") {
+println("opt --opt    : ${c.getOptOr("opt", "(none)")}")
+match c.getOpt("output") {
   Some(v) => println("opt --output : ${v}"),
   None    => println("opt --output : (not given)")
 }
 
 // Flags are a bare `--name` or grouped short `-abc` (letters only).
-println("flag --verbose : ${hasFlag(c, "verbose")}")
-println("flag -v        : ${hasFlag(c, "v")}")
+println("flag --verbose : ${c.hasFlag("verbose")}")
+println("flag -v        : ${c.hasFlag("v")}")
 
 // Positionals are everything that is neither a flag nor an option -- plus anything after `--`.
-println("positionals (${numPositionals(c)}):")
+println("positionals (${c.numPositionals()}):")
 let mut i = 0
-while i < numPositionals(c) {
-  match positionalAt(c, i) {
+while i < c.numPositionals() {
+  match c.positionalAt(i) {
     Some(p) => println("  [${i}] ${p}"),
     None    => println("  [${i}] (none)")
   }
@@ -31,6 +31,6 @@ while i < numPositionals(c) {
 }
 
 // With no arguments every query above is empty/false -- pass some to watch them populate.
-if numPositionals(c) == 0 && !hasFlag(c, "verbose") {
+if c.numPositionals() == 0 && !c.hasFlag("verbose") {
   println("(no arguments -- try: static_vmrun demo/cli.skn build --opt=O2 -v main.skn)")
 }

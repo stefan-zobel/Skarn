@@ -154,9 +154,37 @@ fn _hexDigit(n: Int) -> Int { if n < 10 { 48 + n } else { 87 + n } }
 
 // Lowercase hex encoding of a byte buffer (2 chars per byte, no separators).
 pub fn toHex(data: Bytes) -> String {
-  let mut out = bytes()
+  let mut out = bytes(len(data) * 2)          // exact size known up front -- no regrow
   for b in data { push(out, _hexDigit((b >> 4) & 15))  push(out, _hexDigit(b & 15)) }
   fromBytes(out)
+}
+
+// The value of one hex digit, or -1 if `c` is not one. Accepts both cases.
+fn _hexVal(c: Int) -> Int {
+  if      c >= 48 && c <= 57  { c - 48 }        // '0'..'9'
+  else if c >= 97 && c <= 102 { c - 97 + 10 }   // 'a'..'f'
+  else if c >= 65 && c <= 70  { c - 65 + 10 }   // 'A'..'F'
+  else { -1 }
+}
+
+// Decode a hex string back into bytes -- the inverse of toHex, so fromHex(toHex(b)) == Ok(b).
+// Accepts upper or lower case. An odd digit count or a non-hex byte is an Err (never a trap).
+pub fn fromHex(s: String) -> Result[Bytes, String] {
+  let src = toBytes(s)
+  let n = len(src)
+  if n % 2 != 0 { Err("fromHex: odd number of hex digits") }
+  else {
+    let mut out = bytes(n / 2)
+    let mut i = 0
+    let mut bad = -1
+    while i < n && bad < 0 {
+      let hi = _hexVal(src[i])
+      let lo = _hexVal(src[i + 1])
+      if hi < 0 || lo < 0 { bad = i } else { push(out, (hi << 4) | lo) }
+      i = i + 2
+    }
+    if bad >= 0 { Err("fromHex: invalid hex digit at position " + toString(bad)) } else { Ok(out) }
+  }
 }
 
 // The 32-byte SHA-256 digest of a String's bytes.

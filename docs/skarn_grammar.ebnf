@@ -107,8 +107,10 @@ enum_variant = uident , [ "(" , type , { "," , type } , [ "," ] , ")"
                         | "{" , field_defs , "}"
                         | "=" , [ "-" ] , int_literal ] ;
 
-(* -- traits / protocols (dynamic single-dispatch on arg 0 `self`; call is a   *)
-(* plain function / pipe, never method-dot). Trait + supertrait names UPPER.   *)
+(* -- traits / protocols (dynamic single-dispatch on arg 0 `self`). A trait    *)
+(* method is callable three ways: as a free function / pipe (`show(x)` /        *)
+(* `x |> show`), as a method (`x.show()`), or qualified (`Trait::show(x)`).     *)
+(* Trait + supertrait names UPPER.                                             *)
 (* A trait may be PARAMETRIC: `trait Iterable[T] { fn iter(self) -> Vec[T] }`, *)
 (* the type params appear in method signatures and are solved as OUTPUTS from  *)
 (* the matching impl at a bound's use site (functional-dependency rule).       *)
@@ -116,10 +118,15 @@ trait_item   = "trait" , uident , [ generic_params ] ,
                [ ":" , uident , { "," , uident } , [ "," ] ] ,
                "{" , { terminator } , { method , { terminator } } , "}" ;
 
-(* Generic impls: `impl[T] Trait for List[T]`; a parametric trait takes args:  *)
-(* `impl[X] Iterable[X] for List[X] { .. }`.                                   *)
-impl_item    = "impl" , [ generic_params ] , uident ,
-               [ "[" , type , { "," , type } , "]" ] , "for" , named_type ,
+(* Two forms. A TRAIT impl: `impl[T] Trait for List[T]`; a parametric trait     *)
+(* takes args: `impl[X] Iterable[X] for List[X] { .. }`. An INHERENT impl (no   *)
+(* trait, no `for`): `impl[T: Hashable] Set[T] { .. }` gives a type its own      *)
+(* methods, reachable ONLY via `.method()` (dot-only; orphan rule: the target   *)
+(* head must be module-local). Disambiguated by the token after the head+args:  *)
+(* `for` -> trait impl, `{` -> inherent impl.                                    *)
+impl_item    = "impl" , [ generic_params ] ,
+               ( uident , [ "[" , type , { "," , type } , "]" ] , "for" , named_type
+               | named_type ) ,
                "{" , { terminator } , { method , { terminator } } , "}" ;
 
 (* method name is lident; params mandatorily typed EXCEPT a leading bare       *)
@@ -128,6 +135,9 @@ impl_item    = "impl" , [ generic_params ] , uident ,
 (* `mut self` permits in-place mutation of the receiver (checker-gated to an   *)
 (* aggregate `Self`; binding-local, not part of the signature -- an impl may   *)
 (* add or omit it independently of the trait declaration).                     *)
+(* Omitting `self` in an INHERENT impl declares an ASSOCIATED FUNCTION         *)
+(* (`Point::new(1, 2)`): same syntax, reachable only through `Type::name(..)`, *)
+(* never through `.` (there is no receiver to dispatch on).                    *)
 method        = "fn" , lident , [ generic_params ] ,
                 "(" , [ method_params ] , ")" , "->" , type , [ block ] ;
 method_params = [ "mut" ] , "self" , { "," , param } , [ "," ]
@@ -330,8 +340,17 @@ fmt_type     = 'x' | 'X' | 'b' | 'o' | 'd' | 'f' | 'g' | 'e' | 'E' | 's' ;
              (* '+' force-sign; '#' alternate form (0x/0X/0b/0o base prefix, x/X/b/o); g = shortest   *)
              (* round-trip Double; e/E = scientific Double (default precision 6, minimal exponent)    *)
 char_lit     = "'" , ( char_no_squote_no_bslash | escape ) , "'" ;
-             (* a single BYTE 0..255, typed Int (there is NO scalar Char type);      *)
-             (* escapes \n \t \r \\ \0 \' \"; a multi-byte literal (e.g. 'é' = 2     *)
-             (* UTF-8 bytes), '' (empty), or 'ab' is a lexer error. Lexes to an Int  *)
-             (* token, so it is usable anywhere `literal` is -- incl. patterns.      *)
+             (* a single BYTE 0..255. Typed Int by DEFAULT, but in a `Char`-typed   *)
+             (* context it coerces to `Char` (the opt-in code-point type -- a        *)
+             (* prelude `transparent struct Char(Int)`, so still a bare immediate).  *)
+             (* escapes \n \t \r \\ \0 \' \"; a multi-byte literal (2 UTF-8 bytes),  *)
+             (* '' (empty), or 'ab' is a lexer error -- non-ASCII code points come   *)
+             (* from `Char(cp)` / `chars`. Lexes to a literal token, so it is usable *)
+             (* anywhere `literal` is -- incl. patterns.                             *)
 terminator   = ";" | NEWLINE ;                   (* StmtEnd, via ASI or explicit ";" *)
+             (* GOTCHA: a NEWLINE followed by a line that STARTS with a binary        *)
+             (* operator continues the previous expression -- `a` <NL> `- b` parses   *)
+             (* as `a - b`, NOT two statements. So a statement-leading unary `-`/`~`   *)
+             (* is fragile; unary minus is safe in every other position (`let x = -5`, *)
+             (* `-n` in a block, `f(-1)`). Prefer an explicit `;` if a line must start *)
+             (* with `-`. (This is the same ASI edge the `return`/`break` rule guards.) *)

@@ -6,7 +6,7 @@ use std::json::*
 
 let src = "{\"name\":\"Ada Lovelace\",\"age\":36,\"active\":true,\"langs\":[\"Skarn\",\"Rust\"],\"note\":\"tab\\ttab\"}"
 
-let doc = match parse(src) {
+let doc = match Json::parse(src) {
   Ok(j) => j,
   Err(e) => { println("parse error: " + e)  Null },
 }
@@ -32,7 +32,7 @@ println(doc.stringifyPretty(2))
 
 // ---- a malformed input reports a located error ----
 println("")
-match parse("{\"a\":}") {
+match Json::parse("{\"a\":}") {
   Ok(_)  => println("unexpected ok"),
   Err(e) => println("malformed -> Err: " + e),
 }

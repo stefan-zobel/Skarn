@@ -47,12 +47,15 @@ fn _indexOfByte(b: Bytes, target: Int, from: Int) -> Int {
   found
 }
 
-// The sub-range b[lo, hi) copied into a fresh buffer.
+// The sub-range b[lo, hi) copied into a fresh buffer -- one bulk memcpy (_appendBytesRange) into a
+// pre-sized buffer, not a per-byte push loop. recvLine calls this once per line to keep the tail.
 fn _sub(b: Bytes, lo: Int, hi: Int) -> Bytes {
-  let mut out = bytes()
-  let mut i = lo
-  while i < hi { push(out, b[i])  i = i + 1 }
-  out
+  if hi <= lo { bytes() }
+  else {
+    let mut out = bytes(hi - lo)
+    _appendBytesRange(out, b, lo, hi)
+    out
+  }
 }
 
 // --- a connection's own API (dot syntax: c.send(data), c.recvLine(), ...) ---
@@ -116,13 +119,13 @@ impl TcpListener {
   }
 
   // Stop listening (server self-shutdown).
-  fn closeListener(self) -> Result[(), String] { tcpClose(self.fd) }
+  fn close(self) -> Result[(), String] { tcpClose(self.fd) }
 }
 
 // --- a minimal HTTP/1.0 client (the optional text layer; REST = this + std::json) ---
 
 // A parsed HTTP response: the numeric status code and the raw body text (headers past the status
-// line are dropped in v1). A JSON body feeds `std::json::parse(resp.body)`.
+// line are dropped in v1). A JSON body feeds `Json::parse(resp.body)`.
 pub struct HttpResponse { status: Int, body: String }
 
 // The status code from an HTTP status line like "HTTP/1.0 200 OK" (the 2nd space-separated token),

@@ -20,7 +20,7 @@ fn echo() -> Result[(), String] {
 
   cli.close()?
   srv.close()?
-  lst.closeListener()?
+  lst.close()?
   Ok(())
 }
 

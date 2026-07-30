@@ -34,8 +34,13 @@ pub struct Stopwatch { startNanos: Int }
 
 // --- floor division / modulo (Skarn's `/` and `%` truncate toward zero; the calendar math needs floor
 // semantics for negative epoch-ms and negative years). Divisor is always positive here. ---
+// Computed WITHOUT negating `a`: negating MIN_48 (-2^47) wraps back to itself, which would make
+// the whole calendar conversion silently wrong at the very edge of the representable window.
+// `q * b` never overflows because |q * b| <= |a| by construction.
 fn _floorDiv(a: Int, b: Int) -> Int {
-  if a >= 0 { a / b } else { 0 - ((0 - a + b - 1) / b) }
+  let q = a / b                 // truncates toward zero
+  let r = a - q * b
+  if r < 0 { q - 1 } else { q }
 }
 fn _floorMod(a: Int, b: Int) -> Int { a - _floorDiv(a, b) * b }
 
@@ -137,6 +142,10 @@ fn _rd(b: Bytes, off: Int, k: Int) -> Int {
 
 // Parse a strict `YYYY-MM-DDThh:mm:ss` (with optional `.sss` fraction and optional trailing `Z`) as UTC.
 // Fields are validated via `dateTime`, so an out-of-range component is an Err.
+// LENIENT TAIL: only the fixed prefix is examined -- anything after the seconds (or after the `.sss`
+// fraction) is IGNORED rather than rejected, so a trailing `Z`, an offset like `+02:00` (which is NOT
+// applied -- the result stays UTC), or plain trailing garbage all parse. Validate the tail yourself if
+// you need strictness.
 pub fn parseIso(s: String) -> Result[DateTime, String] {
   let b = toBytes(s)
   let n = len(b)
@@ -197,10 +206,14 @@ impl Duration {
   fn inHours(self) -> Int { self.ms / 3600000 }
   fn inDays(self) -> Int { self.ms / 86400000 }
 
-  fn addDurations(self, other: Duration) -> Duration { Duration { ms: self.ms + other.ms } }
-  fn subDurations(self, other: Duration) -> Duration { Duration { ms: self.ms - other.ms } }
-  fn scaleDuration(self, k: Int) -> Duration { Duration { ms: self.ms * k } }
-  fn negateDuration(self) -> Duration { Duration { ms: 0 - self.ms } }
+  // Arithmetic is plain 48-bit Int arithmetic and WRAPS on overflow, like every Int op in the
+  // language -- no saturation, no error. In particular negate() of the minimum representable
+  // duration is itself (still negative), since +2^47 has no 48-bit representation. Spans that
+  // large are ~4460 years, far outside any real use, so this is a boundary note, not a limit.
+  fn add(self, other: Duration) -> Duration { Duration { ms: self.ms + other.ms } }
+  fn sub(self, other: Duration) -> Duration { Duration { ms: self.ms - other.ms } }
+  fn scale(self, k: Int) -> Duration { Duration { ms: self.ms * k } }
+  fn negate(self) -> Duration { Duration { ms: 0 - self.ms } }
 }
 
 // --- DateTime's own API ---

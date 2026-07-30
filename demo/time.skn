@@ -11,7 +11,7 @@ println("weekday:  ${dt.weekday()}")                 // 2  (ISO Mon=1..Sun=7 -> 
 println("leap?     ${isLeapYear(dt.year)}")          // false
 
 // Arithmetic: add a duration, measure a gap.
-let later = t.addDuration(hours(1).addDurations(minutes(30)))
+let later = t.addDuration(hours(1).add(minutes(30)))
 println("later:    ${later.toDateTime().toIso()}")   // 2026-07-21T16:00:15.123Z
 println("gap min:  ${t.durationBetween(later).inMinutes()}")   // 90
 

@@ -2,10 +2,13 @@
 // built-in container + user types via `impl Iterable for MyType`. A generic `I: Iterable[T]`
 // dispatches `iter` dynamically; a concrete receiver devirtualizes. Baked in now that prelude
 // Trait/Impl items TREE-SHAKE (tree_shake_prelude): a program that never uses Iterable drops
-// the whole block (no dead trait rows, no forced `$List`). NOT re-iterable / single-pass here
-// -- Vec's iter returns self; the others copy into a fresh Vec.
+// the whole block (no dead trait rows, no forced `$List`).
+// CONTRACT: `iter` returns a FRESH Vec the caller owns outright -- `toVec(x)` hands the result
+// straight back, so aliasing internal storage (a bare `{ self }` / `{ self.items }`) would leak a
+// mutable alias of a container. Every built-in impl returns a fresh Vec (Vec via `clone`; the rest
+// build one element-by-element); a user `impl Iterable` must do the same.
 pub trait Iterable[T] { fn iter(self) -> Vec[T] }
-impl[X] Iterable[X] for Vec[X] { fn iter(self) -> Vec[X] { self } }
+impl[X] Iterable[X] for Vec[X] { fn iter(self) -> Vec[X] { clone(self) } }
 impl[X] Iterable[X] for Array[X] { fn iter(self) -> Vec[X] { let mut v: Vec[X] = vec() for e in self { push(v, e) } v } }
 impl[X] Iterable[X] for List[X] { fn iter(self) -> Vec[X] { let mut v: Vec[X] = vec() for e in self { push(v, e) } v } }
 impl Iterable[Int] for Bytes { fn iter(self) -> Vec[Int] { let mut v: Vec[Int] = vec() for b in self { push(v, b) } v } }
@@ -54,20 +57,21 @@ struct MapCursor[K, V] { m: Map[K, V], i: Int }
 impl[K, V] Iterator[(K, V)] for MapCursor[K, V] { fn next(mut self) -> Option[(K, V)] { let j = mapIterNext(self.m, self.i)  if j < 0 { None } else { let k = mapKeyAt(self.m, j)  let v = mapValAt(self.m, j)  self.i = j + 1  Some((k, v)) } } }
 impl[K, V] IntoIterator[(K, V)] for Map[K, V] { fn intoIter(self) -> dyn Iterator[(K, V)] { MapCursor { m: self, i: 0 } } }
 
-// ---- bridges: streamX / toStream now just lift into a dyn Iterator ----
-pub fn streamVec[T](v: Vec[T]) -> dyn Iterator[T] { intoIter(v) }
-pub fn streamArray[T](a: Array[T]) -> dyn Iterator[T] { intoIter(a) }
-pub fn streamBytes(b: Bytes) -> dyn Iterator[Int] { intoIter(b) }
-pub fn streamList[T](l: List[T]) -> dyn Iterator[T] { intoIter(l) }
-// toStream lifts ANY eager Iterable (user types + Map) into a lazy iterator, via a Vec snapshot.
-pub fn toStream[T, I: Iterable[T]](it: I) -> dyn Iterator[T] { intoIter(iter(it)) }
+// `intoIter(x)` is the one lazy-cursor entry for any container with an `IntoIterator` impl
+// (Vec/Array/Bytes/String/List/Map/Set); an `Iterable`-only user type streams via
+// `intoIter(toVec(x))`, which puts the snapshot's copy visibly at the call site.
 
 // ---- String line / field cursors (byte-scan + slice; pure prelude, yield String) ----
 // split(s, sep): N separators -> N+1 fields (empties kept), so join(split(s,sep),sep) == s.
-//   An empty separator panics. `sep` is a literal byte sequence (may be multi-byte). Both cursors
+//   An EMPTY separator yields the whole string as one field ([s]) -- it cannot split, so it passes
+//   the input through (this keeps the join round-trip identity). `sep` is a literal byte sequence
+//   (may be multi-byte). Both cursors
 //   scan bytes and slice out fields lazily; their scan helpers are tail-recursive (TCO). 10 = the
 //   newline byte, 13 = the carriage-return byte (spelled as ints to keep this mirror escape-free).
-struct SplitCursor { s: String, b: Bytes, sep: Bytes, pos: Int, done: Bool }
+// The cursor holds ONLY the materialized bytes, and slices fields out of them with sliceBytes.
+// Keeping the source String around and calling slice(s, ..) per field would re-run toBytes over
+// the WHOLE input for every field -- i.e. O(n^2) over the split as a whole.
+struct SplitCursor { b: Bytes, sep: Bytes, pos: Int, done: Bool }
 fn _strMatchAt(b: Bytes, sep: Bytes, at: Int, i: Int) -> Bool {
   if i >= len(sep) { true } else if at + i >= len(b) { false }
   else if b[at + i] != sep[i] { false } else { _strMatchAt(b, sep, at, i + 1) }
@@ -81,9 +85,9 @@ impl Iterator[String] for SplitCursor {
     if self.done { None } else {
       let k = _strIndexOf(self.b, self.sep, self.pos)
       if k < 0 {
-        let field = slice(self.s, self.pos, len(self.b))  self.done = true  Some(field)
+        let field = sliceBytes(self.b, self.pos, len(self.b))  self.done = true  Some(field)
       } else {
-        let field = slice(self.s, self.pos, k)  self.pos = k + len(self.sep)  Some(field)
+        let field = sliceBytes(self.b, self.pos, k)  self.pos = k + len(self.sep)  Some(field)
       }
     }
   }
@@ -92,13 +96,13 @@ pub fn split(s: String, sep: String) -> dyn Iterator[String] {
   // An empty separator yields the whole string as a single field ([s]) -- it cannot split, so it
   // passes the input through. This keeps join(split(s, sep), sep) == s (join([s], "") == s).
   if len(sep) == 0 { once(s) } else {
-    let c = SplitCursor { s: s, b: toBytes(s), sep: toBytes(sep), pos: 0, done: false }
+    let c = SplitCursor { b: toBytes(s), sep: toBytes(sep), pos: 0, done: false }
     c
   }
 }
 // lines(s): terminator semantics -- a trailing newline yields NO phantom empty last line; a `\r`
 //   directly before a `\n` is stripped (so CRLF text splits cleanly). lines("") is empty.
-struct LinesCursor { s: String, b: Bytes, pos: Int, done: Bool }
+struct LinesCursor { b: Bytes, pos: Int, done: Bool }
 fn _strIndexByte(b: Bytes, byte: Int, from: Int) -> Int {
   if from >= len(b) { -1 } else if b[from] == byte { from } else { _strIndexByte(b, byte, from + 1) }
 }
@@ -108,17 +112,17 @@ impl Iterator[String] for LinesCursor {
       let k = _strIndexByte(self.b, 10, self.pos)
       if k < 0 {
         if self.pos >= len(self.b) { self.done = true  None } else {
-          let line = slice(self.s, self.pos, len(self.b))  self.done = true  Some(line)
+          let line = sliceBytes(self.b, self.pos, len(self.b))  self.done = true  Some(line)
         }
       } else {
         let e = if k > self.pos { if self.b[k - 1] == 13 { k - 1 } else { k } } else { k }
-        let line = slice(self.s, self.pos, e)  self.pos = k + 1  Some(line)
+        let line = sliceBytes(self.b, self.pos, e)  self.pos = k + 1  Some(line)
       }
     }
   }
 }
 pub fn lines(s: String) -> dyn Iterator[String] {
-  LinesCursor { s: s, b: toBytes(s), pos: 0, done: false }
+  LinesCursor { b: toBytes(s), pos: 0, done: false }
 }
 // ---- UTF-8 code-point decode: `chars(s)` lazily yields the Unicode scalar values of s as `Char`s
 // (a zero-cost transparent newtype over the code-point Int; see std::string). This is the opt-in
@@ -172,9 +176,9 @@ fn _nthCharGo(mut it: dyn Iterator[Char], i: Int) -> Option[Char] {
 pub fn nthChar(s: String, i: Int) -> Option[Char] { if i < 0 { None } else { _nthCharGo(chars(s), i) } }
 // fromChars: encode a stream of Chars back to a UTF-8 String (the inverse of `chars`).
 fn _fromCharsGo(mut it: dyn Iterator[Char], mut sb: StringBuilder) -> StringBuilder {
-  match next(it) { Some(c) => _fromCharsGo(it, appendCodePoint(sb, c.0)), None => sb }
+  match next(it) { Some(c) => _fromCharsGo(it, sb.appendCodePoint(c.0)), None => sb }
 }
-pub fn fromChars(mut it: dyn Iterator[Char]) -> String { build(_fromCharsGo(it, stringBuilder())) }
+pub fn fromChars(mut it: dyn Iterator[Char]) -> String { _fromCharsGo(it, stringBuilder()).build() }
 
 // ---- generic sources (return a fresh dyn Iterator) ----
 struct RangeCursor { i: Int, n: Int }
@@ -209,6 +213,38 @@ struct DropStage[T] { up: dyn Iterator[T], left: Int }
 fn _dropStageNext[T](mut c: DropStage[T]) -> Option[T] { while c.left > 0 { c.left = c.left - 1  match next(c.up) { Some(_) => {}, None => { c.left = 0 } } } next(c.up) }
 impl[T] Iterator[T] for DropStage[T] { fn next(mut self) -> Option[T] { _dropStageNext(self) } }
 pub fn drop[T](s: dyn Iterator[T], n: Int) -> dyn Iterator[T] { DropStage { up: s, left: n } }
+// stepBy: yield the first element, then every `step`-th thereafter (`step` >= 1; a bounded skip per pull).
+struct StepByStage[T] { up: dyn Iterator[T], step: Int, first: Bool }
+impl[T] Iterator[T] for StepByStage[T] { fn next(mut self) -> Option[T] { if self.first { self.first = false  next(self.up) } else { let mut k = self.step - 1  while k > 0 { k = k - 1  let _ = next(self.up) } next(self.up) } } }
+pub fn stepBy[T](s: dyn Iterator[T], step: Int) -> dyn Iterator[T] { StepByStage { up: s, step: step, first: true } }
+// inspect: run `f` on each element as it passes (a debug tap), yielding the element unchanged.
+struct InspectStage[T] { up: dyn Iterator[T], f: fn(T) -> () }
+impl[T] Iterator[T] for InspectStage[T] { fn next(mut self) -> Option[T] { match next(self.up) { Some(x) => { (self.f)(x)  Some(x) }, None => None } } }
+pub fn inspect[T](s: dyn Iterator[T], f: fn(T) -> ()) -> dyn Iterator[T] { InspectStage { up: s, f: f } }
+// dedup: collapse CONSECUTIVE equal elements (needs T: Eq); a tail-recursive skip over a run (TCO).
+struct DedupStage[T: Eq] { up: dyn Iterator[T], last: Option[T] }
+fn _dedupNext[T: Eq](mut c: DedupStage[T]) -> Option[T] { match next(c.up) { Some(x) => match c.last { Some(p) => if x == p { _dedupNext(c) } else { c.last = Some(x)  Some(x) }, None => { c.last = Some(x)  Some(x) } }, None => None } }
+impl[T: Eq] Iterator[T] for DedupStage[T] { fn next(mut self) -> Option[T] { _dedupNext(self) } }
+pub fn dedup[T: Eq](s: dyn Iterator[T]) -> dyn Iterator[T] { DedupStage { up: s, last: None } }
+// _vecTail: a fresh Vec copy of `v[from..]` (Vec has no pop-front); `from`=0 is a plain copy.
+fn _vecTail[T](v: Vec[T], from: Int) -> Vec[T] { let mut r: Vec[T] = vec()  let mut i = from  while i < len(v) { push(r, v[i])  i = i + 1 }  r }
+// chunks: non-overlapping blocks of up to `n` (last may be shorter); a fresh Vec per pull (`n` >= 1).
+struct ChunksStage[T] { up: dyn Iterator[T], n: Int }
+fn _chunkFill[T](mut c: ChunksStage[T], mut acc: Vec[T], k: Int) -> Vec[T] { if k <= 0 { acc } else { match next(c.up) { Some(x) => { push(acc, x)  _chunkFill(c, acc, k - 1) }, None => acc } } }
+impl[T] Iterator[Vec[T]] for ChunksStage[T] { fn next(mut self) -> Option[Vec[T]] { let v = _chunkFill(self, vec(), self.n)  if len(v) == 0 { None } else { Some(v) } } }
+pub fn chunks[T](s: dyn Iterator[T], n: Int) -> dyn Iterator[Vec[T]] { ChunksStage { up: s, n: n } }
+// windows: overlapping fixed-size views of `n` (`n` >= 1); holds n elements, COPIES each window out
+// (else all windows would alias one buffer). len(source) < n yields nothing. O(n) per pull.
+struct WindowsStage[T] { up: dyn Iterator[T], n: Int, buf: Vec[T], primed: Bool }
+impl[T] Iterator[Vec[T]] for WindowsStage[T] { fn next(mut self) -> Option[Vec[T]] { if !self.primed { self.primed = true  let mut i = 0  while i < self.n { match next(self.up) { Some(x) => { push(self.buf, x)  i = i + 1 }, None => { i = self.n } } } if len(self.buf) < self.n { None } else { Some(_vecTail(self.buf, 0)) } } else { match next(self.up) { Some(x) => { self.buf = _vecTail(self.buf, 1)  push(self.buf, x)  Some(_vecTail(self.buf, 0)) }, None => None } } } }
+pub fn windows[T](s: dyn Iterator[T], n: Int) -> dyn Iterator[Vec[T]] { WindowsStage { up: s, n: n, buf: vec(), primed: false } }
+// peekable: buffer one element so `.peek()` can look ahead without consuming. Returns a CONCRETE cursor
+// (peek is an inherent method, unreachable through the `dyn Iterator` interface); it still coerces to
+// `dyn Iterator[T]` when passed on to a terminal (peek is then lost, as intended).
+struct PeekableCursor[T] { up: dyn Iterator[T], buf: Option[T], filled: Bool }
+impl[T] Iterator[T] for PeekableCursor[T] { fn next(mut self) -> Option[T] { if self.filled { self.filled = false  let r = self.buf  self.buf = None  r } else { next(self.up) } } }
+impl[T] PeekableCursor[T] { fn peek(mut self) -> Option[T] { if !self.filled { self.buf = next(self.up)  self.filled = true } self.buf } }
+pub fn peekable[T](s: dyn Iterator[T]) -> PeekableCursor[T] { PeekableCursor { up: s, buf: None, filled: false } }
 
 // ---- terminals (drive `next()` to exhaustion; all tail-recursive -> TCO -> O(1) native stack) ----
 pub fn fold[T, U](mut s: dyn Iterator[T], init: U, f: fn(U, T) -> U) -> U { match next(s) { Some(x) => fold(s, f(init, x), f), None => init } }
@@ -293,8 +329,8 @@ fn _unzipGo[A, B](mut s: dyn Iterator[(A, B)], mut xs: Vec[A], mut ys: Vec[B]) -
 pub fn unzip[A, B](mut s: dyn Iterator[(A, B)]) -> (Vec[A], Vec[B]) { let mut xs: Vec[A] = vec()  let mut ys: Vec[B] = vec()  _unzipGo(s, xs, ys) }
 // join: concatenate a stream of Strings with a separator between elements. Threads a StringBuilder
 // (O(n) via BYTES_APPEND) instead of a `+`-accumulator (O(n^2)); still tail-recursive => O(1) stack.
-fn _joinGo(mut s: dyn Iterator[String], mut sb: StringBuilder, sep: String) -> StringBuilder { match next(s) { Some(x) => _joinGo(s, append(append(sb, sep), x), sep), None => sb } }
-pub fn join(mut s: dyn Iterator[String], sep: String) -> String { match next(s) { Some(first) => build(_joinGo(s, append(stringBuilder(), first), sep)), None => "" } }
+fn _joinGo(mut s: dyn Iterator[String], mut sb: StringBuilder, sep: String) -> StringBuilder { match next(s) { Some(x) => _joinGo(s, sb.append(sep).append(x), sep), None => sb } }
+pub fn join(mut s: dyn Iterator[String], sep: String) -> String { match next(s) { Some(first) => _joinGo(s, stringBuilder().append(first), sep).build(), None => "" } }
 // toMap: collect (K, V) pairs into a Map (later pairs overwrite earlier on a duplicate key).
 fn _toMapGo[K, V](mut m: Map[K, V], mut s: dyn Iterator[(K, V)]) -> Map[K, V] { match next(s) { Some(kv) => { let (k, v) = kv  m[k] = v  _toMapGo(m, s) }, None => m } }
 pub fn toMap[K: Hashable, V](mut s: dyn Iterator[(K, V)]) -> Map[K, V] { let mut m: Map[K, V] = #{}  _toMapGo(m, s) }

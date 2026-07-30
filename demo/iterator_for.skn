@@ -71,3 +71,11 @@ println("evens / odds      = " + len(evens) + " / " + len(odds))             // 
 println("joined            = " + join(map(range(0, 5), fn(x: Int) -> String { toString(x) }), ", "))
 let squares = toMap(map(range(1, 5), fn(x: Int) -> (Int, Int) { (x, x * x) }))
 println("squares[4]        = " + toString(squares[4]))    // 16
+
+// extra stages: stepBy / dedup / chunks / windows / peekable.
+println("stepBy 0..20 by 5 = " + toString(sum(stepBy(range(0, 20), 5))))     // 0+5+10+15 = 30
+println("dedup runs        = " + toString(count(dedup(intoIter(toVec([1, 1, 2, 3, 3, 1]))))))  // 1,2,3,1 = 4
+println("chunks of 3       = " + toString(count(chunks(range(0, 7), 3))))     // 3 blocks
+println("windows of 3      = " + toString(count(windows(range(0, 5), 3))))    // 3 views
+let mut pk = peekable(range(10, 20))
+println("peek then sum     = " + unwrapOr(pk.peek(), -1) + " / " + sum(pk))    // 10 / 145

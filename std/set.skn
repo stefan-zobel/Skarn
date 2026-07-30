@@ -8,26 +8,29 @@
 // bound applies to every method, so the inherent `impl[T: Hashable] Set[T]` block carries it once.
 // T is monomorphic, so Map's int-vs-double SameValueZero hazard cannot arise. Iteration is HASH-ORDER, like Map.
 //
-// OPT-IN: reach these via `use std::set::*` (the constructors `set`/`setOf`) + method syntax `s.size()` etc.
-// Tree-shaken.
+// OPT-IN: reach these via `use std::set::*` (the constructors `Set::new`/`Set::fromVec`) + method
+// syntax `s.size()` etc. Tree-shaken.
 
 pub struct Set[T: Hashable] { m: Map[T, Bool] }
 
-// An empty set. (A constructor has no receiver, so it stays a free function.)
-pub fn set[T: Hashable]() -> Set[T] {
-  let m0: Map[T, Bool] = #{}
-  Set { m: m0 }
-}
-
-// A set holding the distinct elements of `v`.
-pub fn setOf[T: Hashable](v: Vec[T]) -> Set[T] {
-  let mut s: Set[T] = set()
-  for x in v { s.insert(x) }
-  s
-}
-
 // The set's own API -- called as `s.size()`, `a.union(b)`, `s.insert(x)`, ...
 impl[T: Hashable] Set[T] {
+  // --- construction (ASSOCIATED functions: no `self`, so `Set::new()` / `Set::fromVec(v)`) ---
+  // The head's `T` is fixed by NOTHING at a `Set::new()` call, so it needs an annotation from the
+  // context (`let s: Set[Int] = Set::new()`); an unsolved bounded parameter is rejected rather than
+  // discharging its own `Hashable` bound vacuously.
+  fn new() -> Set[T] {
+    let m0: Map[T, Bool] = #{}
+    Set { m: m0 }
+  }
+
+  // A set holding the distinct elements of `v` (here `T` comes from the argument).
+  fn fromVec(v: Vec[T]) -> Set[T] {
+    let mut s: Set[T] = Set::new()
+    for x in v { s.insert(x) }
+    s
+  }
+
   // Membership -- O(1).
   fn isMember(self, x: T) -> Bool { has(self.m, x) }
 
@@ -47,38 +50,38 @@ impl[T: Hashable] Set[T] {
   // --- algebra (non-mutating; each returns a fresh set) ---
 
   fn union(self, other: Set[T]) -> Set[T] {
-    let mut r: Set[T] = set()
+    let mut r: Set[T] = Set::new()
     for x in keys(self.m)  { r.insert(x) }
     for x in keys(other.m) { r.insert(x) }
     r
   }
 
   fn intersect(self, other: Set[T]) -> Set[T] {
-    let mut r: Set[T] = set()
+    let mut r: Set[T] = Set::new()
     for x in keys(self.m) { if other.isMember(x) { r.insert(x) } }
     r
   }
 
   fn difference(self, other: Set[T]) -> Set[T] {
-    let mut r: Set[T] = set()
+    let mut r: Set[T] = Set::new()
     for x in keys(self.m) { if !other.isMember(x) { r.insert(x) } }
     r
   }
 
-  // Every element of `self` is in `other`.
+  // Every element of `self` is in `other`. Stops at the first counter-example.
   fn isSubset(self, other: Set[T]) -> Bool {
     let mut ok = true
-    for x in keys(self.m) { if !other.isMember(x) { ok = false } }
+    for x in keys(self.m) { if !other.isMember(x) { ok = false  break } }
     ok
   }
 
-  // `self` and `other` share no element.
+  // `self` and `other` share no element. Stops at the first shared element.
   fn isDisjoint(self, other: Set[T]) -> Bool {
     let mut ok = true
-    for x in keys(self.m) { if other.isMember(x) { ok = false } }
+    for x in keys(self.m) { if other.isMember(x) { ok = false  break } }
     ok
   }
 }
 
 // `for x in s` + the whole lazy-combinator surface, over a keys() snapshot (hash-order).
-impl[T] IntoIterator[T] for Set[T] { fn intoIter(self) -> dyn Iterator[T] { intoIter(keys(self.m)) } }
+impl[T: Hashable] IntoIterator[T] for Set[T] { fn intoIter(self) -> dyn Iterator[T] { intoIter(keys(self.m)) } }

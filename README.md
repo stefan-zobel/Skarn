@@ -1,8 +1,10 @@
-# An Introduction to Skarn
+# The Skarn Language Guide
 
 Skarn is a sound, statically typed language in the ML/Rust tradition — checked ahead of time and *erased* at
 compile time (generics compile to one shared body, not a copy per type) — that happens to target a compact
-bytecode VM (the vMachine interpreter).
+bytecode VM (the vMachine interpreter). Its type system borrows from the functional world, but its **core is
+imperative**: statements, mutable bindings, loops, and in-place updates are ordinary Skarn, not an escape
+hatch ([§22](#22-programming-styles-imperative-functional-streaming) writes the same program three ways).
 This guide is a complete, example-driven tour of the language for working programmers. It assumes you are
 comfortable with a mainstream statically typed language and have seen a few functional-programming ideas
 (closures, pattern matching, immutable-by-default values), but it does **not** assume you know any particular
@@ -17,9 +19,10 @@ Skarn is a statically-typed language with a **Rust-flavored surface** — enums 
 `Option`/`Result` with `?`, traits with bounds, immutability by default, everything an expression — but it runs
 on a garbage-collected bytecode VM, so it **drops the parts of Rust that make Rust hard**.
 
-> **In a hurry?** [Skarn in 15 minutes](SkarnIn15Minutes.md) is the small core — bindings, functions, `struct`,
-> `enum`/`match`, `Option`/`Result`/`?`, and the everyday collections — enough to write real programs. Come back
-> here for traits, generics, iterators, and the standard library.
+> **In a hurry?** [Skarn in 30 minutes](SkarnIn30Minutes.md) is the working core — bindings, functions,
+> `struct`, `enum`/`match`, `Option`/`Result`/`?`, the everyday collections, text handling, iterator pipelines,
+> `use`, and file/argument I/O — enough to finish a real program. Come back here for traits, generics, `dyn`,
+> and the full standard library.
 
 The one-sentence pitch: *the safety and expressiveness of Rust's type system, without the borrow checker.*
 
@@ -58,12 +61,16 @@ points are an opt-in layer). It targets a compact interpreter, not native code, 
 that removes Rust's single hardest concept. Where Rust asks "who owns this, and for how long?", Skarn's answer
 is "the GC does — write the obvious code."
 
+Skarn is also **single-threaded**, by design for v1: there are no threads, no `async`, and no channels; the
+garbage collector is stop-the-world; and `std::net` is blocking (one connection at a time). Concurrency is a
+deliberate non-goal here — when you need parallelism, shell out to OS processes with `std::process`.
+
 Let's be honest about the rest, though: what Skarn removes is Rust's **difficulty** (ownership, lifetimes, the borrow
 checker), not Rust's **feature count**. The surface is Rust-family-sized — traits, generics, `dyn`, exhaustive
 pattern matching, lazy iterators — so this is not a tiny language you learn in an afternoon. What it *is* is a
 **layered** one. The core you need to be productive — `let`/`fn`/`struct`/`enum`/`match`/`Option`/`Result` and
 the everyday collections — is small and quick to hold in your head (that is exactly
-[Skarn in 15 minutes](SkarnIn15Minutes.md)). The heavier machinery — blanket and parametric `impl`s, `dyn`,
+[Skarn in 30 minutes](SkarnIn30Minutes.md)). The heavier machinery — blanket and parametric `impl`s, `dyn`,
 the erasure types, the full call-form and module surface — is mostly there for **reading** the standard library
 and growing into, not for everyday **writing**. You can go a long way on the core and reach for the rest only
 when a problem asks for it.
@@ -73,9 +80,17 @@ when a problem asks for it.
 - Sections build on each other, but each is self-contained enough to skim.
 - Code is shown in normal, multi-line style. In real files you may write several small statements on one line
   separated by spaces; the compiler mostly treats newlines and blank lines as formatting rather than required
-  separators. The one place a newline *is* significant: a value given to `return` or carried out by `break`
-  must start on the **same line** as the keyword — `return\n  x` reads as a bare `return` followed by a
-  separate statement `x`, not as returning `x`.
+  separators. Two precise rules govern where a newline *does* matter:
+  1. **Continuation (look at the next token).** A newline ends the current statement — *unless* the next line
+     begins with a **binary operator** or **`.`**, in which case the expression continues onto it. This is
+     exactly what lets you break long expressions and **method chains** across lines: both
+     `let total = a + b`⏎`    + c` and `sb.append("a")`⏎`  .append("b")`⏎`  .build()` work, because `+` and `.`
+     continue the line. (A leading `(` or `[` does **not** continue, so `f`⏎`(x)` is two statements, not a call.)
+  2. **Value cutoff (look at the previous token).** After `return` or `break`, a newline *always* ends the
+     statement, so the value is never taken from the following line — `return`⏎`  x` is a bare `return` then a
+     separate statement `x`, not `return x`.
+  The one thing to watch falls out of rule 1: a statement you meant to open with a unary `-` continues the line
+  above as a subtraction instead. `-` is the *only* token this happens to — see the note in [§5](#5-operators).
 - Run any example by saving it to a `.skn` file and passing it to the runner:
 
 ```
@@ -203,7 +218,7 @@ bit 47 — so `0x800000000000` is the smallest `Int` and **`0xFFFFFFFFFFFF` (all
 convenient full-width mask. A value beyond 48 bits (e.g. `0x1000000000000`) is a compile error.
 
 ```rust
-let flags   = 0xFF          // 255
+let flags   = 0xFF           // 255
 let allOnes = 0xFFFFFFFFFFFF // -1  (every bit set, in 48-bit two's complement)
 let masked  = allOnes & 0x0F // 15
 let perms   = 0o755          // 493
@@ -236,11 +251,17 @@ println("counter=" + counter)   // => counter=10
 
 `mut` governs **all** mutation through a binding, under one rule (Rust's): the *root* binding must be `mut` to
 reassign it (`x = ..`), to assign through a place path (`p.x = ..`, `a[i] = ..`), **or** to pass it to a
-function that mutates it in place (`push(v, x)`, `sort(v)`, `append(sb, s)` — anything whose parameter is
-`mut`). A plain `let v = vec()` followed by `push(v, 1)` is therefore a compile error — write `let mut v`. (A
-fresh temporary you never bind, like `push(vec(), 1)`, needs no `mut`.) `mut` is meaningful only for the
-mutable aggregates — `struct`/tuple/`Array`/`Vec`/`Bytes`/`Map` and trait objects; a scalar, `enum`, or `List`
-has no in-place mutation surface, so `mut` on one is rejected.
+function or method that mutates it in place (`push(v, x)`, `sort(v)`, `sb.append(s)` — anything whose
+parameter or `mut self` receiver is `mut`). A plain `let v = vec()` followed by `push(v, 1)` is therefore a compile error — write `let mut v`. (A
+fresh temporary you never bind, like `push(vec(), 1)`, needs no `mut`.)
+
+One distinction to keep straight: a **`let mut` binding can be reassigned whatever its type** — `let mut n = 0
+n = n + 1` is fine for a scalar, an `enum`, or a `List`, because reassignment just rebinds the name. The
+"aggregate only" restriction is about **`mut` *parameters*** (and `mut self`): declaring a *parameter* `mut`
+means the callee mutates it **in place** so the *caller* sees the change, and only the mutable aggregates —
+`struct` / tuple / `Array` / `Vec` / `Bytes` / `Map` and trait objects — have an in-place mutation surface. So
+a scalar / `enum` / `List` *parameter* cannot be declared `mut` (there is nothing to propagate back), even
+though a `let mut` local of the same type reassigns freely.
 
 **Type inference is local.** Inside a function body the compiler infers the types of your `let` bindings from
 their initializers, so you rarely annotate them. But function parameters and return types must always be
@@ -306,7 +327,50 @@ treated as `Double` and the result is `Double`.
 let a = 3 + 4 * 2       // => 11 (Int)
 let b = 10.0 / 4.0      // => 2.5 (Double)
 let c = 3 + 0.5         // => 3.5 (Int promoted to Double)
+let d = -5              // unary minus: a negative literal
+let e = -a              // and prefix negation of any expression   // => -11
 ```
+
+A prefix `-` (and `!` for `Bool`, `~` for bitwise-not) works anywhere an expression is expected. The one
+caveat is at the *start of a statement*, and it is just an instance of the newline **continuation** rule
+(rule 1 under [How to read this guide](#how-to-read-this-guide)): because a line that begins with a binary
+operator continues the previous one, `x`⏎`-y` parses as `x - y`. `-` is the *only* token this can bite — it is
+the sole operator that is **both** a line-continuation **and** a valid expression opener (`!` and `~` open an
+expression but are not binary operators; `*`/`&` are not prefix operators), so naming it specifically is exact,
+not a special case. Inside expressions, arguments, and `let` initializers — where negation almost always
+appears — there is nothing to watch for.
+
+### Compound assignment
+
+`+= -= *= /= %=` update a place in one step. `a op= b` means exactly `a = a op b`, so the type rules and the
+traps are the same ones the plain operator has:
+
+```rust
+let mut n = 10
+n += 5                  // => 15
+n *= 2                  // => 30
+n %= 7                  // => 2
+
+struct Counter { hits: Int }
+let mut c = Counter { hits: 0 }
+c.hits += 1             // a field
+let mut v = array(3, 0)
+v[1] += 10              // an element
+println("${n} ${c.hits} ${v[1]}")   // => 2 1 10
+```
+
+Three things are worth knowing, because they are choices rather than consequences:
+
+- **The place is evaluated exactly once.** In `v[nextIndex()] += 1`, `nextIndex()` is called one time, not
+  two — the compiler reads, computes, and writes back through a single evaluation of the index.
+- **It is numeric only** (`Int` and `Double`). `s += "text"` is rejected on purpose: repeated string
+  concatenation is quadratic, and Skarn has [`StringBuilder`](#building-strings-efficiently--stringbuilder)
+  for building text. Plain `s = s + t` still works when you really do want the copy.
+- **`m[k] += 1` needs `k` to already be there.** The read half is the ordinary `m[k]`, which aborts on a
+  missing key ([§14](#14-collections)), so this is not the way to build up a counter map — use `getOrPut` or
+  `upsert` for that. On an `Array`/`Vec` element there is no such caveat, since the slot always exists.
+
+The same rules apply to `mut`: the binding you assign to (or reach through) must be `mut`, exactly as for `=`.
 
 ### Comparison and equality
 
@@ -323,8 +387,12 @@ matches.
 struct Point { x: Int, y: Int }
 let e5 = (Point { x: 1, y: 2 } == Point { x: 1, y: 2 })  // => true
 let e6 = (Some(1) == Some(1))                            // => true
-let e7 = (None == None)                                  // => true
-let e8 = (Some(1) == None)                               // => false
+let na: Option[Int] = None
+let nb: Option[Int] = None
+let e7 = (na == nb)                                      // => true  (two distinct values, so this is real
+                                                         //           structural equality, not the self short-circuit;
+                                                         //           a bare `None == None` has no element type, so annotate)
+let e8 = (Some(1) == None)                               // => false (None's element type comes from Some(1))
 let e9 = (toVec([1, 2, 3]) == toVec([1, 2, 3]))          // => true
 ```
 
@@ -359,10 +427,12 @@ fn f(x: dyn Eq) -> Int { 0 }      // error: 'Eq' is a compile-time marker, not u
 > `NaN`-containing value, `contains(v, x)` answers differently depending on whether `v` holds `x` *itself* or a
 > structural copy of it — the only case where that distinction is observable.
 
-`< <= > >=` compare **two numbers, two strings, or two `Char`s** (there is no ordering on composites). Note the
-`Ord` *trait* — what `sort` / `sorted` / `minOf` / `maxOf` require — is narrower: only `Int` / `Double` /
-`String` (see [§19](#19-iterators)). So a `Char` can be compared with `<` but a `Vec[Char]` cannot be `sort`ed —
-use the comparator form, which needs no `Ord`: `sortBy(chars, fn(a: Char, b: Char) -> Bool { a < b })`.
+`< <= > >=` compare **two numbers, two strings, or two `Char`s** (there is no ordering on composites). The
+`Ord` *trait* — what `sort` / `sorted` / `minOf` / `maxOf` require — is a separate thing from the operators: it
+has **built-in** impls for `Int` / `Double` / `String` (see [§19](#19-iterators)), and your own `struct` / `enum`
+can add it by writing `impl Ord` (only the erasure types, like `Char`, cannot). So a `Char` can be compared with
+`<` but a `Vec[Char]` cannot be `sort`ed — use the comparator form, which needs no `Ord`:
+`sortBy(chars, fn(a: Char, b: Char) -> Bool { a < b })`.
 
 ```rust
 let e1 = (2 + 2 == 4)         // => true
@@ -390,14 +460,14 @@ println("short=" + short)          // => short=false
 ### Bitwise and shift
 
 `& | ^ ~ << >> >>>` operate on `Int` only (`>>` is an arithmetic/sign-preserving shift, `>>>` is logical).
-`~x` is bitwise-not — it flips every bit, equivalent to `x ^ (0 - 1)`.
+`~x` is bitwise-not — it flips every bit, equivalent to `x ^ -1`.
 
 ```rust
 let bits = (6 & 3) | (1 << 4)   // (2) | (16) => 18
 println("bits=" + bits)         // => bits=18
 
-println("not="  + (~5))              // => not=-6   (~x flips every bit)
-println("shr="  + ((0 - 8) >> 1))   // => shr=-4   (arithmetic: sign preserved)
+println("not="  + (~5))             // => not=-6   (~x flips every bit)
+println("shr="  + ((-8) >> 1))      // => shr=-4   (arithmetic: sign preserved)
 println("ushr=" + (8 >>> 1))        // => ushr=4   (logical: zero-filled)
 ```
 
@@ -454,13 +524,27 @@ let imod = 7 % 3      // => 1
 let promoted = 3 + 0.5  // => 3.5
 ```
 
+The promotion above happens **only where the two types meet**. Two `Int`s divided by each other stay integer
+division, even when the result is assigned to a `Double` — the division has already happened by then. When you
+want the other arithmetic, widen the operands first with **`toDouble`**:
+
+```rust
+let w = 470
+let h = 264
+println(w / h)                        // => 1                    (integer division)
+println(toDouble(w) / toDouble(h))    // => 1.7803030303030303   (what you meant)
+```
+
+`toDouble` takes an `Int` and is exact — every 48-bit `Int` is representable as a `Double`. Passing it a value
+that is already a `Double` is an error rather than a silent no-op, since it can only be a mistake.
+
 To convert a `Double` to an `Int`, use `toInt`. It is **saturating and total**: it never aborts. A fractional
 value truncates toward zero; a value too large becomes the maximum `Int`; too small becomes the minimum; and a
 NaN becomes `0`.
 
 ```rust
 println("toInt(3.9)=" + toInt(3.9))    // => toInt(3.9)=3
-println("toInt(-2.7)=" + toInt(0.0 - 2.7))  // => toInt(-2.7)=-2
+println("toInt(-2.7)=" + toInt(-2.7))  // => toInt(-2.7)=-2
 ```
 
 To choose *which* integer, round first — `floor`, `ceil`, `trunc` (toward zero), `round` (ties **away** from
@@ -495,7 +579,8 @@ functions follow IEEE semantics — a domain error yields `NaN` or `±∞` rathe
 - **Trig:** `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2(y, x)`
 - **Sign / magnitude:** `abs` (`Double`), `absInt` (`Int`), `sign` (`Double`), `signInt` (`Int`)
 - **Integer:** `gcd(a, b)`, `lcm(a, b)`
-- **Scalar min/max/clamp** — generic over any ordered type (`Int`, `Double`, `String`), so they preserve the
+- **Scalar min/max/clamp** — generic over any `Ord` type (the built-in `Int` / `Double` / `String`, or your own
+  via `impl Ord`), so they preserve the
   type: `minOf(a, b)`, `maxOf(a, b)`, `clamp(x, lo, hi)`. (The bare `min`/`max` are the *iterator* terminals of
   [§19](#19-iterators); scalar versions get the `-Of` suffix because Skarn has no overloading.)
 - **Constants:** `PI` and `E` (see the `const` note in [§4](#4-bindings-let-and-let-mut)).
@@ -520,8 +605,8 @@ fn parseOr(s: String, fallback: Int) -> Int {
     }
 }
 
-println("parse=" + parseOr("123", 0 - 1))   // => parse=123
-println("bad="   + parseOr("xyz", 0 - 1))   // => bad=-1
+println("parse=" + parseOr("123", -1))   // => parse=123
+println("bad="   + parseOr("xyz", -1))   // => bad=-1
 ```
 
 ---
@@ -695,7 +780,7 @@ or `$` that you would otherwise have to escape.
 
 ```rust
 let path = r"C:\Users\name\file.txt"     // no \U / \n / \f escaping needed
-let re   = r"\d+\.\d+"                    // a regex, verbatim
+let re   = r"\d+\.\d+"                   // a regex, verbatim
 println(path)                            // => C:\Users\name\file.txt
 println("len=${len(re)}")                // => len=8   (\d+\.\d+ is 8 bytes)
 ```
@@ -723,7 +808,8 @@ lowercase `r` immediately before the quote (or `#`) starts a raw string; an iden
 `r` on its own is unaffected.
 
 You can move between a `String` and its raw bytes with `toBytes` and `fromBytes`. This is how you build a
-string from computed bytes (there is no character type to append):
+string from computed **bytes** (for **code points** there is the opt-in `Char` type and
+`codePointToStr` / `appendCodePoint`, covered in [Char and UTF-8 code points](#char-and-utf-8-code-points)):
 
 ```rust
 let bytes = toBytes("Hi")
@@ -756,20 +842,20 @@ you assemble a string piece by piece, reach for `StringBuilder` instead: it accu
 
 ```rust
 let mut sb = stringBuilder()  // or stringBuilderCap(64) to pre-size the buffer
-append(sb, "items: ")
+sb.append("items: ")
 let mut i = 0
 while i < 3 {
-    append(sb, "[")
-    appendByte(sb, '0' + i)   // append a single byte
-    append(sb, "]")
+    sb.append("[")
+    sb.appendByte('0' + i)    // append a single byte
+    sb.append("]")
     i = i + 1
 }
-println(build(sb))            // => items: [0][1][2]
+println(sb.build())           // => items: [0][1][2]
 ```
 
-`append`/`appendByte` mutate the builder in place (and also return it, so calls can chain), so the builder
-binding must be `mut`; `sbLen(sb)` is the number of bytes accumulated so far. `StringBuilder` lives in the
-always-available `std::string` ring.
+`sb.append(...)` / `sb.appendByte(...)` mutate the builder in place (and also return it, so calls chain —
+`sb.append("a").append("b")`), so the builder binding must be `mut`; `sb.len()` is the number of bytes
+accumulated so far. `StringBuilder` lives in the always-available `std::string` ring.
 
 ### String helpers
 
@@ -792,17 +878,17 @@ println(endsWith("README.md", ".md"))         // => true
 println(hasSubstr(s, "lo, W"))                // => true
 
 // trim ASCII whitespace ( \t \n \v \f \r and space )
-println("[" + trim(s) + "]")                   // => [Hello, World]
-println("[" + trimStart(s) + "]")              // => [Hello, World  ]
-println("[" + trimEnd(s) + "]")                // => [  Hello, World]
+println("[" + trim(s) + "]")                  // => [Hello, World]
+println("[" + trimStart(s) + "]")             // => [Hello, World  ]
+println("[" + trimEnd(s) + "]")               // => [  Hello, World]
 
 // ASCII case
-println(toUpper("Hi, x9!"))                    // => HI, X9!
-println(toLower("Hi, X9!"))                    // => hi, x9!
+println(toUpper("Hi, x9!"))                   // => HI, X9!
+println(toLower("Hi, X9!"))                   // => hi, x9!
 
 // small companions
-println(charAt("ABC", 1))                      // => 66   (the byte at index 1)
-println(isEmpty(""))                           // => true
+println(charAt("ABC", 1))                     // => 66   (the byte at index 1)
+println(isEmpty(""))                          // => true
 ```
 
 Three more build the result string from an input. `replace` substitutes **all** occurrences (an empty pattern
@@ -956,7 +1042,7 @@ fn describe(n: Int) -> String {
     }
     "positive"
 }
-println(describe(0 - 5))   // => negative
+println(describe(-5))   // => negative
 ```
 
 A function that does not produce a useful value returns `()` (unit):
@@ -986,7 +1072,7 @@ in constant stack space — you can recurse millions of levels deep without over
 ```rust
 fn countUp(n: Int, acc: Int) -> Int {
     if n == 0 { acc }
-    else { countUp(n - 1, acc + 1) }   // tail call: no stack growth
+    else { countUp(n - 1, acc + 1) }     // tail call: no stack growth
 }
 println("deep=" + countUp(1000000, 0))   // => deep=1000000
 ```
@@ -1017,8 +1103,24 @@ fn adder(by: Int) -> fn(Int) -> Int {
 }
 
 let add10 = adder(10)
-println("closure=" + add10(5))   // => closure=15
+println("closure=" + add10(5))     // => closure=15
 ```
+
+**What "by value" precisely means** — the lambda copies the *slot* of each captured variable at the moment it
+is created, and nothing more. For an **immediate** (an `Int`, `Bool`, `Char`, …) the slot *is* the value, so the
+lambda takes a **snapshot**: a later reassignment of the outer variable is invisible to it.
+
+```rust
+let mut counter = 0
+let peek = fn() -> Int { counter }
+counter = 10
+println(peek())   // => 0   (the snapshot taken at creation, not the current 10)
+```
+
+For a **heap value** (a `Map`, `Vec`, a struct, …) the slot is a *pointer*, so the lambda shares the **same
+object** — mutating it through either name is visible to both (this is exactly what makes the memoize trick in
+[§14](#14-collections) work). But reassigning the outer variable to a *new* object still leaves the lambda holding the
+old one. In short: a capture shares the pointed-to object, never the variable *binding*.
 
 ### Type inference for lambdas
 
@@ -1028,10 +1130,10 @@ explicit function type. In those positions you can drop every annotation:
 
 ```rust
 let evens = collect(filter(range(0, 10), fn(x) { x % 2 == 0 }))  // x: Int, -> Bool  (from filter)
-println(toString(evens))                                        // => [0, 2, 4, 6, 8]
+println(toString(evens))                                         // => [0, 2, 4, 6, 8]
 
-let f: fn(Int) -> Int = fn(x) { x + 1 }                         // x: Int, -> Int   (from the let type)
-println("f=" + f(41))                                           // => f=42
+let f: fn(Int) -> Int = fn(x) { x + 1 }                          // x: Int, -> Int   (from the let type)
+println("f=" + f(41))                                            // => f=42
 ```
 
 The one place you must annotate is a lambda with **no** expected type — such as a bare `let` binding, where
@@ -1063,8 +1165,8 @@ struct Point {
 }
 
 fn manhattan(p: Point) -> Int {
-    let ax = if p.x < 0 { 0 - p.x } else { p.x }
-    let ay = if p.y < 0 { 0 - p.y } else { p.y }
+    let ax = if p.x < 0 { -p.x } else { p.x }
+    let ay = if p.y < 0 { -p.y } else { p.y }
     ax + ay
 }
 
@@ -1097,6 +1199,25 @@ let base = Config { host: "localhost", port: 8080, tls: false }
 let secure = Config { port: 443, tls: true, ..base }   // host copied from base
 println("host=" + secure.host + " port=" + secure.port)   // => host=localhost port=443
 ```
+
+When a field's value is already held by a binding of the *same name*, **field shorthand** lets you write the
+name once: `Point { x, y }` means `Point { x: x, y: y }`. Shorthand and explicit fields mix freely, and it
+combines with record update. The name must be a **local binding** — shorthand does not reach for a global or an
+imported name:
+
+```rust
+fn scaled(x: Int, y: Int, k: Int) -> Point {
+    let x = x * k
+    let y = y * k
+    Point { x, y }                     // == Point { x: x, y: y }
+}
+
+let q = scaled(3, 4, 2)
+println("q.x=" + q.x + " q.y=" + q.y)  // => q.x=6 q.y=8
+```
+
+This is most worth having in constructor functions, where the parameters are deliberately named after the
+fields they fill.
 
 When the binding *is* `mut`, you can assign through a whole **place path** — any chain of field (`.x`) and
 index (`[i]`) steps, e.g. `pts[0].x = 40` or `line.start.y = 9`. Only the **root** binding needs `mut`
@@ -1186,7 +1307,7 @@ enum Direction {
 fn dx(d: Direction) -> Int {
     match d {
         East => 1,
-        West => 0 - 1,
+        West => -1,
         North => 0,
         South => 0
     }
@@ -1342,7 +1463,7 @@ println(euro)                      // => €
 println(codePoint(euro))           // => 8364     (unwrap to the Int code point)
 
 println(c == 'A')                  // => true
-println('a' <= Char('m') && Char('m') <= 'z')   // => true   (Chars compare with < <= > >=)
+println('a' <= Char('m') && Char('m') <= 'z')    // => true   (Chars compare with < <= > >=)
 // note: a Char is comparable with `<`, but not `Ord` — `sort(Vec[Char])` / `minOf(Char, …)` are rejected
 // (an erasure type cannot implement the method trait `Ord`; see §16 and §19).
 
@@ -1405,7 +1526,7 @@ fn sign(n: Int) -> String {
         _          => "zero"
     }
 }
-println(sign(5) + " " + sign(0 - 2) + " " + sign(0))   // => pos neg zero
+println(sign(5) + " " + sign(-2) + " " + sign(0))   // => pos neg zero
 ```
 
 ### Matching literals, including characters
@@ -1481,8 +1602,34 @@ println(classify('7'))   // => digit
 println(classify('Q'))   // => letter
 ```
 
+The sibling form **`lo..<hi` excludes the upper bound** — it matches `lo <= v < hi`:
+
+```rust
+fn grade(n: Int) -> String {
+    match n {
+        0..<60  => "F",
+        60..<70 => "D",
+        70..<80 => "C",
+        80..<90 => "B",
+        _       => "A"
+    }
+}
+println(grade(59) + grade(60) + grade(89) + grade(90))   // => FDBA
+```
+
+Note that `..` is the **inclusive** form — this is not Rust, where a bare `..` excludes the upper bound. On
+`Int` bounds the two spellings are interchangeable (`0..<10` is exactly `0..9`), so pick whichever reads
+better against the number you actually have in mind: `0..<60` says "below 60" more directly than `0..59`.
+On `Double` bounds the choice is real, because there is no way to write the largest double below `1.0`:
+
+```rust
+fn unitInterval(x: Double) -> Bool { match x { 0.0..<1.0 => true, _ => false } }
+println("${unitInterval(0.999)} ${unitInterval(1.0)}")   // => true false
+```
+
 A range binds nothing, and — because the numeric types are unbounded — a range never makes a match
-exhaustive on its own: a `match` built only from ranges still needs a `_` arm.
+exhaustive on its own: a `match` built only from ranges still needs a `_` arm. The two forms are distinct
+patterns, so `1..9` and `1..<9` may appear in the same `match` without either being flagged unreachable.
 
 ### Struct, enum, and tuple patterns
 
@@ -1499,6 +1646,17 @@ fn quadrant(p: Point) -> Int {
 }
 println("q="      + quadrant(Point { x: 2, y: 3 }))   // => q=1
 println("origin=" + quadrant(Point { x: 0, y: 0 }))   // => origin=0
+```
+
+`Point { x, y }` above is the pattern form of the same **field shorthand** the struct literal has: it binds each
+field to a name equal to the field. Two rules go with it. A struct pattern must name **every** field — there is
+no `..` rest pattern, so adding a field to a struct makes the compiler point at each pattern that now needs
+updating. And because shorthand *binds*, it may not appear in an or-pattern, which (in this version) forbids
+bindings entirely:
+
+```rust
+// match e { A(P { x, y }) | B(P { x, y }) => x + y }
+// error: an or-pattern alternative cannot bind a variable; use separate match arms
 ```
 
 Patterns **nest**: you can match a variant inside another variant in one arm, which is how you take apart
@@ -1531,6 +1689,43 @@ fn listLen[T](xs: List[T]) -> Int {
 }
 println("len=" + listLen([10, 20, 30]))   // => len=3
 ```
+
+### Map patterns
+
+A `Map` can be matched with `#{ key => value_pattern, … }`. This is a **partial** match: each key you name
+is a literal, its value is checked or bound by a sub-pattern, and every other entry is ignored. Use a plain
+name to bind the value, or `_` to test only for the key's presence. (There is no whole-map pattern — a map
+pattern never forces a match on its own, so an arm list built only of map patterns still needs a `_`.)
+
+```rust
+let mut inv: Map[String, Int] = #{}
+inv["gold"] = 42
+inv["wood"] = 7
+
+let msg = match inv {
+    #{ "gold" => n } => "you have " + n + " gold",   // binds n = 42
+    _               => "no gold"
+}
+println(msg)   // => you have 42 gold
+```
+
+### Mutable bindings in a pattern
+
+A binding in a `match` arm can be marked `mut`, exactly like a `let`, so you can reassign it inside the arm:
+
+```rust
+fn clampLow(o: Option[Int]) -> Int {
+    match o {
+        Some(mut n) => { if n < 0 { n = 0 }  n },   // n is reassignable here
+        None        => 0
+    }
+}
+println(clampLow(Some(-5)))   // => 0
+println(clampLow(Some(7)))    // => 7
+```
+
+As with any `mut`, this makes the *binding* reassignable; it does not change how the matched value is stored.
+(The `mut` marker applies to a `match` arm's bindings; a destructuring `let` binding stays immutable.)
 
 ### Destructuring `let`
 
@@ -1647,6 +1842,17 @@ match get(v, 5) {
 }
 ```
 
+Iterating a `Vec` with `for x in v` is a **live** view of the same object, not a snapshot: overwriting an
+element in place (`v[i] = …`) before the loop reaches it *is* seen. Structural changes mid-walk stay
+memory-safe — never undefined behaviour — but the walk is bounded by the elements present when it began:
+`push`ing does **not** extend the current walk (the new element is not visited), and `pop`ping the vector
+**below the loop's current position** turns its next read into the same defined **`array index out of bounds`**
+abort as any out-of-range `v[i]` — a clean, located fault, never silent corruption. To grow or shrink while
+iterating, loop over a snapshot (`clone(v)`) or an index range instead. This trap is a **deliberate**
+asymmetry with the map rule below (where mid-walk mutation is *never* a crash): a `Vec` read is a
+bounds-checked index, so failing fast on a shrink beats silently walking a different set — whereas a hash map
+has no positional promise to violate in the first place.
+
 ### Maps: `Map[K, V]`
 
 `#{}` is an empty map. Assign with `m[k] = v` (the binding must be `mut`). Read with `m[k]` (which aborts if
@@ -1687,6 +1893,12 @@ println("nkeys="  + len(keys(scores))) // => nkeys=3
 delete(scores, "b")
 println("after="  + len(keys(scores))) // => after=2
 ```
+
+Because that walk is **live, not a snapshot**, mutating the *same* map inside the loop is defined and
+memory-safe — never a crash, corruption, or undefined behaviour — but **which entries the walk then visits is
+unspecified**: an inserted key may or may not be seen, and deleting keys mid-walk is safe but the order of the
+entries still to come is not promised. When you need to add or remove keys based on what you see, iterate a
+**snapshot** instead — collect `keys(m)` first and loop over that.
 
 Four helpers make the common lookup-with-fallback and read-modify-write patterns concise. `getOr(m, k, dflt)`
 returns the value or a default; `getOrElse(m, k, f)` computes the default lazily via a thunk (only on a miss);
@@ -1855,7 +2067,7 @@ fn spop[T](s: Stack[T]) -> Option[T] { pop(s.items) }   // Option: the stack may
 let s: Stack[Int] = newStack()
 spush(s, 10)
 spush(s, 20)
-println("popped=" + toString(spop(s)))   // => popped=Some(20)
+println("popped=" + toString(spop(s)))    // => popped=Some(20)
 println("size="   + len(s.items))         // => size=1
 ```
 
@@ -1878,15 +2090,16 @@ to.
 ### Calling things — the forms at a glance
 
 By this point you have seen a value passed to a function in a few different ways. Before traits add one more,
-here is the whole picture in one place — there are **four** call forms, and which ones apply depends on
+here is the whole picture in one place — there are **five** call forms, and which ones apply depends on
 *what* you are calling:
 
 | Form | Example | What it can call |
 |------|---------|------------------|
 | **free function** | `area(shape)`, `len(xs)` | any free function or builtin |
-| **pipe** | `shape \|> area`, `xs \|> map(f) \|> sum` | threads a value into *any* free function, left-to-right |
+| **pipe** | `shape \|> area`, `range(0, n) \|> map(f) \|> sum` | threads a value into *any* free function, left-to-right |
 | **method** | `shape.area()`, `rng.nextInt(1, 7)` | a type's own methods — an **inherent** method or a **trait** method |
 | **qualified trait** | `Shape::area(x)` | one specific trait's method, when you need to name it explicitly |
+| **qualified type** | `Point::sum(p)`, `Point::new(1, 2)` | one specific type's **inherent** method, likewise — and the only form for an **associated function** (one without `self`) |
 
 The rule of thumb is short:
 
@@ -1896,11 +2109,12 @@ The rule of thumb is short:
 - **the `.` form reaches a *type's methods*.** Those come from an `impl` block — either a **trait** `impl`
   (a shared contract, this section) or an **inherent** `impl` (a type's own API, later in this section).
 - **a trait method accepts all three of free / pipe / `.`** — `area(s)`, `s |> area`, and `s.area()` are the
-  exact same call. An **inherent** method is **`.`-only**. `Trait::method(x)` is the escape hatch for naming a
-  specific trait when a plain call would be ambiguous.
+  exact same call. An **inherent** method is not a free function, so `area(s)` does *not* reach one — it is
+  written `s.area()` or, qualified, `Point::area(s)`. The two qualified forms are the escape hatches for
+  naming one specific trait or one specific type when the plain form would be ambiguous or unavailable.
 
 So the receiver-centric std types read as methods (`rng.nextInt(1, 7)`, `dt.toIso()`, `conn.send(bytes)?`,
-`json.getField("id")`), while pipelines of standalone verbs stay pipes (`xs |> filter(even) |> toVec`). The rest
+`json.getField("id")`), while pipelines of standalone verbs stay pipes (`range(0, n) |> filter(even) |> collect`). The rest
 of this section fills in the two `impl` kinds behind the method form; the details of resolution order and the
 `.`-vs-`|>` split are collected under *Method-call syntax and inherent methods* below.
 
@@ -2029,6 +2243,32 @@ println(showAll(ws))   // => widget#1 widget#2
 Because `T` is a single type parameter, `showAll` requires a `Vec[Widget]` — every element the same type. When
 you genuinely want a mixed collection, use a trait object; see [§17](#17-trait-objects-dyn-trait).
 
+### Multiple bounds
+
+A parameter can require several traits at once, joined with `+`. Inside the function every method from every
+named trait is available on `T`:
+
+```rust
+fn atMost[T: Ord + Eq](a: T, b: T) -> Bool {
+    lessThan(a, b) || a == b   // `lessThan` comes from Ord, `==` from Eq
+}
+// Why both bounds? A total order *could* derive `==` from `lessThan`, but `Eq` and `Ord` are
+// independent traits here — a type can be `Eq` (auto-derived) without an `impl Ord` — so a function
+// that uses a method from each genuinely needs both named.
+println(atMost(3, 5))   // => true
+println(atMost(5, 5))   // => true
+println(atMost(7, 5))   // => false
+```
+
+Here `Ord` and `Eq` are built-in (`lessThan` and structural `==`); the same `+` syntax works with your own
+traits — `[T: Show + Ord]`, and so on.
+
+You can also **implement the built-in traits for your own types**, not just your own traits — and `Ord` is the
+one you will reach for most often, because it unlocks `sorted` / `sort` / `min` / `max` on a type of your own.
+Just write `impl Ord for YourType { fn lessThan(self, other: YourType) -> Bool { … } }`; there is a worked
+example under [§19 sorting](#19-iterators). (`Clone` is the other user-implementable built-in; `Eq` and
+`Hashable` are sealed markers you never implement — see [§23](#built-in-traits-at-a-glance).)
+
 ### Mutating the receiver: `mut self`
 
 By default a method only reads its receiver. To let a method modify the receiver in place — and have the caller
@@ -2103,7 +2343,7 @@ zero-cost representation. If you need a wrapper type that participates in dispat
 `struct` with a single field instead of a `transparent` one.
 
 The exception is the **compile-time marker traits** `Eq` and `Hashable` (see [§5](#5-operators) and
-[§14](#14-maps)): these carry no methods and dispatch *nothing* — the bound is discharged statically by the
+[§14](#14-collections)): these carry no methods and dispatch *nothing* — the bound is discharged statically by the
 checker — so an erasure type satisfies them like any other value. `UserId` *is* `Eq` and `Hashable`
 (`fn index[K: Hashable](…)` and `fn allEq[T: Eq](…)` accept it), it just cannot implement a *method* trait.
 `Ord` is a method trait (`lessThan`), so it is **not** among the exceptions — an erasure type is not `Ord`.
@@ -2126,14 +2366,31 @@ it introduces the type parameters once and gives the type a first-class API:
 struct Rect { w: Int, h: Int }
 
 impl Rect {
+    fn new(w: Int, h: Int) -> Self { Rect { w: w, h: h } }   // no self -> an associated function
+    fn square(side: Int) -> Self { Rect::new(side, side) }
     fn area(self) -> Int { self.w * self.h }
     fn scaled(self, k: Int) -> Rect { Rect { w: self.w * k, h: self.h * k } }
 }
 
-let r = Rect { w: 3, h: 4 }
+let r = Rect::new(3, 4)
 println(r.area())                 // => 12
 println(r.scaled(2).area())       // => 48   (methods chain left-to-right)
+println(Rect::area(r))            // => 12   the same call, named explicitly
+println(r |> Rect::scaled(2) |> Rect::area)   // => 48   and so it fits a pipe
+println(Rect::square(5).area())   // => 25
 ```
+
+A member **without** `self` is an **associated function** — a constructor or factory that belongs to the type
+rather than to a value of it. It is written `Rect::new(3, 4)`, never `r.new(…)`: there is no receiver, so there
+is nothing for `.` to dispatch on. `Self` names the impl target, in the signature as well as in the body.
+
+Associated functions are how a library keeps its constructors out of the global namespace. Skarn has no
+overloading and no `import … as`, so a free `fn parse(…)` claims that name for every program that imports the
+module; `Doc::parse(…)` does not. The standard library uses this where the pressure was real — `Json::parse`,
+`Regex::compile`, `CliArgs::parse`, `Set::new`, `ByteReader::new`, `Rng::fromSeed` — and it is what lets
+`std::json` and `std::cli` *both* call their parser `parse`. Where a free name reads better it stays free:
+`seconds(30)` beats `Duration::seconds(30)`, so `std::time` keeps its constructors, as do `std::net` and
+`stringBuilder`.
 
 Generic types and `mut self` work as expected:
 
@@ -2148,14 +2405,23 @@ impl[T] Stack[T] {
 
 Rules and boundaries:
 
-- **Inherent methods are called with `.` only** — `r.area()`, not `area(r)` or `r |> area`. (Trait methods keep
-  all three forms.) An inherent method may only be added to a type defined in the same module.
+- **Inherent methods are not free functions** — `r.area()`, not `area(r)` or `r |> area`. (Trait methods keep
+  all three forms.) The qualified `Rect::area(r)` is the exception, described at the end of this list. An
+  inherent method may only be added to a type defined in the same module.
 - **Resolution order for `x.name(...)`** is: a struct **field** named `name` (so a function-valued field stays
   callable), then an **inherent** method, then a **trait** method. An inherent method therefore shadows a
-  same-named trait method for `.`; the trait method is still reachable as `Trait::name(x)`.
+  same-named trait method for `.`; the trait method is still reachable as `Trait::name(x)`. A **field** in
+  turn shadows an inherent method — and since a field is not callable, that method is then reachable *only*
+  as `Type::name(x)`. An **associated function** takes no part in this: it has no receiver, so it never
+  shadows anything for `.` and is reached only as `Type::name(...)`.
+- **An associated function on a generic type needs its type argument fixed** by an argument, by an annotation,
+  or by the enclosing return type — there is no receiver to solve it from and no syntax to name it
+  explicitly. `Bag::of(1)` and `let b: Bag[Int] = Bag::empty()` are fine; a bare `let b = Bag::empty()` is
+  rejected as *cannot infer the type argument*.
 - **`.` and `|>` are complements, not rivals.** `.method()` reaches a type's methods; the pipe threads a value
   into *any* free function or builtin, which is what the lazy-iterator pipelines use:
-  `xs |> map(f) |> filter(p) |> sum`. There is no `xs.map(f)` — `map`/`filter`/… are free functions.
+  `xs |> intoIter |> map(f) |> filter(p) |> sum`. There is no `xs.map(f)` — `map`/`filter`/… are free
+  functions that take a `dyn Iterator` (lift a container with `intoIter` first).
 - **This is exactly why the standard library reads in two styles, and the split is principled, not drift.** The
   built-in collections — `Vec`, `Map`, `String`, `Bytes` — are not defined in any user module, and the orphan
   rule forbids adding an inherent `impl` to a type you do not own, so their verbs *must* be free functions:
@@ -2164,9 +2430,14 @@ Rules and boundaries:
   `j.stringify()`, `rng.nextInt(1, 6)`, `s.insert(x)`, `conn.send(bytes)`. So "collections use free functions"
   and "`std::json`/`std::random`/… use methods" are the same rule seen from both sides — free functions for
   types the library cannot extend, methods for the ones it defines.
-- **Inherent methods are dot-only today.** There is no qualified `Type::method(x)` call form yet (unlike
-  `Trait::method(x)`, which exists); it is a possible later addition. Turning *every* free function into a
-  `x.f()` call (full UFCS) is a deliberate non-goal — it would make `|>` redundant.
+- **`Type::method(x)` names an inherent method explicitly**, mirroring `Trait::method(x)`. `p.sum()` and
+  `Point::sum(p)` are the same call, and the qualified form also works in a pipe (`p |> Point::sum`). It
+  matters most in the one case where `.` cannot reach the method at all: resolution is **field-first**, so a
+  struct with a field named like one of its methods hides that method from `p.value()` — `Counter::value(c)`
+  is then the only way in. If a trait *and* a type share a name and both declare the method, the qualified
+  call is rejected as ambiguous rather than silently resolved. Like `Trait::method`, it must be **called** —
+  `let f = Point::sum` is not (yet) a value. Turning *every* free function into a `x.f()` call (full UFCS)
+  remains a deliberate non-goal — it would make `|>` redundant.
 
 ### Blanket and parametric impls
 
@@ -2236,8 +2507,8 @@ impl Show for Dog { fn show(self) -> String { "Dog " + self.name } }
 impl Show for Cat { fn show(self) -> String { "Cat with " + self.lives + " lives" } }
 
 let zoo: Vec[dyn Show] = vec()
-push(zoo, Dog { name: "Rex" })   // a Dog, seen as `dyn Show`
-push(zoo, Cat { lives: 9 })      // a Cat, seen as `dyn Show`
+push(zoo, Dog { name: "Rex" })    // a Dog, seen as `dyn Show`
+push(zoo, Cat { lives: 9 })       // a Cat, seen as `dyn Show`
 
 for animal in zoo {
     println("  " + show(animal))  // dispatches to each element's real type
@@ -2303,7 +2574,7 @@ println(toString(half(10)))   // => Some(5)
 println(toString(half(7)))    // => None
 
 // a default when absent:
-println("or=" + unwrapOr(half(7), 0 - 1))   // => or=-1
+println("or=" + unwrapOr(half(7), -1))   // => or=-1
 ```
 
 ### Result
@@ -2335,8 +2606,8 @@ println(toString(quarter(20)))   // => Some(5)
 println(toString(quarter(6)))    // => None   (6 -> 3, and half(3) is None)
 
 fn pipeline() -> Result[Int, String] {
-    let x = safeDiv(100, 5)?   // x = 20
-    let y = safeDiv(x, 2)?     // y = 10
+    let x = safeDiv(100, 5)?     // x = 20
+    let y = safeDiv(x, 2)?       // y = 10
     Ok(y)
 }
 match pipeline() {
@@ -2431,8 +2702,9 @@ println("sum=" + sum)   // => sum=10
 
 ### Stages: transforming a pipeline
 
-Stages take an iterator and return a new iterator, so you compose them. Because everything is lazy, no
-intermediate vectors are created.
+Stages take an iterator and return a new iterator, so you compose them. The element-wise stages are lazy and
+build no intermediate vectors — the two exceptions are `chunks` and `windows`, which necessarily materialize a
+`Vec` per pull (see their cost note in [§25](#25-the-memory--cost-model)).
 
 - `map(it, f)` — apply `f` to each element
 - `filter(it, p)` — keep elements where `p` is true
@@ -2443,6 +2715,12 @@ intermediate vectors are created.
 - `chain(a, b)` — one iterator after another
 - `scan(it, init, f)` — running accumulator
 - `flatMap(it, f)` — map each element to an iterator and flatten
+- `stepBy(it, n)` — the first element, then every `n`-th thereafter
+- `inspect(it, f)` — run `f` on each element as it passes (a debug tap), yielding it unchanged
+- `dedup(it)` — collapse *consecutive* equal elements (the element type must be `Eq`)
+- `chunks(it, n)` — non-overlapping blocks of up to `n`, each a `Vec[T]` (the last may be shorter)
+- `windows(it, n)` — overlapping sliding views of exactly `n`, each a `Vec[T]` (fewer than `n` elements yields nothing)
+- `peekable(it)` — a cursor whose `.peek()` method looks at the next element without consuming it
 
 Each stage takes its iterator as the *first* argument, which is exactly the shape the pipe operator (`|>`, from
 [§5](#5-operators)) was made for. Writing a pipeline with `|>` reads top to bottom in the order the data flows —
@@ -2500,9 +2778,9 @@ let squares = toMap(map(range(1, 4), fn(x: Int) -> (Int, Int) { (x, x * x) }))
 println("sq[3]=" + squares[3])   // => sq[3]=9
 ```
 
-`min` and `max` work on an `Ord` element type — `Int` / `Double` / `String` — returning an
-`Option` because the sequence might be empty. When you want to order by a custom rule (or order a `Char`), `minBy`/`maxBy` take a
-comparison function:
+`min` and `max` work on any `Ord` element type — the built-in `Int` / `Double` / `String`, or your own type
+once you `impl Ord` for it — returning an `Option` because the sequence might be empty. When you want to order by
+a custom rule (or order a `Char`, which is *not* `Ord`), `minBy`/`maxBy` take a comparison function:
 
 ```rust
 let words = ["pear", "apple", "kiwi"]
@@ -2513,16 +2791,24 @@ println("maxBy=" + toString(biggest))   // => maxBy=Some(4)
 ```
 
 To order a whole collection, `sorted(v)` returns a **new**, sorted `Vec` (leaving `v` untouched), `sort(v)`
-sorts a `mut` vector **in place**, and `sortBy(v, less)` orders by a custom comparator. All three are a
-**stable** merge sort; `sorted`/`sort` require the element type to be `Ord` — which is **only** `Int` /
-`Double` / `String` (not `Char`, and not the erasure types, even though a `Char` *can* be compared with `<`;
-see the `Ord` note in [§5](#5-operators)). For anything else, `sortBy` with an explicit comparator needs no
-`Ord`, so it sorts `Char`s (or by any key) today:
+sorts a `mut` vector **in place**, and `sortBy(v, less)` orders by an explicit comparator. All three are a
+**stable** merge sort. There are **two ways to give a type an order**. The primary one is to make it `Ord`
+(built in for `Int` / `Double` / `String`; add it to **your own `struct` / `enum`** with `impl Ord`, below) —
+then `sorted` / `sort` / `min` / `max` just work on it. The other is `sortBy` with a comparator, for a **one-off
+ordering** or for a type that cannot be `Ord` at all — a `Char` or the other erasure types, even though a `Char`
+*can* be compared with `<` (see the `Ord` note in [§5](#5-operators)).
 
 ```rust
 let names = sorted(toVec(["cherry", "apple", "banana"]))
 println(toString(names))                          // => ["apple", "banana", "cherry"]
 
+// give your OWN type an order once, with impl Ord, then `sorted` works on it:
+struct Person { name: String, age: Int }
+impl Ord for Person { fn lessThan(self, o: Person) -> Bool { self.age < o.age } }
+let byAge = sorted(toVec([Person { name: "Ann", age: 30 }, Person { name: "Bo", age: 20 }]))
+println(byAge[0].name)                            // => Bo
+
+// sortBy is for a one-off ordering (no Ord needed) — here, by length:
 let byLen = sortBy(toVec(["ccc", "a", "bb"]), fn(a: String, b: String) -> Bool { len(a) < len(b) })
 println(toString(byLen))                          // => ["a", "bb", "ccc"]
 
@@ -2541,6 +2827,12 @@ for (i, x) in enumerate(zip(range(0, 3), range(10, 13))) {
 // =>   #1 -> 1/11
 // =>   #2 -> 2/12
 ```
+
+This reads beautifully but is not free: each step allocates the tuple(s) *and* the iterator's `Option` — a
+tuple-yielding combinator is the most allocation-heavy *element-wise* loop shape (only `chunks`/`windows`, which
+build a whole `Vec` per pull, are heavier still). In a hot loop prefer a plain index, or the zero-allocation
+`for (k, v) in m` (over a map) and direct `for x in xs` (over a container), which bypass both. See
+[§25](#25-the-memory--cost-model) for the full cost model.
 
 ### Writing your own iterator
 
@@ -2593,11 +2885,42 @@ for x in cd { push(out, x) }        // a fresh cursor -> runs again from 3
 println("countdown=" + toString(out))   // => countdown=[3, 2, 1, 3, 2, 1]
 ```
 
-When you want an eager snapshot instead of a lazy pipeline, `toVec(x)` copies any iterable into a `Vec`:
+When you want an eager snapshot instead of a lazy pipeline, `toVec(x)` materializes any iterable into a fresh,
+owned `Vec`:
 
 ```rust
 println("toVec=" + toString(toVec([7, 8, 9])))   // => toVec=[7, 8, 9]
 ```
+
+### `Iterable`: the eager bridge
+
+`Iterator` and `IntoIterator` are the *lazy* protocols — they pull one element at a time. There is a third,
+simpler protocol, **`Iterable[T]`**, for a type that can hand over **all** of its elements at once. Its single
+method is `iter(self) -> Vec[T]`, which **by contract returns a fresh `Vec` the caller owns** (never an alias
+to internal storage). Implementing it is what lets `toVec` (and `for`, as a fallback after
+`Iterator`/`IntoIterator`) work on your type:
+
+```rust
+struct Bag { items: Vec[Int] }
+impl Iterable[Int] for Bag {
+    fn iter(self) -> Vec[Int] { clone(self.items) }   // hand back a COPY, not the internal Vec
+}
+
+let b = Bag { items: toVec([3, 1, 2]) }
+println("snapshot=" + toString(toVec(b)))    // => snapshot=[3, 1, 2]   (goes through your `iter`)
+for x in b { println("  x=" + x) }           // `for` also falls back to `iter`
+```
+
+`toVec` hands your `iter` result straight back, so `iter`'s freshness contract is what makes `toVec(x)` an
+independent snapshot. Returning the internal `self.items` directly would hand callers an alias to the struct's
+own storage (mutating the result would mutate the `Bag`), so `iter` must `clone` it, as above — every built-in
+container already does. `Iterable` is the eager escape hatch: it materializes everything up front, so prefer
+`Iterator` / `IntoIterator` when you want laziness. The built-in collections satisfy the lazy protocols
+directly, which is why `for` and the combinators "just work" on a `Vec`, `Array`, `Map`, or `Bytes` without
+any of this. If your own type is `Iterable`-only and you want a lazy pipeline over it, snapshot it first —
+`intoIter(toVec(x)) |> map(…) |> …` — where the `toVec` copy is the one eager cost, made visible at the call
+site. (Because `for x in b` over the `Iterable` fallback calls `iter` once per loop, it copies the elements
+on **every** pass; a `Vec`/`Array`/… does not, since it iterates through the zero-copy `IntoIterator` cursor.)
 
 ### Streaming text: `split` and `lines`
 
@@ -2667,8 +2990,8 @@ pub fn origin() -> Point { Point { x: 0, y: 0 } }
 pub fn manhattan(a: Point, b: Point) -> Int {
     let dx = a.x - b.x
     let dy = a.y - b.y
-    let ax = if dx < 0 { 0 - dx } else { dx }
-    let ay = if dy < 0 { 0 - dy } else { dy }
+    let ax = if dx < 0 { -dx } else { dx }
+    let ay = if dy < 0 { -dy } else { dy }
     ax + ay
 }
 ```
@@ -2705,7 +3028,7 @@ another module reach it (by `use`, glob, or a `mod::name` qualifier):
 
 ```rust
 // util.skn
-pub fn add(a: Int, b: Int) -> Int { a + b }   // exported
+pub fn add(a: Int, b: Int) -> Int { a + b }    // exported
 fn helper() -> Int { 1 }                       // private to util
 ```
 
@@ -2720,100 +3043,71 @@ println(toString(add(40, 2)))   // => 42
 item's visibility (a `pub enum`'s constructors are public). Within a single module everything is visible, so
 visibility only matters across module boundaries. A `use m::*` glob silently brings in only the `pub` names.
 
+**The file you run is a module too, and it is the one nobody can import.** Its `import`s reach outward, but
+nothing reaches back in — a module cannot see a name defined in the entry file, `pub` or not, because there is
+no path that would name it. So the rule for a growing program is simply: whatever two files need to share,
+put in a module.
+
 ### The standard library
 
-The prelude is organized into `std` modules. The **ring** modules are auto-imported everywhere, so their
-names are available **unqualified** with no `use`:
+The prelude is organized into `std` modules, split by how you reach them. The **ring** modules are
+auto-imported into every module, so their names resolve **unqualified** with no `use`:
 
-- `std::core` — `Option`, `Result`, `Some`/`None`/`Ok`/`Err`, and their combinators, plus the built-in marker
-  traits `Eq` and `Hashable`.
-- `std::iter` — the `Iterator`/`IntoIterator`/`Iterable` traits, `Ord`, all the stream sources, stages,
-  and terminals from [§19](#19-iterators), and the `Vec` sorts `sort`/`sorted`/`sortBy`.
-- `std::string` — string helpers: `slice`/`charStr`/`charAt`/`isEmpty`, search (`indexOf`/`lastIndexOf`/
-  `startsWith`/`endsWith`/`hasSubstr`), `trim`/`trimStart`/`trimEnd`, `toUpper`/`toLower`,
-  `replace`/`padStart`/`padEnd`/`repeatStr`, the `isAscii…` classification family + `hasControl`, and the
-  `StringBuilder` accumulator (`stringBuilder`/`append`/`appendByte`/`build`/`sbLen`).
+- `std::core` — `Option` / `Result` with their constructors and combinators, the `Unwrap` trait, the `Map`
+  lookup helpers, and the sealed marker traits `Eq` and `Hashable`.
+- `std::iter` — the `Iterator` / `IntoIterator` / `Iterable` traits and the whole lazy pipeline of
+  [§19](#19-iterators) (sources, stages, terminals), the `Vec` sorts, `Ord`, and the opt-in code-point layer
+  (`chars` / `charCount` / `nthChar`, [§12](#char-and-utf-8-code-points)).
+- `std::string` — the byte-level `String` helpers (slicing, search, `trim`, case, padding, ASCII
+  classification) and the `StringBuilder` accumulator.
 
-The **opt-in** modules must be brought in with a `use` before their functions resolve:
+Every other module is **opt-in**: its names do not resolve until you `use` it. That is a hard rule rather than
+a convention, and it is also what **gates the natives** — a module that never writes `use std::io` cannot touch
+the filesystem, and one without `use std::process` cannot start a program.
 
-- `std::io` — `readFile`, `writeFile`, `appendFile`, `readTextFile`, `writeTextFile`, `appendTextFile`, `deleteFile`, `rename`, `copyFile`, `mkdir`, `listDir`, `fileExists`, `isFile`, `isDir`, `fileSize`, `readLine`, `readAllStdin`.
-- `std::env` — `getEnv`, `args`, `nanoTime`, `millisTime`.
-- `std::process` — `run`, `runWith`, `runText`, `sh`.
-- `std::math` — numeric functions: `sqrt`/`cbrt`/`pow`/`hypot`, `exp`/`ln`/`log2`/`log10`, the trig family
-  (`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`), `abs`/`absInt`/`sign`/`signInt`, `gcd`/`lcm`, the generic
-  `minOf`/`maxOf`/`clamp`, `isNaN`/`isInfinite`, the constants `PI`/`E`, and the fallible `toIntChecked`. (The
-  rounding builtins `floor`/`ceil`/`trunc`/`round`/`roundHalfToEven` and `toInt` are always-available — no `use`.)
-- `std::bytes` — a little-endian binary reader/writer over `Bytes`: the writers `writeU8`/`writeU16LE`/`writeU32LE`/
-  `writeI32LE`/`writeVarU`/`writeVarI`/`writeStr`/`writeBytes` (each returns the buffer, so they chain with `|>`), and a
-  `reader(b)` cursor (`ByteReader`) with `readU8`/`readU16LE`/`readU32LE`/`readI32LE`/`readVarU`/`readVarI`/`readStr`/
-  `readBytes(n)` (each returns `Result[…, String]` — an underrun is `Err`, never a trap), plus `remaining`/`atEnd`.
-  `writeVarI`/`readVarI` are a compact zigzag varint for signed `Int`s; `writeStr`/`readStr` length-prefix a `String`.
-- `std::json` — a JSON parser and serializer over a `Json` value tree: the free `parse(s) -> Result[Json, String]`
-  constructor, plus **methods on a `Json`** — the serializers `j.stringify()` / `j.stringifyChecked() ->
-  Result[String, String]` / `j.stringifyPretty(indent)`, and the accessors `j.getField(key)`/`j.at(i)`/`j.asInt()`/
-  `j.asDouble()`/`j.asStr()`/`j.asBool()`/`j.asArr()`/`j.asObj()`/`j.asMap()`/`j.isNull()`.
-- `std::random` — a pseudo-random generator (the xoshiro128\*\* algorithm). Seed once with the free `seedRng(seed)
-  -> Rng` (or `rngFromState`), then draw with **methods on the `Rng`**: `rng.nextU32()`, `rng.nextInt(lo, hi)` /
-  `rng.nextIntBounded(bound)`, `rng.nextInt48()`, `rng.nextBool()`, `rng.nextDouble()` (in `[0, 1)`) /
-  `rng.nextDoubleRange(lo, hi)`; plus `rng.shuffle(v)`/`rng.choice(v)` for `Vec`s, `rng.jump()`/`rng.splitRng()` for
-  independent streams, and the bulk `rng.fillU32(out, n)`/`rng.fillDoubles(out, n)`. It also offers
-  `rng.nextGaussian()` / `rng.nextGaussianMS(mu, sigma)` (a normal deviate, via Box–Muller),
-  `rng.choiceWeighted(items, weights) -> Option[T]` (weighted pick), and `rng.sample(v, k) -> Vec[T]` (k distinct
-  elements without replacement). It is **deterministic** (same seed → same
-  stream, so it is fully reproducible) and **not cryptographically secure** — do not use it for keys or secrets.
-  It pulls no entropy on its own; for an unpredictable seed pass one in yourself (e.g. `use std::env` and
-  `seedRng(nanoTime())`).
-- `std::set` — a hash **`Set[T]`** (over `Map[T, Bool]`): the free constructors `set()` / `setOf(vec)`, then
-  **methods on the `Set`** — `s.insert(x)`/`s.remove(x)` (each returns a `Bool`), `s.isMember(x)`, `s.size()`, the
-  algebra `a.union(b)`/`a.intersect(b)`/`a.difference(b)`/`a.isSubset(b)`/`a.isDisjoint(b)`, and
-  `for x in s` (plus the lazy combinators) via `IntoIterator`. The element type `T` must be `Hashable`
-  (`Int`/`Double`/`Bool`/`String`) — a `Set` of any other type is a **compile error** (see below);
-  iteration is hash-order (unspecified), like `Map`.
-- `std::time` — dates and times, **strict UTC** at **millisecond** precision. Three value types plus a
-  `Stopwatch`: an `Instant` (a point on the timeline, epoch milliseconds), a `Duration` (a span), and a
-  `DateTime` (the decomposed civil fields). The free constructors `now() -> Instant` (wall clock),
-  `instantFromMillis`, `fromDateTime`, `dateTime(y, mo, d, h, mi, s, ms) -> Option[DateTime]` (strict validation,
-  bad fields → `None`), `parseIso`, and the `Duration` builders `millis`/`seconds`/`minutes`/`hours`/`days`; then
-  **methods on the value** — `t.toDateTime()`, `t.addDuration(d)`/`t.subDuration(d)`/`a.durationBetween(b)`,
-  `dt.toIso()`, `dt.weekday()` (ISO Mon=1..Sun=7), and a `Duration`'s `d.inSeconds()` etc. + arithmetic
-  (`isLeapYear`/`daysInMonth` take a year, so they stay free). An
-  `Instant` spans roughly year -2490..6429 (the ±2⁴⁷-ms window); sub-millisecond precision and time zones are
-  out of scope for v1.
-- `std::cli` — a small, spec-free command-line argument parser over a `Vec[String]` (typically
-  `parseArgs(toVec(args()))`). The grammar needs no per-option spec: `--name=value` is an **option**, a bare
-  `--name` or `-abc` (letters) are boolean **flags**, `--` terminates option parsing, and anything else is a
-  **positional**. Read the result with `hasFlag(c, name)`, `getOpt(c, name) -> Option[String]` /
-  `getOptOr(c, name, dflt)`, `numPositionals(c)`, and `positionalAt(c, i) -> Option[String]`. A space-separated
-  option value (`--out file`) is not supported — write `--out=file`.
-- `std::hash` — hashing. **CRC-32** (IEEE/zlib): `crc32(bytes) -> Int` / `crc32Str(s) -> Int` return a
-  non-negative 32-bit checksum — an **error-detection** checksum, not secure. **MurmurHash3** (x86_32):
-  `murmur3(bytes, seed) -> Int` / `murmur3Str(s, seed) -> Int` return a non-negative 32-bit hash with good
-  distribution — a fast general-purpose (non-cryptographic) hash for hash tables and fingerprinting.
-  **SHA-256** (FIPS 180-4): `sha256(bytes) -> Bytes` is the raw 32-byte cryptographic digest; `sha256Hex(bytes)`
-  / `sha256HexStr(s)` give the 64-char lowercase hex string, and `toHex(bytes)` hex-encodes any buffer.
-- `std::net` — **TCP networking** (blocking sockets). The free constructors `connect(host, port) ->
-  Result[TcpConn, String]` and `listen(port) -> Result[TcpListener, String]`, then **methods** on the connection —
-  `c.send(b)`/`c.sendStr(s)`/`c.recv(n)`/`c.recvLine()`/`c.recvAll()`/`c.close()`/`c.setTimeout(ms)` — and on the
-  listener — `l.accept()`/`l.closeListener()`. Both IPv4 and IPv6. A minimal HTTP/1.0 `httpGet(host, port, path) ->
-  Result[HttpResponse, String]` sits on top (REST = `httpGet` + `std::json::parse`). **Limits:** blocking only (one
-  connection at a time), plaintext only (no TLS, so `http://` not `https://`), close sockets explicitly.
-- `std::regex` — **regular expressions**, a linear-time byte-level engine (Thompson NFA / Pike VM — no
-  catastrophic backtracking). `compile(pattern) -> Result[Regex, RegexError]` (or `compileWith(pattern, "ims")`);
-  then `isMatch`, `search`/`searchFrom -> Option[Match]`, `captures -> Option[Captures]` with `group(c, i)` /
-  `groupNamed(c, name)`, the lazy `searchAll` / `capturesAll` / `splitRe` (each a `dyn Iterator`), and
-  `replaceRe` (first) / `replaceAllRe` (all) with `$0`..`$N` / `${name}` templates. Syntax: `. * + ? | ( ) (?:)
-  (?<name>) [...] ^ $`, non-greedy `*?`, counts `{n}`/`{n,}`/`{n,m}`, shorthands `\d \w \s` (+ negated), word
-  boundary `\b`, and flags `i` (ASCII case), `m` (multiline), `s` (dotall). **Byte-level** (`.` matches one byte;
-  ASCII-correct); **no** backreferences or lookaround (they'd break the linear guarantee). Match anywhere is
-  `search` (not `find`) and replacement is `replaceRe` (not `replace`) — those names belong to `std::iter` /
-  `std::string`.
+| Module | What it is for |
+|---|---|
+| `std::io` | files — read / write / append, copy, rename, delete, `mkdir`, `listDir`, stat — and standard input |
+| `std::env` | command-line arguments, environment variables, and the clocks `nanoTime` / `millisTime` |
+| `std::process` | run an external command and capture its output |
+| `std::math` | roots, powers, logarithms, trigonometry, `gcd`/`lcm`, generic `minOf`/`maxOf`/`clamp`, `PI`/`E`, the fallible `toIntChecked`. (The rounding builtins `floor`/`ceil`/`trunc`/`round`/`roundHalfToEven`, `toInt` and `toDouble` are **always** available — no `use`.) |
+| `std::bytes` | a little-endian binary reader/writer over `Bytes`, with varints and length-prefixed strings |
+| `std::json` | a JSON parser and serializer over a `Json` value tree |
+| `std::random` | a seedable PRNG (xoshiro128\*\*) — **deterministic** (same seed → same stream) and **not cryptographically secure**; it pulls no entropy of its own, so for an unpredictable seed pass one in (`use std::env`, then `Rng::fromSeed(nanoTime())`) |
+| `std::set` | a hash `Set[T]` with the usual set algebra; `T` must be `Hashable`, and iteration is hash-order |
+| `std::time` | strict-UTC dates and times at millisecond precision — `Instant`, `Duration`, `DateTime`, `Stopwatch`. An `Instant` spans roughly year −2490..6429; sub-millisecond precision and time zones are out of scope for v1 |
+| `std::cli` | a spec-free command-line parser: `--name=value` options, `--name` / `-abc` flags, `--`, positionals |
+| `std::hash` | CRC-32 and MurmurHash3 (fast, **not** secure) plus SHA-256 (cryptographic) and hex encoding |
+| `std::net` | blocking TCP (IPv4 + IPv6) and a minimal HTTP/1.0 `httpGet` — one connection at a time, **plaintext only** (no TLS, so `http://` not `https://`) |
+| `std::regex` | linear-time byte-level regular expressions (Thompson NFA / Pike VM) — no catastrophic backtracking, and therefore **no** backreferences or lookaround |
+
+This table says only what each module is *for*. **Every function of every module, with its signature, is listed
+in [§26](#26-quick-reference-the-standard-library).**
+
+You may define a function of your own named like a built-in, a native, or a trait method — `toInt`, `sqrt`,
+`next`. It wins wherever it is **visible**, which means your own module, and it does not reach any further: the
+standard library keeps calling the real one, so `toIntChecked` still converts even if your file defines its own
+`toInt`. A *library* function you have shadowed this way is still reachable by name — `std::sum(...)` gets the
+real one even where a local `sum` shadows it.
+
+One thing to expect when you read the library: it comes in **three call styles**, and the split follows the
+orphan rule of [§16](#16-traits) rather than taste. A verb whose receiver is a **built-in** type — `Vec`,
+`Map`, `String`, `Bytes` — has to be a free function, because no module owns those types and so none may
+attach methods to them: `len(xs)`, `push(xs, v)`, `map` / `filter` / `sum`, all natural with `|>`. A type the
+library **defines** — `Json`, `Rng`, `Set`, `Instant`, `TcpConn`, `Regex`, `ByteReader`, `CliArgs`,
+`StringBuilder` — owns its behavior and carries it as `.` methods: `j.stringify()`, `rng.nextInt(1, 6)`,
+`s.insert(x)`, `c.send(bytes)`. Its **constructors** are associated functions on the same type, so they read
+`Type::name(…)`: `Json::parse(text)`, `Regex::compile(pat)`, `CliArgs::parse(argv)`, `Set::new()` /
+`Set::fromVec(v)`, `ByteReader::new(b)`, `Rng::fromSeed(seed)`. A handful of constructors stay free where the
+bare name reads better and claims nothing surprising — `now()`, `seconds(30)`, `connect(host, port)`,
+`stringBuilder()` — as do functions with no natural receiver (`isLeapYear(y)`).
 
 For example, `std::json` round-trips a document through its `Json` value tree:
 
 ```rust
 use std::json::*
 
-let doc = unwrap(parse("{\"name\": \"Ada\", \"age\": 36}"))
+let doc = unwrap(Json::parse("{\"name\": \"Ada\", \"age\": 36}"))
 let name = unwrap(unwrap(doc.getField("name")).asStr())
 println(name)                  // => Ada
 println(doc.stringify())       // => {"name":"Ada","age":36}
@@ -2837,8 +3131,8 @@ fn describe(j: Json) -> String {
     Json::Obj(es)    => "object of " + toString(len(es)),
   }
 }
-println(describe(unwrap(parse("42"))))          // => int 42
-println(describe(unwrap(parse("[1,2,3]"))))     // => array of 3
+println(describe(unwrap(Json::parse("42"))))          // => int 42
+println(describe(unwrap(Json::parse("[1,2,3]"))))     // => array of 3
 ```
 
 And `std::random`, seeded for reproducibility, rolls a die and shuffles a deck:
@@ -2846,7 +3140,7 @@ And `std::random`, seeded for reproducibility, rolls a die and shuffles a deck:
 ```rust
 use std::random::*
 
-let mut rng = seedRng(42)
+let mut rng = Rng::fromSeed(42)
 println(rng.nextInt(1, 7))     // a fair die: an Int in [1, 6]
 println(rng.nextDouble())      // a Double in [0, 1)
 
@@ -2872,10 +3166,10 @@ push(argv, "--opt=O2")
 push(argv, "-v")
 push(argv, "main.skn")
 
-let c = parseArgs(argv)                    // real programs: parseArgs(toVec(args()))
-println(getOptOr(c, "opt", "O0"))          // => O2
-println(toString(hasFlag(c, "v")))         // => true
-println(toString(numPositionals(c)))       // => 2   ("build", "main.skn")
+let c = CliArgs::parse(argv)                    // real programs: CliArgs::parse(args())
+println(c.getOptOr("opt", "O0"))           // => O2
+println(toString(c.hasFlag("v")))          // => true
+println(toString(c.numPositionals()))      // => 2   ("build", "main.skn")
 
 println(toString(crc32Str("123456789")))   // => 3421780262
 ```
@@ -2887,13 +3181,13 @@ use std::set::*
 
 let mut v: Vec[Int] = vec()
 push(v, 1) push(v, 2) push(v, 2) push(v, 3)
-let a = setOf(v)               // {1, 2, 3}
+let a = Set::fromVec(v)               // {1, 2, 3}
 println(a.size())              // 3
 println(a.isMember(2))         // true
 
 let mut w: Vec[Int] = vec()
 push(w, 2) push(w, 3) push(w, 4)
-let b = setOf(w)
+let b = Set::fromVec(w)
 println(a.intersect(b).size()) // 2   ({2, 3})
 ```
 
@@ -2931,7 +3225,7 @@ fn echo() -> Result[(), String] {
   let got = srv.recvLine()?                   // => Some("ping")
   println(match got { Some(s) => s, None => "<eof>" })
 
-  cli.close()?  srv.close()?  lst.closeListener()?
+  cli.close()?  srv.close()?  lst.close()?
   Ok(())
 }
 match echo() { Ok(_) => println("done"), Err(e) => println(e) }
@@ -2951,18 +3245,18 @@ And `std::regex` matches, captures, and rewrites text with a linear-time engine 
 
 ```rust
 use std::regex::*
-let re = match compile("(?<key>[a-z]+)=([0-9]+)") { Ok(r) => r, Err(e) => panic(e.message) }
+let re = match Regex::compile("(?<key>[a-z]+)=([0-9]+)") { Ok(r) => r, Err(e) => panic(e.message) }
 
-match captures(re, "  port=8080;") {           // capture groups (0 = whole match)
+match re.captures("  port=8080;") {           // capture groups (0 = whole match)
   Some(c) => {
-    match groupNamed(c, "key") { Some(m) => println(m.text), None => () }   // => port
-    match group(c, 2)          { Some(m) => println(m.text), None => () }   // => 8080
+    match c.groupNamed("key") { Some(m) => println(m.text), None => () }   // => port
+    match c.group(2)          { Some(m) => println(m.text), None => () }   // => 8080
   },
   None => println("no match"),
 }
 
-println(toString(count(searchAll(re, "a=1 b=22 c=333"))))   // lazy: => 3
-println(replaceAllRe(re, "a=1 b=22", "$1:$2"))              // templates: => a:1 b:22
+println(toString(count(re.searchAll("a=1 b=22 c=333"))))   // lazy: => 3
+println(re.replaceAllRe("a=1 b=22", "$1:$2"))              // templates: => a:1 b:22
 ```
 
 Any prelude name can also be reached explicitly as `std::name` (useful when a local definition shadows it).
@@ -3036,7 +3330,7 @@ match writeTextFile(path, "payload") {
     Ok(_)  => println("wrote it: " + fileExists(path)),   // => wrote it: true
     Err(e) => println("write failed: " + e)
 }
-match appendTextFile(path, "!") {                          // now holds "payload!"
+match appendTextFile(path, "!") {                         // now holds "payload!"
     Ok(_)  => match fileSize(path) { Ok(n) => println("size: " + n), Err(_) => () },  // => size: 8
     Err(e) => println("append failed: " + e)
 }
@@ -3194,43 +3488,62 @@ fine — each element is converted at the point you add it.)
 
 ### Built-in traits at a glance
 
-Four traits are built into the standard library and treated specially. Three are **compile-time markers** you
-never implement — the checker decides membership and discharges the bound statically (no dispatch); one,
-`Clone`, is an ordinary dispatched trait you *can* implement.
+Four traits are built into the standard library, and they split **2 + 2** — two are sealed, two are ordinary,
+and the split is *reasoned*, not arbitrary. **Two are sealed compile-time markers** you never implement (the
+checker decides membership and discharges the bound statically, no dispatch): **`Eq`** — sealed because equality
+is **structural by construction**, so there is nothing to implement — and **`Hashable`** — sealed because a heap
+object's **pointer bits are not stable under the moving GC**, so only the primitive-backed types can be keys.
+**The other two are ordinary dispatched traits you *can* implement** for your own types: **`Ord`** (built-in
+impls for `Int`/`Double`/`String`; add your own with `impl Ord` — the one exception is the erasure types) and
+**`Clone`**.
 
 | Trait | What it gates | Members | You `impl` it? | `dyn T`? |
 |-------|---------------|---------|----------------|----------|
 | `Eq` | `==` / `!=` (see [§5](#5-operators)) | derived structurally: any type whose components are all `Eq` (immediates + `String` + erasure types are the leaves; a function-carrying type is **not** `Eq`) | no (auto-derived) | no |
-| `Hashable` | map keys / set elements (see [§14](#14-maps)) | `Int`, `Double`, `Bool`, `String`, and erasure types that wrap one of those (`Char`, integer-backed `enum`s, `transparent` newtypes over these) | no (fixed marker) | no |
-| `Ord` | `sort` / `sorted` / `minOf` / `maxOf` (see [§19](#19-iterators)) | `Int`, `Double`, `String` only (a method trait — erasure types cannot join it; a `Char` compares with `<` but is not `Ord`) | no (fixed instances) | no |
-| `Clone` | `clone(x)` (see [§14](#14-maps)) | built-in for the containers; **user-extensible** — write `impl Clone for MyType` | **yes** | no (returns `Self`) |
+| `Hashable` | map keys / set elements (see [§14](#14-collections)) | `Int`, `Double`, `Bool`, `String`, and erasure types that wrap one of those (`Char`, integer-backed `enum`s, `transparent` newtypes over these) | no (fixed marker) | no |
+| `Ord` | `sort` / `sorted` / `min` / `max` (ring, `std::iter`) and `minOf` / `maxOf` / `clamp` (opt-in `std::math` — needs `use std::math`); see [§19](#19-iterators) | `Int` / `Double` / `String` built in; **user types may `impl Ord`** (write `fn lessThan`). The one exception is **erasure types** (`Char` / `transparent` newtypes / integer-backed `enum`s) — a method trait can't dispatch on them; a `Char` compares with `<` but is not `Ord` | **yes** (like `Clone`; erasure types excepted) | no |
+| `Clone` | `clone(x)` (see [§14](#14-collections)) | built-in for the containers; **user-extensible** — write `impl Clone for MyType` | **yes** | no (returns `Self`) |
 
-The three markers cost nothing at run time; `==` on a leaf is a single instruction and on a composite a
-structural walk. None of the four is usable as `dyn T`, but for two different reasons: `Eq` and `Hashable` are
-**compile-time markers** — there is nothing to dispatch, so a `dyn` of them is meaningless and rejected; `Ord`
-and `Clone` fail **object safety** (`Ord` takes `Self` as a second parameter, `Clone` returns `Self` — see
-[§17](#17-trait-objects-dyn-trait)).
+The two markers (`Eq`, `Hashable`) cost nothing at run time; `==` on a leaf is a single instruction and on a
+composite a structural walk. None of the four is usable as `dyn T`, but for two different reasons: `Eq` and
+`Hashable` are **compile-time markers** — there is nothing to dispatch, so a `dyn` of them is meaningless and
+rejected; `Ord` and `Clone` fail **object safety** (`Ord` takes `Self` as a second parameter, `Clone` returns
+`Self` — see [§17](#17-trait-objects-dyn-trait)).
 
-The same information, seen per *type* — four capabilities with four different membership sets. `==` and map-key
-reach the erasure types (marker traits, statically discharged); the built-in `<` reaches `Char` (the compiler
-knows the static type at the site); only the `Ord` *trait* — which dispatches a real comparison in an erased
-body — is limited to `Int`/`Double`/`String`:
+The same information, seen per *type* — the table below shows each type's **built-in** / automatic capability.
+`==` and map-key reach the erasure types (marker traits, statically discharged); the built-in `<` reaches `Char`
+(the compiler knows the static type at the site). The `Ord` column shows the **built-in** impls (`Int` /
+`Double` / `String`); a `✓` is automatic, but — unlike the markers — `Ord` is an ordinary trait, so **your own
+`struct` / `enum` can add it with `impl Ord`** (the built-in containers can't, by the orphan rule, and the
+erasure types can't, being a method trait):
 
-| Type | `==` (`Eq`) | map key (`Hashable`) | `<` `<=` `>` `>=` | `Ord` (`sort`/`minOf`) |
+| Type | `==` (`Eq`) | map key (`Hashable`) | `<` `<=` `>` `>=` | `Ord` |
 |------|:-----------:|:--------------------:|:-----------------:|:----------------------:|
 | `Int` / `Double` | ✓ | ✓ | ✓ | ✓ |
 | `String` | ✓ | ✓ | ✓ | ✓ |
 | `Bool` | ✓ | ✓ | — | — |
 | `Char` | ✓ | ✓ | ✓ | **—** (use `sortBy` with a comparator) |
 | `transparent` newtype / int-backed `enum` | ✓ | ✓ | — | — |
-| `struct` / tuple / payload `enum` / `Vec` / `Array` / `Map` / `Bytes` | ✓ (if components are `Eq`) | — | — | — |
+| `struct` / payload `enum` | ✓ (if components are `Eq`) | — | — | — (✓ via `impl Ord`) |
+| tuple / `Vec` / `Array` / `Map` / `Bytes` | ✓ (if components are `Eq`) | — | — | — |
 | `()` (unit) | ✓ | — | — | — |
 | a function / closure value | — | — | — | — |
 | `dyn T` (a trait object) | — | — | — | — |
 
-An empty cell is a real limitation, not an omission — the `Char` row's `<`-yes / `Ord`-no split is the one to
-know. Lifting `Ord` (and `<`) to the erasure types is a possible future step (it needs monomorphizing an erased
-body per erasure instantiation, already noted as a deferred idea).
+An empty cell means "not **automatically** a member." For `Eq` / `Hashable` / the `<` operators that is a real,
+fixed limitation — you cannot add them. The **`Ord`** column is the exception: a user `struct` / `enum` can join
+it with `impl Ord` (only the erasure types and the builtin containers genuinely cannot), so its `—` reads "not
+automatic," *not* "impossible."
+
+That makes `<` and `Ord` **orthogonal, with both off-diagonals occupied** — and both are worth knowing, because
+each traps the reader in the opposite direction:
+- a **`Char`** has `<` but is **not** `Ord` (an erasure type — no method dispatch); order a `Vec[Char]` with
+  `sortBy` and a comparator.
+- a **user `struct` with `impl Ord`** has `Ord` but **not** `<` (the operators stay hard-wired to
+  `Int`/`Double`/`String`/`Char`), so you order it with `sorted` / `lessThan`, never `a < b`.
+
+Lifting `Ord` (and `<`) to the **erasure types** is a possible future step (it needs monomorphizing an erased
+body per erasure instantiation, a deferred idea).
 
 ### Advisory warnings
 
@@ -3327,8 +3640,10 @@ does), it helps to know which values live where.
   `Bool`, `()`, `Char`, and the erased types (`transparent struct`s, integer-backed `enum`s). Copying one is
   free; two bindings to `42` are fully independent.
 - **Heap objects** are everything with internal structure: `struct`s and `enum` variants with fields, `Array`,
-  `Vec`, `Map`, `Bytes`, `String`, and capturing closures. A variable or field does **not** hold the object —
-  it holds a **reference** to it. (A plain function or a non-capturing lambda is itself an immediate.)
+  `Vec`, `Map`, `Bytes`, `String`, capturing closures, and **tuples** — a `(a, b)` is a heap object (note the
+  asymmetry with the immediate `()` above: the empty tuple is a slot value, but *any* `(a, b, …)` is on the
+  heap). A variable or field does **not** hold the object — it holds a **reference** to it. (A plain function
+  or a non-capturing lambda is itself an immediate.)
 
 The single most important fact about the cost model:
 
@@ -3400,11 +3715,21 @@ honest — it never silently walks and copies an arbitrarily large object graph.
 
 ### When do you allocate?
 
-You allocate on the heap exactly when you **build or grow** something: constructing a `struct` / `enum` variant;
-creating an `array` / `vec` / `map` / `bytes` / `String`; pushing past a container's capacity; building a
-capturing closure; or producing a new `String` (concatenation, `toString`, interpolation — strings are
+You allocate on the heap exactly when you **build or grow** something: constructing a `struct` / `enum` variant /
+**tuple `(a, b)`**; creating an `array` / `vec` / `map` / `bytes` / `String`; pushing past a container's capacity;
+building a capturing closure; or producing a new `String` (concatenation, `toString`, interpolation — strings are
 immutable, so each makes a new one). Reading, indexing, pattern-matching, and passing values around allocate
 nothing.
+
+A **lazy-iterator** pipeline has its own per-element cost, easy to miss: each pulled element allocates one
+`Option` (the `next()` result), and a **tuple-yielding** combinator — `enumerate`, `zip`, `partition`, `unzip` —
+allocates a tuple on top of it. Heavier still are **`chunks`** and **`windows`**, which build a whole `Vec` per
+pull (strictly more than a tuple). So `for (i, x) in enumerate(zip(a, b))` is the most allocation-heavy
+*element-wise* loop shape (an `Option` and a tuple per step, per stage), and a `chunks`/`windows` pipeline is
+heavier again. The **zero-allocation** loop forms, by contrast, are a
+direct `for x in xs` over a container and `for (k, v) in m` over a map: both bypass the `Option`/tuple entirely via
+a built-in fast path, binding the elements (and, for the map, the key and value) with no per-element heap traffic.
+Reach for those in a hot loop; use the combinator pipelines for clarity where the allocation does not matter.
 
 Everything else is free — the "you pay nothing" side of the design:
 
@@ -3444,6 +3769,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | Function | Purpose |
 |----------|---------|
 | `toInt(d)` | `Double` → `Int` (saturating, never aborts) |
+| `toDouble(i)` | `Int` → `Double` (exact; a `Double` argument is an error) |
 | `floor(d)` / `ceil(d)` / `trunc(d)` | round `Double` → `Double` toward −∞ / +∞ / zero |
 | `round(d)` / `roundHalfToEven(d)` | round `Double` → `Double`, ties away from zero / ties to even |
 | `parseInt(s)` | `String` → `Result[Int, String]` |
@@ -3473,28 +3799,28 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `writeVarI(b,v)` | append a signed `Int` as a zigzag varint (compact for small magnitudes); returns `b` |
 | `writeStr(b,s)` | append a length-prefixed `String` (varU byte-length + raw bytes); returns `b` |
 | `writeBytes(b,src)` | append the raw bytes of `src`; returns `b` |
-| `reader(b)` | a `ByteReader` cursor over `b` (`pos` starts at 0) |
-| `readU8(r)` / `readU16LE(r)` / `readU32LE(r)` / `readI32LE(r)` | read a 1/2/4-byte value → `Result[Int, String]` (`Err` on underrun) |
-| `readVarU(r)` / `readVarI(r)` | read an unsigned LEB128 / a signed zigzag varint → `Result[Int, String]` |
-| `readStr(r)` | read a length-prefixed `String` → `Result[String, String]` |
-| `readBytes(r,n)` | read `n` raw bytes → `Result[Bytes, String]` |
-| `remaining(r)` / `atEnd(r)` | bytes left to read / whether the cursor is at the end |
+| `ByteReader::new(b)` | a `ByteReader` cursor over `b` (`pos` starts at 0) |
+| `r.readU8()` / `r.readU16LE()` / `r.readU32LE()` / `r.readI32LE()` | read a 1/2/4-byte value → `Result[Int, String]` (`Err` on underrun) |
+| `r.readVarU()` / `r.readVarI()` | read an unsigned LEB128 / a signed zigzag varint → `Result[Int, String]` |
+| `r.readStr()` | read a length-prefixed `String` → `Result[String, String]` |
+| `r.readBytes(n)` | read `n` raw bytes → `Result[Bytes, String]` |
+| `r.remaining()` / `r.atEnd()` | bytes left to read / whether the cursor is at the end |
 
 **JSON** *(all `std::json` — `use std::json::*`)*
 
 | Function | Purpose |
 |----------|---------|
-| `parse(s)` | parse JSON text → `Result[Json, String]` (a free function) |
+| `Json::parse(s)` | parse JSON text → `Result[Json, String]` |
 | `j.stringify()` / `j.stringifyPretty(indent)` | serialize a `Json` to compact / indented text |
 | `j.stringifyChecked()` | serialize → `Result[String, String]` (`Err` on a non-finite number) |
 | `j.getField(key)` / `j.at(i)` | look up an object field / array element → `Option[Json]` |
-| `j.asInt()`/`j.asDouble()`/`j.asStr()`/`j.asBool()`/`j.asArr()`/`j.asObj()`/`j.asMap()`/`j.isNull()` | extract a `Json` case (each `Option`, except `isNull` → `Bool`) |
+| `j.asInt()`/`j.asDouble()`/`j.asStr()`/`j.asBool()`/`j.asArr()`/`j.asObj()`/`j.asMap()`/`j.isNull()` | extract a `Json` case (each `Option`, except `isNull` → `Bool`; `asArr`/`asObj` hand back the **live** payload `Vec`, not a copy) |
 
 **Randomness** *(all `std::random` — `use std::random::*`; deterministic, NOT cryptographic)*
 
 | Function | Purpose |
 |----------|---------|
-| `seedRng(seed)` / `rngFromState(a,b,c,d)` | a new `Rng` from an `Int` seed (reproducible) / raw state words (free constructors) |
+| `Rng::fromSeed(seed)` / `Rng::fromState(a,b,c,d)` | a new `Rng` from an `Int` seed (reproducible) / raw state words |
 | `r.nextU32()` | a raw 32-bit draw in `[0, 2³²)` |
 | `r.nextIntBounded(bound)` / `r.nextInt(lo, hi)` | a uniform `Int` in `[0, bound)` / `[lo, hi)` (bias-free) |
 | `r.nextInt48()` | a uniform `Int` over the full signed range (can be negative) |
@@ -3507,14 +3833,14 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `r.jump()` / `r.splitRng()` | advance one stream / return a fresh non-overlapping stream |
 | `r.fillU32(out, n)` / `r.fillDoubles(out, n)` | append `n` draws to a `Vec` (bulk, load/store-optimized) |
 
-**Command-line arguments** *(all `std::cli` — `use std::cli::*`)*
+**Command-line arguments** *(all `std::cli` — `use std::cli::*`; a space-separated option value like `--out file` is **not** supported — write `--out=file`)*
 
 | Function | Purpose |
 |----------|---------|
-| `parseArgs(argv)` | parse a `Vec[String]` (e.g. `toVec(args())`) → `CliArgs` |
-| `hasFlag(c, name)` | was `--name` / short `-n` present? → `Bool` |
-| `getOpt(c, name)` / `getOptOr(c, name, dflt)` | the value of `--name=value` → `Option[String]` / with a default |
-| `numPositionals(c)` / `positionalAt(c, i)` | positional count → `Int` / the i-th positional → `Option[String]` |
+| `CliArgs::parse(argv)` | parse anything iterable of `String` — an `Array` from `args()` or a `Vec` you built — → `CliArgs` |
+| `c.hasFlag(name)` | was `--name` / short `-n` present? → `Bool` |
+| `c.getOpt(name)` / `c.getOptOr(name, dflt)` | the value of `--name=value` → `Option[String]` / with a default |
+| `c.numPositionals()` / `c.positionalAt(i)` | positional count → `Int` / the i-th positional → `Option[String]` |
 
 **Hashing** *(all `std::hash` — `use std::hash::*`)*
 
@@ -3526,11 +3852,11 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `sha256Hex(bytes)` / `sha256HexStr(s)` | SHA-256 as a 64-char lowercase hex `String` |
 | `toHex(bytes)` | lowercase hex encoding of any `Bytes` (2 chars/byte) |
 
-**Sets** *(all `std::set` — `use std::set::*`; `T` must be `Hashable`)*
+**Sets** *(all `std::set` — `use std::set::*`; `T` must be `Hashable`; a `Set` is `IntoIterator`, so `for x in s` and the lazy combinators work — in hash order)*
 
 | Function | Purpose |
 |----------|---------|
-| `set()` / `setOf(v)` | an empty `Set[T]` / a set of the distinct elements of a `Vec` (free constructors) |
+| `Set::new()` / `Set::fromVec(v)` | an empty `Set[T]` — needs an annotation (`let s: Set[Int] = Set::new()`), since nothing else fixes `T` / a set of the distinct elements of a `Vec` |
 | `s.insert(x)` / `s.remove(x)` | add / delete `x` → `Bool` (was-new / was-present); `s` must be `mut` |
 | `s.isMember(x)` / `s.size()` | membership → `Bool` / cardinality → `Int` (both O(1)) |
 | `a.union(b)` / `a.intersect(b)` / `a.difference(b)` | the combined / common / left-only set |
@@ -3550,11 +3876,11 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `millis`/`seconds`/`minutes`/`hours`/`days` `(n)` | build a `Duration` (free constructors) |
 | `d.inMillis()`/`d.inSeconds()`/`d.inMinutes()`/`d.inHours()`/`d.inDays()` | a `Duration` as an `Int` (truncating) |
 | `t.addDuration(d)` / `t.subDuration(d)` / `a.durationBetween(b)` | `Instant` arithmetic |
-| `a.addDurations(b)` / `a.subDurations(b)` / `d.scaleDuration(k)` / `d.negateDuration()` | `Duration` algebra |
+| `a.add(b)` / `a.sub(b)` / `d.scale(k)` / `d.negate()` | `Duration` algebra |
 | `a.isBefore(b)` / `a.isAfter(b)` | order two `Instant`s → `Bool` |
 | `startStopwatch()` / `sw.elapsedNanos()` / `sw.elapsedMillis()` | a monotonic stopwatch (`startStopwatch` free) |
 
-**TCP networking** *(all `std::net` — `use std::net::*`; blocking, plaintext only)*
+**TCP networking** *(all `std::net` — `use std::net::*`; blocking, plaintext only; close sockets explicitly)*
 
 | Function | Purpose |
 |----------|---------|
@@ -3563,21 +3889,25 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `c.recv(n)` | receive up to `n` bytes → `Result[Bytes, String]` (an **empty `Bytes` means EOF**) |
 | `c.recvLine()` / `c.recvAll()` | read one `\n`-line → `Result[Option[String], String]` / drain to EOF → `Result[Bytes, String]` (both need `mut c`) |
 | `c.setTimeout(ms)` / `c.close()` | recv/send timeout (0 = block) / close the connection → `Result[(), String]` |
-| `listen(port)` (free) / `l.accept()` / `l.closeListener()` | server: bind+listen → `TcpListener`; block for a client → `TcpConn`; stop listening |
+| `listen(port)` (free) / `l.accept()` / `l.close()` | server: bind+listen → `TcpListener`; block for a client → `TcpConn`; stop listening |
 | `httpGet(host, port, path)` | a minimal HTTP/1.0 GET → `Result[HttpResponse, String]` (`.status: Int`, `.body: String`; free) |
 
-**Regex** *(all `std::regex` — `use std::regex::*`; byte-level, linear-time Pike VM; no backrefs/lookaround)*
+**Regex** *(all `std::regex` — `use std::regex::*`; byte-level, linear-time Pike VM; no backrefs/lookaround. Note the names: matching anywhere is `search`, not `find`, and rewriting is `replaceRe`, not `replace` — those two belong to `std::iter` / `std::string`)*
 
 | Function | Purpose |
 |----------|---------|
-| `compile(pattern)` / `compileWith(pattern, flags)` | build a `Regex` → `Result[Regex, RegexError]`; `flags` ⊆ `"ims"` (also inline `(?ims)`) |
-| `isMatch(re, s)` | does the pattern match anywhere in `s` → `Bool` |
-| `search(re, s)` / `searchFrom(re, s, from)` | leftmost match → `Option[Match]` (`.start`, `.end`, `.text`) |
-| `captures(re, s)` / `capturesFrom(re, s, from)` | leftmost match with groups → `Option[Captures]` |
-| `group(c, i)` / `groupNamed(c, name)` | the i-th / named capture → `Option[Match]` (group 0 = whole match) |
-| `searchAll(re, s)` / `capturesAll(re, s)` | every non-overlapping match / its captures → a lazy `dyn Iterator` |
-| `splitRe(re, s)` | the substrings between matches → a lazy `dyn Iterator[String]` |
-| `replaceRe(re, s, repl)` / `replaceAllRe(re, s, repl)` | replace the first / all matches; template `$0`..`$N`, `${name}`, `$$` |
+| `Regex::compile(pattern)` / `Regex::compileWith(pattern, flags)` | build a `Regex` → `Result[Regex, RegexError]`; `flags` ⊆ `"ims"` (also inline `(?ims)`) |
+| `re.isMatch(s)` | does the pattern match anywhere in `s` → `Bool` |
+| `re.search(s)` / `re.searchFrom(s, from)` | leftmost match → `Option[Match]` (`.start`, `.end`, `.text`) |
+| `re.captures(s)` / `re.capturesFrom(s, from)` | leftmost match with groups → `Option[Captures]` |
+| `c.group(i)` / `c.groupNamed(name)` | the i-th / named capture → `Option[Match]` (group 0 = whole match) |
+| `re.searchAll(s)` / `re.capturesAll(s)` | every non-overlapping match / its captures → a lazy `dyn Iterator` |
+| `re.splitRe(s)` | the substrings between matches → a lazy `dyn Iterator[String]` |
+| `re.replaceRe(s, repl)` / `re.replaceAllRe(s, repl)` | replace the first / all matches; template `$0`..`$N`, `${name}`, `$$` |
+
+Supported syntax: `. * + ? | ( ) (?:…) (?<name>…) [...] ^ $`, non-greedy `*?`, counts `{n}` / `{n,}` /
+`{n,m}`, the shorthands `\d \w \s` (and their negations), the word boundary `\b`, and the flags `i` (ASCII
+case), `m` (multiline), `s` (dotall) — as `Regex::compileWith(pattern, "ims")` or inline `(?ims)`.
 
 **Strings and bytes**
 
@@ -3600,8 +3930,8 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `split(s, sep)` | lazily split into fields on a literal separator (empties kept; inverse of `join`) |
 | `lines(s)` | lazily split into lines (terminator semantics; `CRLF` handled) |
 | `stringBuilder()` / `stringBuilderCap(n)` | a `StringBuilder` accumulator over `Bytes` (empty / pre-sized to `n`) |
-| `append(sb, s)` / `appendByte(sb, c)` | append a `String` / one byte to a `StringBuilder` (mutates in place; returns `sb`) |
-| `build(sb)` / `sbLen(sb)` | the accumulated `String` / its current byte length |
+| `sb.append(s)` / `sb.appendByte(c)` | append a `String` / one byte to a `StringBuilder` (mutates in place; returns `sb`, so calls chain) |
+| `sb.build()` / `sb.len()` | the accumulated `String` / its current byte length |
 | `format(x, spec)` | format a scalar per a `${x:spec}` specifier (width/align/precision/base, sign `+`, `#` prefix, scientific `e`/`E`) → `String` |
 
 **Unicode code points** *(`std::string` / `std::iter`; the opt-in code-point layer over the default byte model — `for c in s` still iterates bytes)*
@@ -3614,7 +3944,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `codePoint(c)` | a `Char`'s `Int` code point |
 | `codePointToStr(cp)` | encode an `Int` code point → its UTF-8 `String` (invalid/surrogate → U+FFFD) |
 | `fromChars(it)` | build a `String` from an iterator of `Char` (`fromChars(chars(s)) == s` for valid UTF-8) |
-| `appendCodePoint(sb, cp)` | append a code point's UTF-8 to a `StringBuilder` (mutates in place; returns `sb`) |
+| `sb.appendCodePoint(cp)` | append a code point's UTF-8 to a `StringBuilder` (mutates in place; returns `sb`) |
 
 **Collections**
 
@@ -3666,6 +3996,11 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `zip(a, b)` / `chain(a, b)` | pair up / concatenate two iterators |
 | `scan(it, init, f)` | running accumulator |
 | `flatMap(it, f)` | map to iterators and flatten |
+| `stepBy(it, n)` | first element, then every `n`-th |
+| `inspect(it, f)` | run `f` per element (a tap), passthrough |
+| `dedup(it)` | drop *consecutive* duplicates (`T: Eq`) |
+| `chunks(it, n)` / `windows(it, n)` | non-overlapping / overlapping `Vec[T]` groups of `n` |
+| `peekable(it)` | look ahead one element via `.peek()` |
 
 **Iterators — terminals (iterator → value)**
 

@@ -6,21 +6,21 @@ use std::regex::*
 
 // Compile-or-abort helper (a bad pattern here is a bug in the demo, not user input).
 fn rx(pattern: String) -> Regex {
-  match compile(pattern) { Ok(r) => r, Err(e) => panic("bad pattern '" + pattern + "': " + e.message) }
+  match Regex::compile(pattern) { Ok(r) => r, Err(e) => panic("bad pattern '" + pattern + "': " + e.message) }
 }
 
 // 1. Identifier validation (anchors + classes + repetition).
 let ident = rx("^[A-Za-z_][A-Za-z0-9_]*$")
-if !isMatch(ident, "valid_ID9") { panic("ident should match") }
-if isMatch(ident, "9nope") { panic("ident should reject") }
+if !ident.isMatch("valid_ID9") { panic("ident should match") }
+if ident.isMatch("9nope") { panic("ident should reject") }
 println("1. identifier validation ok")
 
 // 2. Key/value extraction via capture groups.
 let kv = rx("([a-z]+)=([0-9]+)")
-match captures(kv, "  port=8080; host=..") {
+match kv.captures("  port=8080; host=..") {
   Some(c) => {
-    let k = match group(c, 1) { Some(m) => m.text, None => "?" }
-    let v = match group(c, 2) { Some(m) => m.text, None => "?" }
+    let k = match c.group(1) { Some(m) => m.text, None => "?" }
+    let v = match c.group(2) { Some(m) => m.text, None => "?" }
     println("2. parsed " + k + " -> " + v)
     if k != "port" || v != "8080" { panic("kv mismatch") }
   },
@@ -29,36 +29,36 @@ match captures(kv, "  port=8080; host=..") {
 
 // 3. Count every run of digits (lazy searchAll).
 let num = rx("[0-9]+")
-let n = count(searchAll(num, "a12 b3 c100 d7"))
+let n = count(num.searchAll("a12 b3 c100 d7"))
 println("3. found " + toString(n) + " numbers")
 if n != 4 { panic("expected 4 numbers") }
 
 // 4. Split on a comma separator (lazy splitRe; note the empty field).
 let comma = rx(",")
 let mut parts = 0
-for _seg in splitRe(comma, "a,b,,c") { parts = parts + 1 }
+for _seg in comma.splitRe("a,b,,c") { parts = parts + 1 }
 println("4. split into " + toString(parts) + " fields")
 if parts != 4 { panic("expected 4 fields") }
 
 // 5. Mask digits (replaceAllRe).
 let digit = rx("[0-9]")
-let masked = replaceAllRe(digit, "card 4111 2222 3333", "#")
+let masked = digit.replaceAllRe("card 4111 2222 3333", "#")
 println("5. " + masked)
 if masked != "card #### #### ####" { panic("mask mismatch") }
 
 // 6. Reformat a date with numbered backrefs in the template ($1..$3) + `{n}` counts.
 let date = rx("([0-9]{4})-([0-9]{2})-([0-9]{2})")
-let out = replaceRe(date, "2026-07-25", "$3/$2/$1")
+let out = date.replaceRe("2026-07-25", "$3/$2/$1")
 println("6. " + out)
 if out != "25/07/2026" { panic("date reformat mismatch") }
 
 // 7. Case-insensitive + non-greedy + shorthands.
 let word = rx("\\w+")                       // \w+ (Skarn source "\\w+")
-if !isMatch(word, "hello_42") { panic("\\w should match") }
-let ci = match compileWith("hello", "i") { Ok(r) => r, Err(e) => panic(e.message) }
-if !isMatch(ci, "shout: HELLO!") { panic("case-insensitive should match") }
+if !word.isMatch("hello_42") { panic("\\w should match") }
+let ci = match Regex::compileWith("hello", "i") { Ok(r) => r, Err(e) => panic(e.message) }
+if !ci.isMatch("shout: HELLO!") { panic("case-insensitive should match") }
 let tag = rx("<.*?>")                        // non-greedy: matches "<a>", not "<a><b>"
-match search(tag, "<a><b>") {
+match tag.search("<a><b>") {
   Some(m) => { println("7. first tag = " + m.text)  if m.text != "<a>" { panic("non-greedy mismatch") } },
   None => panic("tag: no match"),
 }
