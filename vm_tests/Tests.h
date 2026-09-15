@@ -1,0 +1,7335 @@
+#pragma once
+
+#include <iostream>
+#include <sstream>
+#include <vector>
+#include <stdexcept>
+#include <format>
+#include <cmath>
+#include <filesystem>   // temp-dir round-trip for test_native_dirops (listDir / mkdir)
+#include <fstream>      // std::ofstream -- seed the temp dir in test_native_dirops
+#include "Assembler.h"
+#include "Disassembler.h"
+#include "VM_Resources.h"
+#include "Heap.h"
+#include "VM.h"
+#include "GlobalEnv.h"
+#include "Opcodes.h"
+#include "HashTable.h"
+#include "StringInterner.h"
+#include "Execute.h"
+#include "BytecodeIO.h"    // SKBC CARR round-trip in test_const_array
+#include "Debug.h"
+#include "TypeUniverse.h"   // BuiltinTid / BUILTIN_COUNT / TRAIT_METHOD_NONE (trait dispatch)
+#include "NativeRegistry.h" // NativeId ids (nanoTime / millisTime -> test_native_time)
+#include "Natives.h"        // build_native_table() -- the real native registry
+
+// =============================================================================
+// Minimal test harness -- lets the suite FAIL THE BUILD (non-zero exit code).
+//
+// The suite is still a set of `inline void test_*()` that print a human-readable
+// trace; this only adds a pass/fail tally so CI can gate on it. Every assertion
+// goes through check(); every unexpected exception is recorded as a failure
+// (record_fail() from a test's own catch, or the run() backstop in main() for
+// tests without one). main() prints the tally and returns non-zero on any
+// failure. See "Tests" in docs/VirtualMachine.md.
+// =============================================================================
+struct TestStats {
+    int passed       = 0;  // assertions that passed  (check() == true)
+    int failed       = 0;  // assertions/throws that failed (check()==false / record_fail)
+    int tests_passed = 0;  // whole tests with no failed assertion and no throw (via run())
+    int tests_failed = 0;  // whole tests with >=1 failed assertion or an escaped throw
+};
+inline TestStats g_test_stats;
+
+// Print + record one assertion. Returns `ok` for convenience.
+inline bool check(bool ok) {
+    if (ok) ++g_test_stats.passed; else ++g_test_stats.failed;
+    std::cout << (ok ? "CORRECT!\n" : "WRONG!\n");
+    return ok;
+}
+
+// Record an unexpected exception as a failure (used from a test's catch block).
+inline void record_fail(const char* why) {
+    ++g_test_stats.failed;
+    std::cerr << "Test failed: " << why << "\n";
+}
+
+// =============================================================================
+// Native functions -- callable from VM bytecode via CALL_NATIVE
+// =============================================================================
+
+// Adds all integer arguments and returns the sum
+static Value native_add(Value* args, uint8_t nargs, Context*) {
+    int64_t sum = 0;
+    for (uint8_t i = 0; i < nargs; ++i)
+        sum += args[i].asSigned48();
+    return Value::fromSigned48(sum);
+}
+
+// Prints all arguments to stdout, returns nil
+static Value native_print(Value* args, uint8_t nargs, Context*) {
+    for (uint8_t i = 0; i < nargs; ++i) {
+        if (i > 0) std::cout << ", ";
+        if (args[i].isInt())
+            std::cout << args[i].asSigned48();
+        else if (args[i].isBool())
+            std::cout << (args[i].asBool() ? "true" : "false");
+        else if (args[i].isNil())
+            std::cout << "nil";
+        else
+            std::cout << "?";
+    }
+    std::cout << "\n";
+    return Value::fromNil();
+}
+
+// Runs a full GC cycle and returns the number of bytes reclaimed as an Int.
+// Used by test_frame_gc_roots to trigger a collection at a known program point
+// and observe exactly what was freed.
+static Value native_collect(Value*, uint8_t, Context* ctx) {
+    const size_t freed = ctx->vm->heap->collect(ctx);
+    return Value::fromSigned48(static_cast<int64_t>(freed));
+}
+
+// The GC-helper tests drive native_collect through the registry CALL_NATIVE path -- the
+// only mode since the baked-pointer path (load_native_ptr / Assembler::call_native) was
+// retired earlier. This 1-entry table maps id 0 -> native_collect; execute_gc() wires
+// it into execute() so the GC tests keep short call sites instead of spelling out the long
+// positional path to execute()'s native_table parameter.
+static const std::vector<NativeFunc> GC_NTAB = { native_collect };
+
+inline VM_Resources execute_gc(const std::vector<uint32_t>& bc, Heap* heap, GlobalEnv* globals,
+                               uint8_t top, const std::vector<StructType>* structs = nullptr) {
+    return execute(bc, heap, globals, /*interner*/nullptr, top, /*const_pool*/nullptr, structs,
+                   /*string_literals*/nullptr, /*atom_names*/nullptr, /*fn_table*/nullptr,
+                   /*out*/nullptr, /*trait_table*/nullptr, 0, 0,
+                   /*line_table*/nullptr, /*function_names*/nullptr, /*column_table*/nullptr,
+                   &GC_NTAB);
+}
+
+// =============================================================================
+// test_factorial, test_sum_tco, test_load_const_wide,
+// test_set_and_branch, test_cmov  (unchanged -- omitted for brevity)
+// =============================================================================
+// A direct CALL whose target is >32767 instructions away overflows the 16-bit `call` offset. The Assembler's
+// relax_far_calls() must route it through a trampoline island (at the function boundary nearest the midpoint)
+// so it still assembles and runs. `mid` is an (uncalled) function providing a central boundary, as real dense
+// programs always have.
+inline void test_far_call_relaxation() {
+    std::cout << "=== far_call_relaxation ===\n";
+    constexpr uint8_t FRAME = 1;
+    Assembler as;
+    as.func("f", FRAME);
+    as.func("mid", 1);
+    as.label("main");
+    as.CALL("f");                       // f is far below; return value lands in r[FRAME]
+    as.J(OpCode::HALT);
+    for (int k = 0; k < 16000; ++k) as.J(OpCode::NOP);
+    as.label("mid");                    // a central function boundary for the island
+    as.J(OpCode::RET);
+    for (int k = 0; k < 16000; ++k) as.J(OpCode::NOP);
+    as.label("f");
+    as.C2(OpCode::LOAD_CONST, 0, 42);
+    as.J(OpCode::RET);
+    bool assembled = false;
+    int64_t result = -1;
+    try {
+        const auto bytecode = as.assemble();          // must NOT throw -- relaxation kicks in
+        assembled = true;
+        auto res = execute(bytecode, nullptr, nullptr, nullptr, FRAME);
+        result = res.get_reg_base()[FRAME].asSigned48();
+    } catch (const std::exception& e) { record_fail(e.what()); }
+    std::cout << "  far CALL (>32767 away) assembled + ran: result=" << result << "\n";
+    check(assembled && result == 42);
+}
+
+inline void test_factorial() {
+    constexpr uint8_t FACTORIAL_FRAME = 2;
+    Assembler as;
+    as.func("factorial", FACTORIAL_FRAME);
+    as.label("main");
+    as.C2  (OpCode::LOAD_CONST, FACTORIAL_FRAME, 5);
+    as.CALL("factorial");
+    as.J   (OpCode::HALT);
+    as.label("factorial");
+    as.C2(OpCode::LOAD_CONST, 1, 1);
+    as.B (OpCode::BGE_INT, 0, 1, "fact_recursive");
+    as.C2(OpCode::LOAD_CONST, 0, 1);
+    as.J (OpCode::RET);
+    as.label("fact_recursive");
+    as.R6(OpCode::SUB_INT, FACTORIAL_FRAME, 0, 1);
+    as.CALL("factorial");
+    as.R6(OpCode::MUL_INT, 0, 0, FACTORIAL_FRAME);
+    as.J (OpCode::RET);
+    const auto bytecode = as.assemble();
+    std::cout << "=== factorial(5) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size());
+    dis.add_label(0, "main"); dis.add_label(3, "factorial"); dis.add_label(7, "fact_recursive");
+    dis.print();
+    std::cout << "Running...\n";
+    try {
+        // Top-level places the argument at r[FACTORIAL_FRAME] and reads the result
+        // there; with the decoupled contract the slide is the CALLER's frame size,
+        // so the top-level frame size must equal that boundary (FACTORIAL_FRAME).
+        auto res = execute(bytecode, nullptr, nullptr, nullptr, FACTORIAL_FRAME);
+        const int64_t result = res.get_reg_base()[FACTORIAL_FRAME].asSigned48();
+        std::cout << std::format("factorial(5) = {}\n", result);
+        check(result == 120);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+inline void test_sum_tco() {
+    constexpr uint8_t SUM_FRAME = 3;
+    Assembler as;
+    as.func("sum", SUM_FRAME);
+    as.label("main");
+    as.C2(OpCode::LOAD_CONST, SUM_FRAME + 0, 100);
+    as.C2(OpCode::LOAD_CONST, SUM_FRAME + 1,   0);
+    as.CALL("sum");
+    as.J(OpCode::HALT);
+    as.label("sum");
+    as.C2(OpCode::LOAD_CONST, 2, 0);
+    as.B (OpCode::BEQ_INT, 0, 2, "sum_base");
+    as.R6(OpCode::ADD_INT, 2, 1, 0);
+    as.C2(OpCode::DECR, 0);
+    as.R6(OpCode::MOV, 1, 2, 0);
+    as.TCO_CALL("sum");
+    as.label("sum_base");
+    as.R6(OpCode::MOV, 0, 1, 0);
+    as.J(OpCode::RET);
+    const auto bytecode = as.assemble();
+    std::cout << "=== sum_tco(100) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size());
+    dis.add_label(0, "main"); dis.add_label(4, "sum");
+    dis.add_label(8, "sum_recursive"); dis.add_label(12, "sum_base");
+    dis.print();
+    std::cout << "Running...\n";
+    try {
+        // Top-level places the two arguments at r[SUM_FRAME], r[SUM_FRAME+1] and
+        // reads the result at r[SUM_FRAME]; the top-level frame size is that
+        // boundary (SUM_FRAME) since the CALL now slides by the caller frame size.
+        auto res = execute(bytecode, nullptr, nullptr, nullptr, SUM_FRAME);
+        const int64_t result = res.get_reg_base()[SUM_FRAME].asSigned48();
+        std::cout << std::format("sum(100) = {}\n", result);
+        check(result == 5050);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+inline void test_load_const_wide() {
+    constexpr int64_t VALUE = 100'000;
+    Assembler as;
+    as.label("main");
+    as.load_const(0, VALUE);
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== load_const_wide (value = 100'000) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res = execute(bytecode);
+        const int64_t result = res.get_reg_base()[0].asSigned48();
+        std::cout << std::format("r0 = {}\n", result);
+        check(result == VALUE);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+inline void test_set_and_branch() {
+    Assembler as;
+    as.label("main");
+    as.C2(OpCode::LOAD_CONST, 0, 6);
+    as.C2(OpCode::LOAD_CONST, 1, 6);
+    as.C2(OpCode::LOAD_CONST, 2, 7);
+    as.R6(OpCode::SET_EQ, 3, 0, 1);
+    as.B1(OpCode::BF, 3, "was_false_1");
+    as.C2(OpCode::LOAD_CONST, 4, 1);
+    as.J (OpCode::J, "next");
+    as.label("was_false_1");
+    as.C2(OpCode::LOAD_CONST, 4, 0);
+    as.label("next");
+    as.R6(OpCode::SET_EQ, 3, 0, 2);
+    as.B1(OpCode::BF, 3, "was_false_2");
+    as.C2(OpCode::LOAD_CONST, 5, 0);
+    as.J (OpCode::J, "done");
+    as.label("was_false_2");
+    as.C2(OpCode::LOAD_CONST, 5, 1);
+    as.label("done");
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== set_eq + bf ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode);
+        auto* regs = res.get_reg_base();
+        const int64_t r4 = regs[4].asSigned48();
+        const int64_t r5 = regs[5].asSigned48();
+        std::cout << std::format("6==6 branch skipped: {} (expect 1)\n", r4);
+        std::cout << std::format("6==7 branch taken:   {} (expect 1)\n", r5);
+        check(r4 == 1 && r5 == 1);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+inline void test_cmov() {
+    Assembler as;
+    as.label("main");
+    as.C2(OpCode::LOAD_CONST, 0, 3); as.C2(OpCode::LOAD_CONST, 1, 7);
+    as.R6(OpCode::SET_LT, 2, 0, 1); as.Q4(OpCode::CMOV, 4, 1, 0, 2);
+    as.C2(OpCode::LOAD_CONST, 0, 9); as.C2(OpCode::LOAD_CONST, 1, 2);
+    as.R6(OpCode::SET_LT, 2, 0, 1); as.Q4(OpCode::CMOV, 5, 1, 0, 2);
+    as.C2(OpCode::LOAD_CONST, 0, 5); as.C2(OpCode::LOAD_CONST, 1, 5);
+    as.R6(OpCode::SET_LT, 2, 0, 1); as.Q4(OpCode::CMOV, 6, 1, 0, 2);
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== cmov / branchless max ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode);
+        auto* regs = res.get_reg_base();
+        const int64_t r4 = regs[4].asSigned48();
+        const int64_t r5 = regs[5].asSigned48();
+        const int64_t r6 = regs[6].asSigned48();
+        std::cout << std::format("max(3,7)={} max(9,2)={} max(5,5)={}\n", r4, r5, r6);
+        check(r4 == 7 && r5 == 9 && r6 == 5);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// (test_call_native was removed earlier together with the legacy baked-pointer
+//  CALL_NATIVE path it exercised. Its native_add / native_print coverage lives on in
+//  test_native_registry below, driven through the id-based native_table registry.)
+// =============================================================================
+
+// =============================================================================
+// test_native_registry -- the id-based native-call path (the compiler path).
+//
+// Instead of baking a function ADDRESS into the bytecode (load_native_ptr /
+// call_native, the legacy in-process form), the caller passes a native_table to
+// execute() and the bytecode carries only a stable NativeId index. CALL_NATIVE
+// then resolves ctx->vm->native_table[id]. This is what makes the compiler's
+// readFile / writeFile serializable + address-free. See NativeRegistry.h.
+//
+//   Test 1: native at id 0 (native_add) over (5, 7)  -> r1 = 12
+//   Test 2: native at id 1 (native_print) over (42, 1) -> r6 = nil (proves a
+//           non-zero id indexes correctly)
+// =============================================================================
+inline void test_native_registry() {
+    Assembler as;
+    as.label("main");
+
+    // id 0: native_add(&r2, 2)
+    as.C2(OpCode::LOAD_CONST, 2, 5);                  // r2 = 5
+    as.C2(OpCode::LOAD_CONST, 3, 7);                  // r3 = 7
+    as.call_native_id(1, 0, 2, 2, 0);                 // r1 = table[0](&r2, 2)
+
+    // id 1: native_print(&r7, 2)
+    as.C2(OpCode::LOAD_CONST, 7, 42);                 // r7 = 42
+    as.C2(OpCode::LOAD_CONST, 8,  1);                 // r8 = 1
+    as.call_native_id(6, 5, 7, 2, 1);                 // r6 = table[1](&r7, 2)
+
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+
+    std::cout << "=== native_registry (id-based CALL_NATIVE) ===\n";
+    try {
+        // The registry: id 0 -> native_add, id 1 -> native_print.
+        std::vector<NativeFunc> ntab = { native_add, native_print };
+        auto res   = execute(bytecode, nullptr, nullptr, nullptr, 0, nullptr, nullptr,
+                             nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                             nullptr, nullptr, nullptr, &ntab);
+        auto* regs = res.get_reg_base();
+        const int64_t add_result = regs[1].asSigned48();
+        std::cout << std::format("table[0] native_add(5, 7) = {} (expect 12)\n", add_result);
+        std::cout << std::format("table[1] native_print returned nil: {}\n",
+            regs[6].isNil() ? "yes" : "no");
+        check(add_result == 12 && regs[6].isNil());
+    }
+    catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_call_native_high_registers -- CALL_NATIVE must reach the WHOLE 64-register
+// file, not just the low 32.
+//
+// Regression for the q4 -> r6 re-encode. CALL_NATIVE used to ride the
+// q4 layout (four 5-bit fields), so any operand register >= 32 silently truncated
+// in Release: with the encoding below, rd=r40 became r8 and the id register r33
+// became r1 -- i.e. a DIFFERENT native was resolved and its result written to a
+// DIFFERENT register, with no diagnostic. An ordinary Skarn program with ~34 live
+// locals at a native call site reproduced it. Debug caught it only as an assert
+// inside the Q4 builder.
+//
+// Registers here are deliberately all >= 32 (the old 5-bit ceiling):
+//   r33 = the NativeId temp, r34/r35 = the arguments, r40 = the result.
+// r1 and r8 hold sentinels: they are exactly where the truncated fields pointed
+// (33 & 31 == 1, 40 & 31 == 8), so a regression overwrites r8 and reads its native
+// id out of r1 instead of r33.
+// =============================================================================
+inline void test_call_native_high_registers() {
+    Assembler as;
+    as.label("main");
+    as.C2(OpCode::LOAD_CONST,  1, 111);               // r1  = sentinel (old truncated id register)
+    as.C2(OpCode::LOAD_CONST,  8, 222);               // r8  = sentinel (old truncated result register)
+    as.C2(OpCode::LOAD_CONST, 34, 5);                 // r34 = 5
+    as.C2(OpCode::LOAD_CONST, 35, 7);                 // r35 = 7
+    as.call_native_id(40, 33, 34, 2, 0);              // r40 = table[0](&r34, 2)
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+
+    std::cout << "=== call_native_high_registers (r6 fields, registers >= 32) ===\n";
+    try {
+        std::vector<NativeFunc> ntab = { native_add, native_print };
+        auto res   = execute(bytecode, nullptr, nullptr, nullptr, 42, nullptr, nullptr,
+                             nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                             nullptr, nullptr, nullptr, &ntab);
+        auto* regs = res.get_reg_base();
+        const int64_t result = regs[40].asSigned48();
+        std::cout << std::format("r40 = native_add(5, 7) = {} (expect 12)\n", result);
+        std::cout << std::format("sentinels intact: r1 = {} (expect 111), r8 = {} (expect 222)\n",
+            regs[1].asSigned48(), regs[8].asSigned48());
+        check(result == 12 && regs[1].asSigned48() == 111 && regs[8].asSigned48() == 222);
+    }
+    catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_native_time -- the first Plain-return natives (nanoTime / millisTime),
+// exercised through the REAL registry (build_native_table). Both are zero-arg
+// and return a bare Int (no Ok/Err wrap): the "unfehlbar" native pattern.
+//
+//   r0 = millisTime()          -> wall-clock ms since epoch (> 2020)
+//   r2 = nanoTime(); r3 = nanoTime()  -> monotonic, r3 >= r2
+// The zero-arg CALL_NATIVE passes a dummy base register (never dereferenced).
+// =============================================================================
+inline void test_native_time() {
+    Assembler as;
+    as.label("main");
+    as.call_native_id(0, 1, 0, 0, NATIVE_MILLIS_TIME);   // r0 = millisTime()
+    as.call_native_id(2, 4, 0, 0, NATIVE_NANO_TIME);     // r2 = nanoTime()
+    as.call_native_id(3, 4, 0, 0, NATIVE_NANO_TIME);     // r3 = nanoTime()
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+
+    std::cout << "=== native_time (nanoTime / millisTime, Plain Int) ===\n";
+    try {
+        std::vector<NativeFunc> ntab = build_native_table();
+        auto res  = execute(bytecode, nullptr, nullptr, nullptr, 0, nullptr, nullptr,
+                            nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                            nullptr, nullptr, nullptr, &ntab);
+        auto* regs = res.get_reg_base();
+        const int64_t ms    = regs[0].asSigned48();
+        const int64_t nano1 = regs[2].asSigned48();
+        const int64_t nano2 = regs[3].asSigned48();
+        std::cout << std::format("millisTime() = {} (Int: {}, > 1.6e12: {})\n",
+            ms, regs[0].isInt() ? "yes" : "no", ms > 1600000000000LL ? "yes" : "no");
+        std::cout << std::format("nanoTime() twice = {}, {} (Int: {}/{}, monotonic: {})\n",
+            nano1, nano2, regs[2].isInt() ? "yes" : "no", regs[3].isInt() ? "yes" : "no",
+            nano2 >= nano1 ? "yes" : "no");
+        check(regs[0].isInt() && ms > 1600000000000LL &&
+              regs[2].isInt() && regs[3].isInt() && nano2 >= nano1);
+    }
+    catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_native_procctx -- the args() native (Plain -> Array[String]), the first
+// native that BUILDS a multi-object heap structure (an array of freshly allocated
+// strings, rooted while filled). Driven through the real registry with a
+// script_args vector wired into execute()'s new trailing parameter.
+//
+//   r0 = args()  -> ["alpha", "beta"]
+//   r2 = len(r0) -> 2 ;  r4 = r0[0] -> "alpha"
+// =============================================================================
+inline void test_native_procctx() {
+    Assembler as;
+    as.label("main");
+    as.call_native_id(0, 1, 0, 0, NATIVE_ARGS);   // r0 = args()
+    as.R6(OpCode::LEN, 2, 0, 0);                   // r2 = len(r0)
+    as.C2(OpCode::LOAD_CONST, 3, 0);               // r3 = 0 (index)
+    as.R6(OpCode::ARRAY_GET, 4, 0, 3);             // r4 = r0[0]
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+
+    std::cout << "=== native_procctx (args() -> Array[String]) ===\n";
+    try {
+        Heap heap;
+        StringInterner interner;
+        std::vector<std::string> sargs = { "alpha", "beta" };
+        std::vector<NativeFunc> ntab = build_native_table();
+        // top_frame_size = 8 covers r0..r4 as GC roots (r0 holds the heap array).
+        auto res = execute(bytecode, &heap, nullptr, &interner, 8, nullptr, nullptr,
+                           nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                           nullptr, nullptr, nullptr, &ntab, &sargs);
+        auto* regs = res.get_reg_base();
+        const int64_t n = regs[2].asSigned48();
+        bool first_ok = false;
+        if (regs[4].isPtr()) {
+            GcObject* s = GcObject::from_slots(regs[4].asPtr());
+            if (s->kind == GcObject::KIND_STRING)
+                first_ok = std::string(s->bytes(), s->string_length()) == "alpha";
+        }
+        std::cout << std::format("len(args()) = {} (expect 2); args()[0] == \"alpha\": {}\n",
+            n, first_ok ? "yes" : "no");
+        check(n == 2 && first_ok);
+    }
+    catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_native_dirops -- listDir() (Result-model native returning a raw KIND_ARRAY
+// of leaf names) and mkdir() (create_directories -p, returning raw nil), driven
+// through the real registry over a fresh temp directory. At the id-path level the
+// native returns its BARE result (KIND_ARRAY / nil); the Ok/Err wrap is the
+// compiler's job (exercised in static_compiler_tests), so here we inspect the raw array.
+//
+//   r0 = listDir(dirWithOneFile) -> ["one.txt"] ; r2 = len -> 1 ; r4 = r0[0]
+//   r5 = mkdir("<root>/made/deep")  -> nil, and the dir tree now exists (mkdir -p)
+//   r6 = mkdir(dirWithOneFile)      -> nil (idempotent: an existing dir is Ok)
+// =============================================================================
+inline void test_native_dirops() {
+    namespace fs = std::filesystem;
+    std::cout << "=== native_dirops (listDir / mkdir) ===\n";
+    try {
+        std::error_code ec;
+        const fs::path root   = fs::temp_directory_path() / "vmtest_dirops";
+        fs::remove_all(root, ec);                       // clean slate
+        const fs::path listme = root / "listme";
+        fs::create_directories(listme, ec);
+        { std::ofstream(listme / "one.txt") << "x"; }   // one known entry, host-side
+        const fs::path newdir = root / "made" / "deep"; // parent "made" does NOT exist yet
+
+        const std::string s_listme = listme.string();
+        const std::string s_newdir = newdir.string();
+
+        Assembler as;
+        as.label("main");
+        as.load_str(10, s_listme);                      // r10 = path arg for listDir/mkdir
+        as.call_native_id(0, 9, 10, 1, NATIVE_LIST_DIR);// r0 = listDir(r10) (raw array)
+        as.R6(OpCode::LEN, 2, 0, 0);                    // r2 = len(r0)
+        as.C2(OpCode::LOAD_CONST, 3, 0);                // r3 = 0
+        as.R6(OpCode::ARRAY_GET, 4, 0, 3);              // r4 = r0[0]
+        as.load_str(11, s_newdir);                      // r11 = path arg for mkdir -p
+        as.call_native_id(5, 9, 11, 1, NATIVE_MAKE_DIR);// r5 = mkdir(r11) (raw nil)
+        as.call_native_id(6, 9, 10, 1, NATIVE_MAKE_DIR);// r6 = mkdir(r10) again -> nil (idempotent)
+        as.J(OpCode::HALT);
+        const auto bytecode = as.assemble();
+
+        Heap heap;
+        StringInterner interner;
+        const auto slits = as.string_literals();
+        std::vector<NativeFunc> ntab = build_native_table();
+        // top_frame_size = 16 covers r0..r11 as GC roots (r0 array, r4/r10/r11 strings).
+        auto res = execute(bytecode, &heap, nullptr, &interner, 16, nullptr, nullptr,
+                           &slits, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                           nullptr, nullptr, nullptr, &ntab);
+        auto* regs = res.get_reg_base();
+        const int64_t n = regs[2].asSigned48();
+        bool name_ok = false;
+        if (regs[4].isPtr()) {
+            GcObject* s = GcObject::from_slots(regs[4].asPtr());
+            if (s->kind == GcObject::KIND_STRING)
+                name_ok = std::string(s->bytes(), s->string_length()) == "one.txt";
+        }
+        const bool made_ok = regs[5].isNil() && fs::exists(newdir, ec);   // -p created parents
+        const bool idem_ok = regs[6].isNil();                             // existing dir -> nil
+        std::cout << std::format("len(listDir) = {} (expect 1); [0] == \"one.txt\": {}\n",
+            n, name_ok ? "yes" : "no");
+        std::cout << std::format("mkdir -p created tree: {}; mkdir(existing) -> nil: {}\n",
+            made_ok ? "yes" : "no", idem_ok ? "yes" : "no");
+        check(n == 1 && name_ok && made_ok && idem_ok);
+        fs::remove_all(root, ec);                       // cleanup
+    }
+    catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_native_stdin -- readLine() (Option-model: a line, or nil at EOF) and
+// readAllStdin() (Plain: the whole remaining stream to EOF). Both read the VM's
+// input sink (ctx->vm->in), which execute()'s new trailing `in` parameter lets us
+// point at an istringstream -- so the test never blocks on real stdin. At the
+// id-path level readLine returns a BARE String / nil (the Some/None wrap is the
+// compiler's job); we inspect the raw result.
+//
+//   in = "first\nsecond\nthird\n"
+//   r0 = readLine()      -> "first"
+//   r1 = readAllStdin()  -> "second\nthird\n"  (the remainder)
+//   r3 = readLine()      -> nil                (stream now at EOF)
+// =============================================================================
+inline void test_native_stdin() {
+    std::cout << "=== native_stdin (readLine / readAllStdin) ===\n";
+    try {
+        Assembler as;
+        as.label("main");
+        as.call_native_id(0, 8, 0, 0, NATIVE_READ_LINE);       // r0 = readLine()
+        as.call_native_id(1, 8, 0, 0, NATIVE_READ_ALL_STDIN);  // r1 = readAllStdin()
+        as.call_native_id(3, 8, 0, 0, NATIVE_READ_LINE);       // r3 = readLine() at EOF -> nil
+        as.J(OpCode::HALT);
+        const auto bytecode = as.assemble();
+
+        Heap heap;
+        StringInterner interner;
+        std::istringstream input("first\nsecond\nthird\n");
+        std::vector<NativeFunc> ntab = build_native_table();
+        // top_frame_size = 8 covers r0..r3 as GC roots (r0/r1 hold heap strings).
+        auto res = execute(bytecode, &heap, nullptr, &interner, 8, nullptr, nullptr,
+                           nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                           nullptr, nullptr, nullptr, &ntab, nullptr, &input);
+        auto* regs = res.get_reg_base();
+        auto as_str = [](const Value& v) -> std::string {
+            if (!v.isPtr()) return std::string();
+            GcObject* s = GcObject::from_slots(v.asPtr());
+            return s->kind == GcObject::KIND_STRING
+                 ? std::string(s->bytes(), s->string_length()) : std::string();
+        };
+        const std::string line0 = as_str(regs[0]);
+        const std::string rest  = as_str(regs[1]);
+        const bool eof_none     = regs[3].isNil();
+        std::cout << std::format("readLine() = \"{}\" (expect \"first\")\n", line0);
+        std::cout << std::format("readAllStdin() = {} (expect \"second\\nthird\\n\")\n",
+            rest == "second\nthird\n" ? "match" : "MISMATCH");
+        std::cout << std::format("readLine() at EOF -> nil: {}\n", eof_none ? "yes" : "no");
+        check(line0 == "first" && rest == "second\nthird\n" && eof_none);
+    }
+    catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_native_process -- rawRun(argv, input) at the id/registry path (the prelude's
+// run/runWith reshape its result into a ProcessOutput struct, tested at the compiler
+// level). rawRun returns a bare Array[3] {stdoutBytes, stderrBytes, exitInt} on a
+// successful spawn, or an error String on a spawn failure (Rust Command::output
+// semantics: a non-zero exit is a SUCCESS whose exitCode is data; only "could not
+// start" is the error String). The one program per case: build the argv KIND_ARRAY,
+// call rawRun, GET_KIND-branch the result, and on the array path decode stdout via
+// BYTES_TO_STR + read the exit slot. Uses cmd.exe (always present) for determinism.
+// =============================================================================
+inline void test_native_process() {
+    std::cout << "=== native_process (rawRun) ===\n";
+    try {
+        // Result of one rawRun: either an error String (is_err), or a success carrying
+        // the decoded stdout + the exit code.
+        struct RawResult { bool is_err; std::string out; long long exit; };
+        auto run_raw = [](const std::vector<std::string>& argv,
+                          const std::string* stdin_data) -> RawResult {
+            Assembler as;
+            as.label("main");
+            // Build the argv KIND_ARRAY at r0 (scratch r2 = element string, r3 = index).
+            as.C2(OpCode::ALLOC, 0, static_cast<int16_t>(argv.size()));
+            for (size_t i = 0; i < argv.size(); ++i) {
+                as.load_str(2, argv[i]);
+                as.C2(OpCode::LOAD_CONST, 3, static_cast<int16_t>(i));
+                as.R6(OpCode::ARRAY_SET, 2, 0, 3);          // argv[i] = r2
+            }
+            // input at r1: a KIND_BYTES (stdin feed) or a non-ptr Int(0) (native reads
+            // that as "no stdin", since it is not a KIND_BYTES pointer).
+            if (stdin_data) { as.load_str(4, *stdin_data); as.R6(OpCode::BYTES_FROM_STR, 1, 4, 0); }
+            else            { as.C2(OpCode::LOAD_CONST, 1, 0); }
+            as.call_native_id(10, 9, 0, 2, NATIVE_RUN_PROCESS);   // r10 = rawRun(&window[0], 2)
+            // Branch on the result kind: KIND_STRING (1) => spawn error, else the Array[3].
+            as.R6(OpCode::GET_KIND, 5, 10, 0);
+            as.C2(OpCode::LOAD_CONST, 6, 1);
+            as.B(OpCode::BEQ_INT, 5, 6, "is_err");
+            as.C2(OpCode::LOAD_CONST, 7, 0); as.R6(OpCode::ARRAY_GET, 11, 10, 7);  // r11 = stdout bytes
+            as.R6(OpCode::BYTES_TO_STR, 12, 11, 0);                                // r12 = stdout string
+            as.C2(OpCode::LOAD_CONST, 8, 2); as.R6(OpCode::ARRAY_GET, 13, 10, 8);  // r13 = exit int
+            as.J(OpCode::HALT);
+            as.label("is_err");
+            as.J(OpCode::HALT);
+            const auto bytecode = as.assemble();
+
+            Heap heap;
+            StringInterner interner;
+            const auto slits = as.string_literals();
+            std::vector<NativeFunc> ntab = build_native_table();
+            auto res = execute(bytecode, &heap, nullptr, &interner, 16, nullptr, nullptr,
+                               &slits, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                               nullptr, nullptr, nullptr, &ntab);
+            auto* regs = res.get_reg_base();
+            auto as_str = [](const Value& v) -> std::string {
+                if (!v.isPtr()) return std::string();
+                GcObject* s = GcObject::from_slots(v.asPtr());
+                return s->kind == GcObject::KIND_STRING
+                     ? std::string(s->bytes(), s->string_length()) : std::string();
+            };
+            const bool err = regs[10].isPtr() &&
+                GcObject::from_slots(regs[10].asPtr())->kind == GcObject::KIND_STRING;
+            if (err) return { true, as_str(regs[10]), 0 };
+            return { false, as_str(regs[12]), regs[13].asSigned48() };
+        };
+
+        // 1) echo -> stdout carries "hello", exit 0 (a plain successful spawn).
+        RawResult echo = run_raw({ "cmd", "/c", "echo", "hello" }, nullptr);
+        const bool echo_ok = !echo.is_err && echo.exit == 0 &&
+                             echo.out.rfind("hello", 0) == 0;
+        std::cout << std::format("echo -> exit {}, stdout starts \"hello\": {}\n",
+            echo.exit, echo.out.rfind("hello", 0) == 0 ? "yes" : "no");
+
+        // 2) exit 3 -> a NON-zero exit is still a success (Ok), exitCode == 3.
+        RawResult ex = run_raw({ "cmd", "/c", "exit", "3" }, nullptr);
+        const bool exit_ok = !ex.is_err && ex.exit == 3;
+        std::cout << std::format("exit 3 -> is_err {}, exitCode {} (expect 3)\n",
+            ex.is_err ? "yes" : "no", ex.exit);
+
+        // 3) findstr with fed stdin -> the child sees the input (exit 0 == "needle" found)
+        //    and echoes the matching line back, proving the WriteFile + concurrent drain
+        //    path delivers stdin AND captures stdout together.
+        const std::string feed = "has needle here\n";
+        RawResult fs = run_raw({ "cmd", "/c", "findstr", "needle" }, &feed);
+        const bool sort_ok = !fs.is_err && fs.exit == 0 &&
+                             fs.out.find("needle") != std::string::npos;
+        std::cout << std::format("findstr <stdin -> exit {} (expect 0), stdout has \"needle\": {}\n",
+            fs.exit, fs.out.find("needle") != std::string::npos ? "yes" : "no");
+
+        // 4) a non-existent program -> a spawn error (the error String, not an Array).
+        RawResult bad = run_raw({ "definitely_not_a_real_program_zzz_qeg" }, nullptr);
+        const bool bad_ok = bad.is_err;
+        std::cout << std::format("bad program -> is_err (spawn failure): {}\n",
+            bad.is_err ? "yes" : "no");
+
+        check(echo_ok && exit_ok && sort_ok && bad_ok);
+    }
+    catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_gc -- verifies tri-color mark & sweep without the dispatch loop.
+//
+// Scenario A: single live object
+//   - alloc object A (3 slots), store pointer in a fake register window
+//   - run collect() -> A must survive (still reachable from root)
+//
+// Scenario B: dead object collected
+//   - alloc object B, do NOT store pointer anywhere
+//   - alloc object C, store pointer in register window
+//   - run collect() -> B must be gone, C must survive
+//
+// Scenario C: object graph (A -> B)
+//   - alloc B (no root pointer), alloc A (root pointer)
+//   - store pointer to B in A.slot[0]
+//   - run collect() -> both A and B must survive (B reachable via A)
+//
+// Scenario D: cycle (A -> B -> A)
+//   - alloc A and B, cross-link them, root points to A only
+//   - run collect() -> both must survive, no infinite loop
+// =============================================================================
+inline void test_gc() {
+    std::cout << "=== test_gc ===\n";
+
+    VM_Resources res;
+    Value* win = res.get_reg_base();
+
+    // Shared minimal Context
+    Context ctx{};
+    ctx.window_ptr         = win;
+    ctx.ret_stack_base     = res.get_ret_base();
+    ctx.ret_stack_ptr      = res.get_ret_base();
+    ctx.frame_size_ptr     = res.get_frame_size_base();
+    ctx.current_frame_size = 4; // r0..r3 are live roots
+
+    bool all_ok = true;
+
+    // ------------------------------------------------------------------
+    // Scenario A: single live object survives
+    // ------------------------------------------------------------------
+    {
+        for (size_t i = 0; i < 4; ++i) win[i] = Value{};
+        Heap heap(64 * 1024);
+
+        GcObject* a = heap.alloc(GcObject::KIND_ARRAY, 2);
+        assert(a && "Scenario A: alloc failed");
+        a->slots()[0] = Value::fromSigned48(111);
+        a->slots()[1] = Value::fromSigned48(222);
+        win[0] = Value::fromPtr(a->slots());
+
+        const size_t used_before = heap.used();
+        heap.collect(&ctx);
+        const size_t used_after = heap.used();
+
+        GcObject* a2   = GcObject::from_slots(win[0].asPtr());
+        const bool ok  = win[0].isPtr()
+                      && a2->slots()[0].asSigned48() == 111
+                      && a2->slots()[1].asSigned48() == 222
+                      && used_after == used_before;
+
+        std::cout << std::format("  Scenario A (live object survives):      {}\n",
+            ok ? "PASS" : "FAIL");
+        all_ok &= ok;
+    }
+
+    // ------------------------------------------------------------------
+    // Scenario B: unreachable object is collected, live object survives
+    // ------------------------------------------------------------------
+    {
+        for (size_t i = 0; i < 4; ++i) win[i] = Value{};
+        Heap heap(64 * 1024);
+
+        GcObject* b = heap.alloc(GcObject::KIND_ARRAY, 1); // no root -> dead
+        assert(b && "Scenario B: alloc B failed");
+        b->slots()[0] = Value::fromSigned48(999);
+
+        GcObject* c = heap.alloc(GcObject::KIND_ARRAY, 1);
+        assert(c && "Scenario B: alloc C failed");
+        c->slots()[0] = Value::fromSigned48(777);
+        win[1] = Value::fromPtr(c->slots());
+
+        const size_t freed = heap.collect(&ctx);
+
+        GcObject* c2   = GcObject::from_slots(win[1].asPtr());
+        const bool ok  = freed > 0
+                      && win[1].isPtr()
+                      && c2->slots()[0].asSigned48() == 777;
+
+        std::cout << std::format("  Scenario B (dead object collected):     {}\n",
+            ok ? "PASS" : "FAIL");
+        all_ok &= ok;
+    }
+
+    // ------------------------------------------------------------------
+    // Scenario C: object graph A -> B, only A is a root
+    // ------------------------------------------------------------------
+    {
+        for (size_t i = 0; i < 4; ++i) win[i] = Value{};
+        Heap heap(64 * 1024);
+
+        GcObject* b = heap.alloc(GcObject::KIND_ARRAY, 1);
+        assert(b && "Scenario C: alloc B failed");
+        b->slots()[0] = Value::fromSigned48(42);
+
+        GcObject* a = heap.alloc(GcObject::KIND_ARRAY, 1);
+        assert(a && "Scenario C: alloc A failed");
+        a->slots()[0] = Value::fromPtr(b->slots()); // A -> B
+
+        win[2] = Value::fromPtr(a->slots()); // only A is a root
+
+        const size_t freed = heap.collect(&ctx);
+
+        GcObject* a2   = GcObject::from_slots(win[2].asPtr());
+        GcObject* b2   = GcObject::from_slots(a2->slots()[0].asPtr());
+        const bool ok  = freed == 0
+                      && b2->slots()[0].asSigned48() == 42;
+
+        std::cout << std::format("  Scenario C (object graph A->B):         {}\n",
+            ok ? "PASS" : "FAIL");
+        all_ok &= ok;
+    }
+
+    // ------------------------------------------------------------------
+    // Scenario D: cycle A -> B -> A, root holds A only
+    // ------------------------------------------------------------------
+    {
+        for (size_t i = 0; i < 4; ++i) win[i] = Value{};
+        Heap heap(64 * 1024);
+
+        GcObject* a = heap.alloc(GcObject::KIND_ARRAY, 1);
+        assert(a && "Scenario D: alloc A failed");
+        GcObject* b = heap.alloc(GcObject::KIND_ARRAY, 1);
+        assert(b && "Scenario D: alloc B failed");
+
+        a->slots()[0] = Value::fromPtr(b->slots()); // A -> B
+        b->slots()[0] = Value::fromPtr(a->slots()); // B -> A
+
+        win[3] = Value::fromPtr(a->slots()); // only A is a root
+
+        const size_t freed = heap.collect(&ctx);
+
+        GcObject* a2   = GcObject::from_slots(win[3].asPtr());
+        GcObject* b2   = GcObject::from_slots(a2->slots()[0].asPtr());
+        GcObject* a3   = GcObject::from_slots(b2->slots()[0].asPtr());
+        const bool ok  = freed == 0
+                      && a3 == a2; // cycle pointer is consistent
+
+        std::cout << std::format("  Scenario D (cycle A->B->A):             {}\n",
+            ok ? "PASS" : "FAIL");
+        all_ok &= ok;
+    }
+
+    check(all_ok);
+}
+
+// =============================================================================
+// test_globals -- NEW: verify GlobalEnv behavior
+//
+// Scenario A: simple STORE_GLOBAL / LOAD_GLOBAL via bytecode
+// Scenario B: GlobalEnv slots are GC roots (survive GC)
+// =============================================================================
+inline void test_globals() {
+    std::cout << "=== globals ===\n";
+
+    Heap heap(64 * 1024);
+    GlobalEnv globals(heap);
+
+    const uint8_t g0 = globals.define();
+    const uint8_t g1 = globals.define();
+
+    bool all_ok = true;
+
+    // Scenario A ...
+    {
+        Assembler as;
+        as.label("main");
+        as.C2(OpCode::LOAD_CONST, 0, 42);
+        as.STORE_GLOBAL(g0, 0);
+        as.LOAD_GLOBAL(1, g0);
+
+        as.C2(OpCode::LOAD_CONST, 2, 7);
+        as.STORE_GLOBAL(g1, 2);
+        as.LOAD_GLOBAL(3, g1);
+
+        as.J(OpCode::HALT);
+
+        const auto bytecode = as.assemble();
+
+        Disassembler dis(bytecode.data(), bytecode.size());
+        dis.add_label(0, "main");
+        dis.print();
+
+        std::cout << "Running...\n";
+        try {
+            auto res   = execute(bytecode, &heap, &globals);
+            auto* regs = res.get_reg_base();
+
+            const int64_t r1  = regs[1].asSigned48();
+            const int64_t r3  = regs[3].asSigned48();
+            const int64_t gv0 = globals.get(g0).asSigned48();
+            const int64_t gv1 = globals.get(g1).asSigned48();
+
+            const bool ok = (r1 == 42) && (r3 == 7) && (gv0 == 42) && (gv1 == 7);
+
+            std::cout << std::format("globals[g0]={} r1={}\n", gv0, r1);
+            std::cout << std::format("globals[g1]={} r3={}\n", gv1, r3);
+            std::cout << std::format("  Scenario A (bytecode globals):         {}\n",
+                ok ? "PASS" : "FAIL");
+            all_ok &= ok;
+        }
+        catch (const std::exception& e) {
+            // Diagnostic only -- the failure is accounted for by the
+            // check(all_ok) at the end of this test (all_ok is set false here).
+            std::cerr << "Test failed: " << e.what() << "\n";
+            all_ok = false;
+        }
+    }
+
+    // Scenario B ...
+    {
+        VM_Resources res;
+        Value* win = res.get_reg_base();
+        for (size_t i = 0; i < 4; ++i) win[i] = Value{};
+
+        VM vm{};
+        vm.heap = &heap;
+
+        Context ctx{};
+        ctx.window_ptr         = win;
+        ctx.vm                 = &vm;
+        ctx.ret_stack_base     = res.get_ret_base();
+        ctx.ret_stack_ptr      = res.get_ret_base();
+        ctx.ret_stack_limit    = res.get_ret_base() + VM_Resources::RET_FRAME_COUNT;
+        ctx.frame_size_ptr     = res.get_frame_size_base();
+        ctx.current_frame_size = 0;
+
+        GcObject* obj = heap.alloc(GcObject::KIND_ARRAY, 2);
+        assert(obj && "Scenario B: alloc failed");
+        obj->slots()[0] = Value::fromSigned48(123);
+        obj->slots()[1] = Value::fromSigned48(456);
+
+        globals.set(g0, Value::fromPtr(obj->slots()));
+
+        const size_t used_before = heap.used();
+        const size_t freed       = heap.collect(&ctx);
+        const size_t used_after  = heap.used();
+
+        GcObject* obj2 = GcObject::from_slots(globals.get(g0).asPtr());
+        const bool ok =
+            globals.get(g0).isPtr() &&
+            obj2->slots()[0].asSigned48() == 123 &&
+            obj2->slots()[1].asSigned48() == 456 &&
+            freed == 0 &&
+            used_after == used_before;
+
+        std::cout << std::format("  Scenario B (globals are GC roots):      {}\n",
+            ok ? "PASS" : "FAIL");
+        all_ok &= ok;
+
+        globals.set(g0, Value{});
+    }
+
+    check(all_ok);
+}
+
+// =============================================================================
+// test_alloc -- verify ALLOC opcode and heap integration.
+//
+// Scenario A:
+//   - bytecode allocates an array object with 3 slots into r0
+//   - verify r0 is a heap pointer
+//   - verify all slots are initialized to Undefined
+// =============================================================================
+inline void test_alloc() {
+    std::cout << "=== alloc ===\n";
+
+    Heap heap(64 * 1024);
+
+    Assembler as;
+    as.label("main");
+    as.ALLOC(0, 3);      // r0 = new array[3]
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    Disassembler dis(bytecode.data(), bytecode.size());
+    dis.add_label(0, "main");
+    dis.print();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, &heap, nullptr);
+        auto* regs = res.get_reg_base();
+
+        const bool is_ptr = regs[0].isPtr();
+        GcObject* obj = is_ptr ? GcObject::from_slots(regs[0].asPtr()) : nullptr;
+
+        const bool ok =
+            is_ptr &&
+            obj &&
+            obj->slot_count() == 3 &&
+            obj->kind == GcObject::KIND_ARRAY &&
+            obj->slots()[0].isUndefined() &&
+            obj->slots()[1].isUndefined() &&
+            obj->slots()[2].isUndefined();
+
+        std::cout << std::format("r0 is ptr: {}\n", is_ptr ? "yes" : "no");
+        if (obj) {
+            std::cout << std::format("slot_count={} kind={}\n", obj->slot_count(), obj->kind);
+        }
+        std::cout << std::format("  Scenario A (ALLOC basic):               {}\n",
+            ok ? "PASS" : "FAIL");
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_alloc_gc_retry -- force ALLOC to fail once, trigger GC, then retry.
+//
+// Setup:
+//   - tiny heap: 64 bytes
+//   - allocate one live object ("survivor") and store it in a global root
+//   - allocate one dead tail object to fill the heap
+//
+// Then execute bytecode:
+//   ALLOC r0, 2
+//   HALT
+//
+// Expected:
+//   - first ALLOC attempt fails (heap full)
+//   - GC runs
+//   - survivor remains alive via GlobalEnv root
+//   - dead tail object is reclaimed
+//   - ALLOC retry succeeds and writes a fresh pointer to r0
+// =============================================================================
+inline void test_alloc_gc_retry() {
+    std::cout << "=== alloc_gc_retry ===\n";
+
+    // 64 bytes total:
+    //   survivor: 8 + 2*8 = 24
+    //   dead tail: 8 + 2*8 = 24
+    //   used before bytecode = 48
+    //   ALLOC(2) needs 24 -> first attempt fails (48 + 24 > 64)
+    Heap heap(64);
+    GlobalEnv globals(heap);
+    const uint8_t g0 = globals.define();
+
+    // Live object, kept alive through GlobalEnv
+    GcObject* survivor = heap.alloc(GcObject::KIND_ARRAY, 2);
+    assert(survivor && "test_alloc_gc_retry: survivor alloc failed");
+    survivor->slots()[0] = Value::fromSigned48(111);
+    survivor->slots()[1] = Value::fromSigned48(222);
+    globals.set(g0, Value::fromPtr(survivor->slots()));
+
+    // Dead tail object, not rooted
+    GcObject* dead_tail = heap.alloc(GcObject::KIND_ARRAY, 2);
+    assert(dead_tail && "test_alloc_gc_retry: dead_tail alloc failed");
+    dead_tail->slots()[0] = Value::fromSigned48(333);
+    dead_tail->slots()[1] = Value::fromSigned48(444);
+
+    Assembler as;
+    as.label("main");
+    as.ALLOC(0, 2); // must fail once, trigger GC, then succeed
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    Disassembler dis(bytecode.data(), bytecode.size());
+    dis.add_label(0, "main");
+    dis.print();
+
+    std::cout << "Running...\n";
+    try {
+        const size_t used_before = heap.used();
+
+        auto res   = execute(bytecode, &heap, &globals);
+        auto* regs = res.get_reg_base();
+
+        const size_t used_after = heap.used();
+
+        const bool alloc_ok = regs[0].isPtr();
+        GcObject*   new_obj  = alloc_ok ? GcObject::from_slots(regs[0].asPtr()) : nullptr;
+
+        const Value survivor_value = globals.get(g0);
+        const bool  survivor_ok    = survivor_value.isPtr();
+        GcObject*   survivor_after = survivor_ok ? GcObject::from_slots(survivor_value.asPtr()) : nullptr;
+
+        const bool ok =
+            alloc_ok &&
+            new_obj &&
+            new_obj->slot_count() == 2 &&
+            new_obj->kind == GcObject::KIND_ARRAY &&
+            new_obj->slots()[0].isUndefined() &&
+            new_obj->slots()[1].isUndefined() &&
+            survivor_ok &&
+            survivor_after &&
+            survivor_after->slots()[0].asSigned48() == 111 &&
+            survivor_after->slots()[1].asSigned48() == 222 &&
+            used_before == 48 &&
+            used_after == 48; // dead tail freed, new object allocated
+
+        std::cout << std::format("used_before={} used_after={}\n", used_before, used_after);
+        std::cout << std::format("survivor slots = {}, {}\n",
+            survivor_after ? survivor_after->slots()[0].asSigned48() : -1,
+            survivor_after ? survivor_after->slots()[1].asSigned48() : -1);
+        std::cout << std::format("  Scenario A (ALLOC gc-retry path):       {}\n",
+            ok ? "PASS" : "FAIL");
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_alloc_global_root -- ALLOC object, store it in a global, then force GC.
+//
+// Scenario A:
+//   - bytecode allocates an array object with 2 slots into r0
+//   - bytecode stores r0 into globals[g0]
+//   - after execute(), C++ writes payload values into the object
+//   - a manual GC run must keep the object alive via the global root
+// =============================================================================
+inline void test_alloc_global_root() {
+    std::cout << "=== alloc_global_root ===\n";
+
+    Heap heap(64 * 1024);
+    GlobalEnv globals(heap);
+    const uint8_t g0 = globals.define();
+
+    Assembler as;
+    as.label("main");
+    as.ALLOC(0, 2);          // r0 = new array[2]
+    as.STORE_GLOBAL(g0, 0);  // globals[g0] = r0
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    Disassembler dis(bytecode.data(), bytecode.size());
+    dis.add_label(0, "main");
+    dis.print();
+
+    std::cout << "Running...\n";
+    try {
+        auto res = execute(bytecode, &heap, &globals);
+        (void)res;
+
+        const bool global_is_ptr = globals.get(g0).isPtr();
+        GcObject* obj = global_is_ptr ? GcObject::from_slots(globals.get(g0).asPtr()) : nullptr;
+
+        // Write recognizable payload after bytecode execution so we can verify
+        // survival across a later GC cycle.
+        if (obj) {
+            obj->slots()[0] = Value::fromSigned48(123);
+            obj->slots()[1] = Value::fromSigned48(456);
+        }
+
+        VM_Resources gc_res;
+        Value* win = gc_res.get_reg_base();
+        for (size_t i = 0; i < 4; ++i) win[i] = Value{};
+
+        VM vm{};
+        vm.heap = &heap;
+
+        Context ctx{};
+        ctx.window_ptr         = win;
+        ctx.vm                 = &vm;
+        ctx.ret_stack_base     = gc_res.get_ret_base();
+        ctx.ret_stack_ptr      = gc_res.get_ret_base();
+        ctx.ret_stack_limit    = gc_res.get_ret_base() + VM_Resources::RET_FRAME_COUNT;
+        ctx.frame_size_ptr     = gc_res.get_frame_size_base();
+        ctx.current_frame_size = 0;
+
+        const size_t used_before = heap.used();
+        const size_t freed       = heap.collect(&ctx);
+        const size_t used_after  = heap.used();
+
+        const bool survived = globals.get(g0).isPtr();
+        GcObject* obj_after = survived ? GcObject::from_slots(globals.get(g0).asPtr()) : nullptr;
+
+        // Copying GC: the object is evacuated, so the pre-collection handle
+        // `obj` is now a stale from-space address. Everything is inspected via
+        // `obj_after`, re-fetched from the (forwarded) global root.
+        const bool ok =
+            global_is_ptr &&
+            obj &&                 // allocation succeeded before the collection
+            survived &&
+            obj_after &&
+            obj_after->slot_count() == 2 &&
+            obj_after->kind == GcObject::KIND_ARRAY &&
+            obj_after->slots()[0].asSigned48() == 123 &&
+            obj_after->slots()[1].asSigned48() == 456 &&
+            freed == 0 &&
+            used_after == used_before;
+
+        std::cout << std::format("used_before={} used_after={} freed={}\n",
+            used_before, used_after, freed);
+        if (obj_after) {
+            std::cout << std::format("survivor slots = {}, {}\n",
+                obj_after->slots()[0].asSigned48(),
+                obj_after->slots()[1].asSigned48());
+        }
+        std::cout << std::format("  Scenario A (ALLOC survives via global): {}\n",
+            ok ? "PASS" : "FAIL");
+        check(ok);
+
+        globals.set(g0, Value{});
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_string_gc -- verify KIND_STRING allocation and GC behavior//
+// Scenario A:
+//   - allocate one live string and keep it alive through a global root
+//   - allocate one dead tail string with no root
+//   - run GC
+//   - verify the live string survives with intact bytes
+//   - verify the dead tail string is reclaimed
+// =============================================================================
+inline void test_string_gc() {
+    std::cout << "=== string_gc ===\n";
+
+    Heap heap(64 * 1024);
+    GlobalEnv globals(heap);
+    const uint8_t g0 = globals.define();
+
+    GcObject* live = heap.alloc_string("hello");
+    assert(live && "test_string_gc: live string alloc failed");
+    globals.set(g0, Value::fromPtr(live->bytes()));
+
+    GcObject* dead = heap.alloc_string("dead");
+    assert(dead && "test_string_gc: dead string alloc failed");
+    const size_t dead_total = dead->padded_total_bytes();
+
+    VM_Resources res;
+    Value* win = res.get_reg_base();
+    for (size_t i = 0; i < 4; ++i) win[i] = Value{};
+
+    VM vm{};
+    vm.heap = &heap;
+
+    Context ctx{};
+    ctx.window_ptr         = win;
+    ctx.vm                 = &vm;
+    ctx.ret_stack_base     = res.get_ret_base();
+    ctx.ret_stack_ptr      = res.get_ret_base();
+    ctx.ret_stack_limit    = res.get_ret_base() + VM_Resources::RET_FRAME_COUNT;
+    ctx.frame_size_ptr     = res.get_frame_size_base();
+    ctx.current_frame_size = 0;
+
+    const size_t used_before = heap.used();
+    const size_t freed       = heap.collect(&ctx);
+    const size_t used_after  = heap.used();
+
+    const bool survived = globals.get(g0).isPtr();
+    GcObject* live_after = survived ? GcObject::from_slots(globals.get(g0).asPtr()) : nullptr;
+
+    const bool ok =
+        survived &&
+        live_after &&
+        live_after->kind == GcObject::KIND_STRING &&
+        live_after->string_length() == 5 &&
+        std::string_view(live_after->bytes(), live_after->string_length()) == "hello" &&
+        freed == dead_total &&
+        used_after + freed == used_before;
+
+    std::cout << std::format("used_before={} used_after={} freed={}\n",
+        used_before, used_after, freed);
+    if (live_after) {
+        std::cout << std::format("string_len={} bytes=\"{}\"\n",
+            live_after->string_length(),
+            std::string_view(live_after->bytes(), live_after->string_length()));
+    }
+    std::cout << std::format("  Scenario A (rooted string survives):    {}\n",
+        ok ? "PASS" : "FAIL");
+    check(ok);
+
+    globals.set(g0, Value{});
+}
+
+// =============================================================================
+// test_string_pool_policy -- verify content-based hashing/equality for strings.
+//
+// Scenario A:
+//   - two different string objects with the same bytes compare equal
+//   - equal strings produce the same hash
+//   - different strings compare unequal
+// =============================================================================
+inline void test_string_pool_policy() {
+    std::cout << "=== string_pool_policy ===\n";
+
+    Heap heap(64 * 1024);
+
+    GcObject* hello_a = heap.alloc_string("hello");
+    GcObject* hello_b = heap.alloc_string("hello");
+    GcObject* world   = heap.alloc_string("world");
+
+    assert(hello_a && "hello_a alloc failed");
+    assert(hello_b && "hello_b alloc failed");
+    assert(world   && "world alloc failed");
+
+    Value v_hello_a = Value::fromPtr(hello_a->bytes());
+    Value v_hello_b = Value::fromPtr(hello_b->bytes());
+    Value v_world   = Value::fromPtr(world->bytes());
+
+    const uint32_t h_a = StringPoolPolicy::hash(v_hello_a);
+    const uint32_t h_b = StringPoolPolicy::hash(v_hello_b);
+    const uint32_t h_w = StringPoolPolicy::hash(v_world);
+
+    const bool ok =
+        StringPoolPolicy::isEqual(v_hello_a, v_hello_b) &&
+        !StringPoolPolicy::isEqual(v_hello_a, v_world) &&
+        h_a == h_b;
+
+    std::cout << std::format("hash(hello_a)={} hash(hello_b)={} hash(world)={}\n", h_a, h_b, h_w);
+    std::cout << std::format("  Scenario A (content hash/equality):     {}\n",
+        ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+// =============================================================================
+// test_string_hash_table -- verify HashTable<StringPoolPolicy>.
+//
+// Scenario A:
+//   - insert with one string object
+//   - lookup with a different string object of same content succeeds
+//   - lookup with different content fails
+//   - remove via same-content different object succeeds
+// =============================================================================
+inline void test_string_hash_table() {
+    std::cout << "=== string_hash_table ===\n";
+
+    Heap heap(64 * 1024);
+
+    GcObject* hello_a = heap.alloc_string("hello");
+    GcObject* hello_b = heap.alloc_string("hello");
+    GcObject* world   = heap.alloc_string("world");
+
+    assert(hello_a && "hello_a alloc failed");
+    assert(hello_b && "hello_b alloc failed");
+    assert(world   && "world alloc failed");
+
+    Value k_hello_a = Value::fromPtr(hello_a->bytes());
+    Value k_hello_b = Value::fromPtr(hello_b->bytes());
+    Value k_world   = Value::fromPtr(world->bytes());
+
+    HashTable<StringPoolPolicy> table;
+
+    table.set(k_hello_a, Value::fromSigned48(123));
+
+    const Value found_same_content = table.getOrUndefined(k_hello_b);
+    const Value found_other        = table.getOrUndefined(k_world);
+
+    const bool lookup_ok =
+        found_same_content.isInt() &&
+        found_same_content.asSigned48() == 123 &&
+        found_other.isUndefined();
+
+    const bool remove_ok = table.remove(k_hello_b);
+    const Value after_remove = table.getOrUndefined(k_hello_a);
+
+    const bool ok =
+        lookup_ok &&
+        remove_ok &&
+        after_remove.isUndefined();
+
+    std::cout << std::format("lookup(hello_b) = {}\n",
+        found_same_content.isInt() ? found_same_content.asSigned48() : -1);
+    std::cout << std::format("remove(hello_b) = {}\n", remove_ok ? "true" : "false");
+    std::cout << std::format("  Scenario A (string hash table):         {}\n",
+        ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+// =============================================================================
+// test_string_interner -- verify content-based string interning.
+//
+// Scenario A:
+//   - intern "hello" twice
+//   - verify both returned Values are identical
+//   - verify heap usage does not grow on the second intern
+//   - intern "world" and verify it is different
+//   - verify lookup works for both present and absent strings
+// =============================================================================
+inline void test_string_interner() {
+    std::cout << "=== string_interner ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    const size_t used0 = heap.used();
+
+    Value hello_a = interner.intern("hello", heap);
+    const size_t used1 = heap.used();
+
+    Value hello_b = interner.intern("hello", heap);
+    const size_t used2 = heap.used();
+
+    Value world = interner.intern("world", heap);
+    const size_t used3 = heap.used();
+
+    Value found_hello = interner.find("hello");
+    Value found_world = interner.find("world");
+    Value found_absent = interner.find("absent");
+
+    const bool ok =
+        hello_a.isPtr() &&
+        hello_b.isPtr() &&
+        world.isPtr() &&
+        hello_a == hello_b &&
+        hello_a != world &&
+        used1 > used0 &&
+        used2 == used1 &&
+        used3 > used2 &&
+        found_hello == hello_a &&
+        found_world == world &&
+        found_absent.isUndefined();
+
+    std::cout << std::format("used0={} used1={} used2={} used3={}\n",
+        used0, used1, used2, used3);
+    std::cout << std::format("hello_a == hello_b: {}\n", (hello_a == hello_b) ? "yes" : "no");
+    std::cout << std::format("hello_a == world:   {}\n", (hello_a == world) ? "yes" : "no");
+    std::cout << std::format("  Scenario A (string interning):          {}\n",
+        ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+// =============================================================================
+// test_string_interner_gc_root -- interned strings act as strong GC roots.
+//
+// Scenario A:
+//   - intern "hello"
+//   - keep it only in the StringInterner
+//   - run GC with no register roots and no global roots
+//   - verify the string survives
+// =============================================================================
+inline void test_string_interner_gc_root() {
+    std::cout << "=== string_interner_gc_root ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    Value hello = interner.intern("hello", heap);
+    const size_t used_before = heap.used();
+
+    VM_Resources res;
+    Value* win = res.get_reg_base();
+    for (size_t i = 0; i < 4; ++i) {
+        win[i] = Value{};
+    }
+
+    VM vm{};
+    vm.heap     = &heap;
+    vm.interner = &interner;   // interner is a strong root: collect() reaches it via ctx->vm
+
+    Context ctx{};
+    ctx.window_ptr         = win;
+    ctx.vm                 = &vm;
+    ctx.ret_stack_base     = res.get_ret_base();
+    ctx.ret_stack_ptr      = res.get_ret_base();
+    ctx.ret_stack_limit    = res.get_ret_base() + VM_Resources::RET_FRAME_COUNT;
+    ctx.frame_size_ptr     = res.get_frame_size_base();
+    ctx.current_frame_size = 0;
+
+    const size_t freed = heap.collect(&ctx);
+    const size_t used_after = heap.used();
+
+    Value found = interner.find("hello");
+    const bool survived = found.isPtr();
+    GcObject* obj = survived ? GcObject::from_slots(found.asPtr()) : nullptr;
+
+    // Copying GC: the interned string is evacuated and the interner table is
+    // forwarded, so the post-collection handle `found` differs in bits from the
+    // stale pre-collection `hello` (identity is preserved only among rooted
+    // references, which the local `hello` is not). Survival is proven by content
+    // via the re-fetched `found`.
+    const bool ok =
+        hello.isPtr() &&
+        survived &&
+        obj &&
+        obj->kind == GcObject::KIND_STRING &&
+        obj->string_length() == 5 &&
+        std::string_view(obj->bytes(), obj->string_length()) == "hello" &&
+        freed == 0 &&
+        used_after == used_before;
+
+    std::cout << std::format("used_before={} used_after={} freed={}\n",
+        used_before, used_after, freed);
+    if (obj) {
+        std::cout << std::format("string_len={} bytes=\"{}\"\n",
+            obj->string_length(),
+            std::string_view(obj->bytes(), obj->string_length()));
+    }
+    std::cout << std::format("  Scenario A (interner is strong root):   {}\n",
+        ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+// =============================================================================
+// test_string_interner_gc_retry -- force intern() to fail once, trigger GC,
+// then retry successfully.
+//
+// Setup:
+//   - tiny heap: 32 bytes
+//   - intern "hello" first (16 bytes total, padded up from 14)
+//   - allocate one dead tail string "dead" (16 bytes total, padded up from 13)
+//   - used before retry = 32
+//   - interning "world" needs 16 bytes -> first attempt fails
+//
+// Expected:
+//   - GC runs
+//   - "hello" survives because the interner is a strong root source
+//   - dead tail string is reclaimed
+//   - "world" allocation succeeds on retry
+// =============================================================================
+inline void test_string_interner_gc_retry() {
+    std::cout << "=== string_interner_gc_retry ===\n";
+
+    Heap heap(32);
+    StringInterner interner;
+
+    // Interned live string
+    VM_Resources res;
+    Value* win = res.get_reg_base();
+    for (size_t i = 0; i < 4; ++i) {
+        win[i] = Value{};
+    }
+
+    VM vm{};
+    vm.heap     = &heap;
+    vm.interner = &interner;   // interner is a strong root: collect() reaches it via ctx->vm
+
+    Context ctx{};
+    ctx.window_ptr         = win;
+    ctx.vm                 = &vm;
+    ctx.ret_stack_base     = res.get_ret_base();
+    ctx.ret_stack_ptr      = res.get_ret_base();
+    ctx.ret_stack_limit    = res.get_ret_base() + VM_Resources::RET_FRAME_COUNT;
+    ctx.frame_size_ptr     = res.get_frame_size_base();
+    ctx.current_frame_size = 0;
+
+    Value hello = interner.intern("hello", heap, &ctx);
+
+    // Dead tail string, not interned and not rooted
+    GcObject* dead_tail = heap.alloc_string("dead");
+    assert(dead_tail && "test_string_interner_gc_retry: dead_tail alloc failed");
+    const size_t dead_total = dead_tail->padded_total_bytes();
+
+    const size_t used_before = heap.used();
+
+    Value world = interner.intern("world", heap, &ctx);
+    const size_t used_after = heap.used();
+
+    Value hello_after = interner.find("hello");
+    Value world_after = interner.find("world");
+
+    const bool hello_ok = hello_after.isPtr();
+    const bool world_ok = world_after.isPtr();
+
+    GcObject* hello_obj = hello_ok ? GcObject::from_slots(hello_after.asPtr()) : nullptr;
+    GcObject* world_obj = world_ok ? GcObject::from_slots(world_after.asPtr()) : nullptr;
+
+    // Copying GC: the GC that fires inside intern("world") evacuates "hello",
+    // so the pre-collection handle `hello` is stale by design; `hello_after`
+    // (re-fetched post-collection) is the live, forwarded pointer. `world` is
+    // returned by the retry allocation after that GC, so it is already current
+    // and `world_after == world` still holds. Identity between the two live
+    // interned strings is checked via `hello_after != world_after`.
+    const bool ok =
+        hello.isPtr() &&
+        world.isPtr() &&
+        world_after == world &&
+        hello_after != world_after &&
+        hello_obj &&
+        world_obj &&
+        hello_obj->kind == GcObject::KIND_STRING &&
+        world_obj->kind == GcObject::KIND_STRING &&
+        std::string_view(hello_obj->bytes(), hello_obj->string_length()) == "hello" &&
+        std::string_view(world_obj->bytes(), world_obj->string_length()) == "world" &&
+        used_before == 32 &&
+        used_after == (16 + 16); // "hello" survived, "dead" freed, "world" added (padded)
+
+    std::cout << std::format("used_before={} used_after={} dead_total={}\n",
+        used_before, used_after, dead_total);
+    std::cout << std::format("hello survives: {} world interned: {}\n",
+        hello_ok ? "yes" : "no", world_ok ? "yes" : "no");
+    std::cout << std::format("  Scenario A (interner gc-retry path):    {}\n",
+        ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+// =============================================================================
+// Cheney copying-collector regression tests.
+//
+// These pin down the three properties that distinguish the copying collector
+// from the previous suffix-only bump allocator:
+//   1. test_gc_moves            -- survivors are physically relocated, with
+//                                  their contents intact and roots rewritten.
+//   2. test_gc_interleaved_reclaim -- an interior dead object between two live
+//                                  ones is reclaimed (the old allocator could
+//                                  only reclaim a trailing suffix, so this test
+//                                  fails under it and passes under Cheney).
+//   3. test_gc_root_convergence -- one object referenced from two roots (a
+//                                  register and the interner) forwards to a
+//                                  single address; identity is preserved among
+//                                  live references.
+// (Cycle-through-a-move and graph-through-a-move are already covered by
+// test_gc scenarios C and D, which assert pointer consistency after the copy.)
+// =============================================================================
+
+// Small helper: fresh VM_Resources plus a factory for a bare Context with
+// `frame_size` live register roots. The caller writes roots into
+// win[0..frame_size). Context is built on demand (not stored as a member) so
+// its alignas(64) does not pad this helper (MSVC C4324).
+struct GcTestCtx {
+    VM_Resources res;
+    VM           vm;           // heap wired in the ctor; tests may set .interner etc.
+    Heap*        heap;
+    uint8_t      frame_size;
+    Value*       win;
+
+    explicit GcTestCtx(Heap* h, uint8_t fs) : heap(h), frame_size(fs), win(res.get_reg_base()) {
+        vm.heap = h;
+        for (size_t i = 0; i < 64; ++i) win[i] = Value{};
+    }
+
+    [[nodiscard]] Context context() {
+        Context ctx{};
+        ctx.window_ptr         = win;
+        ctx.vm                 = &vm;
+        ctx.ret_stack_base     = res.get_ret_base();
+        ctx.ret_stack_ptr      = res.get_ret_base();
+        ctx.ret_stack_limit    = res.get_ret_base() + VM_Resources::RET_FRAME_COUNT;
+        ctx.frame_size_ptr     = res.get_frame_size_base();
+        ctx.current_frame_size = frame_size;
+        return ctx;
+    }
+};
+
+// =============================================================================
+// test_string_alignment -- regression guard for the 8-byte footprint padding.
+//
+// Odd-length KIND_STRING payloads (e.g. "a" -> 10 bytes total, "hello" -> 14)
+// are not multiples of 8. Without footprint padding the *next* object's header
+// would start misaligned, violating static_assert(alignof(GcObject) == 8).
+// This test allocates an interleaved string/array mix and asserts:
+//   - every object header is 8-aligned (bump stride padded), both the object
+//     directly following an odd-length string and the bump cursor itself;
+//   - the gap between an odd string and the next header is the padded footprint
+//     (16, not the unpadded 10) -- the direct guard the fix exists for;
+//   - the same holds AFTER a collect(), i.e. the copy/scan stride is padded too,
+//     with string contents preserved through the move.
+// =============================================================================
+inline void test_string_alignment() {
+    std::cout << "=== string_alignment ===\n";
+
+    auto aligned8 = [](const void* p) noexcept {
+        return (reinterpret_cast<uintptr_t>(p) % 8) == 0;
+    };
+
+    Heap heap(64 * 1024);
+    GcTestCtx t(&heap, 5); // all five objects are rooted -> all survive
+
+    // Interleave odd-length strings with arrays so a misaligned header would
+    // surface immediately on the object that follows each string.
+    GcObject* s0 = heap.alloc_string("a");            // payload 2  -> padded 16
+    GcObject* a0 = heap.alloc(GcObject::KIND_ARRAY, 1); // 8 + 8   =  16
+    GcObject* s1 = heap.alloc_string("hello");        // payload 6  -> padded 16
+    GcObject* a1 = heap.alloc(GcObject::KIND_ARRAY, 2); // 8 + 16  =  24
+    GcObject* s2 = heap.alloc_string("xyz");          // payload 4  -> padded 16
+    assert(s0 && a0 && s1 && a1 && s2 && "string_alignment: alloc failed");
+
+    const bool pre_aligned =
+        aligned8(s0) && aligned8(a0) && aligned8(s1) && aligned8(a1) && aligned8(s2) &&
+        (heap.used() % 8 == 0);
+
+    // The object right after odd-length "a" must sit at s0 + padded footprint 16,
+    // not the unpadded 10.
+    const size_t gap_after_odd_string =
+        reinterpret_cast<uintptr_t>(a0) - reinterpret_cast<uintptr_t>(s0);
+    const bool gap_padded = (gap_after_odd_string == 16);
+
+    // Root all five survivors, then relocate them through a collection.
+    t.win[0] = Value::fromPtr(s0->payload());
+    t.win[1] = Value::fromPtr(a0->payload());
+    t.win[2] = Value::fromPtr(s1->payload());
+    t.win[3] = Value::fromPtr(a1->payload());
+    t.win[4] = Value::fromPtr(s2->payload());
+
+    Context ctx = t.context();
+    heap.collect(&ctx);
+
+    GcObject* s0b = GcObject::from_slots(t.win[0].asPtr());
+    GcObject* a0b = GcObject::from_slots(t.win[1].asPtr());
+    GcObject* s1b = GcObject::from_slots(t.win[2].asPtr());
+    GcObject* a1b = GcObject::from_slots(t.win[3].asPtr());
+    GcObject* s2b = GcObject::from_slots(t.win[4].asPtr());
+
+    const bool post_aligned =
+        aligned8(s0b) && aligned8(a0b) && aligned8(s1b) && aligned8(a1b) && aligned8(s2b) &&
+        (heap.used() % 8 == 0);
+
+    const bool contents_ok =
+        s1b->kind == GcObject::KIND_STRING &&
+        s1b->string_length() == 5 &&
+        std::string_view(s1b->bytes(), s1b->string_length()) == "hello" &&
+        std::string_view(s2b->bytes(), s2b->string_length()) == "xyz";
+
+    const bool ok = pre_aligned && gap_padded && post_aligned && contents_ok;
+
+    std::cout << std::format("gap_after_odd_string={} (expect 16) used={}\n",
+        gap_after_odd_string, heap.used());
+    std::cout << std::format("  Scenario A (headers 8-aligned pre+post GC): {}\n",
+        ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+inline void test_gc_moves() {
+    std::cout << "=== gc_moves ===\n";
+
+    Heap heap(64 * 1024);
+    GcTestCtx t(&heap, 1); // r0 is the only live root
+
+    GcObject* a = heap.alloc(GcObject::KIND_ARRAY, 2);
+    assert(a && "gc_moves: alloc failed");
+    a->slots()[0] = Value::fromSigned48(7);
+    a->slots()[1] = Value::fromSigned48(8);
+    t.win[0] = Value::fromPtr(a->slots());
+
+    Context      ctx         = t.context();
+    void*        addr_before = t.win[0].asPtr();
+    const size_t used_before = heap.used();
+    const size_t freed       = heap.collect(&ctx);
+    const size_t used_after  = heap.used();
+    void*        addr_after  = t.win[0].asPtr();
+
+    GcObject* a2 = GcObject::from_slots(addr_after);
+
+    const bool ok =
+        t.win[0].isPtr() &&
+        addr_after != addr_before &&   // the survivor was physically relocated
+        a2->slots()[0].asSigned48() == 7 &&
+        a2->slots()[1].asSigned48() == 8 &&
+        freed == 0 &&
+        used_after == used_before;
+
+    std::cout << std::format("addr_before={} addr_after={} moved={} used_before={} used_after={}\n",
+        addr_before, addr_after, addr_before != addr_after, used_before, used_after);
+    std::cout << std::format("  Scenario A (survivor relocated, intact):  {}\n",
+        ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+// =============================================================================
+// test_verify_heap -- positive exercise for the Debug-only Heap::verify_heap()
+// post-collection self-check. A clean Debug run IS the guard: verify_heap()
+// runs inside every collect() below (both the implicit ones from a full
+// semispace and the explicit ones here) and aborts on any inconsistency. This
+// test builds a mixed, cross-linked live set (array + struct + closure +
+// odd-length string, with pointer links and an array<->closure cycle), churns
+// unrooted garbage, forces repeated collections via a small semispace, and
+// confirms the survivors stay intact by identity + values across every move.
+// (KIND_MAP / KIND_VEC / KIND_BYTES headers are exercised by their own
+// test_map / test_vec / test_bytes, which also collect and thus verify.)
+// =============================================================================
+inline void test_verify_heap() {
+    std::cout << "=== verify_heap ===\n";
+
+    Heap heap(8 * 1024); // small -> frequent collections
+    GcTestCtx t(&heap, 4); // r0 array, r1 struct, r2 closure, r3 string
+    Context ctx = t.context();
+
+    // string -> r3 (odd length -> footprint padded; exercises pass-1 sizing).
+    GcObject* s = heap.alloc_string_gc("odd-length!", &ctx);
+    t.win[3] = Value::fromPtr(s->bytes());
+
+    // struct { field0: string, field1: int } -> r1
+    GcObject* st = heap.alloc_object_gc(/*type_id*/ 7, 2, &ctx);
+    st->slots()[0] = t.win[3];                    // struct.field0 -> string
+    st->slots()[1] = Value::fromSigned48(42);
+    t.win[1] = Value::fromPtr(st->slots());
+
+    // array[2] = { struct, <closure> } -> r0  (array[1] wired below to close a cycle)
+    GcObject* arr = heap.alloc_slots_gc(GcObject::KIND_ARRAY, 2, &ctx);
+    arr->slots()[0] = t.win[1];                   // array[0] -> struct
+    t.win[0] = Value::fromPtr(arr->slots());
+
+    // closure (1 capture) capturing the array -> r2
+    GcObject* clo = heap.alloc_closure_gc(/*fn_id*/ 3, 1, &ctx);
+    clo->slots()[0] = t.win[0];                   // capture -> array
+    t.win[2] = Value::fromPtr(clo->slots());
+
+    // Close the array<->closure cycle. Re-fetch the array through its root (the
+    // closure alloc above may have collected and relocated it).
+    GcObject::from_slots(t.win[0].asPtr())->slots()[1] = t.win[2]; // array[1] -> closure
+
+    int  collections = 0;
+    bool ok          = true;
+    for (int i = 0; i < 500; ++i) {
+        // Unrooted garbage -> interior holes for the next collect. alloc_*_gc
+        // collects internally when the small semispace fills (verify runs there).
+        (void)heap.alloc_slots_gc(GcObject::KIND_ARRAY, 2, &ctx);
+        (void)heap.alloc_string_gc("garbage", &ctx);
+
+        if ((i % 50) == 0) {
+            heap.collect(&ctx); // explicit collection -> verify_heap() again
+            ++collections;
+
+            // Re-fetch every survivor through its (moved) root and check the
+            // whole graph: identities, the cycle, header side-data, and values.
+            GcObject* a2  = GcObject::from_slots(t.win[0].asPtr());
+            GcObject* st2 = GcObject::from_slots(t.win[1].asPtr());
+            GcObject* c2  = GcObject::from_slots(t.win[2].asPtr());
+            GcObject* s2  = GcObject::from_slots(t.win[3].asPtr());
+
+            ok = ok
+                && a2->slots()[0].isPtr()  && GcObject::from_slots(a2->slots()[0].asPtr()) == st2  // array[0] -> struct
+                && a2->slots()[1].isPtr()  && GcObject::from_slots(a2->slots()[1].asPtr()) == c2   // array[1] -> closure
+                && c2->slots()[0].isPtr()  && GcObject::from_slots(c2->slots()[0].asPtr()) == a2   // closure cap -> array (cycle)
+                && st2->slots()[0].isPtr() && GcObject::from_slots(st2->slots()[0].asPtr()) == s2  // struct.f0 -> string
+                && st2->slots()[1].asSigned48() == 42
+                && st2->object_type_id() == 7
+                && c2->closure_fn_id() == 3
+                && std::string_view(s2->bytes(), s2->string_length()) == "odd-length!";
+        }
+    }
+
+    std::cout << std::format("  collections={} survivors intact + verify_heap clean: {}\n",
+        collections, ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+inline void test_gc_interleaved_reclaim() {
+    std::cout << "=== gc_interleaved_reclaim ===\n";
+
+    Heap heap(64 * 1024);
+    GcTestCtx t(&heap, 2); // r0, r1 are live roots
+
+    // A (live) | B (dead, interior hole) | C (live)
+    GcObject* a = heap.alloc(GcObject::KIND_ARRAY, 2);       // 8 + 16 = 24
+    GcObject* b = heap.alloc(GcObject::KIND_ARRAY, 3);       // 8 + 24 = 32 (dead)
+    GcObject* c = heap.alloc(GcObject::KIND_ARRAY, 1);       // 8 +  8 = 16
+    assert(a && b && c && "interleaved: alloc failed");
+
+    a->slots()[0] = Value::fromSigned48(100);
+    a->slots()[1] = Value::fromSigned48(101);
+    b->slots()[0] = Value::fromSigned48(999); // no root -> garbage
+    c->slots()[0] = Value::fromSigned48(200);
+
+    t.win[0] = Value::fromPtr(a->slots());
+    t.win[1] = Value::fromPtr(c->slots());
+    // b is deliberately unrooted -- it is an interior hole between A and C.
+
+    const size_t size_a = a->total_bytes();
+    const size_t size_b = b->total_bytes();
+    const size_t size_c = c->total_bytes();
+
+    Context      ctx         = t.context();
+    const size_t used_before = heap.used();
+    const size_t freed       = heap.collect(&ctx);
+    const size_t used_after  = heap.used();
+
+    // Prove the reclaimed interior space is actually reusable: allocate again.
+    GcObject* d = heap.alloc(GcObject::KIND_ARRAY, 2);
+    const bool reused = (d != nullptr);
+
+    GcObject* a2 = GcObject::from_slots(t.win[0].asPtr());
+    GcObject* c2 = GcObject::from_slots(t.win[1].asPtr());
+
+    const bool ok =
+        used_before == size_a + size_b + size_c &&
+        used_after  == size_a + size_c &&   // <-- interior B reclaimed; FAILS on suffix-only
+        freed       == size_b &&
+        a2->slots()[0].asSigned48() == 100 &&
+        a2->slots()[1].asSigned48() == 101 &&
+        c2->slots()[0].asSigned48() == 200 &&
+        reused;
+
+    std::cout << std::format("used_before={} used_after={} freed={} (interior B={})\n",
+        used_before, used_after, freed, size_b);
+    std::cout << std::format("  Scenario A (interior hole reclaimed):     {}\n",
+        ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+inline void test_gc_root_convergence() {
+    std::cout << "=== gc_root_convergence ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+    GcTestCtx t(&heap, 1); // r0 holds the shared string as a register root
+    t.vm.interner = &interner; // interner is a strong root: collect() reaches it via ctx->vm
+
+    // "shared" is referenced from TWO roots: a register AND the interner table.
+    Context ctx = t.context();
+    Value shared = interner.intern("shared", heap, &ctx);
+    t.win[0] = shared;
+
+    heap.collect(&ctx);
+
+    // Both roots must have converged onto the single relocated object.
+    Value from_reg     = t.win[0];
+    Value from_interner = interner.find("shared");
+
+    const bool ok =
+        from_reg.isPtr() &&
+        from_interner.isPtr() &&
+        from_reg.asPtr() == from_interner.asPtr() && // idempotent forward -> one address
+        std::string_view(GcObject::from_slots(from_reg.asPtr())->bytes(), 6) == "shared";
+
+    std::cout << std::format("reg={} interner={} converged={}\n",
+        from_reg.asPtr(), from_interner.asPtr(), from_reg.asPtr() == from_interner.asPtr());
+    std::cout << std::format("  Scenario A (roots converge on one copy):  {}\n",
+        ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+// =============================================================================
+// test_gc_grow_for_oversized -- a single allocation larger than the whole
+// (near-empty) semispace must succeed by growing the heap. This is the case
+// that occupancy-driven growth alone misses: live is ~0, so the post-GC growth
+// threshold never trips, yet the object still does not fit. alloc_slots_gc's
+// last-resort grow_to_fit step is what closes it (see the retry ladder).
+// =============================================================================
+inline void test_gc_grow_for_oversized() {
+    std::cout << "=== gc_grow_for_oversized ===\n";
+
+    Heap heap(64); // tiny 64-byte semispace
+    GcTestCtx t(&heap, 1);
+    Context ctx = t.context();
+
+    const size_t cap_before = heap.capacity();
+
+    // 100 slots -> 8 + 800 = 808 bytes, far larger than the 64-byte semispace.
+    GcObject* big = heap.alloc_slots_gc(GcObject::KIND_ARRAY, 100, &ctx);
+    const bool allocated = (big != nullptr);
+    if (allocated) {
+        for (uint32_t i = 0; i < 100; ++i)
+            big->slots()[i] = Value::fromSigned48(static_cast<int64_t>(i));
+        t.win[0] = Value::fromPtr(big->slots()); // root it
+    }
+
+    const bool ok =
+        allocated &&
+        big->slot_count() == 100 &&
+        big->slots()[0].asSigned48() == 0 &&
+        big->slots()[99].asSigned48() == 99 &&
+        heap.capacity() >= big->total_bytes() &&
+        heap.capacity() > cap_before; // the heap actually grew
+
+    std::cout << std::format("cap_before={} cap_after={} obj_bytes={}\n",
+        cap_before, heap.capacity(), allocated ? big->total_bytes() : 0);
+    std::cout << std::format("  Scenario A (oversized alloc grows heap):  {}\n",
+        ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+// =============================================================================
+// test_debug_dump -- smoke/regression test for the vm_dbg inspection helpers
+// (vmcore/Debug.h): a heap holding a string, a Value array, and a fixed-shape
+// struct is rendered to a string buffer, together with the register window that
+// points at them. It asserts the dumps do not crash and surface the expected
+// fields (kinds, the string bytes, a slot Value, the struct's type id, the
+// register Ptr lines). Not a correctness proof of the VM -- a guard that the
+// debug aids keep working (and a live usage example) as the heap layout evolves.
+// =============================================================================
+inline void test_debug_dump() {
+    std::cout << "=== debug_dump ===\n";
+
+    Heap heap(64 * 1024);
+    GcTestCtx t(&heap, 3); // r0..r2 hold the three objects
+
+    GcObject* s = heap.alloc_string("hello");
+    GcObject* a = heap.alloc(GcObject::KIND_ARRAY, 2);
+    GcObject* o = heap.alloc_object(/*type_id=*/7, /*n_fields=*/1);
+    assert(s && a && o && "debug_dump: alloc failed");
+    a->slots()[0] = Value::fromSigned48(42);
+    a->slots()[1] = Value::fromDouble(3.5);
+    o->slots()[0] = Value::fromBool(true);
+
+    t.win[0] = Value::fromPtr(s->bytes());
+    t.win[1] = Value::fromPtr(a->slots());
+    t.win[2] = Value::fromPtr(o->slots());
+
+    std::ostringstream reg_os, heap_os;
+    Context ctx = t.context();
+    vm_dbg::dump_registers(ctx, reg_os);
+    vm_dbg::dump_heap(heap, heap_os);
+
+    const std::string reg = reg_os.str();
+    const std::string hp  = heap_os.str();
+    std::cout << reg << hp;
+
+    const bool ok =
+        reg.find("r0 = Ptr(") != std::string::npos &&
+        reg.find("r2 = Ptr(") != std::string::npos &&
+        hp.find("STRING")     != std::string::npos &&
+        hp.find("hello")      != std::string::npos &&
+        hp.find("ARRAY")      != std::string::npos &&
+        hp.find("Int(42)")    != std::string::npos &&
+        hp.find("OBJECT")     != std::string::npos &&
+        hp.find("type_id=7")  != std::string::npos;
+
+    std::cout << std::format("  Scenario A (registers + heap dumped):     {}\n",
+        ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+// =============================================================================
+// test_gc_stress -- drive the copying collector through hundreds of collections
+// under sustained allocation churn, so a forwarding bug in a rarer path surfaces
+// (the other GC tests trigger only a handful of collections). The scenario keeps
+// three kinds of persistent, register-rooted live state alive across the churn:
+//
+//   r0  -- the head of a bounded cons-list (2-slot arrays {value, tail}) that is
+//          grown by prepending and periodically dropped whole as garbage, so every
+//          collection has real interior/suffix garbage to reclaim and re-pack;
+//   r1  -- a permanent 3-node CYCLE (n0->n1->n2->n0); only n0 is rooted, so the
+//          collector must forward the whole ring and converge (idempotent forward),
+//          repeatedly -- the direct regression for cyclic-graph forwarding;
+//   r2  -- a persistent heap string (odd length -> padded footprint) that must
+//          survive every move with its bytes intact.
+//
+// Plus per-iteration unrooted garbage and a periodic OVERSIZED block that forces
+// grow_to_fit. The test itself obeys invariant #7: it re-fetches every pointer
+// through the roots after each collection (pointers move). Invariants, checked
+// both periodically AND at the end: the ring still closes by identity with intact
+// values; the string is intact; the list is a strictly-decreasing chain ending in
+// Nil of the expected length; two back-to-back final collections leave `used()`
+// unchanged (the survivor set is a fixed point -- no floating garbage / no double
+// copy); at least one collection actually reclaimed memory; and we really ran many
+// collections (not a no-op loop).
+// =============================================================================
+inline void test_gc_stress() {
+    std::cout << "=== gc_stress ===\n";
+
+    Heap heap(8 * 1024); // small semispace -> frequent collections
+    GcTestCtx t(&heap, 4); // r0 list head, r1 ring root, r2 string, r3 build scratch
+    Context ctx = t.context();
+
+    // Re-fetch through a ring root and verify the 3-cycle closes by identity with
+    // intact values. `root` must be re-read from the (moving) register each call.
+    auto ring_ok = [](Value root) -> bool {
+        if (!root.isPtr()) return false;
+        GcObject* a = GcObject::from_slots(root.asPtr());
+        if (!a->slots()[1].isPtr()) return false;
+        GcObject* b = GcObject::from_slots(a->slots()[1].asPtr());
+        if (!b->slots()[1].isPtr()) return false;
+        GcObject* c = GcObject::from_slots(b->slots()[1].asPtr());
+        if (!c->slots()[1].isPtr()) return false;
+        GcObject* back = GcObject::from_slots(c->slots()[1].asPtr());
+        return back == a &&                                   // cycle closes by identity
+            a->slots()[0].asSigned48() == 1000 &&
+            b->slots()[0].asSigned48() == 1001 &&
+            c->slots()[0].asSigned48() == 1002;
+    };
+    auto str_ok = [](Value root) -> bool {
+        if (!root.isPtr()) return false;
+        GcObject* s = GcObject::from_slots(root.asPtr());
+        return std::string_view(s->bytes(), s->string_length()) == "persist";
+    };
+
+    // ---- Build the permanent 3-cycle. Each alloc may collect and relocate the
+    // already-built nodes, so root every partial node in a register first, then
+    // wire the ring by re-fetching through the roots (no alloc in between). ----
+    GcObject* n = heap.alloc_slots_gc(GcObject::KIND_ARRAY, 2, &ctx);
+    t.win[1] = Value::fromPtr(n->slots());                    // n0 -> r1
+    n = heap.alloc_slots_gc(GcObject::KIND_ARRAY, 2, &ctx);
+    t.win[3] = Value::fromPtr(n->slots());                    // n1 -> r3 (temp root)
+    n = heap.alloc_slots_gc(GcObject::KIND_ARRAY, 2, &ctx);
+    t.win[2] = Value::fromPtr(n->slots());                    // n2 -> r2 (temp root)
+    {
+        GcObject* a = GcObject::from_slots(t.win[1].asPtr());
+        GcObject* b = GcObject::from_slots(t.win[3].asPtr());
+        GcObject* c = GcObject::from_slots(t.win[2].asPtr());
+        a->slots()[0] = Value::fromSigned48(1000); a->slots()[1] = t.win[3]; // n0.tail = n1
+        b->slots()[0] = Value::fromSigned48(1001); b->slots()[1] = t.win[2]; // n1.tail = n2
+        c->slots()[0] = Value::fromSigned48(1002); c->slots()[1] = t.win[1]; // n2.tail = n0
+    }
+    t.win[3] = Value{}; // drop the direct n1 root; n1/n2 stay reachable via n0's tail
+
+    // Persistent odd-length string -> r2 (overwrites the n2 temp root; n2 still
+    // reachable through n1.tail). alloc_string_gc may collect -> roots re-forwarded.
+    n = heap.alloc_string_gc("persist", &ctx);
+    t.win[2] = Value::fromPtr(n->bytes());
+
+    t.win[0] = Value::fromNil(); // empty list to start
+
+    constexpr int N = 20000; // iterations
+    constexpr int L = 40;    // list length cap before it is dropped as garbage
+    int    list_len    = 0;
+    int    collections = 0;
+    size_t freed_total = 0;
+    bool   periodic_ok = true;
+
+    for (int i = 0; i < N; ++i) {
+        // (1) unrooted garbage churn (creates interior holes for the next collect)
+        (void)heap.alloc_slots_gc(GcObject::KIND_ARRAY, 1, &ctx);
+        (void)heap.alloc_slots_gc(GcObject::KIND_ARRAY, 3, &ctx);
+
+        // (2) prepend a node. The alloc may collect first (re-forwarding r0), and
+        //     the fresh node is post-collect; nothing allocates before we root it.
+        GcObject* node = heap.alloc_slots_gc(GcObject::KIND_ARRAY, 2, &ctx);
+        node->slots()[0] = Value::fromSigned48(i);
+        node->slots()[1] = t.win[0];               // old head (Nil or already-forwarded Ptr)
+        t.win[0] = Value::fromPtr(node->slots());
+        ++list_len;
+
+        // (3) drop the whole chain periodically -> lots of reclaimable garbage
+        if (list_len >= L) { t.win[0] = Value::fromNil(); list_len = 0; }
+
+        // (4) force grow_to_fit occasionally with an oversized, unrooted block
+        if ((i % 2000) == 1999)
+            (void)heap.alloc_slots_gc(GcObject::KIND_ARRAY, 4000, &ctx);
+
+        // (5) collect periodically; verify the persistent state under repetition
+        if ((i % 50) == 0) {
+            freed_total += heap.collect(&ctx);
+            ++collections;
+            if (!ring_ok(t.win[1]) || !str_ok(t.win[2])) periodic_ok = false;
+        }
+    }
+
+    // ---- Final invariants ----
+    heap.collect(&ctx);
+    const size_t used1 = heap.used();
+    heap.collect(&ctx);
+    const size_t used2 = heap.used(); // must equal used1: survivors are a fixed point
+
+    const bool ring_final = ring_ok(t.win[1]);
+    const bool str_final  = str_ok(t.win[2]);
+
+    // List integrity: a strictly-decreasing chain of `list_len` nodes ending in Nil.
+    bool list_ok = true;
+    {
+        Value cur = t.win[0];
+        int steps = 0;
+        int64_t prev = 0;
+        bool first = true;
+        bool consec = true;
+        while (cur.isPtr() && steps < L + 5) {
+            GcObject* nd = GcObject::from_slots(cur.asPtr());
+            const int64_t v = nd->slots()[0].asSigned48();
+            if (!first && v != prev - 1) consec = false;
+            prev = v; first = false;
+            cur = nd->slots()[1];
+            ++steps;
+        }
+        list_ok = consec && cur.isNil() && steps == list_len;
+    }
+
+    const bool ok =
+        periodic_ok &&
+        collections >= 200 &&      // really stressed, not a no-op loop
+        ring_final &&              // cyclic graph forwarded correctly to the end
+        str_final &&               // string survived every move intact
+        list_ok &&                 // list chain intact and correctly terminated
+        used1 == used2 &&          // survivor set is a fixed point (no floating garbage)
+        freed_total > 0;           // real reclamation happened
+
+    std::cout << std::format("collections={} freed_total={} B used1={} used2={} list_len={}\n",
+        collections, freed_total, used1, used2, list_len);
+    std::cout << std::format("  ring={} string={} list={} fixed_point={}\n",
+        ring_final, str_final, list_ok, used1 == used2);
+    std::cout << std::format("  Scenario A (survives GC churn intact):    {}\n",
+        ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+// =============================================================================
+// test_div_mod -- DIV_INT / MOD_INT: signed truncated division and remainder.
+// Covers positive, negative (sign-of-dividend for %), and the Java MIN/-1 wrap
+// edge (MIN_48 / -1 == MIN_48, MIN_48 % -1 == 0). MIN_48 is built at runtime as
+// 1 << 47 so the test does not depend on the 48-bit constant loader.
+// =============================================================================
+inline void test_div_mod() {
+    constexpr int64_t MIN_48 = -(int64_t(1) << 47);
+    Assembler as;
+    as.label("main");
+    as.C2(OpCode::LOAD_CONST, 0, 17);
+    as.C2(OpCode::LOAD_CONST, 1, 5);
+    as.R6(OpCode::DIV_INT, 2, 0, 1);      // 17 / 5  = 3
+    as.R6(OpCode::MOD_INT, 3, 0, 1);      // 17 % 5  = 2
+    as.C2(OpCode::LOAD_CONST, 4, -17);
+    as.R6(OpCode::DIV_INT, 6, 4, 1);      // -17 / 5 = -3 (toward zero)
+    as.R6(OpCode::MOD_INT, 7, 4, 1);      // -17 % 5 = -2 (sign of dividend)
+    // MIN_48 via 1 << 47, then MIN_48 / -1 and MIN_48 % -1
+    as.C2(OpCode::LOAD_CONST, 8, 1);
+    as.C2(OpCode::LOAD_CONST, 9, 47);
+    as.R6(OpCode::SHL_INT, 10, 8, 9);     // r10 = MIN_48
+    as.C2(OpCode::LOAD_CONST, 11, -1);
+    as.R6(OpCode::DIV_INT, 12, 10, 11);   // MIN_48 / -1 = MIN_48 (wraps, no trap)
+    as.R6(OpCode::MOD_INT, 13, 10, 11);   // MIN_48 % -1 = 0
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== div_mod ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode);
+        auto* regs = res.get_reg_base();
+        const int64_t r2 = regs[2].asSigned48(), r3 = regs[3].asSigned48();
+        const int64_t r6 = regs[6].asSigned48(), r7 = regs[7].asSigned48();
+        const int64_t r10 = regs[10].asSigned48();
+        const int64_t r12 = regs[12].asSigned48(), r13 = regs[13].asSigned48();
+        std::cout << std::format("17/5={} 17%5={} -17/5={} -17%5={}\n", r2, r3, r6, r7);
+        std::cout << std::format("MIN_48={} MIN_48/-1={} MIN_48%-1={}\n", r10, r12, r13);
+        const bool ok = r2 == 3 && r3 == 2 && r6 == -3 && r7 == -2 &&
+                        r10 == MIN_48 && r12 == MIN_48 && r13 == 0;
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_div_by_zero_trap -- DIV_INT / MOD_INT by zero must raise a VM-level trap
+// (std::runtime_error "Division by zero"), NOT a script-level exception. Catching
+// that exception is the success condition.
+// =============================================================================
+inline void test_div_by_zero_trap() {
+    std::cout << "=== div_by_zero_trap ===\n";
+    auto traps = [](OpCode divlike) -> bool {
+        Assembler as;
+        as.label("main");
+        as.C2(OpCode::LOAD_CONST, 0, 10);
+        as.C2(OpCode::LOAD_CONST, 1, 0);
+        as.R6(divlike, 2, 0, 1);           // 10 / 0  or  10 % 0
+        as.J(OpCode::HALT);
+        try {
+            execute(as.assemble());
+            return false;                  // no trap -> failure
+        } catch (const std::exception& e) {
+            // Phase-1 located message: "division by zero at line ? (in <script>)".
+            return std::string_view(e.what()).find("division by zero") != std::string_view::npos;
+        }
+    };
+    const bool div_ok = traps(OpCode::DIV_INT);
+    const bool mod_ok = traps(OpCode::MOD_INT);
+    std::cout << std::format("  DIV_INT by zero trapped: {}\n", div_ok ? "PASS" : "FAIL");
+    std::cout << std::format("  MOD_INT by zero trapped: {}\n", mod_ok ? "PASS" : "FAIL");
+    check(div_ok && mod_ok);
+}
+
+// =============================================================================
+// test_receiver_faults -- Phase 1: the heap-typed fast-path opcodes raise a
+// DEFINED, located abort (raise_located -> std::runtime_error) when handed a
+// non-heap / wrong-kind receiver, instead of dereferencing a wild pointer. No
+// line table is supplied here, so the message ends with the "line ?" fallback.
+// =============================================================================
+inline void test_receiver_faults() {
+    std::cout << "=== receiver_faults (defined heap-op receiver checks) ===\n";
+    // Build a tiny program applying `op` to an Int (7) receiver, run it, and report
+    // whether it throws a message containing `needle`.
+    auto faults_with = [](auto build, const char* needle) -> bool {
+        Assembler as;
+        as.label("main");
+        as.load_const(0, 7);               // r0 = Int(7) -- never a valid heap receiver
+        build(as);
+        as.J(OpCode::HALT);
+        Heap heap;
+        try {
+            execute(as.assemble(), &heap, nullptr, nullptr, 4);
+            return false;                  // no trap -> failure
+        } catch (const std::exception& e) {
+            return std::string_view(e.what()).find(needle) != std::string_view::npos;
+        }
+    };
+    const bool map_ok  = faults_with([](Assembler& as){ as.load_const(1, 0); as.MAP_GET(2, 0, 1); }, "non-map");
+    const bool arr_ok  = faults_with([](Assembler& as){ as.load_const(1, 0); as.ARRAY_GET(2, 0, 1); }, "non-array");
+    const bool prop_ok = faults_with([](Assembler& as){ as.GET_PROP(1, 0, 0); }, "non-struct");
+    const bool len_ok  = faults_with([](Assembler& as){ as.LEN(1, 0); }, "non-array/non-map");
+    const bool loc_ok  = faults_with([](Assembler& as){ as.LEN(1, 0); }, "line ?");  // no line table -> fallback
+    std::cout << std::format("  MAP_GET on non-map     : {}\n", map_ok  ? "PASS" : "FAIL");
+    std::cout << std::format("  ARRAY_GET on non-array : {}\n", arr_ok  ? "PASS" : "FAIL");
+    std::cout << std::format("  GET_PROP on non-struct : {}\n", prop_ok ? "PASS" : "FAIL");
+    std::cout << std::format("  LEN on non-collection  : {}\n", len_ok  ? "PASS" : "FAIL");
+    std::cout << std::format("  'line ?' fallback       : {}\n", loc_ok ? "PASS" : "FAIL");
+    check(map_ok && arr_ok && prop_ok && len_ok && loc_ok);
+}
+
+// =============================================================================
+// test_neg -- NEG_INT: unary minus, including the MIN_48 wrap (-MIN_48 == MIN_48).
+// =============================================================================
+inline void test_neg() {
+    constexpr int64_t MIN_48 = -(int64_t(1) << 47);
+    Assembler as;
+    as.label("main");
+    as.C2(OpCode::LOAD_CONST, 0, 42);
+    as.R6(OpCode::NEG_INT, 1, 0, 0);      // -42
+    as.C2(OpCode::LOAD_CONST, 2, -7);
+    as.R6(OpCode::NEG_INT, 3, 2, 0);      // 7
+    as.C2(OpCode::LOAD_CONST, 4, 1);
+    as.C2(OpCode::LOAD_CONST, 5, 47);
+    as.R6(OpCode::SHL_INT, 6, 4, 5);      // r6 = MIN_48
+    as.R6(OpCode::NEG_INT, 7, 6, 0);      // -MIN_48 = MIN_48 (wraps)
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== neg ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode);
+        auto* regs = res.get_reg_base();
+        const int64_t r1 = regs[1].asSigned48(), r3 = regs[3].asSigned48(), r7 = regs[7].asSigned48();
+        std::cout << std::format("-42={} -(-7)={} -MIN_48={}\n", r1, r3, r7);
+        const bool ok = r1 == -42 && r3 == 7 && r7 == MIN_48;
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_bitwise -- AND_INT / OR_INT / XOR_INT. Also shows ~x via XOR with -1.
+// =============================================================================
+inline void test_bitwise() {
+    Assembler as;
+    as.label("main");
+    as.C2(OpCode::LOAD_CONST, 0, 12);     // 0b1100
+    as.C2(OpCode::LOAD_CONST, 1, 10);     // 0b1010
+    as.R6(OpCode::AND_INT, 2, 0, 1);      // 0b1000 = 8
+    as.R6(OpCode::OR_INT,  3, 0, 1);      // 0b1110 = 14
+    as.R6(OpCode::XOR_INT, 4, 0, 1);      // 0b0110 = 6
+    as.C2(OpCode::LOAD_CONST, 5, -1);
+    as.R6(OpCode::XOR_INT, 6, 0, 5);      // ~12 = -13
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== bitwise (and/or/xor) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode);
+        auto* regs = res.get_reg_base();
+        const int64_t r2 = regs[2].asSigned48(), r3 = regs[3].asSigned48();
+        const int64_t r4 = regs[4].asSigned48(), r6 = regs[6].asSigned48();
+        std::cout << std::format("12&10={} 12|10={} 12^10={} ~12={}\n", r2, r3, r4, r6);
+        const bool ok = r2 == 8 && r3 == 14 && r4 == 6 && r6 == -13;
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_av_classification -- VM_Resources::address_in_stacks, the predicate that
+// decides how an access violation is reported. Every AV used to be announced as
+// "VM Stack Overflow (hardware guard page)", which is right for one cause and
+// misleading for the rest: a dangling heap pointer faults inside memcpy at a heap
+// address and was reported as a stack overflow. The fault address separates them,
+// so this pins the decision function rather than trying to provoke a real fault
+// (deliberately overflowing a stack in a test would be fragile and unportable).
+// =============================================================================
+inline void test_av_classification() {
+    std::cout << "=== av_classification ===\n";
+
+    VM_Resources res;
+    Heap         heap(16 * 1024);
+
+    // Inside each of the four stack regions -- a fault here IS a stack overflow.
+    const bool reg_base_in = res.address_in_stacks(res.get_reg_base());
+    const bool ret_base_in = res.address_in_stacks(res.get_ret_base());
+    const bool fsz_base_in = res.address_in_stacks(res.get_frame_size_base());
+    const bool clo_base_in = res.address_in_stacks(res.get_closure_base());
+
+    // Past the COMMITTED end but still reserved: the page a growth-disabled Context
+    // faults on. Must still classify as a stack overflow.
+    const bool past_commit_in = res.address_in_stacks(res.reg_committed_end() + 16);
+
+    // The guard page sits immediately past the RESERVED end -- also a stack overflow.
+    const bool guard_in = res.address_in_stacks(res.reg_reserved_end());
+
+    // A heap object is NOT in the stacks -- this is the case that used to be misreported.
+    GcObject* obj = heap.alloc(GcObject::KIND_ARRAY, 2);
+    const bool heap_out  = obj && !res.address_in_stacks(obj->slots());
+    // Neither is a stack address of this very test, nor an obviously wild pointer.
+    int        local     = 0;
+    const bool local_out = !res.address_in_stacks(&local);
+    const bool wild_out  = !res.address_in_stacks(reinterpret_cast<const void*>(uintptr_t{ 0x1234 }));
+
+    const bool bases_ok = reg_base_in && ret_base_in && fsz_base_in && clo_base_in;
+    const bool ok = bases_ok && past_commit_in && guard_in && heap_out && local_out && wild_out;
+
+    std::cout << std::format("  all four stack bases classified in:  {}\n", bases_ok       ? "PASS" : "FAIL");
+    std::cout << std::format("  reserved-but-uncommitted page in:    {}\n", past_commit_in ? "PASS" : "FAIL");
+    std::cout << std::format("  trailing guard page in:              {}\n", guard_in       ? "PASS" : "FAIL");
+    std::cout << std::format("  heap payload NOT in stacks:          {}\n", heap_out       ? "PASS" : "FAIL");
+    std::cout << std::format("  native stack / wild ptr NOT in:      {}\n", (local_out && wild_out) ? "PASS" : "FAIL");
+    check(ok);
+}
+
+// =============================================================================
+// test_mov_take -- MOV_TAKE copies like MOV but EMPTIES the source. Used for the
+// return-value fetch after a call, where a leftover copy would be a heap pointer
+// in a slot no collection forwards again (see the opcode table).
+// =============================================================================
+inline void test_mov_take() {
+    Assembler as;
+    as.label("main");
+    as.C2(OpCode::LOAD_CONST, 0, 42);
+    as.C2(OpCode::LOAD_CONST, 1, 7);
+    as.MOV_TAKE(2, 0);                       // r2 = r0, r0 emptied
+    as.MOV_TAKE(3, 3);                       // degenerate rd == ra: must end up empty
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== mov_take ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto  res  = execute(bytecode);
+        auto* regs = res.get_reg_base();
+        const bool moved       = regs[2].isInt() && regs[2].asSigned48() == 42;
+        const bool src_cleared = regs[0].isUndefined();
+        const bool others_kept = regs[1].isInt() && regs[1].asSigned48() == 7;
+        const bool self_take   = regs[3].isUndefined();   // copy then clear -> empty
+        std::cout << std::format("  value moved to dest:     {}\n", moved       ? "PASS" : "FAIL");
+        std::cout << std::format("  source left empty:       {}\n", src_cleared ? "PASS" : "FAIL");
+        std::cout << std::format("  other registers intact:  {}\n", others_kept ? "PASS" : "FAIL");
+        std::cout << std::format("  self-take (rd == ra):    {}\n", self_take   ? "PASS" : "FAIL");
+        check(moved && src_cleared && others_kept && self_take);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_shifts -- SHL_INT, SHR_INT (arithmetic/signed), USHR_INT (logical).
+// Covers: basic left shift; arithmetic right shift of a negative; the SHR/USHR
+// divergence on a value with bit 47 set (arithmetic keeps the sign, logical does
+// not); and a count >= 48 (defined: left shift out of the 48-bit range -> 0).
+// =============================================================================
+inline void test_shifts() {
+    constexpr int64_t POS_2_46 = (int64_t(1) << 46);
+    Assembler as;
+    as.label("main");
+    as.C2(OpCode::LOAD_CONST, 0, 1);
+    as.C2(OpCode::LOAD_CONST, 1, 4);
+    as.R6(OpCode::SHL_INT, 2, 0, 1);      // 1 << 4 = 16
+    as.C2(OpCode::LOAD_CONST, 3, -16);
+    as.C2(OpCode::LOAD_CONST, 4, 2);
+    as.R6(OpCode::SHR_INT, 5, 3, 4);      // -16 >> 2 = -4 (arithmetic)
+    // r9 = MIN_48 (bit 47 set) via 1 << 47
+    as.C2(OpCode::LOAD_CONST, 6, 1);
+    as.C2(OpCode::LOAD_CONST, 7, 47);
+    as.R6(OpCode::SHL_INT, 9, 6, 7);      // r9 = MIN_48
+    as.C2(OpCode::LOAD_CONST, 8, 1);
+    as.R6(OpCode::SHR_INT,  11, 9, 8);    // MIN_48 >> 1  (arith) = -(2^46)
+    as.R6(OpCode::USHR_INT, 12, 9, 8);    // MIN_48 >>> 1 (logical) = 2^46
+    // count >= 48: 1 << 48 shifts out of the 48-bit range -> 0
+    as.C2(OpCode::LOAD_CONST, 13, 48);
+    as.R6(OpCode::SHL_INT, 15, 0, 13);    // 1 << 48 = 0 (defined)
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== shifts (shl/shr/ushr) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode);
+        auto* regs = res.get_reg_base();
+        const int64_t r2 = regs[2].asSigned48(), r5 = regs[5].asSigned48();
+        const int64_t r11 = regs[11].asSigned48(), r12 = regs[12].asSigned48();
+        const int64_t r15 = regs[15].asSigned48();
+        std::cout << std::format("1<<4={} -16>>2={} MIN_48>>1={} MIN_48>>>1={} 1<<48={}\n",
+                                 r2, r5, r11, r12, r15);
+        const bool ok = r2 == 16 && r5 == -4 &&
+                        r11 == -POS_2_46 && r12 == POS_2_46 && r15 == 0;
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_frame_gc_roots -- regression test for the frame_size GC-roots contract.
+//
+// Drives the real execute() / op_call / Heap::mark_roots path and forces a GC
+// mid-program (via native_collect) at a point where two heap objects are live
+// only through registers:
+//
+//   X -- held only in a TOP-LEVEL register (r0), live across a CALL.
+//        Requires the top-level frame to be scanned as a GC root: consequence
+//        (c) of the window_size contract. execute() must receive a non-zero
+//        top_frame_size (here COLLECTOR_FRAME: X at r0 lies within [0, that), and
+//        because the CALL now slides by the caller frame size the callee's window
+//        opens at r[COLLECTOR_FRAME], leaving r0 untouched).
+//
+//   Z -- held only in a register of the CALLED function's frame, within its
+//        declared frame_size. Requires the callee frame's declared frame_size
+//        to cover it: consequence (b).
+//
+//   D -- a dead canary object, reachable from nothing.
+//
+// The collector function returns the number of bytes freed and stores it in a
+// global. If both X and Z are scanned as roots, exactly D is reclaimed, so
+// freed == D.total_bytes(). With the old behaviour (top-level frame size 0),
+// X would also be collected and freed would be larger -- the test would fail.
+// =============================================================================
+// =============================================================================
+// test_top_frame_validation -- the top-level region is now a validated frame when
+// the codegen declares its size via Assembler::set_top_frame_size() (closes the
+// window_size contract's consequence (c)). validate_frames() checks [0, first
+// function) against the declared size with the same GC-roots rule as any function.
+// Opt-in: bytecode that never declares it stays unchecked (backward compatible).
+// =============================================================================
+inline void test_top_frame_validation() {
+    std::cout << "=== top_frame_validation ===\n";
+    bool all_ok = true;
+
+    // (1) Negative: top-level touches r2 as a pure local but declares frame size 2
+    //     (legal indices [0,2)) -> under-declared -> assemble() must throw, naming <script>.
+    {
+        Assembler as;
+        as.set_top_frame_size(2);
+        as.label("main");
+        as.R6(OpCode::MOV, 2, 0, 0);         // r2 -- a local above the declared frame
+        as.J(OpCode::HALT);
+        bool threw = false;
+        try { (void)as.assemble(); }
+        catch (const std::exception& e) {
+            threw = std::string(e.what()).find("<script>") != std::string::npos;
+        }
+        std::cout << "  under-declared top frame throws: " << (threw ? "PASS" : "FAIL") << "\n";
+        all_ok = all_ok && threw;
+    }
+
+    // (2) Positive: same body with frame size 3 -> r2 is in-frame -> assembles.
+    {
+        Assembler as;
+        as.set_top_frame_size(3);
+        as.label("main");
+        as.R6(OpCode::MOV, 2, 0, 0);
+        as.J(OpCode::HALT);
+        bool ok = false;
+        try { (void)as.assemble(); ok = true; } catch (const std::exception&) {}
+        std::cout << "  correct top frame assembles: " << (ok ? "PASS" : "FAIL") << "\n";
+        all_ok = all_ok && ok;
+    }
+
+    // (3) Overlap positive: frame size 2, but r2 is a legit outgoing CALL argument (the
+    //     window opens at r[frame_size]) -> the same call-overlap widening applies as for
+    //     a function region, so it must assemble.
+    {
+        Assembler as;
+        as.func("f", 2);
+        as.set_top_frame_size(2);
+        as.label("main");
+        as.R6(OpCode::MOV, 2, 0, 0);         // arg0 into the outgoing window at r[2]
+        as.CALL("f");
+        as.J(OpCode::HALT);
+        as.label("f");
+        as.J(OpCode::RET);
+        bool ok = false;
+        try { (void)as.assemble(); ok = true; } catch (const std::exception&) {}
+        std::cout << "  call-overlap arg in top frame assembles: " << (ok ? "PASS" : "FAIL") << "\n";
+        all_ok = all_ok && ok;
+    }
+
+    // (4) Opt-out: no set_top_frame_size() -> the top-level region stays unchecked even with
+    //     a high register (backward compatibility with hand-assembled bytecode).
+    {
+        Assembler as;
+        as.label("main");
+        as.R6(OpCode::MOV, 5, 0, 0);         // high register, but no top frame declared
+        as.J(OpCode::HALT);
+        bool ok = false;
+        try { (void)as.assemble(); ok = true; } catch (const std::exception&) {}
+        std::cout << "  opt-out (no declaration) stays unchecked: " << (ok ? "PASS" : "FAIL") << "\n";
+        all_ok = all_ok && ok;
+    }
+
+    check(all_ok);
+}
+
+inline void test_frame_gc_roots() {
+    std::cout << "=== frame_gc_roots ===\n";
+
+    constexpr uint8_t COLLECTOR_FRAME = 3; // collector uses r0(Z), r1(result), r2(fn ptr)
+
+    Heap heap(64 * 1024);
+    GlobalEnv globals(heap);
+    const uint8_t g_freed = globals.define();
+
+    // Dead canary: allocated but never rooted -- must be the ONLY thing collected.
+    GcObject* dead = heap.alloc(GcObject::KIND_ARRAY, 2);
+    assert(dead && "test_frame_gc_roots: dead canary alloc failed");
+    const size_t dead_total = dead->total_bytes();
+
+    Assembler as;
+    as.func("collector", COLLECTOR_FRAME);
+
+    as.label("main");
+    as.ALLOC(0, 2);              // r0 = X  (top-level heap pointer, live across CALL)
+    as.CALL("collector");
+    as.J(OpCode::HALT);
+
+    as.label("collector");
+    as.ALLOC(0, 1);              // r0 = Z  (callee-frame heap pointer, live across GC)
+    as.call_native_id(1, 2, 2, 0, 0);           // r1 = native_collect() (id 0) -> runs GC
+    as.STORE_GLOBAL(g_freed, 1); // globals[g_freed] = freed byte count
+    as.J(OpCode::RET);
+
+    const auto bytecode = as.assemble();
+    // Top-level frame size = COLLECTOR_FRAME: the slide (now the caller frame size)
+    // opens collector's window at r[COLLECTOR_FRAME], so X at r0 survives and is
+    // scanned, and Z (collector's r0) lands at r[COLLECTOR_FRAME] as before.
+    const uint8_t top = COLLECTOR_FRAME;
+
+    std::cout << "=== frame_gc_roots (top_frame_size = " << static_cast<int>(top) << ") ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size());
+    dis.add_label(0, "main");
+    dis.print();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute_gc(bytecode, &heap, &globals, top);
+        auto* regs = res.get_reg_base();
+
+        // X lives in the top-level frame (r0); Z lives in the collector frame,
+        // whose window starts at reg index COLLECTOR_FRAME.
+        const Value x_val = regs[0];
+        const Value z_val = regs[COLLECTOR_FRAME];
+        const Value freed = globals.get(g_freed);
+
+        GcObject* x_obj = x_val.isPtr() ? GcObject::from_slots(x_val.asPtr()) : nullptr;
+        GcObject* z_obj = z_val.isPtr() ? GcObject::from_slots(z_val.asPtr()) : nullptr;
+
+        const bool x_ok = x_obj &&
+                          x_obj->kind == GcObject::KIND_ARRAY &&
+                          x_obj->slot_count() == 2;
+        const bool z_ok = z_obj &&
+                          z_obj->kind == GcObject::KIND_ARRAY &&
+                          z_obj->slot_count() == 1;
+        const bool freed_ok = freed.isInt() &&
+                              static_cast<size_t>(freed.asSigned48()) == dead_total;
+
+        const bool ok = x_ok && z_ok && freed_ok;
+
+        std::cout << std::format("freed={} (expect dead_total={})\n",
+            freed.isInt() ? freed.asSigned48() : -1, dead_total);
+        std::cout << std::format("  top-level register root survived (c): {}\n",
+            x_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  callee-frame register root survived (b): {}\n",
+            z_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  only the dead canary was collected:      {}\n",
+            freed_ok ? "PASS" : "FAIL");
+        check(ok);
+
+        globals.set(g_freed, Value{});
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_load_str -- string literals via LOAD_STR. execute() pre-interns the
+// assembler's literal texts into a GC-rooted string pool; LOAD_STR indexes it.
+// Checks: r0 is a KIND_STRING with content "hi"; two identical literals dedup to
+// one heap object (interning); EQ compares interned strings by pointer identity.
+// =============================================================================
+// =============================================================================
+// test_const_array -- LOAD_CONST_ARRAY (id 117) + the const-array pool.
+//
+// A `const NAME: Array[T] = [...]` is a heap KIND_ARRAY that can't ride the
+// pointer-free const pool, so execute() pre-builds each into a GC-ROOTED pool
+// (like the string-literal pool) and LOAD_CONST_ARRAY indexes it. This checks:
+// (a) the three scalar element kinds (Int/Double/Bool) round-trip through the
+// pool, (b) LEN + ARRAY_GET work on a pooled const array, and (c) the SKBC CARR
+// chunk serializes/deserializes the pool bit-exactly.
+// =============================================================================
+inline void test_const_array() {
+    std::cout << "=== const arrays (LOAD_CONST_ARRAY) ===\n";
+
+    Heap heap(64 * 1024);
+
+    Assembler as;
+    // Three const arrays exercising every permitted scalar element kind.
+    const uint16_t ints = as.add_const_array(
+        { Value::fromSigned48(10), Value::fromSigned48(20), Value::fromSigned48(30) });
+    const uint16_t dbls = as.add_const_array(
+        { Value::fromDouble(1.5), Value::fromDouble(2.5) });
+    const uint16_t bools = as.add_const_array(
+        { Value::fromBool(true), Value::fromBool(false) });
+
+    as.label("main");
+    as.load_const_array(0, ints);   // r0 = [10,20,30]
+    as.LEN(1, 0);                   // r1 = 3
+    as.load_const(2, 1);            // r2 = index 1
+    as.ARRAY_GET(3, 0, 2);          // r3 = ints[1] = 20
+    as.load_const_array(4, dbls);   // r4 = [1.5,2.5]
+    as.load_const(5, 0);            // r5 = index 0
+    as.ARRAY_GET(6, 4, 5);          // r6 = dbls[0] = 1.5
+    as.load_const_array(7, bools);  // r7 = [true,false]
+    as.load_const(8, 1);            // r8 = index 1
+    as.ARRAY_GET(9, 7, 8);          // r9 = bools[1] = false
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    std::cout << "Running...\n";
+    try {
+        // r0/r4/r7 hold const-array pointers -> top_frame_size = 10 scans r0..r9 as roots.
+        // const_arrays is the LAST execute() param, so every intermediate is left null/default.
+        auto res = execute(bytecode, &heap, nullptr, nullptr, 10,
+                           nullptr, nullptr, nullptr, nullptr, nullptr,   // const_pool..fn_table
+                           nullptr, nullptr, 0, 0,                         // out, trait_table, width, methods
+                           nullptr, nullptr, nullptr, nullptr,             // line, fn_names, column, native_table
+                           nullptr, nullptr, nullptr,                      // script_args, in, function_modules
+                           &as.const_arrays());
+        auto* regs = res.get_reg_base();
+
+        const bool len_ok  = regs[1].isInt()    && regs[1].asSigned48() == 3;
+        const bool int_ok  = regs[3].isInt()    && regs[3].asSigned48() == 20;
+        const bool dbl_ok  = regs[6].isDouble() && regs[6].asDouble()   == 1.5;
+        const bool bool_ok = regs[9].isBool()   && regs[9].asBool()     == false;
+        // r0 is a real heap KIND_ARRAY (the pooled instance).
+        const bool kind_ok = regs[0].isPtr() &&
+            GcObject::from_slots(regs[0].asPtr())->kind == GcObject::KIND_ARRAY;
+
+        std::cout << std::format("  len == 3:            {}\n", len_ok  ? "PASS" : "FAIL");
+        std::cout << std::format("  ints[1] == 20:       {}\n", int_ok  ? "PASS" : "FAIL");
+        std::cout << std::format("  dbls[0] == 1.5:      {}\n", dbl_ok  ? "PASS" : "FAIL");
+        std::cout << std::format("  bools[1] == false:   {}\n", bool_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  r0 is KIND_ARRAY:    {}\n", kind_ok ? "PASS" : "FAIL");
+        check(len_ok && int_ok && dbl_ok && bool_ok && kind_ok);
+    } catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+
+    // ---- SKBC CARR chunk: bit-exact serialize -> deserialize round-trip. ----
+    try {
+        bcio::ModuleImage img;
+        img.bytecode     = bytecode;
+        img.const_arrays = as.const_arrays();
+        const auto bytes = bcio::serialize(img);
+        const auto back  = bcio::deserialize(bytes);
+
+        bool rt_ok = back.const_arrays.size() == img.const_arrays.size();
+        for (size_t i = 0; rt_ok && i < img.const_arrays.size(); ++i) {
+            rt_ok = back.const_arrays[i].size() == img.const_arrays[i].size();
+            for (size_t j = 0; rt_ok && j < img.const_arrays[i].size(); ++j)
+                rt_ok = std::memcmp(&back.const_arrays[i][j],
+                                    &img.const_arrays[i][j], sizeof(Value)) == 0;
+        }
+        std::cout << std::format("  SKBC CARR round-trip: {}\n", rt_ok ? "PASS" : "FAIL");
+        check(rt_ok);
+    } catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+inline void test_load_str() {
+    std::cout << "=== load_str (string literals) ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    Assembler as;
+    as.label("main");
+    as.load_str(0, "hi");         // r0 = "hi"
+    as.load_str(1, "hi");         // r1 = "hi" (same interned object)
+    as.load_str(2, "bye");        // r2 = "bye"
+    as.R6(OpCode::EQ, 3, 0, 1);   // r3 = (r0 == r1) -> true  (pointer identity)
+    as.R6(OpCode::EQ, 4, 0, 2);   // r4 = (r0 == r2) -> false
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    std::cout << "Running...\n";
+    try {
+        // The top-level frame holds three string pointers, so it must be scanned as
+        // a GC root: pass top_frame_size = 3 (harmless here -- no collection runs).
+        auto res   = execute(bytecode, &heap, nullptr, &interner, 3, nullptr, nullptr,
+                             &as.string_literals());
+        auto* regs = res.get_reg_base();
+
+        const bool is_str =
+            regs[0].isPtr() &&
+            GcObject::from_slots(regs[0].asPtr())->kind == GcObject::KIND_STRING;
+
+        const GcObject* o = is_str ? GcObject::from_slots(regs[0].asPtr()) : nullptr;
+        const bool content_ok =
+            o && std::string_view(o->bytes(), o->string_length()) == "hi";
+
+        // Deduped: two identical literals share one heap object.
+        const bool identity_ok = regs[0].isPtr() && regs[1].isPtr() &&
+                                 regs[0].asPtr() == regs[1].asPtr();
+
+        const bool eq_ok =
+            regs[3].isBool() && regs[3].asBool() == true &&
+            regs[4].isBool() && regs[4].asBool() == false;
+
+        const bool ok = is_str && content_ok && identity_ok && eq_ok;
+
+        std::cout << std::format("  KIND_STRING + content \"hi\": {}\n", (is_str && content_ok) ? "PASS" : "FAIL");
+        std::cout << std::format("  interned identity (r0==r1): {}\n", identity_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  EQ true/false:              {}\n", eq_ok ? "PASS" : "FAIL");
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_string_concat -- ADD on two heap strings concatenates into a FRESH
+// (non-interned) KIND_STRING. Drives a 40-deep concat chain under a tiny heap so
+// alloc_string_gc's collect(+grow) retry path runs while the accumulator survives
+// as a register root; asserts the final content and that the result pointer differs
+// from the operand literals (a genuinely new object, not an interned share).
+// =============================================================================
+inline void test_string_concat() {
+    std::cout << "=== string concat (ADD) ===\n";
+
+    Heap heap(1024);                    // tiny: force collect/grow during the chain
+    StringInterner interner;
+
+    constexpr int N = 40;
+    Assembler as;
+    as.label("main");
+    as.load_str(0, "ab");               // r0 = accumulator
+    as.load_str(1, "cd");               // r1 = the piece to append (interned, rooted)
+    for (int k = 0; k < N; ++k)
+        as.R6(OpCode::ADD, 0, 0, 1);    // r0 = r0 + "cd"  (fresh string each time)
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    std::string expected = "ab";
+    for (int k = 0; k < N; ++k) expected += "cd";
+
+    std::cout << "Running...\n";
+    try {
+        // r0 (accumulator) + r1 held live across each concat's possible collection.
+        auto res   = execute(bytecode, &heap, nullptr, &interner, 2, nullptr, nullptr,
+                             &as.string_literals());
+        auto* regs = res.get_reg_base();
+
+        const bool is_str =
+            regs[0].isPtr() &&
+            GcObject::from_slots(regs[0].asPtr())->kind == GcObject::KIND_STRING;
+        const GcObject* o = is_str ? GcObject::from_slots(regs[0].asPtr()) : nullptr;
+        const bool content_ok =
+            o && std::string_view(o->bytes(), o->string_length()) == expected;
+        // The concat result is a new object, distinct from the "cd" literal (r1).
+        const bool distinct = regs[0].isPtr() && regs[1].isPtr() &&
+                              regs[0].asPtr() != regs[1].asPtr();
+
+        const bool ok = is_str && content_ok && distinct;
+        std::cout << std::format("  concatenated content ({} bytes): {}\n",
+                                 expected.size(), (is_str && content_ok) ? "PASS" : "FAIL");
+        std::cout << std::format("  result is a fresh (non-shared) object: {}\n",
+                                 distinct ? "PASS" : "FAIL");
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_string_number_concat -- number+string / string+number coercion in ADD. A
+// numeric (Int or Double) operand is formatted to text (format_number) and
+// concatenated into a fresh KIND_STRING. Covers both operand orders, a negative
+// int, and the Double ".0" rule (2.0 -> "2.0", not "2").
+// =============================================================================
+inline void test_string_number_concat() {
+    std::cout << "=== number+string concat (ADD coercion) ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    Assembler as;
+    as.label("main");
+    as.load_str(0, "!");                 // r0 = "!"
+    as.load_str(1, "n=");                // r1 = "n="
+    as.load_const(2, 42);                // r2 = 42
+    as.load_const(3, 7);                 // r3 = 7
+    as.load_const(4, -3);                // r4 = -3
+    as.load_double(5, 3.5);              // r5 = 3.5
+    as.load_double(6, 2.0);              // r6 = 2.0  (integer-valued double)
+    as.R6(OpCode::ADD, 10, 2, 0);        // r10 = 42 + "!"   -> "42!"
+    as.R6(OpCode::ADD, 11, 1, 3);        // r11 = "n=" + 7   -> "n=7"
+    as.R6(OpCode::ADD, 12, 4, 0);        // r12 = -3 + "!"   -> "-3!"
+    as.R6(OpCode::ADD, 13, 5, 0);        // r13 = 3.5 + "!"  -> "3.5!"
+    as.R6(OpCode::ADD, 14, 6, 0);        // r14 = 2.0 + "!"  -> "2.0!"
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, &heap, nullptr, &interner, 16,
+                             &as.constant_pool(), nullptr, &as.string_literals());
+        auto* regs = res.get_reg_base();
+
+        auto S = [&](int i, std::string_view want) {
+            if (!regs[i].isPtr()) return false;
+            const GcObject* o = GcObject::from_slots(regs[i].asPtr());
+            return o->kind == GcObject::KIND_STRING &&
+                   std::string_view(o->bytes(), o->string_length()) == want;
+        };
+
+        const bool ok =
+            S(10, "42!") && S(11, "n=7") && S(12, "-3!") &&
+            S(13, "3.5!") && S(14, "2.0!");
+
+        std::cout << std::format("  int+string  \"42!\" : {}\n",  S(10, "42!")  ? "PASS" : "FAIL");
+        std::cout << std::format("  string+int  \"n=7\" : {}\n",  S(11, "n=7")  ? "PASS" : "FAIL");
+        std::cout << std::format("  negative    \"-3!\" : {}\n",  S(12, "-3!")  ? "PASS" : "FAIL");
+        std::cout << std::format("  double     \"3.5!\" : {}\n",  S(13, "3.5!") ? "PASS" : "FAIL");
+        std::cout << std::format("  double .0  \"2.0!\" : {}\n",  S(14, "2.0!") ? "PASS" : "FAIL");
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_to_string -- the generic TO_STRING coercion. Atoms resolve to their name
+// WITH a leading ':' (":ok") from the pre-interned atom pool; bool/nil to the
+// constant "true"/"false"/"nil"; a string to itself (identity); Int/Double via
+// format_number (incl. the Double ".0" rule). Exercises the atom_names table
+// plumbed through execute() into the GC-rooted atom pool.
+// =============================================================================
+inline void test_to_string() {
+    std::cout << "=== TO_STRING (generic to-string coercion) ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    Assembler as;
+    as.label("main");
+    as.load_atom(0, "ok");                       // r0 = :ok
+    as.load_atom(1, "error");                    // r1 = :error
+    as.load_str(2, "hello");                     // r2 = "hello"
+    as.load_const(3, 42);                        // r3 = 42
+    as.load_const(4, -7);                        // r4 = -7
+    as.load_double(5, 3.5);                      // r5 = 3.5
+    as.load_double(6, 2.0);                      // r6 = 2.0 (integer-valued double)
+    as.load_constant(7, Value::fromBool(true));  // r7 = true
+    as.load_constant(8, Value::fromBool(false)); // r8 = false
+    as.load_constant(9, Value::fromNil());       // r9 = nil
+    as.R6(OpCode::TO_STRING, 10, 0, 0);          // r10 = toString(:ok)    -> ":ok"
+    as.R6(OpCode::TO_STRING, 11, 1, 0);          // r11 = toString(:error) -> ":error"
+    as.R6(OpCode::TO_STRING, 12, 2, 0);          // r12 = toString("hello")-> "hello"
+    as.R6(OpCode::TO_STRING, 13, 3, 0);          // r13 = toString(42)     -> "42"
+    as.R6(OpCode::TO_STRING, 14, 4, 0);          // r14 = toString(-7)     -> "-7"
+    as.R6(OpCode::TO_STRING, 15, 5, 0);          // r15 = toString(3.5)    -> "3.5"
+    as.R6(OpCode::TO_STRING, 16, 6, 0);          // r16 = toString(2.0)    -> "2.0"
+    as.R6(OpCode::TO_STRING, 17, 7, 0);          // r17 = toString(true)   -> "true"
+    as.R6(OpCode::TO_STRING, 18, 8, 0);          // r18 = toString(false)  -> "false"
+    as.R6(OpCode::TO_STRING, 19, 9, 0);          // r19 = toString(nil)    -> "nil"
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, &heap, nullptr, &interner, 20,
+                             &as.constant_pool(), nullptr, &as.string_literals(),
+                             &as.atom_names());
+        auto* regs = res.get_reg_base();
+
+        auto S = [&](int i, std::string_view want) {
+            if (!regs[i].isPtr()) return false;
+            const GcObject* o = GcObject::from_slots(regs[i].asPtr());
+            return o->kind == GcObject::KIND_STRING &&
+                   std::string_view(o->bytes(), o->string_length()) == want;
+        };
+
+        const bool ok =
+            S(10, ":ok") && S(11, ":error") && S(12, "hello") &&
+            S(13, "42")  && S(14, "-7")     && S(15, "3.5")   &&
+            S(16, "2.0") && S(17, "true")   && S(18, "false") && S(19, "nil");
+
+        std::cout << std::format("  atom   \":ok\"    : {}\n", S(10, ":ok")    ? "PASS" : "FAIL");
+        std::cout << std::format("  atom   \":error\" : {}\n", S(11, ":error") ? "PASS" : "FAIL");
+        std::cout << std::format("  string \"hello\"  : {}\n", S(12, "hello")  ? "PASS" : "FAIL");
+        std::cout << std::format("  int    \"42\"     : {}\n", S(13, "42")     ? "PASS" : "FAIL");
+        std::cout << std::format("  int    \"-7\"     : {}\n", S(14, "-7")     ? "PASS" : "FAIL");
+        std::cout << std::format("  double \"3.5\"    : {}\n", S(15, "3.5")    ? "PASS" : "FAIL");
+        std::cout << std::format("  dbl .0 \"2.0\"    : {}\n", S(16, "2.0")    ? "PASS" : "FAIL");
+        std::cout << std::format("  bool   \"true\"   : {}\n", S(17, "true")   ? "PASS" : "FAIL");
+        std::cout << std::format("  bool   \"false\"  : {}\n", S(18, "false")  ? "PASS" : "FAIL");
+        std::cout << std::format("  nil    \"nil\"    : {}\n", S(19, "nil")    ? "PASS" : "FAIL");
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_to_string_struct -- the struct branch of TO_STRING (the default field dump).
+// Covers: a flat struct (Point { x: 1, y: 2 }), a nested struct (Line of two Points),
+// a QUOTED string field + an atom field, an omitted field rendered as `undefined`,
+// and the depth cap on a self-referential (cyclic) struct -- which must terminate
+// with `... }` instead of overflowing the native stack.
+// =============================================================================
+inline void test_to_string_struct() {
+    std::cout << "=== TO_STRING (struct default field dump) ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    Assembler as;
+    as.define_struct("Point", { "x", "y" });   // id 0
+    as.define_struct("Line",  { "a", "b" });   // id 1 (a, b are Points)
+    as.define_struct("Named", { "s", "tag" }); // id 2 (string + atom)
+    as.define_struct("Node",  { "next" });     // id 3 (self-referential)
+
+    const uint16_t px = as.field("Point", "x"), py = as.field("Point", "y");
+    const uint16_t la = as.field("Line",  "a"), lb = as.field("Line",  "b");
+    const uint16_t ns = as.field("Named", "s"), nt = as.field("Named", "tag");
+    const uint16_t nn = as.field("Node",  "next");
+
+    as.label("main");
+    // r0 = Point { x: 1, y: 2 } ; r1 = its dump
+    as.NEW_STRUCT(0, as.struct_id("Point"));
+    as.load_const(10, 1); as.SET_PROP(0, px, 10);
+    as.load_const(11, 2); as.SET_PROP(0, py, 11);
+    as.R6(OpCode::TO_STRING, 1, 0, 0);
+
+    // r4 = Line { a: Point{3,4}, b: Point{5,6} } ; r5 = its (nested) dump
+    as.NEW_STRUCT(2, as.struct_id("Point"));
+    as.load_const(10, 3); as.SET_PROP(2, px, 10);
+    as.load_const(11, 4); as.SET_PROP(2, py, 11);
+    as.NEW_STRUCT(3, as.struct_id("Point"));
+    as.load_const(10, 5); as.SET_PROP(3, px, 10);
+    as.load_const(11, 6); as.SET_PROP(3, py, 11);
+    as.NEW_STRUCT(4, as.struct_id("Line"));
+    as.SET_PROP(4, la, 2);
+    as.SET_PROP(4, lb, 3);
+    as.R6(OpCode::TO_STRING, 5, 4, 0);
+
+    // r6 = Named { s: "hi", tag: :ok } ; r7 = its dump (string quoted, atom :ok)
+    as.NEW_STRUCT(6, as.struct_id("Named"));
+    as.load_str(12, "hi");   as.SET_PROP(6, ns, 12);
+    as.load_atom(13, "ok");  as.SET_PROP(6, nt, 13);
+    as.R6(OpCode::TO_STRING, 7, 6, 0);
+
+    // r8 = Point { x: 7 } (y omitted -> Undefined) ; r9 = its dump
+    as.NEW_STRUCT(8, as.struct_id("Point"));
+    as.load_const(14, 7); as.SET_PROP(8, px, 14);
+    as.R6(OpCode::TO_STRING, 9, 8, 0);
+
+    // r15 = Node { next: <self> } ; r16 = its depth-capped dump (must not crash)
+    as.NEW_STRUCT(15, as.struct_id("Node"));
+    as.SET_PROP(15, nn, 15);                    // next = itself -> a cycle
+    as.R6(OpCode::TO_STRING, 16, 15, 0);
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, &heap, nullptr, &interner, 17,
+                             &as.constant_pool(), &as.struct_types(),
+                             &as.string_literals(), &as.atom_names());
+        auto* regs = res.get_reg_base();
+
+        auto S = [&](int i, std::string_view want) {
+            if (!regs[i].isPtr()) return false;
+            const GcObject* o = GcObject::from_slots(regs[i].asPtr());
+            return o->kind == GcObject::KIND_STRING &&
+                   std::string_view(o->bytes(), o->string_length()) == want;
+        };
+
+        const std::string_view flat   = "Point { x: 1, y: 2 }";
+        const std::string_view nested = "Line { a: Point { x: 3, y: 4 }, b: Point { x: 5, y: 6 } }";
+        const std::string_view named  = "Named { s: \"hi\", tag: :ok }";
+        const std::string_view omit   = "Point { x: 7, y: undefined }";
+        const std::string_view cyclic =
+            "Node { next: Node { next: Node { next: Node { next: Node { ... } } } } }";
+
+        const bool ok =
+            S(1, flat) && S(5, nested) && S(7, named) && S(9, omit) && S(16, cyclic);
+
+        std::cout << std::format("  flat   : {}\n", S(1, flat)   ? "PASS" : "FAIL");
+        std::cout << std::format("  nested : {}\n", S(5, nested) ? "PASS" : "FAIL");
+        std::cout << std::format("  named  : {}\n", S(7, named)  ? "PASS" : "FAIL");
+        std::cout << std::format("  omit   : {}\n", S(9, omit)   ? "PASS" : "FAIL");
+        std::cout << std::format("  cyclic : {}\n", S(16, cyclic)? "PASS" : "FAIL");
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_to_string_array -- the default ARRAY element dump: `[e0, e1, ...]` (Rust-near).
+// Covers a flat int array, a nested array (arrays recurse), a mixed array whose string
+// element is QUOTED and whose atom element renders `:name`, an array as a STRUCT field
+// (the struct dump now descends into the array instead of `<array>`), the empty array
+// `[]`, and the depth-4 CYCLE cap on a self-referential array (a[0] = a) which must
+// terminate as `[ ... ]` rather than overflow the host stack.
+// =============================================================================
+inline void test_to_string_array() {
+    std::cout << "=== TO_STRING (array element dump) ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    Assembler as;
+    as.define_struct("Bag", { "items" });      // a struct with an array field
+
+    as.label("main");
+    // r0 = [1, 2, 3] ; r1 = its dump
+    as.ALLOC(0, 3);
+    as.load_const(2, 1); as.load_const(3, 0); as.ARRAY_SET(0, 3, 2);
+    as.load_const(2, 2); as.load_const(3, 1); as.ARRAY_SET(0, 3, 2);
+    as.load_const(2, 3); as.load_const(3, 2); as.ARRAY_SET(0, 3, 2);
+    as.R6(OpCode::TO_STRING, 1, 0, 0);
+
+    // r4 = [[1, 2], [3]] ; r5 = its (nested) dump
+    as.ALLOC(6, 2);                                                 // inner0 = [1, 2]
+    as.load_const(2, 1); as.load_const(3, 0); as.ARRAY_SET(6, 3, 2);
+    as.load_const(2, 2); as.load_const(3, 1); as.ARRAY_SET(6, 3, 2);
+    as.ALLOC(7, 1);                                                 // inner1 = [3]
+    as.load_const(2, 3); as.load_const(3, 0); as.ARRAY_SET(7, 3, 2);
+    as.ALLOC(4, 2);                                                 // outer
+    as.load_const(3, 0); as.ARRAY_SET(4, 3, 6);
+    as.load_const(3, 1); as.ARRAY_SET(4, 3, 7);
+    as.R6(OpCode::TO_STRING, 5, 4, 0);
+
+    // r8 = [10, "hi", :ok] ; r9 = its dump (string quoted, atom :ok)
+    as.ALLOC(8, 3);
+    as.load_const(2, 10); as.load_const(3, 0); as.ARRAY_SET(8, 3, 2);
+    as.load_str(2, "hi");  as.load_const(3, 1); as.ARRAY_SET(8, 3, 2);
+    as.load_atom(2, "ok"); as.load_const(3, 2); as.ARRAY_SET(8, 3, 2);
+    as.R6(OpCode::TO_STRING, 9, 8, 0);
+
+    // r12 = Bag { items: [7, 8] } ; r13 = its dump (struct descends into the array)
+    as.ALLOC(10, 2);
+    as.load_const(2, 7); as.load_const(3, 0); as.ARRAY_SET(10, 3, 2);
+    as.load_const(2, 8); as.load_const(3, 1); as.ARRAY_SET(10, 3, 2);
+    as.NEW_STRUCT(12, as.struct_id("Bag"));
+    as.SET_PROP(12, as.field("Bag", "items"), 10);
+    as.R6(OpCode::TO_STRING, 13, 12, 0);
+
+    // r14 = [] ; r15 = its dump
+    as.ALLOC(14, 0);
+    as.R6(OpCode::TO_STRING, 15, 14, 0);
+
+    // r16 = [<self>] ; r17 = its depth-capped dump (must not crash)
+    as.ALLOC(16, 1);
+    as.load_const(3, 0); as.ARRAY_SET(16, 3, 16);                   // a[0] = itself -> a cycle
+    as.R6(OpCode::TO_STRING, 17, 16, 0);
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    std::cout << "Running...\n";
+    try {
+        // top_frame_size = 18: r0..r17 are all scanned as GC roots across the allocating
+        // TO_STRING / ALLOC safepoints (every live array must survive).
+        auto res   = execute(bytecode, &heap, nullptr, &interner, 18,
+                             &as.constant_pool(), &as.struct_types(),
+                             &as.string_literals(), &as.atom_names());
+        auto* regs = res.get_reg_base();
+
+        auto S = [&](int i, std::string_view want) {
+            if (!regs[i].isPtr()) return false;
+            const GcObject* o = GcObject::from_slots(regs[i].asPtr());
+            return o->kind == GcObject::KIND_STRING &&
+                   std::string_view(o->bytes(), o->string_length()) == want;
+        };
+
+        const std::string_view flat   = "[1, 2, 3]";
+        const std::string_view nested = "[[1, 2], [3]]";
+        const std::string_view mixed  = "[10, \"hi\", :ok]";
+        const std::string_view field  = "Bag { items: [7, 8] }";
+        const std::string_view empty  = "[]";
+        const std::string_view cyclic = "[[[[[ ... ]]]]]";
+
+        const bool ok =
+            S(1, flat) && S(5, nested) && S(9, mixed) &&
+            S(13, field) && S(15, empty) && S(17, cyclic);
+
+        std::cout << std::format("  flat   : {}\n", S(1, flat)    ? "PASS" : "FAIL");
+        std::cout << std::format("  nested : {}\n", S(5, nested)  ? "PASS" : "FAIL");
+        std::cout << std::format("  mixed  : {}\n", S(9, mixed)   ? "PASS" : "FAIL");
+        std::cout << std::format("  field  : {}\n", S(13, field)  ? "PASS" : "FAIL");
+        std::cout << std::format("  empty  : {}\n", S(15, empty)  ? "PASS" : "FAIL");
+        std::cout << std::format("  cyclic : {}\n", S(17, cyclic) ? "PASS" : "FAIL");
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_to_string_vec -- the KIND_VEC default dump behind TO_STRING. A vector renders
+// in the SAME surface form as an array `[e0, e1, ...]` (only the live prefix [0,count)),
+// so this mirrors test_to_string_array: flat, a mixed row (quoted string + atom), a
+// nested vec-of-vecs, a vector as a struct field, the empty `[]`, and the depth-4 cycle
+// cap on a self-referential vector (v[0] = v via the dual-kind ARRAY_SET).
+// =============================================================================
+inline void test_to_string_vec() {
+    std::cout << "=== TO_STRING (vector element dump) ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    Assembler as;
+    as.define_struct("Bag", { "items" });      // a struct with a vector field
+
+    as.label("main");
+    // r0 = vec[1, 2, 3] ; r1 = dump
+    as.VEC_NEW(0);
+    as.load_const(2, 1); as.VEC_PUSH(0, 2);
+    as.load_const(2, 2); as.VEC_PUSH(0, 2);
+    as.load_const(2, 3); as.VEC_PUSH(0, 2);
+    as.R6(OpCode::TO_STRING, 1, 0, 0);
+
+    // r4 = vec[10, "hi", :ok] ; r5 = dump (string quoted, atom :ok)
+    as.VEC_NEW(4);
+    as.load_const(2, 10); as.VEC_PUSH(4, 2);
+    as.load_str(2, "hi"); as.VEC_PUSH(4, 2);
+    as.load_atom(2, "ok"); as.VEC_PUSH(4, 2);
+    as.R6(OpCode::TO_STRING, 5, 4, 0);
+
+    // r8 = vec[ vec[1, 2], vec[3] ] ; r9 = nested dump
+    as.VEC_NEW(6); as.load_const(2, 1); as.VEC_PUSH(6, 2); as.load_const(2, 2); as.VEC_PUSH(6, 2);
+    as.VEC_NEW(7); as.load_const(2, 3); as.VEC_PUSH(7, 2);
+    as.VEC_NEW(8); as.VEC_PUSH(8, 6); as.VEC_PUSH(8, 7);
+    as.R6(OpCode::TO_STRING, 9, 8, 0);
+
+    // r12 = Bag { items: vec[7, 8] } ; r13 = dump (struct descends into the vector)
+    as.VEC_NEW(10); as.load_const(2, 7); as.VEC_PUSH(10, 2); as.load_const(2, 8); as.VEC_PUSH(10, 2);
+    as.NEW_STRUCT(12, as.struct_id("Bag"));
+    as.SET_PROP(12, as.field("Bag", "items"), 10);
+    as.R6(OpCode::TO_STRING, 13, 12, 0);
+
+    // r14 = vec[] ; r15 = dump
+    as.VEC_NEW(14);
+    as.R6(OpCode::TO_STRING, 15, 14, 0);
+
+    // r16 = vec[<self>] ; r17 = depth-capped dump (must not crash)
+    as.VEC_NEW(16);
+    as.load_const(2, 0); as.VEC_PUSH(16, 2);           // count 1 (placeholder)
+    as.load_const(3, 0); as.ARRAY_SET(16, 3, 16);      // v[0] = itself -> a cycle (dual-kind set)
+    as.R6(OpCode::TO_STRING, 17, 16, 0);
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, &heap, nullptr, &interner, 18,
+                             &as.constant_pool(), &as.struct_types(),
+                             &as.string_literals(), &as.atom_names());
+        auto* regs = res.get_reg_base();
+
+        auto S = [&](int i, std::string_view want) {
+            if (!regs[i].isPtr()) return false;
+            const GcObject* o = GcObject::from_slots(regs[i].asPtr());
+            return o->kind == GcObject::KIND_STRING &&
+                   std::string_view(o->bytes(), o->string_length()) == want;
+        };
+
+        const std::string_view flat   = "[1, 2, 3]";
+        const std::string_view mixed  = "[10, \"hi\", :ok]";
+        const std::string_view nested = "[[1, 2], [3]]";
+        const std::string_view field  = "Bag { items: [7, 8] }";
+        const std::string_view empty  = "[]";
+        const std::string_view cyclic = "[[[[[ ... ]]]]]";
+
+        const bool ok =
+            S(1, flat) && S(5, mixed) && S(9, nested) &&
+            S(13, field) && S(15, empty) && S(17, cyclic);
+
+        std::cout << std::format("  flat   : {}\n", S(1, flat)    ? "PASS" : "FAIL");
+        std::cout << std::format("  mixed  : {}\n", S(5, mixed)   ? "PASS" : "FAIL");
+        std::cout << std::format("  nested : {}\n", S(9, nested)  ? "PASS" : "FAIL");
+        std::cout << std::format("  field  : {}\n", S(13, field)  ? "PASS" : "FAIL");
+        std::cout << std::format("  empty  : {}\n", S(15, empty)  ? "PASS" : "FAIL");
+        std::cout << std::format("  cyclic : {}\n", S(17, cyclic) ? "PASS" : "FAIL");
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_to_string_map -- the KIND_MAP default dump `#{k => v, ...}` behind TO_STRING.
+// The dump walks the backing in HASH order, so insertion order is NOT preserved:
+// single-entry maps are asserted exactly (unambiguous), the two-entry case accepts
+// either order (exercises the ", " separator), and the rest cover the empty map, a
+// quoted string key, an atom key, a nested map value, and the depth-4 cycle cap on a
+// self-referential map (`m.[1] = m`).
+// =============================================================================
+inline void test_to_string_map() {
+    std::cout << "=== TO_STRING (map dump) ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    Assembler as;
+    as.label("main");
+
+    // r0 = #{} ; r1 = dump
+    as.MAP_NEW(0);
+    as.R6(OpCode::TO_STRING, 1, 0, 0);
+
+    // r2 = #{1 => 100} ; r3 = dump  (scratch key/val in r20/r21)
+    as.MAP_NEW(2);
+    as.load_const(20, 1); as.load_const(21, 100); as.MAP_SET(2, 20, 21);
+    as.R6(OpCode::TO_STRING, 3, 2, 0);
+
+    // r4 = #{"name" => 1} ; r5 = dump  (string key -> quoted)
+    as.MAP_NEW(4);
+    as.load_str(20, "name"); as.load_const(21, 1); as.MAP_SET(4, 20, 21);
+    as.R6(OpCode::TO_STRING, 5, 4, 0);
+
+    // r6 = #{:ok => 1} ; r7 = dump  (atom key -> :ok)
+    as.MAP_NEW(6);
+    as.load_atom(20, "ok"); as.load_const(21, 1); as.MAP_SET(6, 20, 21);
+    as.R6(OpCode::TO_STRING, 7, 6, 0);
+
+    // r8 = #{1 => 10, 2 => 20} ; r9 = dump  (two entries -> either hash order)
+    as.MAP_NEW(8);
+    as.load_const(20, 1); as.load_const(21, 10); as.MAP_SET(8, 20, 21);
+    as.load_const(20, 2); as.load_const(21, 20); as.MAP_SET(8, 20, 21);
+    as.R6(OpCode::TO_STRING, 9, 8, 0);
+
+    // r10 = #{1 => #{2 => 3}} ; r12 = dump  (nested map value; inner in r11)
+    as.MAP_NEW(11);
+    as.load_const(20, 2); as.load_const(21, 3); as.MAP_SET(11, 20, 21);
+    as.MAP_NEW(10);
+    as.load_const(20, 1); as.MAP_SET(10, 20, 11);            // value = inner map
+    as.R6(OpCode::TO_STRING, 12, 10, 0);
+
+    // r13 = #{1 => <self>} ; r14 = depth-capped dump (must not crash)
+    as.MAP_NEW(13);
+    as.load_const(20, 1); as.MAP_SET(13, 20, 13);            // m[1] = itself -> a cycle
+    as.R6(OpCode::TO_STRING, 14, 13, 0);
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    std::cout << "Running...\n";
+    try {
+        // top_frame_size = 22: every live map (r0..r13) + the scratch key/val (r20/r21)
+        // is GC-scanned across the allocating MAP_NEW/MAP_SET/TO_STRING safepoints.
+        auto res   = execute(bytecode, &heap, nullptr, &interner, 22,
+                             &as.constant_pool(), &as.struct_types(),
+                             &as.string_literals(), &as.atom_names());
+        auto* regs = res.get_reg_base();
+
+        auto str_at = [&](int i) -> std::string {
+            if (!regs[i].isPtr()) return "<not-a-ptr>";
+            const GcObject* o = GcObject::from_slots(regs[i].asPtr());
+            if (o->kind != GcObject::KIND_STRING) return "<not-a-string>";
+            return std::string(o->bytes(), o->string_length());
+        };
+        auto S = [&](int i, std::string_view want) {
+            const std::string got = str_at(i);
+            const bool ok = got == want;
+            if (!ok) std::cout << std::format("    (got \"{}\", want \"{}\")\n", got, want);
+            return ok;
+        };
+
+        const std::string two = str_at(9);
+        const bool two_ok = (two == "#{1 => 10, 2 => 20}") || (two == "#{2 => 20, 1 => 10}");
+        if (!two_ok) std::cout << std::format("    (got \"{}\")\n", two);
+
+        const bool empty_ok  = S(1,  "#{}");
+        const bool flat_ok   = S(3,  "#{1 => 100}");
+        const bool strk_ok   = S(5,  "#{\"name\" => 1}");
+        const bool atomk_ok  = S(7,  "#{:ok => 1}");
+        const bool nested_ok = S(12, "#{1 => #{2 => 3}}");
+        const bool cyclic_ok = S(14, "#{1 => #{1 => #{1 => #{1 => #{ ... }}}}}");
+
+        const bool ok = empty_ok && flat_ok && strk_ok && atomk_ok &&
+                        two_ok && nested_ok && cyclic_ok;
+
+        std::cout << std::format("  empty  : {}\n", empty_ok  ? "PASS" : "FAIL");
+        std::cout << std::format("  flat   : {}\n", flat_ok   ? "PASS" : "FAIL");
+        std::cout << std::format("  str key: {}\n", strk_ok   ? "PASS" : "FAIL");
+        std::cout << std::format("  atom k : {}\n", atomk_ok  ? "PASS" : "FAIL");
+        std::cout << std::format("  two    : {}\n", two_ok    ? "PASS" : "FAIL");
+        std::cout << std::format("  nested : {}\n", nested_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  cyclic : {}\n", cyclic_ok ? "PASS" : "FAIL");
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_to_string_tuple -- the DumpStyle::Tuple render behind TO_STRING: a KIND_OBJECT
+// whose struct type is tagged Tuple prints positionally as `(e0, e1)` instead of the
+// `Name { ... }` field dump. Covers a pair, the 1-tuple trailing comma `(7,)`, the empty
+// `()`, a nested tuple, a quoted string + atom element, and a tuple AS a struct field.
+// (The compiler tags its $TupleN fiction type Tuple; here we drive it directly via
+// define_struct(..., DumpStyle::Tuple).)
+// =============================================================================
+inline void test_to_string_tuple() {
+    std::cout << "=== TO_STRING (tuple dump) ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    Assembler as;
+    as.define_struct("Pair", { "_0", "_1" }, DumpStyle::Tuple);   // id 0
+    as.define_struct("One",  { "_0" },        DumpStyle::Tuple);  // id 1
+    as.define_struct("Zero", { },             DumpStyle::Tuple);  // id 2
+    as.define_struct("Wrap", { "t" });                            // id 3 (plain struct)
+
+    as.label("main");
+    // r0 = (1, 2) ; r1 = dump  (scratch value in r20)
+    as.NEW_STRUCT(0, as.struct_id("Pair"));
+    as.load_const(20, 1); as.SET_PROP(0, 0, 20);
+    as.load_const(20, 2); as.SET_PROP(0, 1, 20);
+    as.R6(OpCode::TO_STRING, 1, 0, 0);
+
+    // r2 = (7,) 1-tuple ; r3 = dump
+    as.NEW_STRUCT(2, as.struct_id("One"));
+    as.load_const(20, 7); as.SET_PROP(2, 0, 20);
+    as.R6(OpCode::TO_STRING, 3, 2, 0);
+
+    // r4 = () empty tuple ; r5 = dump
+    as.NEW_STRUCT(4, as.struct_id("Zero"));
+    as.R6(OpCode::TO_STRING, 5, 4, 0);
+
+    // r6 = (1, (2, 3)) nested ; r7 = dump  (inner tuple in r8)
+    as.NEW_STRUCT(8, as.struct_id("Pair"));
+    as.load_const(20, 2); as.SET_PROP(8, 0, 20);
+    as.load_const(20, 3); as.SET_PROP(8, 1, 20);
+    as.NEW_STRUCT(6, as.struct_id("Pair"));
+    as.load_const(20, 1); as.SET_PROP(6, 0, 20);
+    as.SET_PROP(6, 1, 8);
+    as.R6(OpCode::TO_STRING, 7, 6, 0);
+
+    // r9 = ("hi", :ok) ; r10 = dump  (string quoted, atom :ok)
+    as.NEW_STRUCT(9, as.struct_id("Pair"));
+    as.load_str(20, "hi");  as.SET_PROP(9, 0, 20);
+    as.load_atom(20, "ok"); as.SET_PROP(9, 1, 20);
+    as.R6(OpCode::TO_STRING, 10, 9, 0);
+
+    // r11 = Wrap { t: (1, 2) } ; r12 = dump  (tuple as a struct field; inner in r13)
+    as.NEW_STRUCT(13, as.struct_id("Pair"));
+    as.load_const(20, 1); as.SET_PROP(13, 0, 20);
+    as.load_const(20, 2); as.SET_PROP(13, 1, 20);
+    as.NEW_STRUCT(11, as.struct_id("Wrap"));
+    as.SET_PROP(11, as.field("Wrap", "t"), 13);
+    as.R6(OpCode::TO_STRING, 12, 11, 0);
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    std::cout << "Running...\n";
+    try {
+        // top_frame_size = 21: r0..r20 are scanned across the allocating NEW_STRUCT/TO_STRING.
+        auto res   = execute(bytecode, &heap, nullptr, &interner, 21,
+                             &as.constant_pool(), &as.struct_types(),
+                             &as.string_literals(), &as.atom_names());
+        auto* regs = res.get_reg_base();
+
+        auto S = [&](int i, std::string_view want) {
+            if (!regs[i].isPtr()) return false;
+            const GcObject* o = GcObject::from_slots(regs[i].asPtr());
+            const bool ok = o->kind == GcObject::KIND_STRING &&
+                            std::string_view(o->bytes(), o->string_length()) == want;
+            if (!ok && o->kind == GcObject::KIND_STRING)
+                std::cout << std::format("    (got \"{}\", want \"{}\")\n",
+                    std::string_view(o->bytes(), o->string_length()), want);
+            return ok;
+        };
+
+        const bool ok =
+            S(1, "(1, 2)") && S(3, "(7,)") && S(5, "()") &&
+            S(7, "(1, (2, 3))") && S(10, "(\"hi\", :ok)") &&
+            S(12, "Wrap { t: (1, 2) }");
+
+        std::cout << std::format("  pair   : {}\n", S(1, "(1, 2)")             ? "PASS" : "FAIL");
+        std::cout << std::format("  one    : {}\n", S(3, "(7,)")               ? "PASS" : "FAIL");
+        std::cout << std::format("  zero   : {}\n", S(5, "()")                 ? "PASS" : "FAIL");
+        std::cout << std::format("  nested : {}\n", S(7, "(1, (2, 3))")        ? "PASS" : "FAIL");
+        std::cout << std::format("  mixed  : {}\n", S(10, "(\"hi\", :ok)")     ? "PASS" : "FAIL");
+        std::cout << std::format("  field  : {}\n", S(12, "Wrap { t: (1, 2) }")? "PASS" : "FAIL");
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_to_string_list -- the DumpStyle::List render behind TO_STRING: a `$List`-style
+// cons cell prints as `[e0, e1, ...]` via an ITERATIVE spine walk (one depth level, so a
+// long flat list renders fully). Covers [1, 2, 3], the empty list (= nil -> "nil"), a
+// nested list-of-lists, quoted string elements, and a hand-built CYCLIC list, which must
+// terminate via the TO_STRING_MAX_LIST spine cap (not hang / overflow).
+// =============================================================================
+inline void test_to_string_list() {
+    std::cout << "=== TO_STRING (cons-list dump) ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    Assembler as;
+    as.define_struct("Cell", { "head", "tail" }, DumpStyle::List);   // id 0
+
+    as.label("main");
+    // [1, 2, 3] = Cell{1, Cell{2, Cell{3, nil}}}  (c3=r2, c2=r1, c1=r0; scratch r20)
+    as.NEW_STRUCT(2, as.struct_id("Cell"));
+    as.load_const(20, 3); as.SET_PROP(2, 0, 20);
+    as.load_constant(20, Value::fromNil()); as.SET_PROP(2, 1, 20);
+    as.NEW_STRUCT(1, as.struct_id("Cell"));
+    as.load_const(20, 2); as.SET_PROP(1, 0, 20);
+    as.SET_PROP(1, 1, 2);
+    as.NEW_STRUCT(0, as.struct_id("Cell"));
+    as.load_const(20, 1); as.SET_PROP(0, 0, 20);
+    as.SET_PROP(0, 1, 1);
+    as.R6(OpCode::TO_STRING, 3, 0, 0);            // r3 = "[1, 2, 3]"
+
+    // empty list = nil ; r5 = dump ("nil")
+    as.load_constant(4, Value::fromNil());
+    as.R6(OpCode::TO_STRING, 5, 4, 0);
+
+    // [[1], [2]] : inner1=[1] in r6, inner2=[2] in r7, outer head/tail in r8/r9
+    as.NEW_STRUCT(6, as.struct_id("Cell"));
+    as.load_const(20, 1); as.SET_PROP(6, 0, 20);
+    as.load_constant(20, Value::fromNil()); as.SET_PROP(6, 1, 20);
+    as.NEW_STRUCT(7, as.struct_id("Cell"));
+    as.load_const(20, 2); as.SET_PROP(7, 0, 20);
+    as.load_constant(20, Value::fromNil()); as.SET_PROP(7, 1, 20);
+    as.NEW_STRUCT(9, as.struct_id("Cell"));       // tail cell -> inner2
+    as.SET_PROP(9, 0, 7);
+    as.load_constant(20, Value::fromNil()); as.SET_PROP(9, 1, 20);
+    as.NEW_STRUCT(8, as.struct_id("Cell"));       // head cell -> inner1
+    as.SET_PROP(8, 0, 6);
+    as.SET_PROP(8, 1, 9);
+    as.R6(OpCode::TO_STRING, 10, 8, 0);           // r10 = "[[1], [2]]"
+
+    // ["a", "b"] -> quoted string elements
+    as.NEW_STRUCT(12, as.struct_id("Cell"));
+    as.load_str(20, "b"); as.SET_PROP(12, 0, 20);
+    as.load_constant(20, Value::fromNil()); as.SET_PROP(12, 1, 20);
+    as.NEW_STRUCT(11, as.struct_id("Cell"));
+    as.load_str(20, "a"); as.SET_PROP(11, 0, 20);
+    as.SET_PROP(11, 1, 12);
+    as.R6(OpCode::TO_STRING, 13, 11, 0);          // r13 = "[\"a\", \"b\"]"
+
+    // cyclic: c0=Cell{1, c1}, c1=Cell{2, c0} -> spine cap must terminate it
+    as.NEW_STRUCT(14, as.struct_id("Cell"));      // c0
+    as.NEW_STRUCT(15, as.struct_id("Cell"));      // c1
+    as.load_const(20, 1); as.SET_PROP(14, 0, 20); as.SET_PROP(14, 1, 15);
+    as.load_const(20, 2); as.SET_PROP(15, 0, 20); as.SET_PROP(15, 1, 14);
+    as.R6(OpCode::TO_STRING, 16, 14, 0);          // r16 = bounded cyclic dump
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    std::cout << "Running...\n";
+    try {
+        // top_frame_size = 21: every live cell (r0..r15) + scratch r20 is GC-scanned.
+        auto res   = execute(bytecode, &heap, nullptr, &interner, 21,
+                             &as.constant_pool(), &as.struct_types(),
+                             &as.string_literals(), &as.atom_names());
+        auto* regs = res.get_reg_base();
+
+        auto str_at = [&](int i) -> std::string {
+            if (!regs[i].isPtr()) return "<not-a-ptr>";
+            const GcObject* o = GcObject::from_slots(regs[i].asPtr());
+            if (o->kind != GcObject::KIND_STRING) return "<not-a-string>";
+            return std::string(o->bytes(), o->string_length());
+        };
+        auto S = [&](int i, std::string_view want) {
+            const std::string got = str_at(i);
+            const bool ok = got == want;
+            if (!ok) std::cout << std::format("    (got \"{}\", want \"{}\")\n", got, want);
+            return ok;
+        };
+
+        // cyclic: bounded ("[1, 2, 1, 2, ..." then ", ...]" once the cap trips)
+        const std::string cyc = str_at(16);
+        const bool cyc_ok = cyc.starts_with("[1, 2,") && cyc.ends_with(", ...]");
+        if (!cyc_ok) std::cout << std::format("    (cyclic got \"{}\")\n", cyc);
+
+        const bool flat_ok   = S(3,  "[1, 2, 3]");
+        const bool empty_ok  = S(5,  "nil");            // empty list = nil
+        const bool nested_ok = S(10, "[[1], [2]]");
+        const bool strel_ok  = S(13, "[\"a\", \"b\"]");
+
+        const bool ok = flat_ok && empty_ok && nested_ok && strel_ok && cyc_ok;
+
+        std::cout << std::format("  flat   : {}\n", flat_ok   ? "PASS" : "FAIL");
+        std::cout << std::format("  empty  : {}\n", empty_ok  ? "PASS" : "FAIL");
+        std::cout << std::format("  nested : {}\n", nested_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  str el : {}\n", strel_ok  ? "PASS" : "FAIL");
+        std::cout << std::format("  cyclic : {}\n", cyc_ok    ? "PASS" : "FAIL");
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_print -- PRINT / PRINTLN to a REDIRECTABLE sink. execute()'s out parameter
+// points vm->out at a captured std::ostringstream, so the exact bytes are asserted
+// without touching stdout. Covers: a raw PRINT on a LOAD_STR string (no coercion,
+// no newline), PRINTLN (adds '\n'), the TO_STRING + PRINTLN path for a number and
+// an atom (print output == toString output by construction), the 0-arg println()
+// lowering (empty string + PRINTLN -> a bare newline), and the Nil result of PRINT
+// (so print(x) is an expression yielding nil).
+// =============================================================================
+inline void test_print() {
+    std::cout << "=== PRINT / PRINTLN (redirectable sink) ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    Assembler as;
+    as.label("main");
+    as.load_str(0, "hi");          as.PRINT(1, 0);                 // out += "hi"   (no newline)
+    as.load_str(2, "world");       as.PRINTLN(3, 2);               // out += "world\n"
+    as.load_const(4, 42);          as.R6(OpCode::TO_STRING, 4, 4, 0);
+                                   as.PRINTLN(5, 4);               // out += "42\n"
+    as.load_atom(6, "ok");         as.R6(OpCode::TO_STRING, 6, 6, 0);
+                                   as.PRINTLN(7, 6);               // out += ":ok\n"
+    as.load_str(8, "");            as.PRINTLN(9, 8);               // out += "\n"  (bare println())
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    std::cout << "Running...\n";
+    try {
+        std::ostringstream oss;
+        // top_frame_size = 10: r0..r9 scanned as GC roots across the TO_STRING allocs.
+        auto res   = execute(bytecode, &heap, nullptr, &interner, 10,
+                             &as.constant_pool(), &as.struct_types(),
+                             &as.string_literals(), &as.atom_names(), nullptr, &oss);
+        auto* regs = res.get_reg_base();
+
+        const std::string got  = oss.str();
+        const std::string want = "hiworld\n42\n:ok\n\n";
+        const bool out_ok      = (got == want);
+        const bool nil_ok      = regs[1].isNil();   // PRINT sets rd = Nil
+
+        std::cout << std::format("  output : {}  ({} bytes)\n", out_ok ? "PASS" : "FAIL", got.size());
+        std::cout << std::format("  nil rd : {}\n", nil_ok ? "PASS" : "FAIL");
+        check(out_ok && nil_ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_panic -- the PANIC opcode: abort with a LOCATED fault carrying the message
+// string in ra. It never returns (raise_located throws a VmFault), so execute()
+// propagates the exception; the message must contain the panic text.
+// =============================================================================
+inline void test_panic() {
+    std::cout << "=== PANIC (located abort) ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    Assembler as;
+    as.label("main");
+    as.load_str(0, "boom");
+    as.PANIC(0);                    // abort with "boom"; never returns
+    as.J(OpCode::HALT);             // unreachable
+    const auto bytecode = as.assemble();
+
+    std::cout << "Running (expect throw)...\n";
+    bool threw = false, msg_ok = false;
+    try {
+        execute(bytecode, &heap, nullptr, &interner, 1,
+                &as.constant_pool(), &as.struct_types(),
+                &as.string_literals(), &as.atom_names());
+    }
+    catch (const std::exception& e) {
+        threw  = true;
+        msg_ok = std::string(e.what()).find("boom") != std::string::npos;
+        std::cout << "  caught: " << e.what() << "\n";
+    }
+    std::cout << std::format("  threw  : {}\n", threw ? "PASS" : "FAIL");
+    std::cout << std::format("  message: {}\n", msg_ok ? "PASS" : "FAIL");
+    check(threw && msg_ok);
+}
+
+// =============================================================================
+// test_string_compare -- generic LT/LE dispatch. Lexicographic (unsigned byte,
+// prefix < longer) on strings, and the numeric path still works through the same
+// opcodes. (`>`/`>=` are compiler-side operand swaps, so the VM only has LT/LE.)
+// =============================================================================
+inline void test_string_compare() {
+    std::cout << "=== string compare (LT/LE) ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    Assembler as;
+    as.label("main");
+    as.load_str(0, "apple");
+    as.load_str(1, "banana");
+    as.R6(OpCode::LT, 2, 0, 1);         // "apple" < "banana"  -> true
+    as.R6(OpCode::LT, 3, 1, 0);         // "banana" < "apple"  -> false
+    as.load_str(4, "ab");
+    as.load_str(5, "abc");
+    as.R6(OpCode::LT, 6, 4, 5);         // "ab" < "abc" (prefix) -> true
+    as.load_str(7, "x");
+    as.load_str(8, "x");
+    as.R6(OpCode::LT, 9, 7, 8);         // "x" < "x"  -> false
+    as.R6(OpCode::LE, 10, 7, 8);        // "x" <= "x" -> true
+    as.load_const(11, 3);
+    as.load_const(12, 5);
+    as.R6(OpCode::LT, 13, 11, 12);      // 3 < 5 (numeric dispatch) -> true
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, &heap, nullptr, &interner, 14, nullptr, nullptr,
+                             &as.string_literals());
+        auto* regs = res.get_reg_base();
+        auto B = [&](int i, bool want) { return regs[i].isBool() && regs[i].asBool() == want; };
+
+        const bool str_ok = B(2, true) && B(3, false) && B(6, true) && B(9, false) && B(10, true);
+        const bool num_ok = B(13, true);
+        std::cout << std::format("  lexicographic LT/LE: {}\n", str_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  numeric dispatch:    {}\n", num_ok ? "PASS" : "FAIL");
+        check(str_ok && num_ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_string_content_eq -- the strategy-B regression: EQ compares heap strings by
+// CONTENT, not pointer identity. Builds a NON-interned string via concat and EQ-s it
+// against the interned literal of equal content: pointers differ, EQ must still be
+// true (and NE false). Without content-EQ this would wrongly report not-equal.
+// =============================================================================
+inline void test_string_content_eq() {
+    std::cout << "=== string content equality (EQ) ===\n";
+
+    Heap heap(64 * 1024);
+    StringInterner interner;
+
+    Assembler as;
+    as.label("main");
+    as.load_str(0, "foo");
+    as.load_str(1, "bar");
+    as.R6(OpCode::ADD, 2, 0, 1);        // r2 = "foobar" (fresh, NOT interned)
+    as.load_str(3, "foobar");           // r3 = interned literal "foobar"
+    as.R6(OpCode::EQ, 4, 2, 3);         // content-equal -> true
+    as.R6(OpCode::NE, 5, 2, 3);         // -> false
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, &heap, nullptr, &interner, 6, nullptr, nullptr,
+                             &as.string_literals());
+        auto* regs = res.get_reg_base();
+
+        const bool distinct_ptr = regs[2].isPtr() && regs[3].isPtr() &&
+                                  regs[2].asPtr() != regs[3].asPtr();
+        const bool eq_ok = regs[4].isBool() && regs[4].asBool() == true &&
+                           regs[5].isBool() && regs[5].asBool() == false;
+        std::cout << std::format("  distinct pointers, equal content: {}\n", distinct_ptr ? "PASS" : "FAIL");
+        std::cout << std::format("  EQ true / NE false by content:    {}\n", eq_ok ? "PASS" : "FAIL");
+        check(distinct_ptr && eq_ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_struct -- fixed-shape struct basics: NEW_STRUCT / SET_PROP / GET_PROP /
+// IS_OBJECT. Defines Point{ x, y }, constructs one, round-trips both fields, and
+// checks IS_OBJECT (true for the struct, false for an int). No GC involved.
+// =============================================================================
+inline void test_struct() {
+    std::cout << "=== struct ===\n";
+
+    Heap heap(64 * 1024);
+
+    Assembler as;
+    const uint16_t Point = as.define_struct("Point", { "x", "y" });
+
+    as.label("main");
+    as.NEW_STRUCT(0, Point);                        // r0 = new Point
+    as.load_const(1, 111);
+    as.load_const(2, 222);
+    as.SET_PROP(0, as.field("Point", "x"), 1);      // r0.x = 111
+    as.SET_PROP(0, as.field("Point", "y"), 2);      // r0.y = 222
+    as.GET_PROP(3, 0, as.field("Point", "x"));      // r3 = r0.x
+    as.GET_PROP(4, 0, as.field("Point", "y"));      // r4 = r0.y
+    as.IS_OBJECT(5, 0);                             // r5 = IS_OBJECT(r0) -> true
+    as.IS_OBJECT(6, 1);                             // r6 = IS_OBJECT(r1) -> false (int)
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    Disassembler dis(bytecode.data(), bytecode.size());
+    dis.add_label(0, "main");
+    dis.print();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, &heap, nullptr, nullptr, 0, nullptr, &as.struct_types());
+        auto* regs = res.get_reg_base();
+
+        const bool is_ptr = regs[0].isPtr();
+        GcObject*  obj    = is_ptr ? GcObject::from_slots(regs[0].asPtr()) : nullptr;
+
+        const bool shape_ok =
+            is_ptr && obj &&
+            obj->kind == GcObject::KIND_OBJECT &&
+            obj->slot_count() == 2 &&
+            obj->object_type_id() == Point;
+
+        const bool fields_ok =
+            obj &&
+            obj->slots()[0].asSigned48() == 111 &&
+            obj->slots()[1].asSigned48() == 222 &&
+            regs[3].asSigned48() == 111 &&
+            regs[4].asSigned48() == 222;
+
+        const bool isobj_ok =
+            regs[5].isBool() && regs[5].asBool() == true &&
+            regs[6].isBool() && regs[6].asBool() == false;
+
+        const bool ok = shape_ok && fields_ok && isobj_ok;
+
+        std::cout << std::format("  shape (kind/arity/type id):  {}\n", shape_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  field round-trip:            {}\n", fields_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  IS_OBJECT true/false:        {}\n", isobj_ok ? "PASS" : "FAIL");
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_eq_deep -- the EQ_DEEP opcode: STRUCTURAL (deep / value) equality behind
+// the surface `==` on a composite. Proves the VM half of "structural ==" in
+// isolation (no compiler involved): two separately-built equal composites compare
+// EQUAL where the reference-identity EQ would say false. Covers structs (equal /
+// unequal / nested), distinct type-ids (the enum None-vs-Some shape), arrays,
+// vectors, byte buffers, ORDER-INDEPENDENT maps, same-pointer short-circuit, and
+// the fresh-string content path. Cyclic-value -> "stack overflow" and the closure
+// trap are defensive (checker-forbidden) and not exercised here.
+// =============================================================================
+inline void test_eq_deep() {
+    std::cout << "=== eq_deep (EQ_DEEP structural equality) ===\n";
+
+    // ---- Block A: structs -- equal, unequal, nested (a compiler never sees this) ----
+    {
+        Heap heap(256 * 1024);
+        Assembler as;
+        const uint16_t Point = as.define_struct("Point", { "x", "y" });
+        const uint16_t Line  = as.define_struct("Line",  { "a", "b" });
+        as.label("main");
+        // Two SEPARATE Point{1,2} objects -> distinct pointers, structurally equal.
+        as.NEW_STRUCT(0, Point);
+        as.load_const(10, 1); as.SET_PROP(0, as.field("Point","x"), 10);
+        as.load_const(10, 2); as.SET_PROP(0, as.field("Point","y"), 10);
+        as.NEW_STRUCT(1, Point);
+        as.load_const(10, 1); as.SET_PROP(1, as.field("Point","x"), 10);
+        as.load_const(10, 2); as.SET_PROP(1, as.field("Point","y"), 10);
+        // A third Point{1,3} -> differs in one field.
+        as.NEW_STRUCT(2, Point);
+        as.load_const(10, 1); as.SET_PROP(2, as.field("Point","x"), 10);
+        as.load_const(10, 3); as.SET_PROP(2, as.field("Point","y"), 10);
+        as.R6(OpCode::EQ_DEEP, 3, 0, 1);   // r3 = Point{1,2} == Point{1,2} -> true
+        as.R6(OpCode::EQ_DEEP, 4, 0, 2);   // r4 = Point{1,2} == Point{1,3} -> false
+        // Nested: Line{ Point{1,2}, Point{1,3} } built twice (fresh Points each time).
+        as.NEW_STRUCT(5, Line);  as.SET_PROP(5, as.field("Line","a"), 0); as.SET_PROP(5, as.field("Line","b"), 2);
+        as.NEW_STRUCT(6, Line);
+        as.NEW_STRUCT(7, Point); as.load_const(10,1); as.SET_PROP(7, as.field("Point","x"),10); as.load_const(10,2); as.SET_PROP(7, as.field("Point","y"),10);
+        as.NEW_STRUCT(8, Point); as.load_const(10,1); as.SET_PROP(8, as.field("Point","x"),10); as.load_const(10,3); as.SET_PROP(8, as.field("Point","y"),10);
+        as.SET_PROP(6, as.field("Line","a"), 7); as.SET_PROP(6, as.field("Line","b"), 8);
+        as.R6(OpCode::EQ_DEEP, 9, 5, 6);   // r9 = Line{P{1,2},P{1,3}} == same -> true
+        // Break the nested one: change r8.y to 4.
+        as.load_const(10, 4); as.SET_PROP(8, as.field("Point","y"), 10);
+        as.R6(OpCode::EQ_DEEP, 11, 5, 6);  // r11 = now differs -> false
+        as.J(OpCode::HALT);
+        std::cout << "Running Block A (structs)...\n";
+        try {
+            auto res = execute(as.assemble(), &heap, nullptr, nullptr, 16, nullptr, &as.struct_types());
+            auto* r = res.get_reg_base();
+            auto B = [&](int i, bool want){ return r[i].isBool() && r[i].asBool() == want; };
+            const bool ok = B(3,true) && B(4,false) && B(9,true) && B(11,false);
+            std::cout << std::format("  Point{{1,2}}==Point{{1,2}} (distinct) : {}\n", B(3,true)?"PASS":"FAIL");
+            std::cout << std::format("  Point{{1,2}}==Point{{1,3}}           : {}\n", B(4,false)?"PASS":"FAIL");
+            std::cout << std::format("  nested Line equal / unequal       : {}\n", (B(9,true)&&B(11,false))?"PASS":"FAIL");
+            check(ok);
+        } catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block B: distinct type-ids (the enum None-vs-Some / nullary shape) ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        const uint16_t None = as.define_struct("None", {});          // 0-field variant (like enum None)
+        const uint16_t Some = as.define_struct("Some", { "v" });     // 1-field variant (like Some(v))
+        as.label("main");
+        as.NEW_STRUCT(0, None);                                      // None #1
+        as.NEW_STRUCT(1, None);                                      // None #2 (distinct pointer)
+        as.NEW_STRUCT(2, Some); as.load_const(10, 7); as.SET_PROP(2, as.field("Some","v"), 10);  // Some(7)
+        as.NEW_STRUCT(3, Some); as.load_const(10, 7); as.SET_PROP(3, as.field("Some","v"), 10);  // Some(7) #2
+        as.R6(OpCode::EQ_DEEP, 4, 0, 1);   // None == None -> true (same type-id, 0 fields)
+        as.R6(OpCode::EQ_DEEP, 5, 0, 2);   // None == Some(7) -> false (different type-id)
+        as.R6(OpCode::EQ_DEEP, 6, 2, 3);   // Some(7) == Some(7) -> true
+        as.J(OpCode::HALT);
+        std::cout << "Running Block B (enum-shape type-ids)...\n";
+        try {
+            auto res = execute(as.assemble(), &heap, nullptr, nullptr, 16, nullptr, &as.struct_types());
+            auto* r = res.get_reg_base();
+            auto B = [&](int i, bool want){ return r[i].isBool() && r[i].asBool() == want; };
+            const bool ok = B(4,true) && B(5,false) && B(6,true);
+            std::cout << std::format("  None==None true, None==Some false, Some(7)==Some(7) true : {}\n", ok?"PASS":"FAIL");
+            check(ok);
+        } catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block C: arrays -- equal / element-differ / length-differ ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        auto fill3 = [&](uint8_t dst, int a, int b, int c){
+            as.ALLOC(dst, 3);
+            as.load_const(10, static_cast<int16_t>(a)); as.load_const(11,0); as.ARRAY_SET(dst,11,10);
+            as.load_const(10, static_cast<int16_t>(b)); as.load_const(11,1); as.ARRAY_SET(dst,11,10);
+            as.load_const(10, static_cast<int16_t>(c)); as.load_const(11,2); as.ARRAY_SET(dst,11,10);
+        };
+        fill3(0, 1,2,3);
+        fill3(1, 1,2,3);
+        fill3(2, 1,2,4);
+        as.ALLOC(3, 2); as.load_const(10,1); as.load_const(11,0); as.ARRAY_SET(3,11,10); as.load_const(10,2); as.load_const(11,1); as.ARRAY_SET(3,11,10); // [1,2]
+        as.R6(OpCode::EQ_DEEP, 4, 0, 1);   // [1,2,3]==[1,2,3] -> true
+        as.R6(OpCode::EQ_DEEP, 5, 0, 2);   // [1,2,3]==[1,2,4] -> false
+        as.R6(OpCode::EQ_DEEP, 6, 0, 3);   // [1,2,3]==[1,2]   -> false (length)
+        as.J(OpCode::HALT);
+        std::cout << "Running Block C (arrays)...\n";
+        try {
+            auto res = execute(as.assemble(), &heap, nullptr, nullptr, 16);
+            auto* r = res.get_reg_base();
+            auto B = [&](int i, bool want){ return r[i].isBool() && r[i].asBool() == want; };
+            const bool ok = B(4,true) && B(5,false) && B(6,false);
+            std::cout << std::format("  array equal / differ / length : {}\n", ok?"PASS":"FAIL");
+            check(ok);
+        } catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block D: vectors + byte buffers ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.VEC_NEW(0); as.load_const(10,10); as.VEC_PUSH(0,10); as.load_const(10,20); as.VEC_PUSH(0,10);  // [10,20]
+        as.VEC_NEW(1); as.load_const(10,10); as.VEC_PUSH(1,10); as.load_const(10,20); as.VEC_PUSH(1,10);  // [10,20]
+        as.VEC_NEW(2); as.load_const(10,10); as.VEC_PUSH(2,10); as.load_const(10,99); as.VEC_PUSH(2,10);  // [10,99]
+        as.R6(OpCode::EQ_DEEP, 3, 0, 1);   // vec equal -> true
+        as.R6(OpCode::EQ_DEEP, 4, 0, 2);   // vec differ -> false
+        // Bytes via a fresh copy of a string ("AB") vs another fresh copy; and "AB" vs "AC".
+        as.load_str(5, "AB"); as.BYTES_FROM_STR(6, 5);   // r6 = bytes("AB")
+        as.load_str(7, "AB"); as.BYTES_FROM_STR(8, 7);   // r8 = bytes("AB") (distinct)
+        as.load_str(9, "AC"); as.BYTES_FROM_STR(12, 9);  // r12 = bytes("AC")
+        as.R6(OpCode::EQ_DEEP, 13, 6, 8);  // bytes equal -> true
+        as.R6(OpCode::EQ_DEEP, 14, 6, 12); // bytes differ -> false
+        as.J(OpCode::HALT);
+        std::cout << "Running Block D (vec + bytes)...\n";
+        try {
+            StringInterner interner;
+            auto res = execute(as.assemble(), &heap, nullptr, &interner, 16, nullptr, nullptr, &as.string_literals());
+            auto* r = res.get_reg_base();
+            auto B = [&](int i, bool want){ return r[i].isBool() && r[i].asBool() == want; };
+            const bool ok = B(3,true) && B(4,false) && B(13,true) && B(14,false);
+            std::cout << std::format("  vec equal / differ            : {}\n", (B(3,true)&&B(4,false))?"PASS":"FAIL");
+            std::cout << std::format("  bytes equal / differ          : {}\n", (B(13,true)&&B(14,false))?"PASS":"FAIL");
+            check(ok);
+        } catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block E: maps -- ORDER-INDEPENDENT equal, value-differ, size-differ ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        // A = {1:100, 2:200, 3:300} inserted 1,2,3
+        as.MAP_NEW(0);
+        as.load_const(10,1); as.load_const(11,100); as.MAP_SET(0,10,11);
+        as.load_const(10,2); as.load_const(11,200); as.MAP_SET(0,10,11);
+        as.load_const(10,3); as.load_const(11,300); as.MAP_SET(0,10,11);
+        // B = same entries inserted 3,1,2 (different order)
+        as.MAP_NEW(1);
+        as.load_const(10,3); as.load_const(11,300); as.MAP_SET(1,10,11);
+        as.load_const(10,1); as.load_const(11,100); as.MAP_SET(1,10,11);
+        as.load_const(10,2); as.load_const(11,200); as.MAP_SET(1,10,11);
+        // C = {1:100, 2:200, 3:999} -- one value differs
+        as.MAP_NEW(2);
+        as.load_const(10,1); as.load_const(11,100); as.MAP_SET(2,10,11);
+        as.load_const(10,2); as.load_const(11,200); as.MAP_SET(2,10,11);
+        as.load_const(10,3); as.load_const(11,999); as.MAP_SET(2,10,11);
+        // D = {1:100, 2:200} -- smaller
+        as.MAP_NEW(3);
+        as.load_const(10,1); as.load_const(11,100); as.MAP_SET(3,10,11);
+        as.load_const(10,2); as.load_const(11,200); as.MAP_SET(3,10,11);
+        as.R6(OpCode::EQ_DEEP, 4, 0, 1);   // order-independent equal -> true
+        as.R6(OpCode::EQ_DEEP, 5, 0, 2);   // value differs -> false
+        as.R6(OpCode::EQ_DEEP, 6, 0, 3);   // size differs -> false
+        as.J(OpCode::HALT);
+        std::cout << "Running Block E (maps, order-independent)...\n";
+        try {
+            auto res = execute(as.assemble(), &heap, nullptr, nullptr, 16);
+            auto* r = res.get_reg_base();
+            auto B = [&](int i, bool want){ return r[i].isBool() && r[i].asBool() == want; };
+            const bool ok = B(4,true) && B(5,false) && B(6,false);
+            std::cout << std::format("  map order-indep / value / size : {}\n", ok?"PASS":"FAIL");
+            check(ok);
+        } catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block F: same-pointer short-circuit + fresh-string content path ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.ALLOC(0, 1); as.load_const(10, 5); as.load_const(11, 0); as.ARRAY_SET(0, 11, 10); // r0 = [5]
+        as.R6(OpCode::EQ_DEEP, 1, 0, 0);   // same object -> true
+        // s1 interned, s2 = a FRESH copy (distinct pointer, same content) via a bytes round-trip.
+        as.load_str(2, "hello");
+        as.BYTES_FROM_STR(3, 2); as.BYTES_TO_STR(4, 3);   // r4 = fresh "hello"
+        as.load_str(5, "world");
+        as.R6(OpCode::EQ_DEEP, 6, 2, 4);   // "hello" == fresh "hello" -> true (content)
+        as.R6(OpCode::EQ_DEEP, 7, 2, 5);   // "hello" == "world"       -> false
+        as.J(OpCode::HALT);
+        std::cout << "Running Block F (same-ptr + string content)...\n";
+        try {
+            StringInterner interner;
+            auto res = execute(as.assemble(), &heap, nullptr, &interner, 16, nullptr, nullptr, &as.string_literals());
+            auto* r = res.get_reg_base();
+            auto B = [&](int i, bool want){ return r[i].isBool() && r[i].asBool() == want; };
+            const bool ok = B(1,true) && B(6,true) && B(7,false);
+            std::cout << std::format("  same-pointer -> true          : {}\n", B(1,true)?"PASS":"FAIL");
+            std::cout << std::format("  fresh-string content equal    : {}\n", (B(6,true)&&B(7,false))?"PASS":"FAIL");
+            check(ok);
+        } catch (const std::exception& e) { record_fail(e.what()); }
+    }
+}
+
+// =============================================================================
+// test_get_type_id -- GET_TYPE_ID reads a struct's runtime type id into an Int
+// register (the primitive a multi-type `match` dispatches on), and yields the -1
+// sentinel for any non-struct operand.
+// =============================================================================
+inline void test_get_type_id() {
+    std::cout << "=== get_type_id ===\n";
+
+    Heap heap(64 * 1024);
+
+    Assembler as;
+    const uint16_t Point  = as.define_struct("Point",  { "x", "y" });
+    const uint16_t Circle = as.define_struct("Circle", { "r" });
+
+    as.label("main");
+    as.NEW_STRUCT(0, Point);              // r0 = Point
+    as.NEW_STRUCT(1, Circle);             // r1 = Circle
+    as.load_const(2, 42);                 // r2 = Int (not a struct)
+    as.load_constant(3, Value::fromNil());// r3 = nil (not a struct)
+    as.GET_TYPE_ID(4, 0);                 // r4 = type id of Point   -> Point
+    as.GET_TYPE_ID(5, 1);                 // r5 = type id of Circle  -> Circle
+    as.GET_TYPE_ID(6, 2);                 // r6 = type id of Int     -> -1
+    as.GET_TYPE_ID(7, 3);                 // r7 = type id of nil     -> -1
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    Disassembler dis(bytecode.data(), bytecode.size());
+    dis.add_label(0, "main");
+    dis.print();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, &heap, nullptr, nullptr, 0, &as.constant_pool(), &as.struct_types());
+        auto* regs = res.get_reg_base();
+
+        const bool ok =
+            regs[4].isInt() && regs[4].asSigned48() == static_cast<int64_t>(Point)  &&
+            regs[5].isInt() && regs[5].asSigned48() == static_cast<int64_t>(Circle) &&
+            regs[6].isInt() && regs[6].asSigned48() == -1 &&
+            regs[7].isInt() && regs[7].asSigned48() == -1 &&
+            Point != Circle;
+
+        std::cout << std::format("  Point id={} Circle id={} Int->{} nil->{}\n",
+                                 regs[4].asSigned48(), regs[5].asSigned48(),
+                                 regs[6].asSigned48(), regs[7].asSigned48());
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_i2d -- I2D widens a 48-bit Int to a double. The coercion the static front
+// end emits at an N1 boundary (an Int value flowing into a Double context).
+// =============================================================================
+inline void test_i2d() {
+    std::cout << "=== i2d ===\n";
+
+    Heap heap(64 * 1024);
+
+    Assembler as;
+    as.label("main");
+    as.load_const(0, 42);                 // r0 = Int 42
+    as.I2D(1, 0);                         // r1 = Double 42.0
+    as.load_const(2, -7);                 // r2 = Int -7
+    as.I2D(3, 2);                         // r3 = Double -7.0
+    as.load_const(4, 0);                  // r4 = Int 0
+    as.I2D(5, 4);                         // r5 = Double 0.0
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    Disassembler dis(bytecode.data(), bytecode.size());
+    dis.add_label(0, "main");
+    dis.print();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, &heap, nullptr, nullptr, 0, &as.constant_pool());
+        auto* regs = res.get_reg_base();
+
+        const bool ok =
+            regs[1].isDouble() && regs[1].asDouble() == 42.0 &&
+            regs[3].isDouble() && regs[3].asDouble() == -7.0 &&
+            regs[5].isDouble() && regs[5].asDouble() == 0.0;
+
+        std::cout << std::format("  42->{} -7->{} 0->{}\n",
+                                 regs[1].asDouble(), regs[3].asDouble(), regs[5].asDouble());
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_d2i -- D2I saturating Double->Int (the `toInt` builtin). Java semantics:
+// NaN -> 0, +-inf / overflow -> MAX/MIN_48, else truncate toward zero. Total, no
+// trap. The mirror of test_i2d.
+// =============================================================================
+inline void test_d2i() {
+    std::cout << "=== d2i ===\n";
+
+    Heap heap(64 * 1024);
+
+    Assembler as;
+    as.label("main");
+    as.load_double(0, 3.9);            as.D2I(0, 0);   // 3
+    as.load_double(1, -3.9);           as.D2I(1, 1);   // -3
+    as.load_double(2, 0.0);            as.D2I(2, 2);   // 0
+    as.load_double(3, 5.0);            as.D2I(3, 3);   // 5
+    as.load_double(4, std::nan(""));   as.D2I(4, 4);   // NaN -> 0
+    as.load_double(5, INFINITY);       as.D2I(5, 5);   // +inf -> MAX_48
+    as.load_double(6, -INFINITY);      as.D2I(6, 6);   // -inf -> MIN_48
+    as.load_double(7, 1e20);           as.D2I(7, 7);   // overflow -> MAX_48
+    as.load_double(8, -1e20);          as.D2I(8, 8);   // underflow -> MIN_48
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    Disassembler dis(bytecode.data(), bytecode.size());
+    dis.add_label(0, "main");
+    dis.print();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, &heap, nullptr, nullptr, 0, &as.constant_pool());
+        auto* regs = res.get_reg_base();
+
+        constexpr int64_t MAX_48 =  140737488355327LL;   //  2^47 - 1
+        constexpr int64_t MIN_48 = -140737488355328LL;   // -2^47
+        const bool ok =
+            regs[0].isInt() && regs[0].asSigned48() == 3 &&
+            regs[1].isInt() && regs[1].asSigned48() == -3 &&
+            regs[2].isInt() && regs[2].asSigned48() == 0 &&
+            regs[3].isInt() && regs[3].asSigned48() == 5 &&
+            regs[4].isInt() && regs[4].asSigned48() == 0 &&
+            regs[5].isInt() && regs[5].asSigned48() == MAX_48 &&
+            regs[6].isInt() && regs[6].asSigned48() == MIN_48 &&
+            regs[7].isInt() && regs[7].asSigned48() == MAX_48 &&
+            regs[8].isInt() && regs[8].asSigned48() == MIN_48;
+
+        std::cout << std::format("  3.9->{} -3.9->{} nan->{} +inf->{} -inf->{}\n",
+                                 regs[0].asSigned48(), regs[1].asSigned48(),
+                                 regs[4].asSigned48(), regs[5].asSigned48(), regs[6].asSigned48());
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_dround -- DROUND rounds a Double by the MODE in the flags field:
+// 0=floor 1=ceil 2=trunc 3=round(ties away) 4=roundHalfToEven(ties to even).
+// The half-way cases separate mode 3 from mode 4 (2.5 -> 3 vs 2; 3.5 -> 4 vs 4).
+// =============================================================================
+inline void test_dround() {
+    std::cout << "=== dround ===\n";
+
+    Heap heap(64 * 1024);
+
+    Assembler as;
+    as.label("main");
+    as.load_double(0, 2.7);            as.DROUND(0, 0, 0);   // floor -> 2
+    as.load_double(1, -2.3);           as.DROUND(1, 1, 0);   // floor -> -3
+    as.load_double(2, 2.3);            as.DROUND(2, 2, 1);   // ceil  -> 3
+    as.load_double(3, -2.7);           as.DROUND(3, 3, 1);   // ceil  -> -2
+    as.load_double(4, 2.7);            as.DROUND(4, 4, 2);   // trunc -> 2
+    as.load_double(5, -2.7);           as.DROUND(5, 5, 2);   // trunc -> -2
+    as.load_double(6, 2.5);            as.DROUND(6, 6, 3);   // round -> 3  (away)
+    as.load_double(7, -2.5);           as.DROUND(7, 7, 3);   // round -> -3 (away)
+    as.load_double(8, 2.4);            as.DROUND(8, 8, 3);   // round -> 2
+    as.load_double(9, 2.5);            as.DROUND(9, 9, 4);   // even  -> 2
+    as.load_double(10, 3.5);           as.DROUND(10, 10, 4); // even  -> 4
+    as.load_double(11, -2.5);          as.DROUND(11, 11, 4); // even  -> -2
+    as.load_double(12, std::nan(""));  as.DROUND(12, 12, 0); // NaN passes through
+    as.load_double(13, INFINITY);      as.DROUND(13, 13, 1); // +inf passes through
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+
+    Disassembler dis(bytecode.data(), bytecode.size());
+    dis.add_label(0, "main");
+    dis.print();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, &heap, nullptr, nullptr, 0, &as.constant_pool());
+        auto* r    = res.get_reg_base();
+
+        auto isD = [](const Value& v, double x) { return v.isDouble() && v.asDouble() == x; };
+        const bool ok =
+            isD(r[0], 2.0) && isD(r[1], -3.0) &&
+            isD(r[2], 3.0) && isD(r[3], -2.0) &&
+            isD(r[4], 2.0) && isD(r[5], -2.0) &&
+            isD(r[6], 3.0) && isD(r[7], -3.0) && isD(r[8], 2.0) &&
+            isD(r[9], 2.0) && isD(r[10], 4.0) && isD(r[11], -2.0) &&
+            (r[12].isDouble() && r[12].asDouble() != r[12].asDouble()) &&   // NaN
+            (r[13].isDouble() && r[13].asDouble() == INFINITY);
+
+        std::cout << std::format("  floor(2.7)={} ceil(-2.7)={} round(2.5)={} even(2.5)={} even(3.5)={}\n",
+                                 r[0].asDouble(), r[3].asDouble(), r[6].asDouble(),
+                                 r[9].asDouble(), r[10].asDouble());
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_get_kind -- GET_KIND reads the heap-object kind byte, distinguishing an
+// ARRAY from a MAP (both non-structs, so GET_TYPE_ID reports -1 for each). The
+// primitive the compiler's `for … in …` lowering dispatches on. Also -1 for a
+// non-heap value.
+// =============================================================================
+inline void test_get_kind() {
+    std::cout << "=== get_kind ===\n";
+
+    Heap heap(64 * 1024);
+
+    Assembler as;
+    const uint16_t Point = as.define_struct("Point", { "x", "y" });
+
+    as.label("main");
+    as.ALLOC(0, 2);                        // r0 = array   -> KIND_ARRAY (0)
+    as.NEW_STRUCT(1, Point);               // r1 = struct  -> KIND_OBJECT (2)
+    as.MAP_NEW(2);                         // r2 = map     -> KIND_MAP (4)
+    as.load_const(3, 42);                  // r3 = Int     -> -1
+    as.load_constant(4, Value::fromNil()); // r4 = nil     -> -1
+    as.GET_KIND(5, 0);
+    as.GET_KIND(6, 1);
+    as.GET_KIND(7, 2);
+    as.GET_KIND(8, 3);
+    as.GET_KIND(9, 4);
+    as.J(OpCode::HALT);
+
+    const auto bytecode = as.assemble();
+    const uint8_t top = 10;                // scan r0..r9 (heap roots held across MAP_NEW alloc)
+
+    Disassembler dis(bytecode.data(), bytecode.size());
+    dis.add_label(0, "main");
+    dis.print();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, &heap, nullptr, nullptr, top, &as.constant_pool(), &as.struct_types());
+        auto* regs = res.get_reg_base();
+
+        const bool ok =
+            regs[5].isInt() && regs[5].asSigned48() == GcObject::KIND_ARRAY  &&
+            regs[6].isInt() && regs[6].asSigned48() == GcObject::KIND_OBJECT &&
+            regs[7].isInt() && regs[7].asSigned48() == GcObject::KIND_MAP    &&
+            regs[8].isInt() && regs[8].asSigned48() == -1 &&
+            regs[9].isInt() && regs[9].asSigned48() == -1 &&
+            GcObject::KIND_ARRAY != GcObject::KIND_MAP;
+
+        std::cout << std::format("  array->{} struct->{} map->{} int->{} nil->{}\n",
+                                 regs[5].asSigned48(), regs[6].asSigned48(), regs[7].asSigned48(),
+                                 regs[8].asSigned48(), regs[9].asSigned48());
+        check(ok);
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_struct_gc -- the moving-GC guard for KIND_OBJECT. A struct's heap-pointer
+// FIELD must be forwarded through the Cheney scan of the object payload.
+//
+//   Box{ inner } is built at top level (r0); its `inner` field is set to a heap
+//   array (r1), then r1 is CLOBBERED so `inner` is reachable ONLY through the
+//   struct field. A collection is forced mid-call (native_collect): the struct
+//   survives via the top-level register root and -- crucially -- its `inner`
+//   field survives only because the collector scans/forwards the object payload.
+//   A dead canary is the ONLY thing that may be reclaimed, so freed == its size.
+// =============================================================================
+inline void test_struct_gc() {
+    std::cout << "=== struct_gc ===\n";
+
+    constexpr uint8_t COLLECTOR_FRAME = 3; // collector uses r1(result), r2(fn ptr)
+
+    Heap heap(64 * 1024);
+    GlobalEnv globals(heap);
+    const uint8_t g_freed = globals.define();
+
+    // Dead canary: allocated but never rooted -- must be the ONLY thing collected.
+    GcObject* dead = heap.alloc(GcObject::KIND_ARRAY, 2);
+    assert(dead && "test_struct_gc: dead canary alloc failed");
+    const size_t dead_total = dead->total_bytes();
+
+    Assembler as;
+    const uint16_t Box = as.define_struct("Box", { "inner" });
+    as.func("collector", COLLECTOR_FRAME);
+
+    as.label("main");
+    as.NEW_STRUCT(0, Box);                          // r0 = Box (top-level, live across CALL+GC)
+    as.ALLOC(1, 4);                                 // r1 = inner array[4]
+    as.SET_PROP(0, as.field("Box", "inner"), 1);    // r0.inner = r1
+    as.load_const(1, 0);                            // clobber r1: inner reachable ONLY via r0.inner
+    as.CALL("collector");
+    as.J(OpCode::HALT);
+
+    as.label("collector");
+    as.call_native_id(1, 2, 2, 0, 0);               // r1 = collect() (id 0) -> runs GC
+    as.STORE_GLOBAL(g_freed, 1);
+    as.J(OpCode::RET);
+
+    const auto bytecode = as.assemble();
+    // Top-level frame size = COLLECTOR_FRAME: scans r0..r2 as roots (r0=Box) and the
+    // slide opens collector's window at r[COLLECTOR_FRAME], leaving r0 untouched.
+    const uint8_t top = COLLECTOR_FRAME;
+
+    Disassembler dis(bytecode.data(), bytecode.size());
+    dis.add_label(0, "main");
+    dis.print();
+
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute_gc(bytecode, &heap, &globals, top, &as.struct_types());
+        auto* regs = res.get_reg_base();
+
+        const Value box_val = regs[0];
+        GcObject*   box     = box_val.isPtr() ? GcObject::from_slots(box_val.asPtr()) : nullptr;
+
+        const bool box_ok = box &&
+                            box->kind == GcObject::KIND_OBJECT &&
+                            box->slot_count() == 1 &&
+                            box->object_type_id() == Box;
+
+        GcObject* inner = nullptr;
+        if (box) {
+            const Value inner_val = box->slots()[0];
+            inner = inner_val.isPtr() ? GcObject::from_slots(inner_val.asPtr()) : nullptr;
+        }
+        const bool inner_ok = inner &&
+                              inner->kind == GcObject::KIND_ARRAY &&
+                              inner->slot_count() == 4;
+
+        const Value freed    = globals.get(g_freed);
+        const bool  freed_ok = freed.isInt() &&
+                               static_cast<size_t>(freed.asSigned48()) == dead_total;
+
+        const bool ok = box_ok && inner_ok && freed_ok;
+
+        std::cout << std::format("freed={} (expect dead_total={})\n",
+            freed.isInt() ? freed.asSigned48() : -1, dead_total);
+        std::cout << std::format("  struct survived collection:          {}\n", box_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  heap field forwarded via payload:    {}\n", inner_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  only the dead canary was collected:  {}\n", freed_ok ? "PASS" : "FAIL");
+        check(ok);
+
+        globals.set(g_freed, Value{});
+    }
+    catch (const std::exception& e) {
+        record_fail(e.what());
+    }
+}
+
+// =============================================================================
+// test_array -- fixed-size arrays: ARRAY_GET/ARRAY_SET/LEN/ANEW/AFILL + the empty
+// array + the out-of-bounds SEH trap + a heap value stored in an array surviving a
+// collection. KIND_ARRAY storage already existed (ALLOC); these opcodes add
+// random access on top of it.
+// =============================================================================
+inline void test_array() {
+    std::cout << "=== array (ARRAY_GET/SET/LEN/ANEW/AFILL) ===\n";
+
+    // ---- Part A: core get/set/len/anew/afill/empty (one program) ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.ALLOC(0, 3);                       // r0 = array(3)
+        as.load_const(2, 10); as.load_const(1, 0); as.ARRAY_SET(0, 1, 2); // a[0] = 10
+        as.load_const(2, 20); as.load_const(1, 1); as.ARRAY_SET(0, 1, 2); // a[1] = 20
+        as.load_const(2, 30); as.load_const(1, 2); as.ARRAY_SET(0, 1, 2); // a[2] = 30
+        as.load_const(1, 0); as.ARRAY_GET(3, 0, 1);   // r3 = a[0]
+        as.load_const(1, 1); as.ARRAY_GET(4, 0, 1);   // r4 = a[1]
+        as.load_const(1, 2); as.ARRAY_GET(5, 0, 1);   // r5 = a[2]
+        as.LEN(6, 0);                          // r6 = len(a) = 3
+        as.load_const(7, 5); as.ANEW(8, 7);    // r8 = array(5) (dynamic count)
+        as.LEN(9, 8);                          // r9 = len = 5
+        as.ALLOC(10, 3); as.load_const(11, 7); as.AFILL(10, 11); // b = array(3), fill 7
+        as.load_const(1, 0); as.ARRAY_GET(12, 10, 1); // r12 = b[0]
+        as.load_const(1, 2); as.ARRAY_GET(13, 10, 1); // r13 = b[2]
+        as.ALLOC(14, 0);                       // r14 = array(0) (empty)
+        as.LEN(15, 14);                        // r15 = len = 0
+        as.J(OpCode::HALT);
+
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part A...\n";
+        try {
+            auto res   = execute(bytecode, &heap, nullptr, nullptr, 16);
+            auto* regs = res.get_reg_base();
+            auto I = [&](int i, int64_t want) {
+                return regs[i].isInt() && regs[i].asSigned48() == want;
+            };
+            const bool ok = I(3, 10) && I(4, 20) && I(5, 30) && I(6, 3) &&
+                            I(9, 5) && I(12, 7) && I(13, 7) && I(15, 0);
+            std::cout << std::format("  get a[0..2]=10,20,30 : {}\n", (I(3,10)&&I(4,20)&&I(5,30)) ? "PASS" : "FAIL");
+            std::cout << std::format("  len(a)=3             : {}\n", I(6, 3) ? "PASS" : "FAIL");
+            std::cout << std::format("  anew(5) len=5        : {}\n", I(9, 5) ? "PASS" : "FAIL");
+            std::cout << std::format("  afill 7 -> b[0],b[2] : {}\n", (I(12,7)&&I(13,7)) ? "PASS" : "FAIL");
+            std::cout << std::format("  empty array len=0    : {}\n", I(15, 0) ? "PASS" : "FAIL");
+            check(ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Part B: out-of-bounds traps (positive over-index AND negative index) ----
+    {
+        auto oob_traps = [](int64_t idx) -> bool {
+            Heap heap(64 * 1024);
+            Assembler as;
+            as.label("main");
+            as.ALLOC(0, 2);                     // array(2), valid indices 0..1
+            as.load_const(1, static_cast<int16_t>(idx));
+            as.ARRAY_GET(2, 0, 1);              // a[idx] -> must trap
+            as.J(OpCode::HALT);
+            const auto bc = as.assemble();
+            try { execute(bc, &heap, nullptr, nullptr, 3); return false; }
+            catch (const std::exception& e) {
+                return std::string_view(e.what()).find("out of bounds") != std::string_view::npos;
+            }
+        };
+        std::cout << "Running Part B (OOB)...\n";
+        const bool over_ok = oob_traps(5);
+        const bool neg_ok  = oob_traps(-1);
+        std::cout << std::format("  a[5] on len-2 traps  : {}\n", over_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  a[-1] traps          : {}\n", neg_ok ? "PASS" : "FAIL");
+        check(over_ok && neg_ok);
+    }
+
+    // ---- Part C: a struct stored in an array survives a mid-call collection ----
+    {
+        constexpr uint8_t COLLECTOR_FRAME = 3;
+        Heap heap(64 * 1024);
+        GlobalEnv globals(heap);
+
+        Assembler as;
+        const uint16_t Point = as.define_struct("Point", { "x" });
+        as.func("collector", COLLECTOR_FRAME);
+
+        as.label("main");
+        as.ALLOC(0, 1);                                 // r0 = array(1)  [survivor]
+        as.NEW_STRUCT(1, Point);                        // r1 = Point (temp)
+        as.load_const(2, 99); as.SET_PROP(1, as.field("Point", "x"), 2); // Point.x = 99
+        as.load_const(2, 0); as.ARRAY_SET(0, 2, 1);     // a[0] = Point
+        as.load_const(1, 0); as.load_const(2, 0);       // clobber r1/r2: Point only via a[0]
+        as.CALL("collector");
+        as.J(OpCode::HALT);
+
+        as.label("collector");
+        as.call_native_id(1, 2, 2, 0, 0);               // run GC mid-call (id 0 = native_collect)
+        as.J(OpCode::RET);
+
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part C (GC root)...\n";
+        try {
+            auto res   = execute_gc(bytecode, &heap, &globals, COLLECTOR_FRAME, &as.struct_types());
+            auto* regs = res.get_reg_base();
+            const Value arr_val = regs[0];
+            GcObject*   arr     = arr_val.isPtr() ? GcObject::from_slots(arr_val.asPtr()) : nullptr;
+            const bool  arr_ok  = arr && arr->kind == GcObject::KIND_ARRAY && arr->slot_count() == 1;
+
+            GcObject* pt = nullptr;
+            if (arr) {
+                const Value pv = arr->slots()[0];
+                pt = pv.isPtr() ? GcObject::from_slots(pv.asPtr()) : nullptr;
+            }
+            const bool pt_ok = pt && pt->kind == GcObject::KIND_OBJECT &&
+                               pt->object_type_id() == Point &&
+                               pt->slots()[0].isInt() && pt->slots()[0].asSigned48() == 99;
+
+            std::cout << std::format("  array survived collection      : {}\n", arr_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  struct in slot forwarded (x=99): {}\n", pt_ok ? "PASS" : "FAIL");
+            check(arr_ok && pt_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+}
+
+// =============================================================================
+// test_vec -- the growable vector type (KIND_VEC): VEC_NEW / VEC_PUSH / VEC_POP,
+// the grow (doubling) path, empty-pop -> Nil, and a struct pushed into a vector
+// surviving a mid-call collection (header + backing scanned as GC roots). Slice 1
+// reads back via VEC_POP + the header slots directly (v[i]/len land in Slice 2).
+// The vector header payload is Value[2] = {backing (slot 0), count (slot 1)}.
+// =============================================================================
+inline void test_vec() {
+    std::cout << "=== vec (VEC_NEW/PUSH/POP + grow + GC) ===\n";
+    constexpr uint32_t VEC_BACKING = 0;   // op_vec.h VEC_SLOT_BACKING
+    constexpr uint32_t VEC_COUNT   = 1;   // op_vec.h VEC_SLOT_COUNT
+
+    // ---- Part A: push 10 (forces one grow 8->16), pop the last three LIFO ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.VEC_NEW(0);                                  // r0 = vec()
+        for (int16_t k = 0; k < 10; ++k) {              // push 0..9 (9th push grows 8->16)
+            as.load_const(1, k);
+            as.VEC_PUSH(0, 1);
+        }
+        as.VEC_POP(2, 0);                               // r2 = 9
+        as.VEC_POP(3, 0);                               // r3 = 8
+        as.VEC_POP(4, 0);                               // r4 = 7
+        as.J(OpCode::HALT);
+
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part A...\n";
+        try {
+            auto res   = execute(bytecode, &heap, nullptr, nullptr, 8);
+            auto* regs = res.get_reg_base();
+            auto I = [&](int i, int64_t want) {
+                return regs[i].isInt() && regs[i].asSigned48() == want;
+            };
+            const Value  vv  = regs[0];
+            GcObject*    vec = vv.isPtr() ? GcObject::from_slots(vv.asPtr()) : nullptr;
+            const bool   kind_ok = vec && vec->kind == GcObject::KIND_VEC;
+            int64_t      count   = kind_ok ? vec->slots()[VEC_COUNT].asSigned48() : -1;
+            GcObject*    backing = kind_ok ? GcObject::from_slots(vec->slots()[VEC_BACKING].asPtr()) : nullptr;
+            const bool   cap_ok  = backing && backing->kind == GcObject::KIND_ARRAY &&
+                                   backing->slot_count() == 16;   // grew once
+            const bool   pop_ok  = I(2, 9) && I(3, 8) && I(4, 7);
+            const bool   cnt_ok  = count == 7;                    // 10 pushed - 3 popped
+            std::cout << std::format("  kind == KIND_VEC     : {}\n", kind_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  pop LIFO 9,8,7       : {}\n", pop_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  count == 7           : {}\n", cnt_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  backing grew to 16   : {}\n", cap_ok ? "PASS" : "FAIL");
+            check(kind_ok && pop_ok && cnt_ok && cap_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Part B: pop on an empty vector -> Nil, count stays 0 ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.VEC_NEW(0);
+        as.VEC_POP(1, 0);                               // r1 = Nil (empty)
+        as.J(OpCode::HALT);
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part B (empty pop)...\n";
+        try {
+            auto res   = execute(bytecode, &heap, nullptr, nullptr, 4);
+            auto* regs = res.get_reg_base();
+            GcObject*  vec = regs[0].isPtr() ? GcObject::from_slots(regs[0].asPtr()) : nullptr;
+            const bool nil_ok = regs[1].isNil();
+            const bool cnt_ok = vec && vec->kind == GcObject::KIND_VEC &&
+                                vec->slots()[VEC_COUNT].asSigned48() == 0;
+            std::cout << std::format("  empty pop -> nil     : {}\n", nil_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  count still 0        : {}\n", cnt_ok ? "PASS" : "FAIL");
+            check(nil_ok && cnt_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Part C: a struct pushed into a vector survives a mid-call collection ----
+    {
+        constexpr uint8_t COLLECTOR_FRAME = 3;
+        Heap heap(64 * 1024);
+        GlobalEnv globals(heap);
+
+        Assembler as;
+        const uint16_t Point = as.define_struct("Point", { "x" });
+        as.func("collector", COLLECTOR_FRAME);
+
+        as.label("main");
+        as.VEC_NEW(0);                                  // r0 = vec()  [survivor]
+        as.NEW_STRUCT(1, Point);                        // r1 = Point (temp)
+        as.load_const(2, 99); as.SET_PROP(1, as.field("Point", "x"), 2); // Point.x = 99
+        as.VEC_PUSH(0, 1);                              // vec.push(Point)
+        as.load_const(1, 0); as.load_const(2, 0);       // clobber: Point only via the vec
+        as.CALL("collector");
+        as.J(OpCode::HALT);
+
+        as.label("collector");
+        as.call_native_id(1, 2, 2, 0, 0);               // run GC mid-call (id 0 = native_collect)
+        as.J(OpCode::RET);
+
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part C (GC root)...\n";
+        try {
+            auto res   = execute_gc(bytecode, &heap, &globals, COLLECTOR_FRAME, &as.struct_types());
+            auto* regs = res.get_reg_base();
+            GcObject*  vec = regs[0].isPtr() ? GcObject::from_slots(regs[0].asPtr()) : nullptr;
+            const bool vec_ok = vec && vec->kind == GcObject::KIND_VEC &&
+                                vec->slots()[VEC_COUNT].asSigned48() == 1;
+            GcObject*  pt = nullptr;
+            if (vec_ok) {
+                GcObject*   backing = GcObject::from_slots(vec->slots()[VEC_BACKING].asPtr());
+                const Value pv      = backing->slots()[0];
+                pt = pv.isPtr() ? GcObject::from_slots(pv.asPtr()) : nullptr;
+            }
+            const bool pt_ok = pt && pt->kind == GcObject::KIND_OBJECT &&
+                               pt->object_type_id() == Point &&
+                               pt->slots()[0].isInt() && pt->slots()[0].asSigned48() == 99;
+            std::cout << std::format("  vector survived collection     : {}\n", vec_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  struct in vec forwarded (x=99) : {}\n", pt_ok ? "PASS" : "FAIL");
+            check(vec_ok && pt_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Part D: dual-kind ARRAY_GET / ARRAY_SET / LEN over a KIND_VEC ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.VEC_NEW(0);
+        as.load_const(1, 5); as.VEC_PUSH(0, 1);
+        as.load_const(1, 6); as.VEC_PUSH(0, 1);
+        as.load_const(1, 7); as.VEC_PUSH(0, 1);         // v = [5, 6, 7]
+        as.LEN(2, 0);                                   // r2 = len(v) = 3
+        as.load_const(1, 1); as.ARRAY_GET(3, 0, 1);     // r3 = v[1] = 6
+        as.load_const(4, 42); as.load_const(1, 0); as.ARRAY_SET(0, 1, 4); // v[0] = 42
+        as.load_const(1, 0); as.ARRAY_GET(5, 0, 1);     // r5 = v[0] = 42
+        as.J(OpCode::HALT);
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part D (v[i]/len)...\n";
+        try {
+            auto res   = execute(bytecode, &heap, nullptr, nullptr, 8);
+            auto* regs = res.get_reg_base();
+            auto I = [&](int i, int64_t want) {
+                return regs[i].isInt() && regs[i].asSigned48() == want;
+            };
+            const bool len_ok = I(2, 3);
+            const bool get_ok = I(3, 6);
+            const bool set_ok = I(5, 42);
+            std::cout << std::format("  len(v) == 3          : {}\n", len_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  v[1] == 6            : {}\n", get_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  v[0]=42 then read    : {}\n", set_ok ? "PASS" : "FAIL");
+            check(len_ok && get_ok && set_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Part E: bounds are vs count, NOT the backing capacity ----
+    // v holds 3 elements in a capacity-8 backing; v[3] must trap even though slot 3
+    // physically exists in the backing.
+    {
+        auto vec_oob_traps = [](int64_t idx) -> bool {
+            Heap heap(64 * 1024);
+            Assembler as;
+            as.label("main");
+            as.VEC_NEW(0);
+            as.load_const(1, 5); as.VEC_PUSH(0, 1);
+            as.load_const(1, 6); as.VEC_PUSH(0, 1);
+            as.load_const(1, 7); as.VEC_PUSH(0, 1);     // count 3, capacity 8
+            as.load_const(1, static_cast<int16_t>(idx));
+            as.ARRAY_GET(2, 0, 1);                      // v[idx] -> must trap
+            as.J(OpCode::HALT);
+            const auto bc = as.assemble();
+            try { execute(bc, &heap, nullptr, nullptr, 4); return false; }
+            catch (const std::exception& e) {
+                return std::string_view(e.what()).find("out of bounds") != std::string_view::npos;
+            }
+        };
+        std::cout << "Running Part E (bounds vs count)...\n";
+        const bool over_ok = vec_oob_traps(3);          // within capacity, past count
+        const bool neg_ok  = vec_oob_traps(-1);
+        std::cout << std::format("  v[3] (count 3) traps : {}\n", over_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  v[-1] traps          : {}\n", neg_ok ? "PASS" : "FAIL");
+        check(over_ok && neg_ok);
+    }
+
+    // ---- Part F: VEC_NEW_CAP -- a capacity hint (count 0), honored, no regrow within it;
+    // capacity 0 still grows on the first push (the vec_grow zero floor). ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.load_const(1, 20); as.VEC_NEW_CAP(0, 1);     // r0 = capacity-20 vec, count 0
+        as.load_const(1, 5); as.VEC_PUSH(0, 1);
+        as.load_const(1, 6); as.VEC_PUSH(0, 1);
+        as.load_const(1, 7); as.VEC_PUSH(0, 1);         // 3 pushes: count 3, backing stays 20
+        as.load_const(2, 0); as.VEC_NEW_CAP(3, 2);      // r3 = capacity-0 vec
+        as.load_const(2, 9); as.VEC_PUSH(3, 2);         // first push grows 0 -> VEC_INITIAL_CAP (8)
+        as.J(OpCode::HALT);
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part F (VEC_NEW_CAP capacity hint)...\n";
+        try {
+            auto  res  = execute(bytecode, &heap, nullptr, nullptr, 8);
+            auto* regs = res.get_reg_base();
+            bool capped_ok = false, count_ok = false, no_regrow = false, zero_ok = false;
+            if (regs[0].isPtr()) {
+                GcObject* v = GcObject::from_slots(regs[0].asPtr());
+                if (v->kind == GcObject::KIND_VEC) {
+                    GcObject* b = GcObject::from_slots(v->slots()[VEC_BACKING].asPtr());
+                    capped_ok = true;
+                    count_ok  = v->slots()[VEC_COUNT].asSigned48() == 3;
+                    no_regrow = b->slot_count() == 20;   // capacity 20 honored; 3 pushes didn't grow
+                }
+            }
+            if (regs[3].isPtr()) {
+                GcObject* v = GcObject::from_slots(regs[3].asPtr());
+                if (v->kind == GcObject::KIND_VEC) {
+                    GcObject* b = GcObject::from_slots(v->slots()[VEC_BACKING].asPtr());
+                    zero_ok = v->slots()[VEC_COUNT].asSigned48() == 1 && b->slot_count() == 8;
+                }
+            }
+            std::cout << std::format("  cap 20 honored       : {}\n", (capped_ok && no_regrow) ? "PASS" : "FAIL");
+            std::cout << std::format("  count 3 (len 0 init) : {}\n", count_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  cap 0 grows on push  : {}\n", zero_ok ? "PASS" : "FAIL");
+            check(capped_ok && no_regrow && count_ok && zero_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Part G: a negative VEC_NEW_CAP capacity is a located trap ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.load_const(1, -1); as.VEC_NEW_CAP(0, 1);
+        as.J(OpCode::HALT);
+        const auto bc = as.assemble();
+        std::cout << "Running Part G (negative capacity traps)...\n";
+        bool trap_ok = false;
+        try { execute(bc, &heap, nullptr, nullptr, 2); }
+        catch (const std::exception& e) {
+            trap_ok = std::string_view(e.what()).find("capacity") != std::string_view::npos;
+        }
+        std::cout << std::format("  vec(-1) traps        : {}\n", trap_ok ? "PASS" : "FAIL");
+        check(trap_ok);
+    }
+}
+
+// =============================================================================
+// test_bytes -- the growable byte buffer (KIND_BYTES): BYTES_NEW_CAP, the tri-kind
+// push/pop/index/len (a byte reads/writes as an Int 0..255, masked on write), the
+// grow + memcpy path interleaved with the moving collector (the KIND_STRING backing
+// must forward with its bytes intact), GET_KIND == 6, and the bounds-vs-count trap.
+// The string bridges toBytes/fromBytes and the hex toString are covered end-to-end
+// in static_compiler_tests (strings are natural there). See op_bytes.h.
+// =============================================================================
+inline void test_bytes() {
+    std::cout << "=== bytes (KIND_BYTES: BYTES_NEW_CAP/push/pop/index/len + grow + GC) ===\n";
+    constexpr uint32_t BYTES_BACKING = 0;   // op_bytes.h BYTES_SLOT_BACKING
+    constexpr uint32_t BYTES_COUNT   = 1;   // op_bytes.h BYTES_SLOT_COUNT
+
+    // ---- Part A: bytes(4), push 5 (forces grow 4->8), push masking, index get/set, pop ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.load_const(9, 4);
+        as.BYTES_NEW_CAP(0, 9);                         // r0 = bytes(4)
+        const int16_t vals[5] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x1FF }; // last is masked -> 0xFF
+        for (int k = 0; k < 5; ++k) { as.load_const(1, vals[k]); as.VEC_PUSH(0, 1); }
+        as.load_const(2, 0); as.ARRAY_GET(3, 0, 2);     // r3 = b[0] = 0xDE
+        as.load_const(2, 4); as.ARRAY_GET(4, 0, 2);     // r4 = b[4] = 0xFF (pushed 0x1FF, masked)
+        as.load_const(5, 0x122); as.load_const(2, 1); as.ARRAY_SET(0, 2, 5); // b[1] = 0x122 & 0xFF
+        as.load_const(2, 1); as.ARRAY_GET(6, 0, 2);     // r6 = b[1] = 0x22
+        as.LEN(7, 0);                                   // r7 = 5
+        as.VEC_POP(8, 0);                               // r8 = 0xFF (last), count -> 4
+        as.J(OpCode::HALT);
+
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part A...\n";
+        try {
+            auto res   = execute(bytecode, &heap, nullptr, nullptr, 10);
+            auto* regs = res.get_reg_base();
+            auto I = [&](int i, int64_t want) { return regs[i].isInt() && regs[i].asSigned48() == want; };
+            const Value  bv  = regs[0];
+            GcObject*    buf = bv.isPtr() ? GcObject::from_slots(bv.asPtr()) : nullptr;
+            const bool   kind_ok = buf && buf->kind == GcObject::KIND_BYTES;
+            const int64_t count  = kind_ok ? buf->slots()[BYTES_COUNT].asSigned48() : -1;
+            GcObject*    backing = kind_ok ? GcObject::from_slots(buf->slots()[BYTES_BACKING].asPtr()) : nullptr;
+            const bool   back_ok = backing && backing->kind == GcObject::KIND_STRING &&
+                                   backing->string_length() == 8;      // grew 4 -> 8
+            const bool   get_ok  = I(3, 0xDE) && I(4, 0xFF) && I(6, 0x22);
+            const bool   len_ok  = I(7, 5) && count == 4;              // 5 pushed, 1 popped
+            const bool   pop_ok  = I(8, 0xFF);
+            std::cout << std::format("  kind == KIND_BYTES     : {}\n", kind_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  push mask + index get  : {}\n", get_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  index set masked       : {}\n", I(6, 0x22) ? "PASS" : "FAIL");
+            std::cout << std::format("  len 5 / count 4        : {}\n", len_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  pop == 0xFF            : {}\n", pop_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  backing grew to 8      : {}\n", back_ok ? "PASS" : "FAIL");
+            check(kind_ok && get_ok && len_ok && pop_ok && back_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Part B: pop on an empty buffer -> Nil, count stays 0 ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.load_const(1, 0); as.BYTES_NEW_CAP(0, 1);    // bytes(0)
+        as.VEC_POP(1, 0);                               // Nil (empty)
+        as.J(OpCode::HALT);
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part B (empty pop)...\n";
+        try {
+            auto res   = execute(bytecode, &heap, nullptr, nullptr, 4);
+            auto* regs = res.get_reg_base();
+            GcObject*  buf = regs[0].isPtr() ? GcObject::from_slots(regs[0].asPtr()) : nullptr;
+            const bool nil_ok = regs[1].isNil();
+            const bool cnt_ok = buf && buf->kind == GcObject::KIND_BYTES &&
+                                buf->slots()[BYTES_COUNT].asSigned48() == 0;
+            std::cout << std::format("  empty pop -> nil     : {}\n", nil_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  count still 0        : {}\n", cnt_ok ? "PASS" : "FAIL");
+            check(nil_ok && cnt_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Part C: a byte buffer survives a mid-call collection with its bytes intact ----
+    // Pushing 10 bytes into a bytes(2) forces grows 2->4->8->16; the collector must
+    // forward the KIND_BYTES header AND its KIND_STRING backing (moved as opaque bytes).
+    {
+        constexpr uint8_t COLLECTOR_FRAME = 3;
+        Heap heap(64 * 1024);
+        GlobalEnv globals(heap);
+        Assembler as;
+        as.func("collector", COLLECTOR_FRAME);
+        as.label("main");
+        as.load_const(1, 2); as.BYTES_NEW_CAP(0, 1);    // r0 = bytes(2)  [survivor]
+        for (int k = 0; k < 10; ++k) { as.load_const(1, static_cast<int16_t>(100 + k)); as.VEC_PUSH(0, 1); }
+        as.load_const(1, 0);                            // clobber temp
+        as.CALL("collector");
+        as.J(OpCode::HALT);
+        as.label("collector");
+        as.call_native_id(1, 2, 2, 0, 0);               // run GC mid-call (id 0 = native_collect)
+        as.J(OpCode::RET);
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part C (GC root)...\n";
+        try {
+            auto res   = execute_gc(bytecode, &heap, &globals, COLLECTOR_FRAME);
+            auto* regs = res.get_reg_base();
+            GcObject*  buf = regs[0].isPtr() ? GcObject::from_slots(regs[0].asPtr()) : nullptr;
+            const bool cnt_ok = buf && buf->kind == GcObject::KIND_BYTES &&
+                                buf->slots()[BYTES_COUNT].asSigned48() == 10;
+            bool bytes_ok = false;
+            if (cnt_ok) {
+                GcObject* backing = GcObject::from_slots(buf->slots()[BYTES_BACKING].asPtr());
+                const unsigned char b0 = static_cast<unsigned char>(backing->bytes()[0]);
+                const unsigned char b9 = static_cast<unsigned char>(backing->bytes()[9]);
+                bytes_ok = backing->kind == GcObject::KIND_STRING && b0 == 100 && b9 == 109;
+            }
+            std::cout << std::format("  buffer survived collection     : {}\n", cnt_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  bytes intact (b[0]=100,b[9]=109): {}\n", bytes_ok ? "PASS" : "FAIL");
+            check(cnt_ok && bytes_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Part D: GET_KIND == 6 (KIND_BYTES) and dual-kind LEN ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.load_const(1, 3); as.BYTES_NEW_CAP(0, 1);
+        as.load_const(1, 1); as.VEC_PUSH(0, 1);
+        as.load_const(1, 2); as.VEC_PUSH(0, 1);         // count 2
+        as.GET_KIND(2, 0);                              // r2 = 6
+        as.LEN(3, 0);                                   // r3 = 2
+        as.J(OpCode::HALT);
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part D (GET_KIND/len)...\n";
+        try {
+            auto res   = execute(bytecode, &heap, nullptr, nullptr, 4);
+            auto* regs = res.get_reg_base();
+            const bool kind_ok = regs[2].isInt() && regs[2].asSigned48() == GcObject::KIND_BYTES;
+            const bool len_ok  = regs[3].isInt() && regs[3].asSigned48() == 2;
+            std::cout << std::format("  GET_KIND == 6        : {}\n", kind_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  len == 2             : {}\n", len_ok ? "PASS" : "FAIL");
+            check(kind_ok && len_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Part E: bounds are vs count, NOT the backing capacity; negative traps ----
+    {
+        auto bytes_oob_traps = [](int64_t idx) -> bool {
+            Heap heap(64 * 1024);
+            Assembler as;
+            as.label("main");
+            as.load_const(1, 8); as.BYTES_NEW_CAP(0, 1);        // capacity 8, count 0
+            as.load_const(1, 7); as.VEC_PUSH(0, 1);
+            as.load_const(1, 8); as.VEC_PUSH(0, 1);             // count 2, capacity 8
+            as.load_const(1, static_cast<int16_t>(idx));
+            as.ARRAY_GET(2, 0, 1);                              // b[idx] -> must trap
+            as.J(OpCode::HALT);
+            const auto bc = as.assemble();
+            try { execute(bc, &heap, nullptr, nullptr, 4); return false; }
+            catch (const std::exception& e) {
+                return std::string_view(e.what()).find("out of bounds") != std::string_view::npos;
+            }
+        };
+        std::cout << "Running Part E (bounds vs count)...\n";
+        const bool over_ok = bytes_oob_traps(2);        // within capacity, past count
+        const bool neg_ok  = bytes_oob_traps(-1);
+        std::cout << std::format("  b[2] (count 2) traps : {}\n", over_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  b[-1] traps          : {}\n", neg_ok ? "PASS" : "FAIL");
+        check(over_ok && neg_ok);
+    }
+}
+
+// =============================================================================
+// test_bytes_append -- the bulk byte-blit ops BYTES_APPEND (whole String/Bytes) and
+// BYTES_APPEND_RANGE (a Bytes sub-range). Covers value equality, growth across
+// capacity, src == dst self-append, an empty source no-op, GC survival, and the
+// receiver / bounds traps.
+// =============================================================================
+inline void test_bytes_append() {
+    std::cout << "=== bytes_append (BYTES_APPEND / BYTES_APPEND_RANGE) ===\n";
+
+    auto str_of = [](Value v) -> std::string {
+        if (!v.isPtr()) return "<not-ptr>";
+        GcObject* o = GcObject::from_slots(v.asPtr());
+        if (o->kind != GcObject::KIND_STRING) return "<not-str>";
+        return std::string(o->bytes(), o->string_length());
+    };
+
+    // ---- Part A: append whole String src + whole Bytes src + a Bytes sub-range ----
+    {
+        Heap heap(64 * 1024);
+        StringInterner interner;
+        Assembler as;
+        as.label("main");
+        as.load_const(1, 0); as.BYTES_NEW_CAP(0, 1);      // r0 = bytes()  (dst)
+        as.load_str(2, "foo"); as.BYTES_APPEND(0, 2);     // dst += "foo"
+        as.load_str(3, "BAR"); as.BYTES_FROM_STR(4, 3);   // r4 = bytes("BAR")
+        as.BYTES_APPEND(0, 4);                            // dst += bytes("BAR")  -> "fooBAR"
+        as.load_const(5, 1); as.load_const(6, 3);
+        as.BYTES_APPEND_RANGE(0, 4, 5, 6);                // dst += r4[1,3) = "AR" -> "fooBARAR"
+        as.BYTES_TO_STR(7, 0);                            // r7 = fromBytes(dst)
+        as.J(OpCode::HALT);
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part A (whole + whole + range)...\n";
+        try {
+            auto res = execute(bytecode, &heap, nullptr, &interner, 8, nullptr, nullptr,
+                               &as.string_literals());
+            const std::string got = str_of(res.get_reg_base()[7]);
+            const bool ok = got == "fooBARAR";
+            std::cout << std::format("  \"{}\" == fooBARAR : {}\n", got, ok ? "PASS" : "FAIL");
+            check(ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Part B: growth across capacity + src == dst self-append ----
+    {
+        Heap heap(64 * 1024);
+        StringInterner interner;
+        Assembler as;
+        as.label("main");
+        as.load_const(1, 2); as.BYTES_NEW_CAP(0, 1);      // r0 = bytes(2) (cap 2)
+        as.load_str(2, "abcd"); as.BYTES_APPEND(0, 2);    // dst = "abcd" (grew 2->4)
+        as.BYTES_APPEND(0, 0);                            // self-append -> "abcdabcd"
+        as.BYTES_TO_STR(3, 0);
+        as.J(OpCode::HALT);
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part B (grow + self-append)...\n";
+        try {
+            auto res = execute(bytecode, &heap, nullptr, &interner, 4, nullptr, nullptr,
+                               &as.string_literals());
+            const std::string got = str_of(res.get_reg_base()[3]);
+            const bool ok = got == "abcdabcd";
+            std::cout << std::format("  \"{}\" == abcdabcd : {}\n", got, ok ? "PASS" : "FAIL");
+            check(ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Part C: empty source is a no-op (uses a fresh empty buffer as the source) ----
+    {
+        Heap heap(64 * 1024);
+        StringInterner interner;
+        Assembler as;
+        as.label("main");
+        as.load_const(1, 0); as.BYTES_NEW_CAP(0, 1);      // r0 = dst = bytes()
+        as.load_str(2, "hi"); as.BYTES_APPEND(0, 2);      // dst = "hi"
+        as.load_const(3, 0); as.BYTES_NEW_CAP(5, 3);      // r5 = empty bytes() (empty src)
+        as.BYTES_APPEND(0, 5);                            // no-op
+        as.BYTES_APPEND_RANGE(0, 5, 1, 1);                // r1 holds 0; [0,0) no-op
+        as.BYTES_TO_STR(6, 0);
+        as.J(OpCode::HALT);
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part C (empty no-op)...\n";
+        try {
+            auto res = execute(bytecode, &heap, nullptr, &interner, 7, nullptr, nullptr,
+                               &as.string_literals());
+            const std::string got = str_of(res.get_reg_base()[6]);
+            const bool ok = got == "hi";
+            std::cout << std::format("  \"{}\" == hi (empty no-op) : {}\n", got, ok ? "PASS" : "FAIL");
+            check(ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Part D: a buffer built by BYTES_APPEND survives a mid-call collection ----
+    {
+        constexpr uint8_t COLLECTOR_FRAME = 3;
+        Heap heap(64 * 1024);
+        GlobalEnv globals(heap);
+        StringInterner interner;
+        Assembler as;
+        as.func("collector", COLLECTOR_FRAME);
+        as.label("main");
+        as.load_const(1, 1); as.BYTES_NEW_CAP(0, 1);      // r0 = bytes(1)  [survivor]
+        as.load_str(2, "abcdefghij"); as.BYTES_APPEND(0, 2);  // grows 1->..->16 via append
+        as.load_const(2, 0);                              // clobber temp
+        as.CALL("collector");
+        as.BYTES_TO_STR(2, 0);
+        as.J(OpCode::HALT);
+        as.label("collector");
+        as.call_native_id(1, 2, 2, 0, 0);                 // run GC mid-call (id 0 = native_collect)
+        as.J(OpCode::RET);
+        const auto bytecode = as.assemble();
+        std::cout << "Running Part D (GC survival)...\n";
+        try {
+            // execute_gc() doesn't forward string_literals, so spell out the full call
+            // (interner + string_literals for LOAD_STR, GC_NTAB for native_collect).
+            auto res = execute(bytecode, &heap, &globals, &interner, COLLECTOR_FRAME,
+                               nullptr, nullptr, &as.string_literals(), nullptr, nullptr,
+                               nullptr, nullptr, 0, 0, nullptr, nullptr, nullptr, &GC_NTAB);
+            const std::string got = str_of(res.get_reg_base()[2]);
+            const bool ok = got == "abcdefghij";
+            std::cout << std::format("  \"{}\" survived GC : {}\n", got, ok ? "PASS" : "FAIL");
+            check(ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Part E: receiver + bounds traps ----
+    {
+        auto append_traps = [](bool range, int64_t lo, int64_t hi, bool bad_dst) -> bool {
+            Heap heap(64 * 1024);
+            StringInterner interner;
+            Assembler as;
+            as.label("main");
+            as.load_const(1, 0); as.BYTES_NEW_CAP(0, 1);  // r0 = dst bytes()
+            as.load_str(2, "ab"); as.BYTES_FROM_STR(3, 2);// r3 = bytes("ab"), len 2
+            if (bad_dst) { as.load_const(0, 5); }         // r0 now an Int -> bad dst
+            if (range) {
+                as.load_const(4, static_cast<int16_t>(lo));
+                as.load_const(5, static_cast<int16_t>(hi));
+                as.BYTES_APPEND_RANGE(0, 3, 4, 5);
+            } else {
+                as.BYTES_APPEND(0, 3);
+            }
+            as.J(OpCode::HALT);
+            const auto bc = as.assemble();
+            try { execute(bc, &heap, nullptr, &interner, 6, nullptr, nullptr, &as.string_literals());
+                  return false; }
+            catch (const std::exception&) { return true; }
+        };
+        std::cout << "Running Part E (traps)...\n";
+        const bool bad_dst_ok = append_traps(false, 0, 0, true);   // appendBytes into an Int
+        const bool oob_hi_ok  = append_traps(true, 0, 3, false);   // hi 3 > len 2
+        const bool oob_lo_ok  = append_traps(true, -1, 1, false);  // lo < 0
+        std::cout << std::format("  bad dst traps        : {}\n", bad_dst_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  range hi>len traps   : {}\n", oob_hi_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  range lo<0 traps     : {}\n", oob_lo_ok ? "PASS" : "FAIL");
+        check(bad_dst_ok && oob_hi_ok && oob_lo_ok);
+    }
+}
+
+// =============================================================================
+// test_map -- the dynamic map type (KIND_MAP): MAP_NEW / MAP_GET / MAP_SET, the
+// dual-kind LEN, key identity (content strings + SameValueZero immediates), the
+// grow/rehash path interleaved with the moving collector, and the invalid-key
+// trap. Six blocks, each with its own Heap. See op_map.h.
+// =============================================================================
+inline void test_map() {
+    std::cout << "=== map (MAP_NEW/GET/SET/LEN) ===\n";
+
+    // ---- Block A: core int-key set / get / miss / overwrite / len ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.load_const(1, 1); as.load_const(2, 100); as.MAP_SET(0, 1, 2);   // m[1] = 100
+        as.load_const(1, 2); as.load_const(2, 200); as.MAP_SET(0, 1, 2);   // m[2] = 200
+        as.load_const(1, 1); as.MAP_GET(3, 0, 1);                          // r3 = m[1] = 100
+        as.load_const(1, 2); as.MAP_GET(4, 0, 1);                          // r4 = m[2] = 200
+        as.load_const(1, 9); as.MAP_GET(5, 0, 1);                          // r5 = m[9] = nil (miss)
+        as.load_const(1, 1); as.load_const(2, 111); as.MAP_SET(0, 1, 2);   // m[1] = 111 (overwrite)
+        as.load_const(1, 1); as.MAP_GET(6, 0, 1);                          // r6 = 111
+        as.LEN(7, 0);                                                      // r7 = 2 (count, not 3)
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block A (core)...\n";
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, nullptr, 8);
+            auto* regs = res.get_reg_base();
+            auto I = [&](int i, int64_t want) { return regs[i].isInt() && regs[i].asSigned48() == want; };
+            const bool ok = I(3, 100) && I(4, 200) && regs[5].isNil() && I(6, 111) && I(7, 2);
+            std::cout << std::format("  get m[1],m[2]=100,200 : {}\n", (I(3,100)&&I(4,200)) ? "PASS" : "FAIL");
+            std::cout << std::format("  miss m[9] -> nil      : {}\n", regs[5].isNil() ? "PASS" : "FAIL");
+            std::cout << std::format("  overwrite m[1]=111    : {}\n", I(6, 111) ? "PASS" : "FAIL");
+            std::cout << std::format("  len = 2 (count)       : {}\n", I(7, 2) ? "PASS" : "FAIL");
+            check(ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block M: MAP_GET_OR_TRAP -- present returns the value; a missing key TRAPS ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.load_const(1, 5); as.load_const(2, 50); as.MAP_SET(0, 1, 2);    // m[5] = 50
+        as.load_const(1, 5); as.MAP_GET_OR_TRAP(3, 0, 1);                  // r3 = m[5] = 50 (present)
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block M (MAP_GET_OR_TRAP)...\n";
+        bool present_ok = false, miss_traps = false;
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, nullptr, 4);
+            auto* regs = res.get_reg_base();
+            present_ok = regs[3].isInt() && regs[3].asSigned48() == 50;
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+
+        // A missing key aborts with a located "map key not found" fault (mirrors ARRAY_GET OOB).
+        Heap heap2(64 * 1024);
+        Assembler as2;
+        as2.label("main");
+        as2.MAP_NEW(0);
+        as2.load_const(1, 5); as2.load_const(2, 50); as2.MAP_SET(0, 1, 2); // m[5] = 50
+        as2.load_const(1, 9); as2.MAP_GET_OR_TRAP(3, 0, 1);                // m[9] -> TRAP
+        as2.J(OpCode::HALT);
+        try {
+            execute(as2.assemble(), &heap2, nullptr, nullptr, 4);
+        }
+        catch (const std::exception& e) {
+            miss_traps = std::string_view(e.what()).find("map key not found") != std::string_view::npos;
+        }
+        std::cout << std::format("  present m[5] = 50     : {}\n", present_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  missing m[9] traps    : {}\n", miss_traps ? "PASS" : "FAIL");
+        check(present_ok && miss_traps);
+    }
+
+    // ---- Block B: key types bool/atom/nil, Int(1) != Double(1.0), nil-value ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.load_constant(1, Value::fromBool(true));  as.load_const(2, 1); as.MAP_SET(0, 1, 2); // m[true]=1
+        as.load_constant(1, Value::fromBool(false)); as.load_const(2, 2); as.MAP_SET(0, 1, 2); // m[false]=2
+        as.load_constant(1, Value::fromAtom(7));     as.load_const(2, 3); as.MAP_SET(0, 1, 2); // m[:7]=3
+        as.load_constant(1, Value::fromNil());       as.load_const(2, 4); as.MAP_SET(0, 1, 2); // m[nil]=4
+        as.load_const(1, 1);       as.load_const(2, 10); as.MAP_SET(0, 1, 2);                  // m[Int 1]=10
+        as.load_double(1, 1.0);    as.load_const(2, 20); as.MAP_SET(0, 1, 2);                  // m[Dbl 1.0]=20
+        as.load_const(1, 42); as.load_constant(2, Value::fromNil()); as.MAP_SET(0, 1, 2);      // m[42]=nil
+        as.load_constant(1, Value::fromBool(true));  as.MAP_GET(3,  0, 1);   // 1
+        as.load_constant(1, Value::fromBool(false)); as.MAP_GET(4,  0, 1);   // 2
+        as.load_constant(1, Value::fromAtom(7));     as.MAP_GET(5,  0, 1);   // 3
+        as.load_constant(1, Value::fromNil());       as.MAP_GET(6,  0, 1);   // 4
+        as.load_const(1, 1);    as.MAP_GET(7,  0, 1);                        // 10  (int key)
+        as.load_double(1, 1.0); as.MAP_GET(8,  0, 1);                        // 20  (double key: distinct!)
+        as.load_const(1, 42);   as.MAP_GET(9,  0, 1);                        // nil (value is nil)
+        as.LEN(10, 0);                                                       // 7 distinct keys
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block B (key types, Int!=Double)...\n";
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, nullptr, 12, &as.constant_pool());
+            auto* regs = res.get_reg_base();
+            auto I = [&](int i, int64_t want) { return regs[i].isInt() && regs[i].asSigned48() == want; };
+            const bool types_ok = I(3,1) && I(4,2) && I(5,3) && I(6,4);
+            const bool split_ok  = I(7,10) && I(8,20);           // Int(1) and Double(1.0) are separate keys
+            const bool nilval_ok = regs[9].isNil();              // stored nil is indistinguishable from a miss
+            const bool len_ok    = I(10, 7);
+            std::cout << std::format("  bool/atom/nil keys    : {}\n", types_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  Int(1)!=Double(1.0)   : {}\n", split_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  m[42]=nil reads nil   : {}\n", nilval_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  len = 7 distinct keys : {}\n", len_ok ? "PASS" : "FAIL");
+            check(types_ok && split_ok && nilval_ok && len_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block C: SameValueZero -- -0.0/+0.0 collapse, NaN keys collapse ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.load_double(1, 0.0);  as.load_const(2, 1); as.MAP_SET(0, 1, 2);  // m[0.0]=1
+        as.load_double(1, -0.0); as.load_const(2, 2); as.MAP_SET(0, 1, 2);  // m[-0.0]=2 -> same key (overwrite)
+        as.load_double(1, 0.0);  as.MAP_GET(3, 0, 1);                       // 2
+        as.load_constant(1, Value::nan()); as.load_const(2, 5); as.MAP_SET(0, 1, 2); // m[NaN]=5
+        as.load_constant(1, Value::nan()); as.load_const(2, 6); as.MAP_SET(0, 1, 2); // m[NaN]=6 -> same key
+        as.load_constant(1, Value::nan()); as.MAP_GET(4, 0, 1);             // 6
+        as.LEN(5, 0);                                                       // 2 (zero-key + nan-key)
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block C (SameValueZero)...\n";
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, nullptr, 8, &as.constant_pool());
+            auto* regs = res.get_reg_base();
+            auto I = [&](int i, int64_t want) { return regs[i].isInt() && regs[i].asSigned48() == want; };
+            const bool ok = I(3, 2) && I(4, 6) && I(5, 2);
+            std::cout << std::format("  -0.0/+0.0 one key     : {}\n", (I(3,2)&&I(5,2)) ? "PASS" : "FAIL");
+            std::cout << std::format("  NaN keys collapse     : {}\n", I(4, 6) ? "PASS" : "FAIL");
+            check(ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block D: string keys hash/compare by CONTENT (concat == literal) ----
+    {
+        Heap heap(64 * 1024);
+        StringInterner interner;
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.load_str(1, "hello"); as.load_const(2, 1); as.MAP_SET(0, 1, 2);   // m["hello"]=1
+        // GET via a FRESH non-interned concat "hel"+"lo" -> must hit by content.
+        as.load_str(3, "hel"); as.load_str(4, "lo"); as.R6(OpCode::ADD, 5, 3, 4); // r5 = "hello" (fresh)
+        as.MAP_GET(6, 0, 5);                                                 // 1
+        // SET via a fresh concat key, GET via the literal -> must hit by content.
+        as.load_str(3, "wor"); as.load_str(4, "ld"); as.R6(OpCode::ADD, 7, 3, 4);  // r7 = "world" (fresh)
+        as.load_const(2, 2); as.MAP_SET(0, 7, 2);                            // m["world"(fresh)]=2
+        as.load_str(1, "world"); as.MAP_GET(8, 0, 1);                        // 2
+        as.LEN(9, 0);                                                        // 2
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block D (content string keys)...\n";
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, &interner, 12,
+                                 nullptr, nullptr, &as.string_literals());
+            auto* regs = res.get_reg_base();
+            auto I = [&](int i, int64_t want) { return regs[i].isInt() && regs[i].asSigned48() == want; };
+            const bool ok = I(6, 1) && I(8, 2) && I(9, 2);
+            std::cout << std::format("  get concat->literal   : {}\n", I(6, 1) ? "PASS" : "FAIL");
+            std::cout << std::format("  set concat/get literal: {}\n", I(8, 2) ? "PASS" : "FAIL");
+            std::cout << std::format("  len = 2               : {}\n", I(9, 2) ? "PASS" : "FAIL");
+            check(ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block E: grow / rehash interleaved with GC under a tiny heap ----
+    {
+        Heap heap(8 * 1024);                       // tiny -> the grows collect
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.load_const(1, 0);                       // i
+        as.load_const(5, 40);                      // limit
+        as.label("loop");
+        as.B(OpCode::BGE_INT, 1, 5, "done");       // while i < 40
+        as.MAP_SET(0, 1, 1);                       // m[i] = i  (rd=value=r1, ra=map=r0, rb=key=r1)
+        as.C2(OpCode::INCR, 1);
+        as.J(OpCode::J, "loop");
+        as.label("done");
+        as.load_const(2, 0);  as.MAP_GET(6, 0, 2); // m[0]  = 0
+        as.load_const(2, 7);  as.MAP_GET(7, 0, 2); // m[7]  = 7
+        as.load_const(2, 39); as.MAP_GET(8, 0, 2); // m[39] = 39
+        as.load_const(2, 40); as.MAP_GET(9, 0, 2); // m[40] = nil (never set)
+        as.LEN(10, 0);                             // 40
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block E (grow + GC)...\n";
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, nullptr, 12);
+            auto* regs = res.get_reg_base();
+            auto I = [&](int i, int64_t want) { return regs[i].isInt() && regs[i].asSigned48() == want; };
+            const bool ok = I(6, 0) && I(7, 7) && I(8, 39) && regs[9].isNil() && I(10, 40);
+            std::cout << std::format("  40 keys survive grows : {}\n", (I(6,0)&&I(7,7)&&I(8,39)) ? "PASS" : "FAIL");
+            std::cout << std::format("  len = 40              : {}\n", I(10, 40) ? "PASS" : "FAIL");
+            check(ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block F: an invalid key type (a non-string heap object) traps ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.ALLOC(1, 2);                            // r1 = array -> not a permitted key
+        as.load_const(2, 5);
+        as.MAP_SET(0, 1, 2);                       // must trap "Invalid map key type"
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block F (invalid key trap)...\n";
+        bool trapped = false;
+        try { execute(as.assemble(), &heap, nullptr, nullptr, 4); }
+        catch (const std::exception& e) {
+            trapped = std::string_view(e.what()).find("invalid map key") != std::string_view::npos;
+        }
+        std::cout << std::format("  array key traps       : {}\n", trapped ? "PASS" : "FAIL");
+        check(trapped);
+    }
+
+    // ---- Block G: MAP_HAS -- presence test distinct from value (B4) ----
+    {
+        Heap heap(64 * 1024);
+        StringInterner interner;
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.load_const(1, 1);  as.load_const(2, 100); as.MAP_SET(0, 1, 2);          // m[1] = 100
+        as.load_const(1, 7);  as.load_constant(2, Value::fromNil()); as.MAP_SET(0, 1, 2); // m[7] = nil
+        as.load_const(1, 1);  as.MAP_HAS(3, 0, 1);                                  // r3 = has(m,1)  = true
+        as.load_const(1, 9);  as.MAP_HAS(4, 0, 1);                                  // r4 = has(m,9)  = false (absent)
+        as.load_const(1, 7);  as.MAP_HAS(5, 0, 1);                                  // r5 = has(m,7)  = true  (value is nil!)
+        as.load_const(1, 7);  as.MAP_GET(6, 0, 1);                                  // r6 = m[7]      = nil
+        // string key by CONTENT: set via literal, test presence via a fresh concat.
+        as.load_str(1, "hello"); as.load_const(2, 5); as.MAP_SET(0, 1, 2);          // m["hello"] = 5
+        as.load_str(7, "hel"); as.load_str(8, "lo"); as.R6(OpCode::ADD, 9, 7, 8);   // r9 = "hello" (fresh)
+        as.MAP_HAS(10, 0, 9);                                                       // r10 = true  (content hit)
+        as.load_str(1, "nope"); as.MAP_HAS(11, 0, 1);                               // r11 = false
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block G (MAP_HAS presence)...\n";
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, &interner, 12,
+                                 &as.constant_pool(), nullptr, &as.string_literals());
+            auto* regs = res.get_reg_base();
+            auto B = [&](int i, bool want) { return regs[i].isBool() && regs[i].asBool() == want; };
+            const bool present_ok = B(3, true) && B(4, false);
+            const bool nilval_ok  = B(5, true) && regs[6].isNil();   // key present, value nil
+            const bool string_ok  = B(10, true) && B(11, false);     // content hit / miss
+            std::cout << std::format("  has present / absent  : {}\n", present_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  has key->nil is true  : {}\n", nilval_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  has string by content : {}\n", string_ok ? "PASS" : "FAIL");
+            check(present_ok && nilval_ok && string_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block H: MAP_HAS on an invalid key type traps ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.ALLOC(1, 2);                            // r1 = array -> not a permitted key
+        as.MAP_HAS(2, 0, 1);                       // must trap "Invalid map key type"
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block H (MAP_HAS invalid key trap)...\n";
+        bool trapped = false;
+        try { execute(as.assemble(), &heap, nullptr, nullptr, 4); }
+        catch (const std::exception& e) {
+            trapped = std::string_view(e.what()).find("invalid map key") != std::string_view::npos;
+        }
+        std::cout << std::format("  has array key traps   : {}\n", trapped ? "PASS" : "FAIL");
+        check(trapped);
+    }
+
+    // ---- Block I: MAP_DELETE -- remove, tombstone-chain integrity, reuse (B5) ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        // Five int keys 1..5 -> 10..50 (5 keys stay under the cap-8 grow threshold, so
+        // the collision structure survives -- deleting a middle key must not break the
+        // probe chains of the others).
+        as.load_const(1, 1); as.load_const(2, 10); as.MAP_SET(0, 1, 2);
+        as.load_const(1, 2); as.load_const(2, 20); as.MAP_SET(0, 1, 2);
+        as.load_const(1, 3); as.load_const(2, 30); as.MAP_SET(0, 1, 2);
+        as.load_const(1, 4); as.load_const(2, 40); as.MAP_SET(0, 1, 2);
+        as.load_const(1, 5); as.load_const(2, 50); as.MAP_SET(0, 1, 2);
+        as.load_const(1, 3);  as.MAP_DELETE(3, 0, 1);   // r3 = true  (was present)
+        as.load_const(1, 3);  as.MAP_DELETE(4, 0, 1);   // r4 = false (already gone)
+        as.load_const(1, 99); as.MAP_DELETE(5, 0, 1);   // r5 = false (never present)
+        as.load_const(1, 3);  as.MAP_HAS(6, 0, 1);      // r6 = false
+        as.load_const(1, 3);  as.MAP_GET(7, 0, 1);      // r7 = nil
+        as.load_const(1, 1);  as.MAP_GET(8, 0, 1);      // 10  survivors still reachable
+        as.load_const(1, 2);  as.MAP_GET(9, 0, 1);      // 20  (past the tombstone)
+        as.load_const(1, 4);  as.MAP_GET(10, 0, 1);     // 40
+        as.load_const(1, 5);  as.MAP_GET(11, 0, 1);     // 50
+        as.LEN(12, 0);                                  // 4   (count decremented)
+        // Reinsert key 3 -> the tombstone slot is reused (used did not grow).
+        as.load_const(1, 3);  as.load_const(2, 33); as.MAP_SET(0, 1, 2);
+        as.load_const(1, 3);  as.MAP_GET(13, 0, 1);     // 33
+        as.LEN(14, 0);                                  // 5
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block I (MAP_DELETE)...\n";
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, nullptr, 16);
+            auto* regs = res.get_reg_base();
+            auto I = [&](int i, int64_t want) { return regs[i].isInt() && regs[i].asSigned48() == want; };
+            auto B = [&](int i, bool want) { return regs[i].isBool() && regs[i].asBool() == want; };
+            const bool ret_ok      = B(3, true) && B(4, false) && B(5, false);
+            const bool gone_ok     = B(6, false) && regs[7].isNil();
+            const bool survivors_ok= I(8, 10) && I(9, 20) && I(10, 40) && I(11, 50) && I(12, 4);
+            const bool reuse_ok    = I(13, 33) && I(14, 5);
+            std::cout << std::format("  delete present/absent : {}\n", ret_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  deleted key gone      : {}\n", gone_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  chain intact + len 4  : {}\n", survivors_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  tombstone reuse       : {}\n", reuse_ok ? "PASS" : "FAIL");
+            check(ret_ok && gone_ok && survivors_ok && reuse_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block J: MAP_DELETE on an invalid key type traps ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.ALLOC(1, 2);                            // r1 = array -> not a permitted key
+        as.MAP_DELETE(2, 0, 1);                    // must trap "Invalid map key type"
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block J (MAP_DELETE invalid key trap)...\n";
+        bool trapped = false;
+        try { execute(as.assemble(), &heap, nullptr, nullptr, 4); }
+        catch (const std::exception& e) {
+            trapped = std::string_view(e.what()).find("invalid map key") != std::string_view::npos;
+        }
+        std::cout << std::format("  delete array key traps: {}\n", trapped ? "PASS" : "FAIL");
+        check(trapped);
+    }
+
+    // ---- Block K: MAP_KEYS / MAP_VALUES -- snapshot to arrays + alignment (B6) ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.load_const(1, 1); as.load_const(2, 10); as.MAP_SET(0, 1, 2);
+        as.load_const(1, 2); as.load_const(2, 20); as.MAP_SET(0, 1, 2);
+        as.load_const(1, 3); as.load_const(2, 30); as.MAP_SET(0, 1, 2);
+        as.MAP_KEYS(3, 0);                              // r3 = [keys]  (hash order)
+        as.MAP_VALUES(4, 0);                            // r4 = [values]
+        as.LEN(5, 3);                                   // r5 = 3
+        as.LEN(6, 4);                                   // r6 = 3
+        // Fetch keys[0..2] (r7,r8,r9) and values[0..2] (r10,r11,r12) at aligned indices.
+        as.load_const(1, 0); as.ARRAY_GET(7, 3, 1);  as.ARRAY_GET(10, 4, 1);
+        as.load_const(1, 1); as.ARRAY_GET(8, 3, 1);  as.ARRAY_GET(11, 4, 1);
+        as.load_const(1, 2); as.ARRAY_GET(9, 3, 1);  as.ARRAY_GET(12, 4, 1);
+        // Keys are a permutation of {1,2,3} -> sum 6; values of {10,20,30} -> sum 60.
+        as.R6(OpCode::ADD, 13, 7, 8);  as.R6(OpCode::ADD, 13, 13, 9);   // r13 = 6
+        as.R6(OpCode::ADD, 14, 10, 11); as.R6(OpCode::ADD, 14, 14, 12); // r14 = 60
+        // Alignment: m[keys[i]] == values[i] for each i.
+        as.MAP_GET(15, 0, 7); as.R6(OpCode::EQ, 15, 15, 10);
+        as.MAP_GET(16, 0, 8); as.R6(OpCode::EQ, 16, 16, 11);
+        as.MAP_GET(17, 0, 9); as.R6(OpCode::EQ, 17, 17, 12);
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block K (MAP_KEYS/MAP_VALUES)...\n";
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, nullptr, 18);
+            auto* regs = res.get_reg_base();
+            auto I = [&](int i, int64_t want) { return regs[i].isInt() && regs[i].asSigned48() == want; };
+            auto B = [&](int i, bool want) { return regs[i].isBool() && regs[i].asBool() == want; };
+            const bool len_ok   = I(5, 3) && I(6, 3);
+            const bool set_ok   = I(13, 6) && I(14, 60);    // right keys / values (order-free)
+            const bool align_ok = B(15, true) && B(16, true) && B(17, true);
+            std::cout << std::format("  keys/values len = 3  : {}\n", len_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  key/value sets right : {}\n", set_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  keys[i]/values[i] aln: {}\n", align_ok ? "PASS" : "FAIL");
+            check(len_ok && set_ok && align_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block L: keys/values of an empty map, and after a delete ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.MAP_KEYS(1, 0);   as.LEN(2, 1);              // empty -> r2 = 0
+        as.MAP_VALUES(3, 0); as.LEN(4, 3);              // empty -> r4 = 0
+        // Fill 3, delete 1 -> live count 2 reflected by keys()/values().
+        as.load_const(5, 1); as.load_const(6, 1); as.MAP_SET(0, 5, 6);
+        as.load_const(5, 2); as.load_const(6, 2); as.MAP_SET(0, 5, 6);
+        as.load_const(5, 3); as.load_const(6, 3); as.MAP_SET(0, 5, 6);
+        as.load_const(5, 2); as.MAP_DELETE(7, 0, 5);    // remove key 2
+        as.MAP_KEYS(8, 0);   as.LEN(9, 8);              // r9 = 2
+        as.MAP_VALUES(10, 0); as.LEN(11, 10);           // r11 = 2
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block L (empty / after-delete keys)...\n";
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, nullptr, 12);
+            auto* regs = res.get_reg_base();
+            auto I = [&](int i, int64_t want) { return regs[i].isInt() && regs[i].asSigned48() == want; };
+            const bool empty_ok = I(2, 0) && I(4, 0);
+            const bool after_ok = I(9, 2) && I(11, 2);
+            std::cout << std::format("  empty keys/values 0  : {}\n", empty_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  after delete len = 2 : {}\n", after_ok ? "PASS" : "FAIL");
+            check(empty_ok && after_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+}
+
+// =============================================================================
+// test_map_iter_next -- the no-copy live map cursor (MAP_ITER_NEXT / MAP_KEY_AT /
+// MAP_VAL_AT, ids 109-111). Build a map, delete one key (creating a tombstone the
+// scan must skip), then drive the cursor to exhaustion accumulating key-sum,
+// value-sum and a visit count (all order-independent, since the walk is in hash
+// order). Verifies: every live pair visited exactly once, tombstones skipped, and
+// the -1 terminator. A second block checks an OOB MAP_KEY_AT index traps.
+// =============================================================================
+inline void test_map_iter_next() {
+    std::cout << "=== map iter (MAP_ITER_NEXT/KEY_AT/VAL_AT) ===\n";
+
+    // ---- Block A: walk live pairs (with a tombstone in the middle) ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);                                              // r0 = map
+        as.load_const(1, 1); as.load_const(2, 10); as.MAP_SET(0, 1, 2);   // m[1]=10
+        as.load_const(1, 2); as.load_const(2, 20); as.MAP_SET(0, 1, 2);   // m[2]=20
+        as.load_const(1, 3); as.load_const(2, 30); as.MAP_SET(0, 1, 2);   // m[3]=30
+        as.load_const(1, 2); as.MAP_DELETE(9, 0, 1);                // remove key 2 -> tombstone
+        // accumulators + cursor
+        as.load_const(10, 0);   // cursor
+        as.load_const(14, 0);   // key sum
+        as.load_const(15, 0);   // value sum
+        as.load_const(16, 0);   // visit count
+        as.load_const(17, 0);   // constant 0 (for the j<0 test)
+        as.load_const(18, 1);   // constant 1
+        as.label("loop");
+        as.MAP_ITER_NEXT(11, 0, 10);                 // r11 = next live index (or -1)
+        as.B(OpCode::BLT_INT, 11, 17, "end");        // r11 < 0 -> done
+        as.MAP_KEY_AT(12, 0, 11);                    // r12 = key
+        as.MAP_VAL_AT(13, 0, 11);                    // r13 = value
+        as.R6(OpCode::ADD_INT, 14, 14, 12);          // key sum += key
+        as.R6(OpCode::ADD_INT, 15, 15, 13);          // value sum += value
+        as.R6(OpCode::ADD_INT, 16, 16, 18);          // count += 1
+        as.R6(OpCode::ADD_INT, 10, 11, 18);          // cursor = index + 1
+        as.J(OpCode::J, "loop");
+        as.label("end");
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block A (walk live pairs, skip tombstone)...\n";
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, nullptr, 20);
+            auto* regs = res.get_reg_base();
+            auto I = [&](int i, int64_t want) { return regs[i].isInt() && regs[i].asSigned48() == want; };
+            const bool count_ok = I(16, 2);          // 2 live entries (1 and 3)
+            const bool keys_ok  = I(14, 4);          // 1 + 3
+            const bool vals_ok  = I(15, 40);         // 10 + 30
+            const bool term_ok  = I(11, -1);         // loop exited on the -1 terminator
+            std::cout << std::format("  count = 2 (skip tomb): {}\n", count_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  key sum = 4          : {}\n", keys_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  value sum = 40       : {}\n", vals_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  terminator = -1      : {}\n", term_ok ? "PASS" : "FAIL");
+            check(count_ok && keys_ok && vals_ok && term_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block B: an empty map yields -1 on the first MAP_ITER_NEXT ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.load_const(1, 0);
+        as.MAP_ITER_NEXT(2, 0, 1);                   // r2 = -1 (no live entries)
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block B (empty map -> -1)...\n";
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, nullptr, 4);
+            auto* regs = res.get_reg_base();
+            const bool ok = regs[2].isInt() && regs[2].asSigned48() == -1;
+            std::cout << std::format("  empty -> -1          : {}\n", ok ? "PASS" : "FAIL");
+            check(ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block C: an out-of-range MAP_KEY_AT index traps (defensive guard) ----
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.load_const(1, 1); as.load_const(2, 10); as.MAP_SET(0, 1, 2);
+        as.load_const(3, 1000); as.MAP_KEY_AT(4, 0, 3);   // index 1000 >> cap -> TRAP
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block C (OOB index traps)...\n";
+        bool traps = false;
+        try {
+            execute(as.assemble(), &heap, nullptr, nullptr, 8);
+        }
+        catch (const std::exception& e) {
+            traps = std::string_view(e.what()).find("map iteration index out of range") != std::string_view::npos;
+        }
+        std::cout << std::format("  OOB index traps      : {}\n", traps ? "PASS" : "FAIL");
+        check(traps);
+    }
+}
+
+// =============================================================================
+// test_closure_gc -- the moving-GC guard for KIND_CLOSURE (Milestone A1). A
+// closure's by-value CAPTURE that is itself a heap pointer must be forwarded
+// through the Cheney scan of the closure payload (which is scanned like a
+// KIND_ARRAY / KIND_OBJECT), and the 16-bit function id in the header `_pad`
+// must ride forward()'s memcpy intact.
+//
+//   A heap array `inner` is captured into closure slot 0; slot 1 holds a plain
+//   Int. The closure is the ONLY root (win[0]); `inner` is reachable solely
+//   through the capture. A dead canary is allocated but never rooted. After a
+//   collect(): the closure is physically relocated (still fn_id-tagged), its
+//   capture[0] is forwarded to the moved `inner` (contents intact), capture[1]'s
+//   Int is preserved, and the dead canary is the ONLY thing reclaimed.
+//
+// This is a pure heap-level test (no bytecode): MAKE_CLOSURE / LOAD_CAPTURE do
+// not exist until A3/A4, so the closure is built directly via heap.alloc_closure.
+// =============================================================================
+inline void test_closure_gc() {
+    std::cout << "=== closure_gc ===\n";
+
+    constexpr uint16_t FN_ID = 42; // arbitrary function-table id, must survive the move
+
+    Heap heap(64 * 1024);
+    GcTestCtx t(&heap, 1); // r0 (the closure) is the only live root
+
+    // The captured heap array -- reachable ONLY through the closure capture slot.
+    GcObject* inner = heap.alloc(GcObject::KIND_ARRAY, 3);
+    assert(inner && "closure_gc: inner alloc failed");
+    inner->slots()[0] = Value::fromSigned48(11);
+    inner->slots()[1] = Value::fromSigned48(22);
+    inner->slots()[2] = Value::fromSigned48(33);
+
+    // The closure: 2 captures. slot0 = inner (heap ptr), slot1 = a plain Int.
+    GcObject* clo = heap.alloc_closure(FN_ID, 2);
+    assert(clo && "closure_gc: closure alloc failed");
+    clo->slots()[0] = Value::fromPtr(inner->slots());
+    clo->slots()[1] = Value::fromSigned48(7);
+
+    // Dead canary: allocated but never rooted -- must be the ONLY thing collected.
+    GcObject* dead = heap.alloc(GcObject::KIND_ARRAY, 2);
+    assert(dead && "closure_gc: dead canary alloc failed");
+    const size_t dead_total = dead->total_bytes();
+
+    // Root ONLY the closure. `inner` survives solely via the closure payload scan.
+    t.win[0] = Value::fromPtr(clo->slots());
+
+    Context      ctx         = t.context();
+    void*        clo_before  = t.win[0].asPtr();
+    const size_t freed       = heap.collect(&ctx);
+
+    // Re-fetch everything THROUGH the root -- pointers moved.
+    GcObject* clo2 = t.win[0].isPtr() ? GcObject::from_slots(t.win[0].asPtr()) : nullptr;
+
+    const bool clo_ok = clo2 &&
+                        clo2->kind == GcObject::KIND_CLOSURE &&
+                        clo2->slot_count() == 2 &&
+                        clo2->closure_fn_id() == FN_ID &&
+                        t.win[0].asPtr() != clo_before; // physically relocated
+
+    GcObject* inner2 = nullptr;
+    if (clo2) {
+        const Value cap0 = clo2->slots()[0];
+        inner2 = cap0.isPtr() ? GcObject::from_slots(cap0.asPtr()) : nullptr;
+    }
+    const bool inner_ok = inner2 &&
+                          inner2->kind == GcObject::KIND_ARRAY &&
+                          inner2->slot_count() == 3 &&
+                          inner2->slots()[0].asSigned48() == 11 &&
+                          inner2->slots()[1].asSigned48() == 22 &&
+                          inner2->slots()[2].asSigned48() == 33;
+
+    const bool cap1_ok = clo2 &&
+                         clo2->slots()[1].isInt() &&
+                         clo2->slots()[1].asSigned48() == 7;
+
+    const bool freed_ok = freed == dead_total;
+
+    const bool ok = clo_ok && inner_ok && cap1_ok && freed_ok;
+
+    std::cout << std::format("freed={} (expect dead_total={})\n", freed, dead_total);
+    std::cout << std::format("  closure survived + fn_id intact:       {}\n", clo_ok ? "PASS" : "FAIL");
+    std::cout << std::format("  captured heap ptr forwarded + intact:  {}\n", inner_ok ? "PASS" : "FAIL");
+    std::cout << std::format("  captured Int preserved:                {}\n", cap1_ok ? "PASS" : "FAIL");
+    std::cout << std::format("  only the dead canary was collected:    {}\n", freed_ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+// =============================================================================
+// test_frame_size_root_boundary -- the NEGATIVE half of the frame_size GC-roots
+// contract. test_frame_gc_roots proves a pointer INSIDE [0, frame_size) survives;
+// this proves a pointer at or ABOVE frame_size is NOT a root, which is the other
+// half of the contract and had no coverage.
+//
+// It matters because that is exactly where a dead frame's leftovers live: once a
+// frame returns, its registers sit above the caller's frame_size and nothing
+// forwards them any more. A collector that scanned them would resurrect dead
+// objects here -- and, once such a leftover has gone stale across a collection,
+// would follow a dangling pointer instead (the memory-safety hole this contract
+// exists to prevent).
+//
+// The out-of-frame slot deliberately points at a VALID but otherwise unreachable
+// object, so a regression fails as a clean "it survived" assertion rather than by
+// dereferencing garbage and taking the whole suite down with it.
+// =============================================================================
+inline void test_frame_size_root_boundary() {
+    std::cout << "=== frame_size_root_boundary ===\n";
+
+    Heap heap(64 * 1024);
+    GcTestCtx t(&heap, 2);   // ONLY r0 and r1 are roots
+
+    GcObject* live = heap.alloc(GcObject::KIND_ARRAY, 2);
+    assert(live && "root_boundary: live alloc failed");
+    live->slots()[0] = Value::fromSigned48(101);
+    live->slots()[1] = Value::fromSigned48(202);
+
+    // Unreachable except through r2, which lies ABOVE frame_size (2) -- so it must die.
+    GcObject* out_of_frame = heap.alloc(GcObject::KIND_ARRAY, 3);
+    assert(out_of_frame && "root_boundary: out_of_frame alloc failed");
+    const size_t out_total = out_of_frame->total_bytes();
+
+    // Plain dead canary, referenced by nothing at all.
+    GcObject* dead = heap.alloc(GcObject::KIND_ARRAY, 2);
+    assert(dead && "root_boundary: dead canary alloc failed");
+    const size_t dead_total = dead->total_bytes();
+
+    t.win[0] = Value::fromPtr(live->slots());          // in-frame  -> must survive
+    t.win[1] = Value::fromSigned48(9);                 // in-frame immediate
+    t.win[2] = Value::fromPtr(out_of_frame->slots());  // OUT of frame -> must NOT be a root
+
+    Context      ctx           = t.context();
+    void*        live_before   = t.win[0].asPtr();
+    const void*  out_before    = t.win[2].asPtr();
+    const size_t freed         = heap.collect(&ctx);
+
+    GcObject* live2 = t.win[0].isPtr() ? GcObject::from_slots(t.win[0].asPtr()) : nullptr;
+    const bool live_ok = live2 &&
+                         live2->kind == GcObject::KIND_ARRAY &&
+                         live2->slot_count() == 2 &&
+                         live2->slots()[0].asSigned48() == 101 &&
+                         live2->slots()[1].asSigned48() == 202 &&
+                         t.win[0].asPtr() != live_before;      // physically relocated
+
+    // Both unrooted objects must be gone: the canary AND the one reachable only
+    // from the out-of-frame slot.
+    const bool freed_ok = freed == dead_total + out_total;
+
+    // The out-of-frame slot must be left completely alone -- not forwarded, not cleared.
+    const bool untouched_ok = t.win[2].isPtr() && t.win[2].asPtr() == out_before;
+
+    const bool ok = live_ok && freed_ok && untouched_ok;
+
+    std::cout << std::format("freed={} (expect dead={} + out_of_frame={} = {})\n",
+                             freed, dead_total, out_total, dead_total + out_total);
+    std::cout << std::format("  in-frame root survived + forwarded:      {}\n", live_ok ? "PASS" : "FAIL");
+    std::cout << std::format("  out-of-frame object was NOT retained:    {}\n", freed_ok ? "PASS" : "FAIL");
+    std::cout << std::format("  out-of-frame slot left untouched:        {}\n", untouched_ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+// =============================================================================
+// test_closure_roots -- the GC-root guard for the parallel closure stack +
+// current_closure (Milestone A2). Both are new strong root sources scanned by
+// forward_vm_external_roots: the innermost activation's closure (vm.current_closure)
+// and every saved caller closure on the closure stack (closure_stack_base[0..ret_depth)).
+//
+//   Closure A is installed as the current closure; Closure B is pushed onto the
+//   closure stack as a saved caller closure (with ret_depth == 1). Each captures a
+//   heap array reachable ONLY through its payload. A Context with one saved frame
+//   that scans ZERO registers is built by hand, so the closures survive SOLELY via
+//   the two new closure roots -- not via any register frame. After a collect(): both
+//   closures are relocated (fn_id intact), their captures forwarded via the payload
+//   scan, and only the dead canary is reclaimed.
+//
+// A2 installs no closure through bytecode yet (MAKE_CLOSURE/CALL_INDIRECT-on-closure
+// land in A3/A4), so this drives the root scan directly at the VM level.
+// =============================================================================
+inline void test_closure_roots() {
+    std::cout << "=== closure_roots ===\n";
+
+    constexpr uint16_t FN_A = 5;
+    constexpr uint16_t FN_B = 9;
+
+    Heap heap(64 * 1024);
+    VM_Resources res;
+    VM vm;
+    vm.heap               = &heap;
+    vm.closure_stack_base = res.get_closure_base();
+
+    // Two captured heap arrays, each reachable ONLY through a closure capture slot.
+    GcObject* inner_a = heap.alloc(GcObject::KIND_ARRAY, 2);
+    GcObject* inner_b = heap.alloc(GcObject::KIND_ARRAY, 2);
+    assert(inner_a && inner_b && "closure_roots: inner alloc failed");
+    inner_a->slots()[0] = Value::fromSigned48(111);
+    inner_a->slots()[1] = Value::fromSigned48(222);
+    inner_b->slots()[0] = Value::fromSigned48(333);
+    inner_b->slots()[1] = Value::fromSigned48(444);
+
+    GcObject* cloA = heap.alloc_closure(FN_A, 1); // -> current_closure root
+    GcObject* cloB = heap.alloc_closure(FN_B, 1); // -> closure-stack root
+    assert(cloA && cloB && "closure_roots: closure alloc failed");
+    cloA->slots()[0] = Value::fromPtr(inner_a->slots());
+    cloB->slots()[0] = Value::fromPtr(inner_b->slots());
+
+    // Dead canary: unrooted -> must be the ONLY thing reclaimed.
+    GcObject* dead = heap.alloc(GcObject::KIND_ARRAY, 3);
+    assert(dead && "closure_roots: dead canary alloc failed");
+    const size_t dead_total = dead->total_bytes();
+
+    // Install A as the innermost activation's closure; push B as a saved caller closure.
+    vm.current_closure        = Value::fromPtr(cloA->slots());
+    res.get_closure_base()[0] = Value::fromPtr(cloB->slots());
+
+    // One saved return frame that scans ZERO registers (frame size 0), so the closures
+    // are reachable SOLELY via the two closure roots -- never a register frame.
+    res.get_frame_size_base()[0]     = 0;
+    res.get_ret_base()[0].old_ip     = nullptr;            // unused when frame size is 0
+    res.get_ret_base()[0].old_window = res.get_reg_base();
+
+    Context ctx{};
+    ctx.window_ptr         = res.get_reg_base();
+    ctx.vm                 = &vm;
+    ctx.ret_stack_base     = res.get_ret_base();
+    ctx.ret_stack_ptr      = res.get_ret_base() + 1;                    // ret_depth == 1
+    ctx.ret_stack_limit    = res.get_ret_base() + VM_Resources::RET_FRAME_COUNT;
+    ctx.frame_size_ptr     = res.get_frame_size_base() + 1;            // parallel to ret_stack_ptr
+    ctx.current_frame_size = 0;                                        // current frame scans 0 registers
+
+    void*        a_before = vm.current_closure.asPtr();
+    void*        b_before = res.get_closure_base()[0].asPtr();
+    const size_t freed    = heap.collect(&ctx);
+
+    // Re-fetch THROUGH the roots -- pointers moved.
+    GcObject* a2 = vm.current_closure.isPtr()
+                 ? GcObject::from_slots(vm.current_closure.asPtr()) : nullptr;
+    GcObject* b2 = res.get_closure_base()[0].isPtr()
+                 ? GcObject::from_slots(res.get_closure_base()[0].asPtr()) : nullptr;
+
+    const bool a_ok = a2 && a2->kind == GcObject::KIND_CLOSURE &&
+                      a2->closure_fn_id() == FN_A &&
+                      vm.current_closure.asPtr() != a_before;
+    const bool b_ok = b2 && b2->kind == GcObject::KIND_CLOSURE &&
+                      b2->closure_fn_id() == FN_B &&
+                      res.get_closure_base()[0].asPtr() != b_before;
+
+    GcObject* ia = (a2 && a2->slots()[0].isPtr())
+                 ? GcObject::from_slots(a2->slots()[0].asPtr()) : nullptr;
+    GcObject* ib = (b2 && b2->slots()[0].isPtr())
+                 ? GcObject::from_slots(b2->slots()[0].asPtr()) : nullptr;
+    const bool ia_ok = ia && ia->slots()[0].asSigned48() == 111 && ia->slots()[1].asSigned48() == 222;
+    const bool ib_ok = ib && ib->slots()[0].asSigned48() == 333 && ib->slots()[1].asSigned48() == 444;
+
+    const bool freed_ok = freed == dead_total;
+
+    const bool ok = a_ok && b_ok && ia_ok && ib_ok && freed_ok;
+    std::cout << std::format("freed={} (expect dead_total={})\n", freed, dead_total);
+    std::cout << std::format("  current_closure root forwarded:      {}\n", a_ok ? "PASS" : "FAIL");
+    std::cout << std::format("  closure-stack root forwarded:        {}\n", b_ok ? "PASS" : "FAIL");
+    std::cout << std::format("  A capture forwarded via payload:     {}\n", ia_ok ? "PASS" : "FAIL");
+    std::cout << std::format("  B capture forwarded via payload:     {}\n", ib_ok ? "PASS" : "FAIL");
+    std::cout << std::format("  only the dead canary collected:      {}\n", freed_ok ? "PASS" : "FAIL");
+    check(ok);
+}
+
+// =============================================================================
+// test_cross_frame_call -- regression test for the DECOUPLED window_size contract
+// (consequence (a)). A caller with a LARGE frame calls a callee with a SMALL frame.
+//
+//   Top-level frame size = 3: r0, r1, r2 hold three live locals (10, 20, 30).
+//   It calls "smallee", whose frame size is 1 (it uses only r0), and which just
+//   writes 999 into its r0 and returns.
+//
+// Under the OLD design the slide was the CALLEE's size (1), so smallee.r0 would map
+// to the caller's r1 and clobber the live local 20 -- and the result would not
+// appear at r3. Under the decoupled design the slide is the CALLER's frame size (3),
+// so smallee's window opens at r3: r0..r2 are untouched and the result lands at r3.
+// This test therefore passes ONLY with the decoupled contract.
+// =============================================================================
+inline void test_cross_frame_call() {
+    constexpr uint8_t TOP_FRAME    = 3;  // top-level reserves r0..r2 for live locals
+    constexpr uint8_t SMALLEE_FRAME = 1; // callee uses only r0
+
+    Assembler as;
+    as.func("smallee", SMALLEE_FRAME);
+
+    as.label("main");
+    as.C2(OpCode::LOAD_CONST, 0, 10);
+    as.C2(OpCode::LOAD_CONST, 1, 20);
+    as.C2(OpCode::LOAD_CONST, 2, 30);
+    as.CALL("smallee");                  // slide = TOP_FRAME (3): smallee.r0 == top.r3
+    as.J(OpCode::HALT);
+
+    as.label("smallee");
+    as.C2(OpCode::LOAD_CONST, 0, 999);
+    as.J(OpCode::RET);
+
+    const auto bytecode = as.assemble();
+    std::cout << "=== cross_frame_call (caller frame 3 -> callee frame 1) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size());
+    dis.add_label(0, "main"); dis.add_label(4, "smallee");
+    dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, nullptr, nullptr, nullptr, TOP_FRAME);
+        auto* regs = res.get_reg_base();
+        const int64_t r0 = regs[0].asSigned48();
+        const int64_t r1 = regs[1].asSigned48();
+        const int64_t r2 = regs[2].asSigned48();
+        const int64_t r3 = regs[TOP_FRAME].asSigned48(); // smallee's r0 via the overlap
+        std::cout << std::format("caller locals: r0={} r1={} r2={} (expect 10 20 30)\n", r0, r1, r2);
+        std::cout << std::format("callee result: r{}={} (expect 999)\n",
+            static_cast<int>(TOP_FRAME), r3);
+        const bool ok = r0 == 10 && r1 == 20 && r2 == 30 && r3 == 999;
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// Small helper for the double tests -- all expected results below are exact in
+// binary, but a tolerance keeps the checks robust against incidental rounding.
+static bool approx(double a, double b) { return std::fabs(a - b) < 1e-12; }
+
+// =============================================================================
+// test_load_double -- the constant pool + LOAD_CONST_POOL. Loads a double, the
+// canonicalized -0.0 (-> 0.0), and an arbitrary non-double Value (an Int) through
+// the pool, proving it materializes values a LOAD_CONST chain cannot build.
+// =============================================================================
+inline void test_load_double() {
+    Assembler as;
+    as.label("main");
+    as.load_double(0, 3.14159);
+    as.load_double(1, -0.0);                          // fromDouble maps -0.0 -> 0.0
+    as.load_constant(2, Value::fromSigned48(42));     // arbitrary Value via pool
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== load_double (constant pool) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, nullptr, nullptr, nullptr, 0, &as.constant_pool());
+        auto* regs = res.get_reg_base();
+        const bool r0_ok = regs[0].isDouble() && approx(regs[0].asDouble(), 3.14159);
+        const bool r1_ok = regs[1].isDouble() && regs[1].asDouble() == 0.0;
+        const bool r2_ok = regs[2].isInt()    && regs[2].asSigned48() == 42;
+        std::cout << std::format("r0={} r1={} r2={}\n", regs[0], regs[1], regs[2]);
+        check(r0_ok && r1_ok && r2_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_double_arith -- generic ADD/SUB/MUL/DIV/NEG on two doubles (both-double
+// path). All operands and results are exact binary fractions.
+// =============================================================================
+inline void test_double_arith() {
+    Assembler as;
+    as.label("main");
+    as.load_double(0, 1.5);
+    as.load_double(1, 0.25);
+    as.R6(OpCode::ADD, 2, 0, 1);      // 1.75
+    as.R6(OpCode::SUB, 3, 0, 1);      // 1.25
+    as.R6(OpCode::MUL, 4, 0, 1);      // 0.375
+    as.R6(OpCode::DIV, 5, 0, 1);      // 6.0
+    as.R6(OpCode::NEG, 6, 0, 0);      // -1.5
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== double_arith (add/sub/mul/div/neg) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, nullptr, nullptr, nullptr, 0, &as.constant_pool());
+        auto* regs = res.get_reg_base();
+        const double r2 = regs[2].asDouble(), r3 = regs[3].asDouble();
+        const double r4 = regs[4].asDouble(), r5 = regs[5].asDouble(), r6 = regs[6].asDouble();
+        std::cout << std::format("1.5+0.25={} 1.5-0.25={} 1.5*0.25={} 1.5/0.25={} -1.5={}\n",
+                                 r2, r3, r4, r5, r6);
+        const bool ok = regs[2].isDouble() && regs[3].isDouble() && regs[4].isDouble() &&
+                        regs[5].isDouble() && regs[6].isDouble() &&
+                        approx(r2, 1.75) && approx(r3, 1.25) && approx(r4, 0.375) &&
+                        approx(r5, 6.0) && approx(r6, -1.5);
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_num_promotion -- the int->double promotion rule on the generic ops:
+//   - Int + Double and Double + Int both promote to Double.
+//   - Int + Int stays Int (wrapping arithmetic).
+//   - Generic DIV on two Ints does truncating integer division (Int result);
+//     with a Double operand it does IEEE division (Double result).
+//   - Double division by 0.0 yields +inf, NOT a trap.
+// =============================================================================
+inline void test_num_promotion() {
+    Assembler as;
+    as.label("main");
+    as.C2(OpCode::LOAD_CONST, 0, 2);      // Int 2
+    as.load_double(1, 0.5);               // Dbl 0.5
+    as.R6(OpCode::ADD, 2, 0, 1);          // 2 + 0.5   -> Dbl 2.5
+    as.R6(OpCode::ADD, 3, 1, 0);          // 0.5 + 2   -> Dbl 2.5 (order-independent)
+    as.C2(OpCode::LOAD_CONST, 4, 40);     // Int 40
+    as.R6(OpCode::ADD, 5, 0, 4);          // 2 + 40    -> Int 42
+    as.C2(OpCode::LOAD_CONST, 6, 7);      // Int 7
+    as.C2(OpCode::LOAD_CONST, 7, 2);      // Int 2
+    as.R6(OpCode::DIV, 8, 6, 7);          // 7 / 2     -> Int 3  (truncating)
+    as.load_double(9, 2.0);               // Dbl 2.0
+    as.R6(OpCode::DIV, 10, 6, 9);         // 7 / 2.0   -> Dbl 3.5
+    as.load_double(11, 0.0);              // Dbl 0.0
+    as.R6(OpCode::DIV, 12, 10, 11);       // 3.5 / 0.0 -> +inf (no trap)
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== num_promotion (int<->double) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, nullptr, nullptr, nullptr, 0, &as.constant_pool());
+        auto* regs = res.get_reg_base();
+        const bool r2_ok  = regs[2].isDouble()  && approx(regs[2].asDouble(), 2.5);
+        const bool r3_ok  = regs[3].isDouble()  && approx(regs[3].asDouble(), 2.5);
+        const bool r5_ok  = regs[5].isInt()     && regs[5].asSigned48() == 42;
+        const bool r8_ok  = regs[8].isInt()     && regs[8].asSigned48() == 3;
+        const bool r10_ok = regs[10].isDouble() && approx(regs[10].asDouble(), 3.5);
+        const bool r12_ok = regs[12].isDouble() && std::isinf(regs[12].asDouble());
+        std::cout << std::format("2+0.5={} 0.5+2={} 2+40={} 7/2={} 7/2.0={} 3.5/0.0={}\n",
+                                 regs[2], regs[3], regs[5], regs[8], regs[10], regs[12]);
+        const bool ok = r2_ok && r3_ok && r5_ok && r8_ok && r10_ok && r12_ok;
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_type_checks -- IS_INT / IS_DOUBLE / IS_BOOL / IS_NIL / IS_UNDEF. Also
+// exercises loading Bool / Nil / Undefined Values through the constant pool.
+// =============================================================================
+inline void test_type_checks() {
+    Assembler as;
+    as.label("main");
+    as.C2(OpCode::LOAD_CONST, 0, 7);                    // Int
+    as.load_double(1, 1.5);                             // Double
+    as.load_constant(2, Value::fromBool(true));         // Bool
+    as.load_constant(3, Value::fromNil());              // Nil
+    as.load_constant(4, Value::fromUndefined());        // Undefined
+    as.R6(OpCode::IS_INT,    10, 0, 0);   // true
+    as.R6(OpCode::IS_INT,    11, 1, 0);   // false
+    as.R6(OpCode::IS_DOUBLE, 12, 1, 0);   // true
+    as.R6(OpCode::IS_DOUBLE, 13, 0, 0);   // false
+    as.R6(OpCode::IS_BOOL,   14, 2, 0);   // true
+    as.R6(OpCode::IS_NIL,    15, 3, 0);   // true
+    as.R6(OpCode::IS_NIL,    16, 0, 0);   // false
+    as.R6(OpCode::IS_UNDEF,  17, 4, 0);   // true
+    as.R6(OpCode::IS_UNDEF,  18, 0, 0);   // false
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== type_checks (is_int/double/bool/nil/undef) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, nullptr, nullptr, nullptr, 0, &as.constant_pool());
+        auto* regs = res.get_reg_base();
+        const bool ok =
+            regs[10].asBool() == true  && regs[11].asBool() == false &&
+            regs[12].asBool() == true  && regs[13].asBool() == false &&
+            regs[14].asBool() == true  &&
+            regs[15].asBool() == true  && regs[16].asBool() == false &&
+            regs[17].asBool() == true  && regs[18].asBool() == false;
+        std::cout << std::format(
+            "IS_INT(7)={} IS_INT(1.5)={} IS_DOUBLE(1.5)={} IS_BOOL(true)={} "
+            "IS_NIL(nil)={} IS_UNDEF(undef)={}\n",
+            regs[10].asBool(), regs[11].asBool(), regs[12].asBool(),
+            regs[14].asBool(), regs[15].asBool(), regs[17].asBool());
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_to_bool -- TO_BOOL coerces any Value to its truth value per the committed
+// truthiness rules. Falsy: false, Int(0), Double(0.0) (incl. normalized -0.0),
+// Nil, Undefined. Truthy: everything else -- true, nonzero int/double, NaN, atoms.
+// =============================================================================
+inline void test_to_bool() {
+    Assembler as;
+    as.label("main");
+    as.load_constant(0, Value::fromBool(false));       // -> false
+    as.load_constant(1, Value::fromBool(true));        // -> true
+    as.C2(OpCode::LOAD_CONST, 2, 0);                   // Int(0)   -> false
+    as.C2(OpCode::LOAD_CONST, 3, 5);                   // Int(5)   -> true
+    as.C2(OpCode::LOAD_CONST, 4, -3);                  // Int(-3)  -> true
+    as.load_double(5, 0.0);                            // 0.0      -> false
+    as.load_double(6, -0.0);                           // -0.0     -> false (normalized)
+    as.load_double(7, 2.5);                            // 2.5      -> true
+    as.load_constant(8, Value::nan());                 // NaN      -> true
+    as.load_constant(9, Value::fromNil());             // nil      -> false
+    as.load_constant(10, Value::fromUndefined());      // undef    -> false
+    as.load_constant(11, Value::fromAtom(7));          // :atom    -> true
+    for (uint8_t i = 0; i <= 11; ++i)
+        as.R6(OpCode::TO_BOOL, static_cast<uint8_t>(20 + i), i, 0);
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== to_bool (truthiness coercion) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, nullptr, nullptr, nullptr, 0, &as.constant_pool());
+        auto* regs = res.get_reg_base();
+        const bool ok =
+            regs[20].asBool() == false && regs[21].asBool() == true  &&
+            regs[22].asBool() == false && regs[23].asBool() == true  &&
+            regs[24].asBool() == true  &&
+            regs[25].asBool() == false && regs[26].asBool() == false &&
+            regs[27].asBool() == true  && regs[28].asBool() == true  &&  // NaN is truthy
+            regs[29].asBool() == false && regs[30].asBool() == false &&
+            regs[31].asBool() == true;
+        std::cout << std::format(
+            "false={} true={} Int0={} Int5={} 0.0={} NaN={} nil={} undef={} atom={}\n",
+            regs[20].asBool(), regs[21].asBool(), regs[22].asBool(), regs[23].asBool(),
+            regs[25].asBool(), regs[28].asBool(), regs[29].asBool(), regs[30].asBool(),
+            regs[31].asBool());
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_lnot -- LNOT is the exact negation of TO_BOOL (`!x` with truthiness). Same
+// value table as test_to_bool, results inverted: falsy -> true, truthy -> false.
+// The generic counterpart of the bool-only NOT_BOOL fast path.
+// =============================================================================
+inline void test_lnot() {
+    Assembler as;
+    as.label("main");
+    as.load_constant(0, Value::fromBool(false));       // -> true
+    as.load_constant(1, Value::fromBool(true));        // -> false
+    as.C2(OpCode::LOAD_CONST, 2, 0);                   // Int(0)   -> true
+    as.C2(OpCode::LOAD_CONST, 3, 5);                   // Int(5)   -> false
+    as.C2(OpCode::LOAD_CONST, 4, -3);                  // Int(-3)  -> false
+    as.load_double(5, 0.0);                            // 0.0      -> true
+    as.load_double(6, -0.0);                           // -0.0     -> true (normalized)
+    as.load_double(7, 2.5);                            // 2.5      -> false
+    as.load_constant(8, Value::nan());                 // NaN      -> false (NaN is truthy)
+    as.load_constant(9, Value::fromNil());             // nil      -> true
+    as.load_constant(10, Value::fromUndefined());      // undef    -> true
+    as.load_constant(11, Value::fromAtom(7));          // :atom    -> false
+    for (uint8_t i = 0; i <= 11; ++i)
+        as.R6(OpCode::LNOT, static_cast<uint8_t>(20 + i), i, 0);
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== lnot (!x with truthiness) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, nullptr, nullptr, nullptr, 0, &as.constant_pool());
+        auto* regs = res.get_reg_base();
+        const bool ok =
+            regs[20].asBool() == true  && regs[21].asBool() == false &&
+            regs[22].asBool() == true  && regs[23].asBool() == false &&
+            regs[24].asBool() == false &&
+            regs[25].asBool() == true  && regs[26].asBool() == true  &&
+            regs[27].asBool() == false && regs[28].asBool() == false &&  // !NaN is false
+            regs[29].asBool() == true  && regs[30].asBool() == true  &&
+            regs[31].asBool() == false;
+        std::cout << std::format(
+            "!false={} !true={} !Int0={} !Int5={} !0.0={} !NaN={} !nil={} !undef={} !atom={}\n",
+            regs[20].asBool(), regs[21].asBool(), regs[22].asBool(), regs[23].asBool(),
+            regs[25].asBool(), regs[28].asBool(), regs[29].asBool(), regs[30].asBool(),
+            regs[31].asBool());
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_equality -- the general EQ / NE ops (Value::operator==). Correct for EVERY
+// type: atom/nil/bool bit-identity, numeric promotion (Int(1) == Double(1.0)),
+// NaN != NaN -- and crucially an atom is NOT equal to an int that shares its low 48
+// bits (EQ compares the full tagged value, unlike the int-only SET_EQ).
+// =============================================================================
+inline void test_equality() {
+    Assembler as;
+    as.label("main");
+    as.load_constant(0, Value::fromAtom(5));           // :atom#5
+    as.load_constant(1, Value::fromAtom(5));           // :atom#5 (same id)
+    as.load_constant(2, Value::fromAtom(9));           // :atom#9 (different)
+    // fromAtom(5) low 48 bits = (5<<8)|3 = 0x503 = 1283. An Int(1283) shares those low
+    // bits but has a different tag -> must compare UNEQUAL.
+    as.C2(OpCode::LOAD_CONST, 3, 1283);                // Int(1283)
+    as.C2(OpCode::LOAD_CONST, 4, 1);                   // Int(1)
+    as.load_double(5, 1.0);                            // Double(1.0)
+    as.load_constant(6, Value::fromNil());             // nil
+    as.load_constant(7, Value::fromUndefined());       // undefined
+    as.load_constant(8, Value::fromBool(true));        // true
+    as.load_constant(9, Value::fromBool(false));       // false
+    as.load_constant(10, Value::nan());                // NaN
+    as.load_constant(11, Value::nan());                // NaN
+    as.R6(OpCode::EQ, 20, 0, 1);   // atom==atom (same)   -> true
+    as.R6(OpCode::EQ, 21, 0, 2);   // atom==atom (diff)   -> false
+    as.R6(OpCode::EQ, 22, 0, 3);   // atom==int low-bits  -> false (tag differs)
+    as.R6(OpCode::EQ, 23, 4, 5);   // Int(1)==Double(1.0) -> true  (promotion)
+    as.R6(OpCode::EQ, 24, 6, 6);   // nil==nil            -> true
+    as.R6(OpCode::EQ, 25, 6, 7);   // nil==undefined      -> false
+    as.R6(OpCode::EQ, 26, 8, 8);   // true==true          -> true
+    as.R6(OpCode::EQ, 27, 8, 9);   // true==false         -> false
+    as.R6(OpCode::EQ, 28, 10, 11); // NaN==NaN            -> false
+    as.R6(OpCode::NE, 29, 0, 2);   // atom!=atom (diff)   -> true
+    as.R6(OpCode::NE, 30, 10, 11); // NaN!=NaN            -> true
+    as.R6(OpCode::NE, 31, 0, 1);   // atom!=atom (same)   -> false
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== equality (general EQ / NE) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, nullptr, nullptr, nullptr, 0, &as.constant_pool());
+        auto* regs = res.get_reg_base();
+        const bool ok =
+            regs[20].asBool() == true  && regs[21].asBool() == false &&
+            regs[22].asBool() == false &&                                   // atom != int (tag!)
+            regs[23].asBool() == true  &&                                   // promotion
+            regs[24].asBool() == true  && regs[25].asBool() == false &&
+            regs[26].asBool() == true  && regs[27].asBool() == false &&
+            regs[28].asBool() == false &&                                   // NaN == NaN is false
+            regs[29].asBool() == true  && regs[30].asBool() == true  &&     // NaN != NaN is true
+            regs[31].asBool() == false;
+        std::cout << std::format(
+            "atom==atom={} atom!=int={} 1==1.0={} nil==nil={} true==true={} NaN==NaN={} NaN!=NaN={}\n",
+            regs[20].asBool(), !regs[22].asBool(), regs[23].asBool(), regs[24].asBool(),
+            regs[26].asBool(), regs[28].asBool(), regs[30].asBool());
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_func_value -- the Func immediate (a first-class SCRIPT function value): a
+// GC-invisible TAG_SPECIAL sub-tag carrying a 16-bit function-table id. Verifies
+// the id round-trip, that it is distinct from the neighbouring Atom sub-tag and
+// from the pointer tags (so the GC never treats it as a heap object), its
+// truthiness, identity-by-id equality, and its formatter rendering. This is the
+// C1 slice of the closures work -- no opcode yet, just the value representation.
+// =============================================================================
+inline void test_func_value() {
+    std::cout << "=== func value (first-class function immediate) ===\n";
+    const Value f5  = Value::fromFunc(5);
+    const Value f5b = Value::fromFunc(5);
+    const Value f6  = Value::fromFunc(6);
+    const Value fmax = Value::fromFunc(0xFFFF);
+    try {
+        const bool ok =
+            f5.isFunc() && f5.asFuncId() == 5 &&
+            fmax.asFuncId() == 0xFFFF &&
+            f5.type() == Value::Type::Func &&
+            // GC-invisible + not confused with the Atom sub-tag that shares low bits
+            !f5.isPtr() && !f5.isFuncPtr() && !f5.isAtom() && !f5.isNil() &&
+            !Value::fromAtom(5).isFunc() &&
+            f5.isTruthy() &&
+            // identity by id: same id equal, different id unequal, atom!=func
+            (f5 == f5b) && !(f5 == f6) && !(f5 == Value::fromAtom(5)) &&
+            // formatter
+            std::format("{}", f6) == "Func(#6)";
+        std::cout << std::format("f5={} f6={} fmax_id={}\n", f5, f6, fmax.asFuncId());
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_function_table -- the C2 slice: the assembler builds a per-function side
+// table (indexed by fn id) from declare_fn() registrations, resolving each entry's
+// code_offset from its label during assemble(). No opcode reads it yet (that is
+// C4/CALL_INDIRECT); this verifies the table is assembled correctly and that
+// func_id() hands back the ids the runtime will index with.
+// =============================================================================
+inline void test_function_table() {
+    std::cout << "=== function table (C2: per-function side table build) ===\n";
+    Assembler as;
+    // Two first-class-declared functions with distinct frame sizes / arities.
+    const uint16_t id_f = as.declare_fn("f", /*frame_size*/ 2, /*arity*/ 1);
+    const uint16_t id_g = as.declare_fn("g", /*frame_size*/ 3, /*arity*/ 2);
+    as.label("main");
+    as.J(OpCode::HALT);
+    const uint32_t off_f = static_cast<uint32_t>(as.instruction_count());
+    as.label("f");
+    as.C2(OpCode::LOAD_CONST, 0, 0);
+    as.J(OpCode::RET);
+    const uint32_t off_g = static_cast<uint32_t>(as.instruction_count());
+    as.label("g");
+    as.C2(OpCode::LOAD_CONST, 0, 0);
+    as.J(OpCode::RET);
+    try {
+        (void)as.assemble();                 // resolves each entry's code_offset
+        const auto& tab = as.function_table();
+        const bool ok =
+            tab.size() == 2 &&
+            as.func_id("f") == id_f && as.func_id("g") == id_g &&
+            tab[id_f].code_offset == off_f && tab[id_f].frame_size == 2 &&
+            tab[id_f].arity == 1 && tab[id_f].ncaptures == 0 &&
+            tab[id_f].self_slot == FnInfo::NO_SELF &&
+            tab[id_g].code_offset == off_g && tab[id_g].frame_size == 3 &&
+            tab[id_g].arity == 2 && tab[id_g].ncaptures == 0;
+        std::cout << std::format("f: off={} fs={} arity={}; g: off={} fs={} arity={}\n",
+            tab[id_f].code_offset, tab[id_f].frame_size, tab[id_f].arity,
+            tab[id_g].code_offset, tab[id_g].frame_size, tab[id_g].arity);
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_load_fn -- the C3 slice: the LOAD_FN opcode materializes a first-class
+// function value (a Func immediate) from a function-table id. Verifies the value
+// lands in the register as a Func carrying the id declare_fn() assigned. The call
+// side (CALL_INDIRECT) is C4; here we only check the value is produced.
+// =============================================================================
+inline void test_load_fn() {
+    Assembler as;
+    const uint16_t id_f = as.declare_fn("f", /*frame_size*/ 1, /*arity*/ 0);
+    const uint16_t id_g = as.declare_fn("g", /*frame_size*/ 1, /*arity*/ 0);
+    as.label("main");
+    as.LOAD_FN(0, id_f);          // r0 = Func(#f)
+    as.LOAD_FN(1, id_g);          // r1 = Func(#g)
+    as.J(OpCode::HALT);
+    as.label("f");
+    as.J(OpCode::RET);
+    as.label("g");
+    as.J(OpCode::RET);
+    const auto bytecode = as.assemble();
+    std::cout << "=== load_fn (first-class function value) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, nullptr, nullptr, nullptr, 0,
+                             nullptr, nullptr, nullptr, nullptr, &as.function_table());
+        auto* regs = res.get_reg_base();
+        const bool ok =
+            regs[0].isFunc() && regs[0].asFuncId() == id_f &&
+            regs[1].isFunc() && regs[1].asFuncId() == id_g &&
+            !(regs[0] == regs[1]);               // distinct function values
+        std::cout << std::format("r0={} r1={}\n", regs[0], regs[1]);
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_call_indirect -- the C4 slice: CALL_INDIRECT calls a function VALUE held in
+// a register (a Func immediate), recovering the callee's frame size + entry point
+// from the function table at run time. Two programs:
+//   (A) higher-order: one apply(f, x) = f(x) dispatches to DIFFERENT functions
+//       (inc / dbl) purely by the Func value passed in -- the essence of
+//       first-class functions.
+//   (B) indirect self-recursion: fact loads its own Func via LOAD_FN and calls
+//       itself with CALL_INDIRECT -- recursion routed through the function table.
+// The immediate path only; the KIND_CLOSURE path is Milestone A.
+// =============================================================================
+inline void test_call_indirect() {
+    std::cout << "=== call_indirect (first-class / higher-order / indirect recursion) ===\n";
+    bool ok = true;
+
+    // ---- (A) higher-order apply(f, x) = f(x) ----
+    try {
+        Assembler as;
+        const uint16_t id_inc   = as.declare_fn("inc",   /*fs*/ 2, /*arity*/ 1);
+        const uint16_t id_dbl   = as.declare_fn("dbl",   /*fs*/ 2, /*arity*/ 1);
+        (void)                    as.declare_fn("apply", /*fs*/ 2, /*arity*/ 2);
+        as.label("main");                       // top_frame_size = 2 (args at r2, r3)
+        as.LOAD_FN(2, id_inc);                  // arg0 = Func(inc)
+        as.C2(OpCode::LOAD_CONST, 3, 20);       // arg1 = 20
+        as.CALL("apply");                       // apply(inc, 20) -> r2
+        as.R6(OpCode::MOV, 0, 2, 0);            // r0 = 21
+        as.LOAD_FN(2, id_dbl);                  // arg0 = Func(dbl)
+        as.C2(OpCode::LOAD_CONST, 3, 21);       // arg1 = 21
+        as.CALL("apply");                       // apply(dbl, 21) -> r2
+        as.R6(OpCode::MOV, 1, 2, 0);            // r1 = 42
+        as.J(OpCode::HALT);
+        as.label("apply");                      // apply(f=r0, x=r1)
+        as.R6(OpCode::MOV, 2, 1, 0);            // arg = x at r[frame_size]=r2
+        as.CALL_INDIRECT(0, 1);                 // f(x); result at r2
+        as.R6(OpCode::MOV, 0, 2, 0);            // result -> r0
+        as.J(OpCode::RET);
+        as.label("inc");                        // inc(x) = x + 1
+        as.C2(OpCode::LOAD_CONST, 1, 1);
+        as.R6(OpCode::ADD_INT, 0, 0, 1);
+        as.J(OpCode::RET);
+        as.label("dbl");                        // dbl(x) = x + x
+        as.R6(OpCode::ADD_INT, 0, 0, 0);
+        as.J(OpCode::RET);
+        const auto bc = as.assemble();
+        Disassembler dis(bc.data(), bc.size()); dis.add_label(0, "main"); dis.print();
+        auto res   = execute(bc, nullptr, nullptr, nullptr, 2,
+                             nullptr, nullptr, nullptr, nullptr, &as.function_table());
+        auto* regs = res.get_reg_base();
+        std::cout << std::format("apply(inc,20)={}  apply(dbl,21)={}\n",
+                                 regs[0].asSigned48(), regs[1].asSigned48());
+        ok = ok && regs[0].asSigned48() == 21 && regs[1].asSigned48() == 42;
+    } catch (const std::exception& e) { record_fail(e.what()); ok = false; }
+
+    // ---- (B) indirect self-recursion: fact(5) via LOAD_FN + CALL_INDIRECT ----
+    try {
+        Assembler as;
+        const uint16_t id_fact = as.declare_fn("fact", /*fs*/ 3, /*arity*/ 1);
+        as.label("main");                       // top_frame_size = 1 (arg at r1)
+        as.LOAD_FN(0, id_fact);                 // r0 = Func(fact)
+        as.C2(OpCode::LOAD_CONST, 1, 5);        // arg = 5 at r1
+        as.CALL_INDIRECT(0, 1);                 // fact(5); result at r1
+        as.J(OpCode::HALT);
+        as.label("fact");                       // fact(n=r0)
+        as.C2(OpCode::LOAD_CONST, 1, 1);
+        as.B(OpCode::BGE_INT, 1, 0, "fact_base"); // if 1 >= n -> base
+        as.R6(OpCode::SUB_INT, 3, 0, 1);        // r3 = n - 1 (arg at r[frame_size]=r3)
+        as.LOAD_FN(2, id_fact);                 // r2 = Func(fact)
+        as.CALL_INDIRECT(2, 1);                 // fact(n-1); result at r3
+        as.R6(OpCode::MUL_INT, 0, 0, 3);        // r0 = n * fact(n-1)
+        as.J(OpCode::RET);
+        as.label("fact_base");
+        as.C2(OpCode::LOAD_CONST, 0, 1);
+        as.J(OpCode::RET);
+        const auto bc = as.assemble();
+        Disassembler dis(bc.data(), bc.size()); dis.add_label(0, "main"); dis.print();
+        auto res   = execute(bc, nullptr, nullptr, nullptr, 1,
+                             nullptr, nullptr, nullptr, nullptr, &as.function_table());
+        const int64_t fact5 = res.get_reg_base()[1].asSigned48();
+        std::cout << std::format("fact(5) via indirect recursion = {}\n", fact5);
+        ok = ok && fact5 == 120;
+    } catch (const std::exception& e) { record_fail(e.what()); ok = false; }
+
+    check(ok);
+}
+
+// =============================================================================
+// test_proto_resolve -- the trait-dispatch VM primitive (Slice 1). PROTO_RESOLVE
+// folds the receiver's runtime type into one dense key, indexes the flat trait
+// table (fn_id[method_id * width + dense_id]) and yields a Func value, which the
+// following CALL_INDIRECT dispatches like any first-class function. Three parts:
+//   (A/B) SINGLE method `show` (id 0) with TWO impls -- Show for Point (a struct,
+//         show(p) = p.x + p.y) and Show for Int (show(x) = x * 2). One program
+//         resolves+calls show on a Point AND on an Int; correct results prove the
+//         dense-key dispatch reaches the right impl across the struct/immediate
+//         type worlds.
+//   (C)   MISS: resolving `show` on a Nil receiver (a type with no impl) traps
+//         with "No trait implementation for type".
+// The table is hand-built here (the compiler builds it in a later slice).
+// =============================================================================
+inline void test_proto_resolve() {
+    std::cout << "=== proto_resolve (trait dispatch: struct + immediate, and miss) ===\n";
+    bool ok = true;
+
+    // ---- (A/B) dispatch `show` to Show-for-Point and Show-for-Int ----
+    try {
+        Heap heap(64 * 1024);
+        Assembler as;
+        const uint16_t Point   = as.define_struct("Point", { "x", "y" });
+        const uint16_t sx      = as.field("Point", "x");
+        const uint16_t sy      = as.field("Point", "y");
+        const uint16_t id_spt  = as.declare_fn("show_point", /*fs*/ 3, /*arity*/ 1);
+        const uint16_t id_sint = as.declare_fn("show_int",   /*fs*/ 2, /*arity*/ 1);
+
+        constexpr uint16_t M_SHOW = 0;          // the single global method id
+
+        as.label("main");                       // top_frame_size = 4 (locals r0..r3, args at r4)
+        // Point{1,2} in r0
+        as.NEW_STRUCT(0, Point);
+        as.load_const(1, 1); as.SET_PROP(0, sx, 1);
+        as.load_const(1, 2); as.SET_PROP(0, sy, 1);
+        // show(point) -> r0
+        as.PROTO_RESOLVE(3, 0, M_SHOW);         // r3 = Func(show_point)
+        as.R6(OpCode::MOV, 4, 0, 0);            // arg0 = point at r4
+        as.CALL_INDIRECT(3, 1);                 // show_point(point) -> r4
+        as.R6(OpCode::MOV, 0, 4, 0);            // r0 = 3
+        // show(21) -> r1
+        as.load_const(1, 21);
+        as.PROTO_RESOLVE(3, 1, M_SHOW);         // r3 = Func(show_int)
+        as.R6(OpCode::MOV, 4, 1, 0);            // arg0 = 21 at r4
+        as.CALL_INDIRECT(3, 1);                 // show_int(21) -> r4
+        as.R6(OpCode::MOV, 1, 4, 0);            // r1 = 42
+        as.J(OpCode::HALT);
+
+        as.label("show_point");                 // show_point(p=r0) = p.x + p.y
+        as.GET_PROP(1, 0, sx);
+        as.GET_PROP(2, 0, sy);
+        as.R6(OpCode::ADD_INT, 0, 1, 2);
+        as.J(OpCode::RET);
+
+        as.label("show_int");                   // show_int(x=r0) = x * 2
+        as.R6(OpCode::ADD_INT, 0, 0, 0);
+        as.J(OpCode::RET);
+
+        const auto bc = as.assemble();
+
+        // Build the trait table: width = BUILTIN_COUNT + #structs; one method row.
+        const uint32_t width = BUILTIN_COUNT + static_cast<uint32_t>(as.struct_types().size());
+        const uint32_t methods = 1;
+        std::vector<uint16_t> trait_table(static_cast<size_t>(width) * methods, TRAIT_METHOD_NONE);
+        trait_table[M_SHOW * width + TID_INT]                 = id_sint;   // Show for Int
+        trait_table[M_SHOW * width + (BUILTIN_COUNT + Point)] = id_spt;    // Show for Point
+
+        Disassembler dis(bc.data(), bc.size()); dis.add_label(0, "main"); dis.print();
+        auto res = execute(bc, &heap, nullptr, nullptr, /*top*/ 4,
+                           &as.constant_pool(), &as.struct_types(), nullptr, nullptr,
+                           &as.function_table(), nullptr,
+                           &trait_table, width, methods);
+        auto* regs = res.get_reg_base();
+        std::cout << std::format("show(Point{{1,2}})={}  show(21)={}\n",
+                                 regs[0].asSigned48(), regs[1].asSigned48());
+        ok = ok && regs[0].asSigned48() == 3 && regs[1].asSigned48() == 42;
+    } catch (const std::exception& e) { record_fail(e.what()); ok = false; }
+
+    // ---- (C) miss: show on a Nil receiver traps ----
+    try {
+        Assembler as;
+        constexpr uint16_t M_SHOW = 0;
+        as.label("main");                        // fs = 2, no CALL slide needed
+        as.load_constant(0, Value::fromNil());   // r0 = nil (dense = TID_NIL, no impl)
+        as.PROTO_RESOLVE(1, 0, M_SHOW);          // -> miss -> trap
+        as.J(OpCode::HALT);
+        const auto bc = as.assemble();
+
+        const uint32_t width   = BUILTIN_COUNT;  // no structs here
+        const uint32_t methods = 1;
+        std::vector<uint16_t> trait_table(static_cast<size_t>(width) * methods, TRAIT_METHOD_NONE);
+        trait_table[M_SHOW * width + TID_INT] = 0;   // only Int implemented; Nil is a miss
+
+        bool trapped = false;
+        try {
+            execute(bc, nullptr, nullptr, nullptr, /*top*/ 2,
+                    &as.constant_pool(), nullptr, nullptr, nullptr, nullptr, nullptr,
+                    &trait_table, width, methods);
+        } catch (const std::exception& e) {
+            trapped = true;
+            std::cout << std::format("miss trapped as expected: {}\n", e.what());
+        }
+        ok = ok && trapped;
+    } catch (const std::exception& e) { record_fail(e.what()); ok = false; }
+
+    // ---- (D) dispatch on a KIND_VEC receiver (the TID_VEC dense column) ----
+    try {
+        Heap heap(64 * 1024);
+        Assembler as;
+        const uint16_t id_vlen = as.declare_fn("vlen", /*fs*/ 2, /*arity*/ 1);
+        constexpr uint16_t M_LEN = 0;
+
+        as.label("main");                       // top_frame_size = 4
+        as.VEC_NEW(0);                          // r0 = vec()
+        as.load_const(1, 10); as.VEC_PUSH(0, 1);
+        as.load_const(1, 20); as.VEC_PUSH(0, 1);
+        as.load_const(1, 30); as.VEC_PUSH(0, 1);
+        as.PROTO_RESOLVE(3, 0, M_LEN);          // r3 = Func(vlen) via the TID_VEC column
+        as.R6(OpCode::MOV, 4, 0, 0);            // arg0 = vec at r4
+        as.CALL_INDIRECT(3, 1);                 // vlen(vec) -> r4
+        as.R6(OpCode::MOV, 0, 4, 0);            // r0 = 3
+        as.J(OpCode::HALT);
+
+        as.label("vlen");                       // vlen(v=r0) = len(v)
+        as.R6(OpCode::LEN, 0, 0, 0);
+        as.J(OpCode::RET);
+
+        const auto bc = as.assemble();
+        const uint32_t width   = BUILTIN_COUNT;  // no structs
+        const uint32_t methods = 1;
+        std::vector<uint16_t> trait_table(static_cast<size_t>(width) * methods, TRAIT_METHOD_NONE);
+        trait_table[M_LEN * width + TID_VEC] = id_vlen;   // impl for Vec
+
+        auto res = execute(bc, &heap, nullptr, nullptr, /*top*/ 4,
+                           &as.constant_pool(), &as.struct_types(), nullptr, nullptr,
+                           &as.function_table(), nullptr,
+                           &trait_table, width, methods);
+        auto* regs = res.get_reg_base();
+        std::cout << std::format("vlen(vec[10,20,30])={}\n", regs[0].asSigned48());
+        ok = ok && regs[0].asSigned48() == 3;
+    } catch (const std::exception& e) { record_fail(e.what()); ok = false; }
+
+    check(ok);
+}
+
+// =============================================================================
+// test_resolve_call -- the FUSED PROTO_RESOLVE + CALL_INDIRECT primitive
+// (RESOLVE_CALL, id 112). Identical dispatch to test_proto_resolve, but a SINGLE
+// op: the receiver is the outgoing arg 0 (window[frame_size]), so no Func register
+// and no separate resolve. Parts:
+//   (A/B) `show` (id 0) with two impls -- Show for Point (show(p)=p.x+p.y) and
+//         Show for Int (show(x)=x*2). One program fuse-dispatches show on a Point
+//         AND on an Int -> the dense-key dispatch reaches the right impl across the
+//         struct/immediate worlds through the fused op.
+//   (C)   MISS: fused show on a Nil receiver (no impl) traps, exactly like
+//         PROTO_RESOLVE's miss.
+// =============================================================================
+inline void test_resolve_call() {
+    std::cout << "=== resolve_call (FUSED resolve+call: struct + immediate, and miss) ===\n";
+    bool ok = true;
+
+    // ---- (A/B) fuse-dispatch `show` to Show-for-Point and Show-for-Int ----
+    try {
+        Heap heap(64 * 1024);
+        Assembler as;
+        const uint16_t Point   = as.define_struct("Point", { "x", "y" });
+        const uint16_t sx      = as.field("Point", "x");
+        const uint16_t sy      = as.field("Point", "y");
+        const uint16_t id_spt  = as.declare_fn("show_point", /*fs*/ 3, /*arity*/ 1);
+        const uint16_t id_sint = as.declare_fn("show_int",   /*fs*/ 2, /*arity*/ 1);
+        constexpr uint16_t M_SHOW = 0;
+
+        as.label("main");                       // top_frame_size = 4 (locals r0..r3, args at r4)
+        as.NEW_STRUCT(0, Point);
+        as.load_const(1, 1); as.SET_PROP(0, sx, 1);
+        as.load_const(1, 2); as.SET_PROP(0, sy, 1);
+        // show(point): place the receiver as arg 0 at r4, then ONE fused op resolves + calls.
+        as.R6(OpCode::MOV, 4, 0, 0);            // arg0 = point at r4 (= window[frame_size])
+        as.RESOLVE_CALL(1, M_SHOW);             // resolve show for typeof(r4)=Point, call -> r4
+        as.R6(OpCode::MOV, 0, 4, 0);            // r0 = 3
+        // show(21): arg0 = 21 at r4
+        as.load_const(1, 21);
+        as.R6(OpCode::MOV, 4, 1, 0);
+        as.RESOLVE_CALL(1, M_SHOW);             // resolve show for Int, call -> r4
+        as.R6(OpCode::MOV, 1, 4, 0);            // r1 = 42
+        as.J(OpCode::HALT);
+
+        as.label("show_point");                 // show_point(p=r0) = p.x + p.y
+        as.GET_PROP(1, 0, sx);
+        as.GET_PROP(2, 0, sy);
+        as.R6(OpCode::ADD_INT, 0, 1, 2);
+        as.J(OpCode::RET);
+
+        as.label("show_int");                   // show_int(x=r0) = x * 2
+        as.R6(OpCode::ADD_INT, 0, 0, 0);
+        as.J(OpCode::RET);
+
+        const auto bc = as.assemble();
+        const uint32_t width   = BUILTIN_COUNT + static_cast<uint32_t>(as.struct_types().size());
+        const uint32_t methods = 1;
+        std::vector<uint16_t> trait_table(static_cast<size_t>(width) * methods, TRAIT_METHOD_NONE);
+        trait_table[M_SHOW * width + TID_INT]                 = id_sint;   // Show for Int
+        trait_table[M_SHOW * width + (BUILTIN_COUNT + Point)] = id_spt;    // Show for Point
+
+        Disassembler dis(bc.data(), bc.size()); dis.add_label(0, "main"); dis.print();
+        auto res = execute(bc, &heap, nullptr, nullptr, /*top*/ 4,
+                           &as.constant_pool(), &as.struct_types(), nullptr, nullptr,
+                           &as.function_table(), nullptr,
+                           &trait_table, width, methods);
+        auto* regs = res.get_reg_base();
+        std::cout << std::format("show(Point{{1,2}})={}  show(21)={}\n",
+                                 regs[0].asSigned48(), regs[1].asSigned48());
+        ok = ok && regs[0].asSigned48() == 3 && regs[1].asSigned48() == 42;
+    } catch (const std::exception& e) { record_fail(e.what()); ok = false; }
+
+    // ---- (C) miss: fused show on a Nil receiver traps ----
+    try {
+        Assembler as;
+        constexpr uint16_t M_SHOW = 0;
+        as.label("main");                        // top_frame_size = 2 (locals r0,r1, arg at r2)
+        as.load_constant(0, Value::fromNil());   // r0 = nil (dense = TID_NIL, no impl)
+        as.R6(OpCode::MOV, 2, 0, 0);             // arg0 = nil at r2 (= window[frame_size])
+        as.RESOLVE_CALL(1, M_SHOW);              // -> miss -> trap
+        as.J(OpCode::HALT);
+        const auto bc = as.assemble();
+
+        const uint32_t width   = BUILTIN_COUNT;  // no structs here
+        const uint32_t methods = 1;
+        std::vector<uint16_t> trait_table(static_cast<size_t>(width) * methods, TRAIT_METHOD_NONE);
+        trait_table[M_SHOW * width + TID_INT] = 0;   // only Int implemented; Nil is a miss
+
+        bool trapped = false;
+        try {
+            execute(bc, nullptr, nullptr, nullptr, /*top*/ 2,
+                    &as.constant_pool(), nullptr, nullptr, nullptr, nullptr, nullptr,
+                    &trait_table, width, methods);
+        } catch (const std::exception& e) {
+            trapped = true;
+            std::cout << std::format("miss trapped as expected: {}\n", e.what());
+        }
+        ok = ok && trapped;
+    } catch (const std::exception& e) { record_fail(e.what()); ok = false; }
+
+    check(ok);
+}
+
+// =============================================================================
+// test_resolve_tco_call -- the FUSED tail resolve-and-call (RESOLVE_TCO_CALL, id
+// 113). The tail sibling of RESOLVE_CALL: it resolves a trait method for the
+// receiver AND reuses the current frame in place. Two scenarios:
+//   (A) O(1)-stack tail recursion THROUGH the fused op. step(n, acc) is a trait
+//       method (M_STEP) whose Int impl tail-recurses via RESOLVE_TCO_CALL down to
+//       n==0, summing 1..N. The receiver = arg 0 stays an Int every iteration, so
+//       each pass re-resolves M_STEP for TID_INT. N = 1,000,000 >> the 16384-frame
+//       return stack, so completing at all proves the frame is REUSED (no push) --
+//       exactly the TCO guarantee, but with resolution fused in. main kicks it off
+//       with a NON-tail RESOLVE_CALL (which pushes the one frame the final RET pops).
+//   (B) a miss: RESOLVE_TCO_CALL on a Nil receiver (TID_NIL has no impl) traps
+//       BEFORE any frame reuse -- it reads the receiver at window[0] and resolves.
+// The ONE asymmetry vs RESOLVE_CALL is exercised here: the receiver is read at
+// window[0] (reused-frame arg 0), not window[frame_size].
+// =============================================================================
+inline void test_resolve_tco_call() {
+    std::cout << "=== resolve_tco_call (FUSED tail resolve+call: O(1) stack, and miss) ===\n";
+    bool ok = true;
+
+    // ---- (A) sum 1..N via a trait method tail-recursing through RESOLVE_TCO_CALL ----
+    try {
+        constexpr int64_t N = 1'000'000;
+        Heap heap(64 * 1024);
+        Assembler as;
+        // step(n=r0, acc=r1): frame 3 (r2 = scratch for the base-case compare). The tail args
+        // (n', acc') are already in [0, 2) after the ADD/DECR, so the reused frame needs no MOVs.
+        const uint16_t id_step = as.declare_fn("step", /*fs*/ 3, /*arity*/ 2);
+        constexpr uint16_t M_STEP = 0;
+
+        as.label("main");                          // top_frame_size = 2 (locals r0,r1; args at r2,r3)
+        as.load_constant(0, Value::fromSigned48(N)); // r0 = N
+        as.C2(OpCode::LOAD_CONST, 1, 0);           // r1 = 0 (acc)
+        as.R6(OpCode::MOV, 2, 0, 0);               // arg0 = N at r2 (= window[frame_size])
+        as.R6(OpCode::MOV, 3, 1, 0);               // arg1 = 0 at r3
+        as.RESOLVE_CALL(2, M_STEP);                // NON-tail: push a frame, resolve step for Int, call
+        as.R6(OpCode::MOV, 0, 2, 0);               // r0 = result (at window[frame_size])
+        as.J(OpCode::HALT);
+
+        as.label("step");                          // step(n=r0, acc=r1)
+        as.C2(OpCode::LOAD_CONST, 2, 0);           // r2 = 0
+        as.B(OpCode::BEQ_INT, 0, 2, "step_base");  // if n == 0 -> return acc
+        as.R6(OpCode::ADD_INT, 1, 1, 0);           // acc' = acc + n   (reads OLD n first)
+        as.C2(OpCode::DECR, 0);                    // n'   = n - 1     (in place; arg0 stays r0)
+        as.RESOLVE_TCO_CALL(2, M_STEP);            // tail: reuse frame, resolve step for typeof(r0)=Int
+        as.label("step_base");
+        as.R6(OpCode::MOV, 0, 1, 0);               // return acc
+        as.J(OpCode::RET);
+
+        const auto bc = as.assemble();
+        const uint32_t width   = BUILTIN_COUNT;    // no structs
+        const uint32_t methods = 1;
+        std::vector<uint16_t> trait_table(static_cast<size_t>(width) * methods, TRAIT_METHOD_NONE);
+        trait_table[M_STEP * width + TID_INT] = id_step;   // step for Int
+
+        Disassembler dis(bc.data(), bc.size()); dis.add_label(0, "main"); dis.print();
+        auto res = execute(bc, &heap, nullptr, nullptr, /*top*/ 2,
+                           &as.constant_pool(), nullptr, nullptr, nullptr,
+                           &as.function_table(), nullptr,
+                           &trait_table, width, methods);
+        const int64_t result   = res.get_reg_base()[0].asSigned48();
+        const int64_t expected = N * (N + 1) / 2;  // 500000500000
+        std::cout << std::format("step-sum 1..{} = {} (expect {})\n", N, result, expected);
+        ok = ok && result == expected;
+    } catch (const std::exception& e) { record_fail(e.what()); ok = false; }
+
+    // ---- (B) miss: fused tail step on a Nil receiver traps ----
+    try {
+        Assembler as;
+        constexpr uint16_t M_STEP = 0;
+        as.label("main");                          // top_frame_size = 1 (receiver = window[0])
+        as.load_constant(0, Value::fromNil());     // r0 = nil (dense = TID_NIL, no impl)
+        as.RESOLVE_TCO_CALL(1, M_STEP);            // reads window[0] = nil -> miss -> trap
+        as.J(OpCode::HALT);
+        const auto bc = as.assemble();
+
+        const uint32_t width   = BUILTIN_COUNT;
+        const uint32_t methods = 1;
+        std::vector<uint16_t> trait_table(static_cast<size_t>(width) * methods, TRAIT_METHOD_NONE);
+        trait_table[M_STEP * width + TID_INT] = 0;   // only Int implemented; Nil is a miss
+
+        bool trapped = false;
+        try {
+            execute(bc, nullptr, nullptr, nullptr, /*top*/ 1,
+                    &as.constant_pool(), nullptr, nullptr, nullptr, nullptr, nullptr,
+                    &trait_table, width, methods);
+        } catch (const std::exception& e) {
+            trapped = true;
+            std::cout << std::format("miss trapped as expected: {}\n", e.what());
+        }
+        ok = ok && trapped;
+    } catch (const std::exception& e) { record_fail(e.what()); ok = false; }
+
+    check(ok);
+}
+
+// =============================================================================
+// test_make_closure -- MAKE_CLOSURE construction (Milestone A3). Builds a
+// KIND_CLOSURE from bytecode and inspects the resulting heap object directly
+// (calling it is A4). Two scenarios:
+//   (A) plain captures: a 2-capture closure grabs r0/r1 into its payload slots.
+//   (B) self-capture back-patch: a function declared with a self_slot has that
+//       slot overwritten with the closure itself (the direct self-recursive-lambda
+//       machinery, whose compiler side is A6). slots[self_slot] must point at the
+//       closure object it lives in.
+// The captured/closed-over functions have minimal RET bodies -- not exercised here.
+// =============================================================================
+inline void test_make_closure() {
+    std::cout << "=== make_closure ===\n";
+    bool ok = true;
+
+    try {
+        Heap heap(64 * 1024);
+
+        Assembler as;
+        // (A) 2 captures, no self slot. (B) 2 captures, self_slot = 1.
+        const uint16_t plain = as.declare_fn("plain_fn", /*fs*/ 2, /*arity*/ 1, /*ncaptures*/ 2);
+        const uint16_t selfy = as.declare_fn("self_fn",  /*fs*/ 2, /*arity*/ 0, /*ncaptures*/ 2,
+                                             /*self_slot*/ 1);
+
+        as.label("main");                         // top-level frame: r0..r3 live across the allocs
+        as.load_const(0, 111);                    // r0 = capture 0
+        as.load_const(1, 222);                    // r1 = capture 1
+        as.MAKE_CLOSURE(2, plain, 0);             // r2 = closure(plain_fn) capturing r0, r1
+        as.load_const(0, 333);                    // reuse r0 for scenario B's capture 0
+        as.MAKE_CLOSURE(3, selfy, 0);             // r3 = closure(self_fn); slot1 back-patched to self
+        as.J(OpCode::HALT);
+
+        as.label("plain_fn");                     // minimal body (not called in A3)
+        as.J(OpCode::RET);
+        as.label("self_fn");
+        as.J(OpCode::RET);
+
+        const auto bytecode = as.assemble();
+        Disassembler dis(bytecode.data(), bytecode.size());
+        dis.add_label(0, "main");
+        dis.print();
+
+        // top_frame_size = 4: r0..r3 are GC roots during the MAKE_CLOSURE allocations
+        // (r2 holds closure A across the second alloc's potential collection).
+        auto res   = execute(bytecode, &heap, nullptr, nullptr, /*top*/ 4,
+                             nullptr, nullptr, nullptr, nullptr, &as.function_table());
+        auto* regs = res.get_reg_base();
+
+        // --- (A) plain closure ---
+        const Value a_val = regs[2];
+        GcObject*   a     = a_val.isPtr() ? GcObject::from_slots(a_val.asPtr()) : nullptr;
+        const bool a_ok = a &&
+                          a->kind == GcObject::KIND_CLOSURE &&
+                          a->closure_fn_id() == plain &&
+                          a->slot_count() == 2 &&
+                          a->slots()[0].asSigned48() == 111 &&
+                          a->slots()[1].asSigned48() == 222;
+
+        // --- (B) self-capturing closure ---
+        const Value b_val = regs[3];
+        GcObject*   b     = b_val.isPtr() ? GcObject::from_slots(b_val.asPtr()) : nullptr;
+        const bool b_ok = b &&
+                          b->kind == GcObject::KIND_CLOSURE &&
+                          b->closure_fn_id() == selfy &&
+                          b->slot_count() == 2 &&
+                          b->slots()[0].asSigned48() == 333 &&
+                          b->slots()[1].isPtr() &&
+                          b->slots()[1].asPtr() == b_val.asPtr(); // slot1 == the closure itself
+
+        std::cout << std::format("  (A) plain closure captures [r0,r1]:  {}\n", a_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  (B) self_slot back-patched to self:  {}\n", b_ok ? "PASS" : "FAIL");
+        ok = a_ok && b_ok;
+    } catch (const std::exception& e) { record_fail(e.what()); ok = false; }
+
+    check(ok);
+}
+
+// =============================================================================
+// test_load_capture -- CALLING a capturing closure end to end (Milestone A4):
+// MAKE_CLOSURE builds it, CALL_INDIRECT branches on the KIND_CLOSURE tag and installs
+// it as current_closure, and LOAD_CAPTURE reads its by-value captures inside the body.
+//
+//   combine(x) = x + cap0 + cap1, closed over (cap0=10, cap1=20). It is called TWICE
+//   through the same closure value (combine(5)=35, combine(100)=130) to confirm
+//   current_closure is installed on entry and restored on return each time.
+// =============================================================================
+inline void test_load_capture() {
+    std::cout << "=== load_capture (calling a capturing closure) ===\n";
+    bool ok = true;
+
+    try {
+        Heap heap(64 * 1024);
+
+        Assembler as;
+        // combine(x=r0) closes over 2 captures; body uses r0 (param), r1/r2 (capture temps).
+        const uint16_t combine = as.declare_fn("combine", /*fs*/ 3, /*arity*/ 1, /*ncaptures*/ 2);
+
+        as.label("main");                         // top_frame_size = 3 (args at r3)
+        as.load_const(0, 10);                     // r0 = cap0
+        as.load_const(1, 20);                     // r1 = cap1
+        as.MAKE_CLOSURE(2, combine, 0);           // r2 = closure(combine) capturing r0,r1
+        as.load_const(3, 5);                      // arg at r[top_frame_size]=r3
+        as.CALL_INDIRECT(2, 1);                   // combine(5) -> r3
+        as.R6(OpCode::MOV, 0, 3, 0);              // r0 = 35
+        as.load_const(3, 100);                    // arg at r3
+        as.CALL_INDIRECT(2, 1);                   // combine(100) -> r3 (same closure)
+        as.R6(OpCode::MOV, 1, 3, 0);              // r1 = 130
+        as.J(OpCode::HALT);
+
+        as.label("combine");                      // combine(x=r0) = x + cap0 + cap1
+        as.LOAD_CAPTURE(1, 0);                    // r1 = captures[0] = cap0
+        as.LOAD_CAPTURE(2, 1);                    // r2 = captures[1] = cap1
+        as.R6(OpCode::ADD_INT, 0, 0, 1);          // r0 = x + cap0
+        as.R6(OpCode::ADD_INT, 0, 0, 2);          // r0 = x + cap0 + cap1
+        as.J(OpCode::RET);
+
+        const auto bytecode = as.assemble();
+        Disassembler dis(bytecode.data(), bytecode.size());
+        dis.add_label(0, "main");
+        dis.print();
+
+        auto res   = execute(bytecode, &heap, nullptr, nullptr, /*top*/ 3,
+                             nullptr, nullptr, nullptr, nullptr, &as.function_table());
+        auto* regs = res.get_reg_base();
+
+        const int64_t r0 = regs[0].asSigned48();
+        const int64_t r1 = regs[1].asSigned48();
+        std::cout << std::format("combine(5)={} (expect 35)  combine(100)={} (expect 130)\n", r0, r1);
+        ok = (r0 == 35) && (r1 == 130);
+    } catch (const std::exception& e) { record_fail(e.what()); ok = false; }
+
+    check(ok);
+}
+
+// =============================================================================
+// test_closure_self_recursion -- a self-recursive closure end to end: the VM-side
+// composition of A3 (the MAKE_CLOSURE self_slot back-patch) and A4 (LOAD_CAPTURE +
+// the CALL_INDIRECT closure path). A6 is only the COMPILER emitting this pattern.
+//
+//   factc is declared with self_slot 0, so MAKE_CLOSURE stores the closure ITSELF
+//   into capture slot 0. Its body recurses by LOAD_CAPTURE-ing that self reference
+//   and CALL_INDIRECT-ing it: factc(n) = n <= 1 ? 1 : n * self(n-1). factc(5) = 120.
+// =============================================================================
+inline void test_closure_self_recursion() {
+    std::cout << "=== closure_self_recursion ===\n";
+    bool ok = true;
+
+    try {
+        Heap heap(64 * 1024);
+
+        Assembler as;
+        // 1 capture (slot 0 = self); body uses r0(n), r1(temp/self), r3(arg/result).
+        const uint16_t factc = as.declare_fn("factc", /*fs*/ 3, /*arity*/ 1,
+                                             /*ncaptures*/ 1, /*self_slot*/ 0);
+
+        as.label("main");                         // top_frame_size = 2 (arg at r2)
+        as.MAKE_CLOSURE(0, factc, 1);             // r0 = self-recursive closure (slot0 = self)
+        as.load_const(2, 5);                      // arg at r[top]=r2
+        as.CALL_INDIRECT(0, 1);                   // factc(5) -> r2
+        as.J(OpCode::HALT);
+
+        as.label("factc");                        // factc(n=r0)
+        as.load_const(1, 1);
+        as.B(OpCode::BGE_INT, 1, 0, "factc_base"); // if 1 >= n -> base (return 1)
+        as.R6(OpCode::SUB_INT, 3, 0, 1);          // r3 = n - 1 (arg at r[frame_size]=r3)
+        as.LOAD_CAPTURE(1, 0);                    // r1 = self (captures[0])
+        as.CALL_INDIRECT(1, 1);                   // self(n-1) -> r3
+        as.R6(OpCode::MUL_INT, 0, 0, 3);          // r0 = n * factc(n-1)
+        as.J(OpCode::RET);
+        as.label("factc_base");
+        as.load_const(0, 1);                      // return 1
+        as.J(OpCode::RET);
+
+        const auto bytecode = as.assemble();
+        Disassembler dis(bytecode.data(), bytecode.size());
+        dis.add_label(0, "main");
+        dis.print();
+
+        auto res   = execute(bytecode, &heap, nullptr, nullptr, /*top*/ 2,
+                             nullptr, nullptr, nullptr, nullptr, &as.function_table());
+        const int64_t fact5 = res.get_reg_base()[2].asSigned48();
+        std::cout << std::format("factc(5) via self-recursive closure = {} (expect 120)\n", fact5);
+        ok = (fact5 == 120);
+    } catch (const std::exception& e) { record_fail(e.what()); ok = false; }
+
+    check(ok);
+}
+
+// =============================================================================
+// test_tco_call_indirect_func -- TCO_CALL_INDIRECT over a Func immediate. A
+// tail-recursive loop(n, acc) = n == 0 ? acc : loop(n - 1, acc + n) tail-calls
+// ITSELF indirectly (via a LOAD_FN'd Func value in a HIGH register, above the
+// [0, nargs) argument window) with TCO_CALL_INDIRECT. Run over 1,000,000
+// iterations: without in-place frame reuse this overflows the return stack long
+// before finishing, so a correct sum is the O(1)-stack proof (the indirect analogue
+// of test_sum_tco). Entry is a single CALL_INDIRECT (one frame); every recursion is
+// a TCO_CALL_INDIRECT (no push).
+// =============================================================================
+inline void test_tco_call_indirect_func() {
+    std::cout << "=== tco_call_indirect (Func immediate, O(1) stack) ===\n";
+    bool ok = true;
+    try {
+        constexpr int64_t N = 1'000'000;
+        Assembler as;
+        // loop(n=r0, acc=r1): frame 5 so the callee Func sits at r4, above [0, 2).
+        const uint16_t id_loop = as.declare_fn("loop", /*fs*/ 5, /*arity*/ 2);
+
+        as.label("main");                         // top_frame_size = 1 (callee at r0, args r1/r2)
+        as.LOAD_FN(0, id_loop);                   // r0 = Func(loop)
+        as.load_const(1, N);                      // arg0 = n  (at r1)
+        as.C2(OpCode::LOAD_CONST, 2, 0);          // arg1 = acc = 0 (at r2)
+        as.CALL_INDIRECT(0, 2);                   // loop(N, 0) -> result at r1
+        as.J(OpCode::HALT);
+
+        as.label("loop");                         // loop(n=r0, acc=r1)
+        as.C2(OpCode::LOAD_CONST, 2, 0);
+        as.B(OpCode::BEQ_INT, 0, 2, "loop_base"); // if n == 0 -> return acc
+        as.R6(OpCode::ADD_INT, 1, 1, 0);          // acc' = acc + n   (reads old n first)
+        as.C2(OpCode::DECR, 0);                   // n'   = n - 1     (in place)
+        as.LOAD_FN(4, id_loop);                   // r4 = Func(loop)  (callee, above [0,2))
+        as.TCO_CALL_INDIRECT(4, 2);               // tail-call loop(n', acc')
+        as.label("loop_base");
+        as.R6(OpCode::MOV, 0, 1, 0);              // return acc
+        as.J(OpCode::RET);
+
+        const auto bc = as.assemble();
+        Disassembler dis(bc.data(), bc.size()); dis.add_label(0, "main"); dis.print();
+        auto res = execute(bc, nullptr, nullptr, nullptr, 1,
+                           nullptr, nullptr, nullptr, nullptr, &as.function_table());
+        const int64_t result   = res.get_reg_base()[1].asSigned48();
+        const int64_t expected = N * (N + 1) / 2;   // sum 1..N = 500000500000
+        std::cout << std::format("loop({}, 0) = {} (expect {})\n", N, result, expected);
+        ok = (result == expected);
+    } catch (const std::exception& e) { record_fail(e.what()); ok = false; }
+
+    check(ok);
+}
+
+// =============================================================================
+// test_tco_call_indirect_closure -- TCO_CALL_INDIRECT over a KIND_CLOSURE, under
+// GC churn. A self-recursive closure loopc(n, acc) captures [self (slot 0), k
+// (slot 1)] and tail-recurses via LOAD_CAPTURE(self) + TCO_CALL_INDIRECT, adding
+// k each step: loopc(N, 0) = N (k == 1). Each iteration ALLOCs a throwaway array
+// to churn a small heap, forcing many collections DURING the tail loop -- so the
+// closure held in current_closure (and the self capture inside it) must be
+// forwarded in place and stay readable across every collect(). Proves both the
+// O(1)-stack tail loop AND that the closure activation state survives GC.
+// =============================================================================
+inline void test_tco_call_indirect_closure() {
+    std::cout << "=== tco_call_indirect (KIND_CLOSURE, GC churn) ===\n";
+    bool ok = true;
+    try {
+        constexpr int64_t N = 50'000;
+        Heap heap(64 * 1024);                     // small on purpose: forces collections
+
+        Assembler as;
+        // loopc(n=r0, acc=r1): 2 captures (slot0 = self, slot1 = k); frame 6 so the
+        // ALLOC dest (r5) and the self callee (r4, above [0,2)) both fit.
+        const uint16_t id_loopc = as.declare_fn("loopc", /*fs*/ 6, /*arity*/ 2,
+                                                /*ncaptures*/ 2, /*self_slot*/ 0);
+
+        as.label("main");                         // top_frame_size = 3 (closure r0; args r3/r4)
+        as.C2(OpCode::LOAD_CONST, 1, 0);          // slot0 source placeholder (overwritten by self)
+        as.C2(OpCode::LOAD_CONST, 2, 1);          // slot1 source = k = 1
+        as.MAKE_CLOSURE(0, id_loopc, 1);          // r0 = closure; capture window [r1, r2)
+        as.load_const(3, N);                      // arg0 = n   (at r3)
+        as.C2(OpCode::LOAD_CONST, 4, 0);          // arg1 = acc (at r4)
+        as.CALL_INDIRECT(0, 2);                   // loopc(N, 0) -> result at r3
+        as.J(OpCode::HALT);
+
+        as.label("loopc");                        // loopc(n=r0, acc=r1)
+        as.C2(OpCode::LOAD_CONST, 2, 0);
+        as.B(OpCode::BEQ_INT, 0, 2, "loopc_base"); // if n == 0 -> return acc
+        as.C2(OpCode::ALLOC, 5, 8);               // churn: throwaway 8-slot array at r5
+        as.LOAD_CAPTURE(2, 1);                    // r2 = k (captures[1])
+        as.R6(OpCode::ADD_INT, 1, 1, 2);          // acc' = acc + k
+        as.C2(OpCode::DECR, 0);                   // n'   = n - 1
+        as.LOAD_CAPTURE(4, 0);                    // r4 = self (captures[0]); callee, above [0,2)
+        as.TCO_CALL_INDIRECT(4, 2);               // tail-call self(n', acc')
+        as.label("loopc_base");
+        as.R6(OpCode::MOV, 0, 1, 0);              // return acc
+        as.J(OpCode::RET);
+
+        const auto bc = as.assemble();
+        Disassembler dis(bc.data(), bc.size()); dis.add_label(0, "main"); dis.print();
+        auto res = execute(bc, &heap, nullptr, nullptr, 3,
+                           nullptr, nullptr, nullptr, nullptr, &as.function_table());
+        const int64_t result = res.get_reg_base()[3].asSigned48();
+        std::cout << std::format("loopc({}, 0) with k=1 = {} (expect {})\n", N, result, N);
+        ok = (result == N);
+    } catch (const std::exception& e) { record_fail(e.what()); ok = false; }
+
+    check(ok);
+}
+
+// =============================================================================
+// test_mod -- generic promoting MOD. int/int mirrors MOD_INT (sign of dividend,
+// VM-level trap on %0); a double operand takes std::fmod (sign of dividend,
+// x % 0.0 -> NaN, no trap); mixed int/double promotes to double.
+// =============================================================================
+inline void test_mod() {
+    Assembler as;
+    as.label("main");
+    as.C2(OpCode::LOAD_CONST, 0, 7);
+    as.C2(OpCode::LOAD_CONST, 1, 3);
+    as.R6(OpCode::MOD, 2, 0, 1);      // 7 % 3   = 1   (Int)
+    as.C2(OpCode::LOAD_CONST, 3, -7);
+    as.R6(OpCode::MOD, 4, 3, 1);      // -7 % 3  = -1  (Int, sign of dividend)
+    as.load_double(5, 5.5);
+    as.load_double(6, 2.0);
+    as.R6(OpCode::MOD, 7, 5, 6);      // 5.5 % 2.0 = 1.5 (Dbl, fmod)
+    as.load_double(8, 0.0);
+    as.R6(OpCode::MOD, 9, 5, 8);      // 5.5 % 0.0 = NaN (Dbl, no trap)
+    as.R6(OpCode::MOD, 10, 0, 6);     // 7 % 2.0   = 1.0 (Dbl, promoted)
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << "=== mod (generic promoting %) ===\n";
+    Disassembler dis(bytecode.data(), bytecode.size()); dis.add_label(0, "main"); dis.print();
+    std::cout << "Running...\n";
+    try {
+        auto res   = execute(bytecode, nullptr, nullptr, nullptr, 0, &as.constant_pool());
+        auto* regs = res.get_reg_base();
+        const bool r2_ok  = regs[2].isInt()    && regs[2].asSigned48() == 1;
+        const bool r4_ok  = regs[4].isInt()    && regs[4].asSigned48() == -1;
+        const bool r7_ok  = regs[7].isDouble() && approx(regs[7].asDouble(), 1.5);
+        const bool r9_ok  = regs[9].isDouble() && std::isnan(regs[9].asDouble());
+        const bool r10_ok = regs[10].isDouble() && approx(regs[10].asDouble(), 1.0);
+        std::cout << std::format("7%3={} -7%3={} 5.5%2.0={} 5.5%0.0={} 7%2.0={}\n",
+                                 regs[2], regs[4], regs[7], regs[9], regs[10]);
+        const bool nontrap_ok = r2_ok && r4_ok && r7_ok && r9_ok && r10_ok;
+
+        // int % 0 must raise the VM-level "Division by zero" trap (like MOD_INT).
+        Assembler tas;
+        tas.label("main");
+        tas.C2(OpCode::LOAD_CONST, 0, 10);
+        tas.C2(OpCode::LOAD_CONST, 1, 0);
+        tas.R6(OpCode::MOD, 2, 0, 1);     // 10 % 0 -> trap
+        tas.J(OpCode::HALT);
+        bool trap_ok = false;
+        try {
+            execute(tas.assemble());
+        } catch (const std::exception& e) {
+            trap_ok = std::string_view(e.what()).find("division by zero") != std::string_view::npos;
+        }
+        std::cout << std::format("int %% 0 trapped: {}\n", trap_ok ? "PASS" : "FAIL");
+        check(nontrap_ok && trap_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_num_compare -- the six generic promoting SET comparison ops (EQ/NE/LT/LE/
+// GT/GE_NUM -> Bool). Covers double/double, mixed int/double promotion, and the
+// IEEE NaN rules (ordered relations and == false, != true).
+// =============================================================================
+inline void test_num_compare() {
+    std::cout << "=== num_compare (SET_*_NUM) ===\n";
+    // Returns the Bool result of `op` applied to Values va, vb via the pool.
+    auto cmp = [](OpCode opc, Value va, Value vb) -> bool {
+        Assembler as;
+        as.label("main");
+        as.load_constant(0, va);
+        as.load_constant(1, vb);
+        as.R6(opc, 2, 0, 1);
+        as.J(OpCode::HALT);
+        auto res = execute(as.assemble(), nullptr, nullptr, nullptr, 0, &as.constant_pool());
+        return res.get_reg_base()[2].asBool();
+    };
+    const Value d15 = Value::fromDouble(1.5);
+    const Value d25 = Value::fromDouble(2.5);
+    const Value d20 = Value::fromDouble(2.0);
+    const Value i1  = Value::fromSigned48(1);
+    const Value i2  = Value::fromSigned48(2);
+    const Value nan = Value::nan();
+
+    struct Case { const char* name; bool got; bool want; };
+    const Case cases[] = {
+        { "1.5 <  2.5",        cmp(OpCode::SET_LT_NUM, d15, d25), true  },
+        { "2.5 <  1.5",        cmp(OpCode::SET_LT_NUM, d25, d15), false },
+        { "2.0 <= 2.0",        cmp(OpCode::SET_LE_NUM, d20, d20), true  },
+        { "2.5 >  1.5",        cmp(OpCode::SET_GT_NUM, d25, d15), true  },
+        { "1.5 >= 2.5",        cmp(OpCode::SET_GE_NUM, d15, d25), false },
+        { "2.0 == 2.0",        cmp(OpCode::SET_EQ_NUM, d20, d20), true  },
+        { "1.5 != 2.5",        cmp(OpCode::SET_NE_NUM, d15, d25), true  },
+        { "Int2 == Dbl2.0",    cmp(OpCode::SET_EQ_NUM, i2,  d20), true  },
+        { "Int1 <  Dbl1.5",    cmp(OpCode::SET_LT_NUM, i1,  d15), true  },
+        { "NaN == NaN",        cmp(OpCode::SET_EQ_NUM, nan, nan), false },
+        { "NaN != NaN",        cmp(OpCode::SET_NE_NUM, nan, nan), true  },
+        { "NaN <  1.5",        cmp(OpCode::SET_LT_NUM, nan, d15), false },
+        { "NaN >= 1.5",        cmp(OpCode::SET_GE_NUM, nan, d15), false },
+    };
+    bool ok = true;
+    try {
+        for (const auto& c : cases) {
+            const bool pass = c.got == c.want;
+            ok = ok && pass;
+            std::cout << std::format("  {:<16} -> {}  (expect {})  {}\n",
+                c.name, c.got, c.want, pass ? "PASS" : "FAIL");
+        }
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_num_branch -- the six generic promoting compare-and-branch ops (BEQ/BNE/
+// BLT/BLE/BGT/BGE_NUM). Same IEEE semantics as the SET family; a NaN operand
+// makes the ordered branches and BEQ_NUM fall through while BNE_NUM is taken.
+// =============================================================================
+inline void test_num_branch() {
+    std::cout << "=== num_branch (B*_NUM) ===\n";
+    // Returns true iff the branch `op` is taken for operands va, vb.
+    auto taken = [](OpCode opc, Value va, Value vb) -> bool {
+        Assembler as;
+        as.label("main");
+        as.load_constant(0, va);
+        as.load_constant(1, vb);
+        as.C2(OpCode::LOAD_CONST, 2, 0);        // default: not taken
+        as.B(opc, 0, 1, "taken");
+        as.J(OpCode::J, "done");
+        as.label("taken");
+        as.C2(OpCode::LOAD_CONST, 2, 1);
+        as.label("done");
+        as.J(OpCode::HALT);
+        auto res = execute(as.assemble(), nullptr, nullptr, nullptr, 0, &as.constant_pool());
+        return res.get_reg_base()[2].asSigned48() == 1;
+    };
+    const Value d15 = Value::fromDouble(1.5);
+    const Value d25 = Value::fromDouble(2.5);
+    const Value d20 = Value::fromDouble(2.0);
+    const Value i1  = Value::fromSigned48(1);
+    const Value i2  = Value::fromSigned48(2);
+    const Value nan = Value::nan();
+
+    struct Case { const char* name; bool got; bool want; };
+    const Case cases[] = {
+        { "BLT 1.5,2.5",       taken(OpCode::BLT_NUM, d15, d25), true  },
+        { "BLT 2.5,1.5",       taken(OpCode::BLT_NUM, d25, d15), false },
+        { "BLE 2.0,2.0",       taken(OpCode::BLE_NUM, d20, d20), true  },
+        { "BGT 2.5,1.5",       taken(OpCode::BGT_NUM, d25, d15), true  },
+        { "BGE 2.0,2.0",       taken(OpCode::BGE_NUM, d20, d20), true  },
+        { "BGE 1.5,2.5",       taken(OpCode::BGE_NUM, d15, d25), false },
+        { "BEQ 2.0,2.0",       taken(OpCode::BEQ_NUM, d20, d20), true  },
+        { "BNE 1.5,2.5",       taken(OpCode::BNE_NUM, d15, d25), true  },
+        { "BEQ Int2,Dbl2.0",   taken(OpCode::BEQ_NUM, i2,  d20), true  },
+        { "BLT Int1,Dbl1.5",   taken(OpCode::BLT_NUM, i1,  d15), true  },
+        { "BEQ NaN,NaN",       taken(OpCode::BEQ_NUM, nan, nan), false },
+        { "BNE NaN,NaN",       taken(OpCode::BNE_NUM, nan, nan), true  },
+        { "BLT NaN,1.5",       taken(OpCode::BLT_NUM, nan, d15), false },
+        { "BGE NaN,1.5",       taken(OpCode::BGE_NUM, nan, d15), false },
+    };
+    bool ok = true;
+    try {
+        for (const auto& c : cases) {
+            const bool pass = c.got == c.want;
+            ok = ok && pass;
+            std::cout << std::format("  {:<18} -> {}  (expect {})  {}\n",
+                c.name, c.got, c.want, pass ? "PASS" : "FAIL");
+        }
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_tco_canary -- big-loop sanity check (Release-only).
+//
+// HISTORICAL rationale (now retired): under the old threaded tail-call dispatch this
+// was a stack-SAFETY guard. That model's safety hinged on MSVC turning
+// `return dispatch_table[next](ctx);` into a `jmp`, not a `call`; if that broke
+// (toolset bump, /O change, one stray non-__fastcall handler) the native C++ stack
+// grew one frame PER INSTRUCTION EXECUTED and a long-running program silently
+// overflowed the thread stack. That dispatch model was retired to a benchmark
+// project (vm_bench, since removed); the shipping runtime dispatches via
+// run_switch_loop (Interpreter.h), whose plain `for(;;){ switch }` loop
+// CANNOT grow the native stack per instruction. So this test can no longer overflow
+// -- the stack-safety concern it was built for no longer exists here.
+//
+// What it still checks: run ~10M instructions in a tight, non-recursive, int-only
+// loop (no CALL/TCO_CALL, no ALLOC) and assert it runs to completion with r0 == 0 --
+// a cheap smoke test that the hot dispatch path executes a long flat loop correctly.
+//
+// Release-only (by its own #ifdef): under /Od Debug those ~10M instructions are just
+// a slow, no-value run -- the correctness they exercise is covered by other tests,
+// and the large instruction count only ever mattered for the now-impossible native-
+// stack growth. Debug prints SKIPPED. Registered LAST in main() by convention (under
+// the old model a regression here could hard-crash the process before the summary
+// printed; harmless now, but the ordering is kept).
+// =============================================================================
+inline void test_tco_canary() {
+    std::cout << "=== tco_canary ===\n";
+#ifdef _DEBUG
+    std::cout << "SKIPPED (Release-only: ~10M-instruction smoke loop, no value under /Od Debug)\n";
+    return;  // no check() -- counts as a (vacuous) passed test in Debug
+#else
+    // ~10M executed instructions: 2 per iteration (DECR + BNE) over N iterations.
+    constexpr int64_t N = 5'000'000;
+    Assembler as;
+    as.label("main");
+    as.load_const(0, N);                   // r0 = N (auto-chains LOAD_CONST + WIDE)
+    as.C2(OpCode::LOAD_CONST, 1, 0);       // r1 = 0 (compare target)
+    as.label("loop");
+    as.C2(OpCode::DECR, 0);                // r0 = r0 - 1
+    as.B (OpCode::BNE_INT, 0, 1, "loop");  // if r0 != 0 goto loop (backward branch)
+    as.J (OpCode::HALT);
+    const auto bytecode = as.assemble();
+    std::cout << std::format("Running {} instructions in a flat-stack loop...\n",
+                             2 * N);
+    try {
+        auto res = execute(bytecode);
+        const int64_t r0 = res.get_reg_base()[0].asSigned48();
+        // r0 == 0 proves the flat loop ran to completion (all ~10M instructions),
+        // rather than exiting early -- the smoke check on the hot dispatch path.
+        std::cout << std::format("Survived; r0 = {}\n", r0);
+        check(r0 == 0);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+#endif
+}
