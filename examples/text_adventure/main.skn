@@ -1,0 +1,134 @@
+// text_adventure -- a tiny adventure game as a state machine, driven by a scripted list of commands.
+//
+// Shows: enums with and without payloads as states and commands, exhaustive `match` over a
+// (state, command) pair, a Set for the inventory, parsing input with `words`, and `while let`.
+
+use std::set::*
+
+enum Room { Hall, Library, Cellar, Garden }
+
+enum Command {
+    Go(String),
+    Take(String),
+    Use(String),
+    Look,
+    Unknown(String),
+}
+
+enum Outcome { Continue, Won, Lost(String) }
+
+struct Game { room: Room, inventory: Set[String], moves: Int, doorOpen: Bool }
+
+fn roomName(r: Room) -> String {
+    match r { Hall => "the hall", Library => "the library", Cellar => "the cellar", Garden => "the garden" }
+}
+
+fn parseCommand(line: String) -> Command {
+    let parts = line |> toLower |> words |> collect
+    let verb = get(parts, 0).unwrapOr("")
+    let arg = get(parts, 1).unwrapOr("")
+    match (verb, len(parts)) {
+        ("go", 2)   => Go(arg),
+        ("take", 2) => Take(arg),
+        ("use", 2)  => Use(arg),
+        ("look", 1) => Look,
+        _           => Unknown(line),
+    }
+}
+
+// Where `dir` leads from `room`, if anywhere.
+fn exit(room: Room, dir: String, doorOpen: Bool) -> Option[Room] {
+    match (room, dir) {
+        (Hall, "north")    => Some(Library),
+        (Hall, "down")     => Some(Cellar),
+        (Library, "south") => Some(Hall),
+        (Cellar, "up")     => Some(Hall),
+        (Hall, "east")     => if doorOpen { Some(Garden) } else { None },
+        _                  => None,
+    }
+}
+
+fn look(g: Game) -> () {
+    let items = match g.room {
+        Library => "A dusty book lies on a table.",
+        Cellar  => "Something glints in the dark: a key.",
+        Hall    => if g.doorOpen { "The east door stands open." } else { "A locked door leads east." },
+        Garden  => "Sunlight.",
+    }
+    println("  You are in ${roomName(g.room)}. ${items}")
+}
+
+fn step(mut g: Game, cmd: Command) -> Outcome {
+    g.moves = g.moves + 1
+    match cmd {
+        Look => { look(g)  Continue },
+        Go(dir) => match exit(g.room, dir, g.doorOpen) {
+            Some(Garden) => { g.room = Garden  Won },
+            Some(next) => {
+                g.room = next
+                println("  You go ${dir} to ${roomName(next)}.")
+                Continue
+            },
+            None => {
+                println("  You cannot go ${dir} from ${roomName(g.room)}.")
+                Continue
+            },
+        },
+        Take(item) => {
+            let here = match (g.room, item) {
+                (Cellar, "key")   => true,
+                (Library, "book") => true,
+                _                 => false,
+            }
+            if !here {
+                println("  There is no ${item} here.")
+            } else if g.inventory.insert(item) {
+                println("  Taken: ${item}.")
+            } else {
+                println("  You already carry the ${item}.")
+            }
+            Continue
+        },
+        Use(item) => {
+            if !g.inventory.isMember(item) {
+                println("  You do not have a ${item}.")
+                Continue
+            } else if item == "key" && g.room == Hall {
+                g.doorOpen = true
+                println("  The key turns. The east door opens.")
+                Continue
+            } else if item == "book" && g.room == Cellar {
+                Lost("you read the book by candlelight and fall asleep forever")
+            } else {
+                println("  Nothing happens.")
+                Continue
+            }
+        },
+        Unknown(text) => { println("  I do not understand '${text}'.")  Continue },
+    }
+}
+
+let script = "look\ngo north\ntake book\ngo east\ngo south\ngo down\ntake key\ntake key\ndance\ngo up\nuse key\ngo east\nlook"
+
+let mut game = Game { room: Hall, inventory: Set::new(), moves: 0, doorOpen: false }
+let mut commands = script |> lines |> collect
+let mut pending: Vec[String] = vec()
+while let Some(c) = pop(commands) { push(pending, c) }     // reverse, so pop() yields them in order
+
+let mut result = Continue
+while let Some(line) = pop(pending) {
+    println("> ${line}")
+    result = step(game, parseCommand(line))
+    match result {
+        Continue => {},
+        _        => break,
+    }
+}
+
+match result {
+    Won          => println("You step into the garden. You win in ${game.moves} moves!"),
+    Lost(reason) => println("Game over: ${reason}."),
+    Continue     => println("The script ended before the game did."),
+}
+let carried = sorted(game.inventory |> intoIter |> collect)
+println("You carry: ${join(carried |> intoIter, ", ")}")

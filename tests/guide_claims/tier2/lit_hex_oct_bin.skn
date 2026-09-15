@@ -1,0 +1,4 @@
+// CLAIM: hex/octal/binary integer literals (0x/0o/0b).
+// GUIDE: §Literals
+// EXPECT: ok 268
+println(0xFF + 0o10 + 0b101)

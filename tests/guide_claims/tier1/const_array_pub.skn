@@ -1,0 +1,5 @@
+// CLAIM: a const array cannot be pub (module-private table; expose an accessor fn).
+// GUIDE: const arrays
+// EXPECT: fail a const array cannot be
+pub const K: Array[Int] = [1, 2, 3]
+println(K[0])

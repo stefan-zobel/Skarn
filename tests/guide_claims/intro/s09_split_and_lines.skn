@@ -1,0 +1,8 @@
+// CLAIM:  split and lines are lazy iterators, so `for` consumes them directly.
+// GUIDE:  SkarnIn30Minutes.md 9 (Working with text)
+// EXPECT: ok [Ada] [36] [Berlin] one two three
+let raw = "  Ada, 36 , Berlin  "
+let mut acc = ""
+for field in split(trim(raw), ",") { acc = acc + "[" + trim(field) + "] " }
+for ln in lines("one\ntwo\nthree") { acc = acc + ln + " " }
+println(trim(acc))

@@ -1,0 +1,6 @@
+// CLAIM: newcomer diagnostics -- passing an immutable binding to `push` says to declare it `mut`.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail declare it 'mut'
+let v: Vec[Int] = vec()
+push(v, 1)
+println(len(v))

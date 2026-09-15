@@ -1,0 +1,5 @@
+// CLAIM:  An opt-in std module is reachable after `use`.
+// GUIDE:  SkarnIn30Minutes.md 12 (Modules and use)
+// EXPECT: ok 3.0
+use std::math::*
+println(sqrt(9.0))

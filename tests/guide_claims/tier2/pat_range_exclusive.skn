@@ -1,0 +1,12 @@
+// CLAIM: `lo..<hi` excludes the upper bound (`lo <= v < hi`), while `..` stays INCLUSIVE — so on Int
+//        bounds `0..<10` and `0..9` are the same set. (Not Rust: a bare `..` does not exclude here.)
+// GUIDE: SkarnGuide.md 13 (Range patterns)
+// EXPECT: ok FDBA | 1 1 | 0 0
+fn grade(n: Int) -> String {
+    match n { 0..<60 => "F", 60..<70 => "D", 70..<80 => "C", 80..<90 => "B", _ => "A" }
+}
+fn ex(n: Int) -> Int { match n { 0..<10 => 1, _ => 0 } }
+fn inc(n: Int) -> Int { match n { 0..9 => 1, _ => 0 } }
+
+// 9 is in both; 10 is in neither — the two spellings agree on every Int.
+println("${grade(59)}${grade(60)}${grade(89)}${grade(90)} | ${ex(9)} ${inc(9)} | ${ex(10)} ${inc(10)}")

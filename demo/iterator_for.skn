@@ -5,7 +5,7 @@
 // (a pull cursor -- next() mutates it in place), else `intoIter(e)` (a fresh
 // cursor). Streams, user cursors, and user collections all iterate the same way.
 // A `dyn Iterator[T]` value IS the plain cursor -- no box, no vtable pointer;
-// the dissolved combinators (range/map/filter/...) each return one.
+// the combinators (range/map/filter/...) each return one.
 //
 // Run:  x64\Release\static_vmrun.exe demo\iterator_for.skn
 // ============================================================================

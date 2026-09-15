@@ -1,0 +1,10 @@
+// CLAIM:  A Vec pipeline lifts with intoIter and ends in a terminal (collect / sum).
+// GUIDE:  SkarnIn30Minutes.md 11 (Pipelines: iterators)
+// EXPECT: ok [2, 4] 30
+fn even(n: Int) -> Bool { n % 2 == 0 }
+fn dbl(n: Int) -> Int { n * 2 }
+let mut xs: Vec[Int] = vec()
+push(xs, 1)  push(xs, 2)  push(xs, 3)  push(xs, 4)  push(xs, 5)
+let kept = xs |> intoIter |> filter(even) |> collect
+let total = xs |> intoIter |> map(dbl) |> sum
+println("${toString(kept)} ${total}")

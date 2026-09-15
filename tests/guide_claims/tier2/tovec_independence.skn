@@ -1,0 +1,23 @@
+// CLAIM:  three linked promises that a future "stop the aliasing" cleanup must not silently break:
+//         (1) toVec(x) is an independent owned snapshot; (2) for x in v is a LIVE element view;
+//         (3) intoIter(v) is a zero-copy live cursor. (2)/(3) are the ones a copy-everywhere "fix" kills.
+// GUIDE:  19 (Iterable freshness contract) / 25 (no hidden deep copies; laziness is a live view)
+// EXPECT: ok indep=3 for=1039 live=100
+let mut v = toVec([10, 20, 30])
+let mut snap = toVec(v)             // (1) INDEPENDENT snapshot -- Iterable::iter clones for a Vec
+push(snap, 99)                      //     pushing to the snapshot must NOT grow v
+let indep = len(v)                  //     3 => independent (aliasing would give 4)
+
+let mut v2 = toVec([10, 20, 30])    // (2) for x in v is a LIVE element view, not a snapshot copy
+let mut acc = 0
+for x in v2 {
+    if x == 10 { v2[1] = 999 }      //     overwrite a not-yet-visited slot mid-walk
+    acc = acc + x
+}                                    //     10 + 999 + 30 = 1039 (a copy would give 60)
+
+let mut v3 = toVec([10, 20, 30])    // (3) intoIter(v) is a zero-copy live cursor
+let mut c = intoIter(v3)
+v3[0] = 100                         //     mutate an element before consuming the cursor
+let live = unwrap(next(c))          //     100 (a copy taken at intoIter would read 10)
+
+println("indep=" + indep + " for=" + acc + " live=" + live)

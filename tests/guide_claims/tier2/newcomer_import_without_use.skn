@@ -1,0 +1,5 @@
+// CLAIM: newcomer diagnostics -- `import std::json` alone does not bring `Json` into scope, and the hint says which `use` does.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail add `use std::json::*`
+import std::json
+let j = Json::parse("1")

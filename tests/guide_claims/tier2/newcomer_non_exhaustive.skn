@@ -1,0 +1,6 @@
+// CLAIM: newcomer diagnostics -- a match missing a variant is rejected.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail non-exhaustive match
+enum Dir { North, South, East }
+fn f(d: Dir) -> Int { match d { North => 1, South => 2 } }
+println(f(East))

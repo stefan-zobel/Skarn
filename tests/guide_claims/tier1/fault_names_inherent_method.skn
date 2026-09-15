@@ -1,0 +1,12 @@
+// CLAIM: a runtime fault inside an INHERENT method names it `Type::method` — the same spelling the
+//        source can use to call it — not the compiler's internal `$inherent$Type$method`.
+// GUIDE: SkarnGuide.md (When something goes wrong)
+// EXPECT: fail division by zero at line 9 (in Ratio::value)
+// NOTE: two things keep `value` out-of-line so the name is observable (inlining is on by default):
+//       `get` is called through a function VALUE (never inlined), and inside it `r.value()` sits in
+//       TAIL position, where a tail call always wins over an expansion.
+struct Ratio { num: Int, den: Int }
+impl Ratio { fn value(self) -> Int { self.num / self.den } }
+fn get(r: Ratio) -> Int { r.value() }
+let f: fn(Ratio) -> Int = get
+println("${f(Ratio { num: 1, den: 0 })}")

@@ -1,0 +1,5 @@
+// CLAIM:  `?` needs a function to return from -- at the top level it is a compile error.
+// GUIDE:  SkarnIn30Minutes.md 7 (Option, Result, ?)
+// EXPECT: fail requires the enclosing function to return a Result
+let n = parseInt("10")?
+println(n)

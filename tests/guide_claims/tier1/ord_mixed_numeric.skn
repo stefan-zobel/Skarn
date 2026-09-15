@@ -1,0 +1,4 @@
+// CLAIM: ordering < DOES coerce Int -> Double (Int <: Double at the compare boundary) — the asymmetry with == (see eq_mixed_numeric).
+// GUIDE: 5 arithmetic / numeric coercion
+// EXPECT: ok true
+println(1 < 2.0)

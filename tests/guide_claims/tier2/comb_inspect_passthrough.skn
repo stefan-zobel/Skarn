@@ -1,0 +1,5 @@
+// CLAIM: inspect(f) taps each element and yields it unchanged — the sum through inspect equals the plain sum.
+// GUIDE: §19 combinators
+// EXPECT: ok 6
+let r = range(1, 4) |> inspect(fn(_x) { }) |> sum
+println(r)

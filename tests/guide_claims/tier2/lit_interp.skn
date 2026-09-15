@@ -1,0 +1,5 @@
+// CLAIM: string interpolation "${e}" splices a stringified expression.
+// GUIDE: §Strings / interpolation
+// EXPECT: ok n=7
+let n = 7
+println("n=${n}")

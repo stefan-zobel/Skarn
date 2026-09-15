@@ -1,0 +1,11 @@
+// CLAIM: `name @ sub` binds the whole matched value AND requires `sub` to match.
+// GUIDE: §Patterns (@-bindings)
+// EXPECT: ok fail(42)
+fn grade(n: Int) -> String {
+    match n {
+        k @ 0..59   => "fail(" + toString(k) + ")",
+        k @ 60..100 => "pass(" + toString(k) + ")",
+        _           => "out of range"
+    }
+}
+println(grade(42))

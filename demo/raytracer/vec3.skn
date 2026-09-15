@@ -1,0 +1,57 @@
+// Vec3 -- the 3-component Double vector everything else in the renderer is built on.
+//
+// REPRESENTATION. Every operation returns a FRESH Vec3, i.e. one heap object per operation,
+// rather than writing into pre-allocated scratch vectors through `mut` out-parameters. The
+// Cheney collector copies only survivors, so this short-lived churn is cheap -- and the
+// readable form wins.
+//
+// The vector doubles as the renderer's colour type (r, g, b in 0.0 .. 1.0), which is why
+// `mul` is component-wise: that is colour modulation, not a vector product.
+
+use std::math::*
+
+pub struct Vec3 { x: Double, y: Double, z: Double }
+
+// Constructors stay free functions -- they have no receiver to hang off.
+pub fn vec3(x: Double, y: Double, z: Double) -> Vec3 { Vec3 { x: x, y: y, z: z } }
+pub fn zero3() -> Vec3 { Vec3 { x: 0.0, y: 0.0, z: 0.0 } }
+
+impl Vec3 {
+    fn add(self, b: Vec3) -> Vec3 { Vec3 { x: self.x + b.x, y: self.y + b.y, z: self.z + b.z } }
+    fn sub(self, b: Vec3) -> Vec3 { Vec3 { x: self.x - b.x, y: self.y - b.y, z: self.z - b.z } }
+
+    // Component-wise product -- colour modulation (a surface tint applied to incoming light).
+    fn mul(self, b: Vec3) -> Vec3 { Vec3 { x: self.x * b.x, y: self.y * b.y, z: self.z * b.z } }
+
+    fn scale(self, k: Double) -> Vec3 { Vec3 { x: self.x * k, y: self.y * k, z: self.z * k } }
+    fn neg(self) -> Vec3 { Vec3 { x: -self.x, y: -self.y, z: -self.z } }
+
+    fn dot(self, b: Vec3) -> Double { self.x * b.x + self.y * b.y + self.z * b.z }
+
+    fn cross(self, b: Vec3) -> Vec3 {
+        Vec3 { x: self.y * b.z - self.z * b.y,
+               y: self.z * b.x - self.x * b.z,
+               z: self.x * b.y - self.y * b.x }
+    }
+
+    // The squared length -- preferred wherever only a comparison is needed, since it
+    // avoids the sqrt. The ray-sphere intersection is written against this one.
+    fn lengthSquared(self) -> Double { self.x * self.x + self.y * self.y + self.z * self.z }
+    fn length(self) -> Double { sqrt(self.lengthSquared()) }
+
+    // The unit vector in the same direction. Undefined for the zero vector (division by
+    // zero yields IEEE infinities rather than a trap -- the caller must not hand one in).
+    fn unit(self) -> Vec3 { self.scale(1.0 / self.length()) }
+
+    // Mirror this vector about the surface whose unit normal is `n`.
+    fn reflect(self, n: Vec3) -> Vec3 { self.sub(n.scale(2.0 * self.dot(n))) }
+
+    // True when every component has collapsed to (almost) zero -- a scattered ray in that
+    // state must be replaced, or later normalization produces NaNs.
+    fn nearZero(self) -> Bool {
+        let eps = 0.00000001
+        abs(self.x) < eps && abs(self.y) < eps && abs(self.z) < eps
+    }
+
+    fn fmt(self) -> String { "(${self.x}, ${self.y}, ${self.z})" }
+}

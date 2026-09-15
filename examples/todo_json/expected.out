@@ -1,0 +1,14 @@
+before saving:
+  [ ] #1 write the parser
+  [ ] #2 add error messages
+  [x] #3 run the tests
+  2 open
+saved 281 bytes to todos.json
+there is no todo #99
+after loading and editing:
+  [x] #1 write the parser
+  [ ] #2 add error messages
+  [x] #3 run the tests
+  [ ] #4 write the README
+  2 open
+first todo: write the parser (done: true)

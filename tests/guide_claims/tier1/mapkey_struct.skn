@@ -1,0 +1,6 @@
+// CLAIM: a non-Hashable type (a plain struct) cannot be a map key — a COMPILE error.
+// GUIDE: Maps / hash identity
+// EXPECT: fail cannot be a map key
+struct P { k: Int }
+let m: Map[P, Int] = #{}
+println(1)

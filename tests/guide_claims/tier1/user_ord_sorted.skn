@@ -1,0 +1,7 @@
+// CLAIM: a regular struct that impl Ord can be sorted (the primary ordering path).
+// GUIDE: 19 sorting; 23 (Ord is a normal implementable trait)
+// EXPECT: ok 123
+struct P { k: Int }
+impl Ord for P { fn lessThan(self, o: P) -> Bool { self.k < o.k } }
+let s = sorted(toVec([P { k: 3 }, P { k: 1 }, P { k: 2 }]))
+println(s[0].k * 100 + s[1].k * 10 + s[2].k)

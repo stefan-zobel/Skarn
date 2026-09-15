@@ -1,0 +1,6 @@
+// CLAIM: a `pub` struct from another module can be constructed and used.
+// GUIDE: §Modules / visibility (pub)
+// EXPECT: ok 25
+import geo
+use geo::{Point, mag2}
+println(mag2(Point { x: 3, y: 4 }))

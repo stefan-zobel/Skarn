@@ -1,0 +1,14 @@
+// CLAIM: an inherent method WITHOUT `self` is an associated function — a namespaced constructor,
+//        reached as `Point::new(...)`. It may call another associated function of the same type,
+//        and `-> Self` names the impl target in the signature.
+// GUIDE: SkarnGuide.md 16 (method-call syntax and inherent methods)
+// EXPECT: ok 25 | 0
+struct Point { x: Int, y: Int }
+
+impl Point {
+    fn new(x: Int, y: Int) -> Point { Point { x: x, y: y } }
+    fn origin() -> Self { Point::new(0, 0) }
+    fn norm(self) -> Int { self.x * self.x + self.y * self.y }
+}
+
+println("${Point::new(3, 4).norm()} | ${Point::origin().norm()}")

@@ -1,0 +1,4 @@
+// CLAIM: Vec compares structurally element-by-element.
+// GUIDE: Comparison and equality (e9)
+// EXPECT: ok true
+println(toVec([1, 2, 3]) == toVec([1, 2, 3]))

@@ -1,0 +1,8 @@
+// CLAIM:  Int / Double / Bool / String literals and their interpolated rendering.
+// GUIDE:  SkarnIn30Minutes.md 2 (The primitive types)
+// EXPECT: ok Ada: 10, 0.75, true
+let count: Int = 10
+let ratio: Double = 3.0 / 4.0
+let ok: Bool = count > 5
+let name: String = "Ada"
+println("${name}: ${count}, ${ratio}, ${ok}")

@@ -1,0 +1,5 @@
+// CLAIM: a const array is read at its use site with K[i].
+// GUIDE: const arrays
+// EXPECT: ok 20
+const K: Array[Int] = [10, 20, 30]
+println(K[1])

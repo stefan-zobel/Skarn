@@ -1,0 +1,5 @@
+// CLAIM: a non-exhaustive match is a compile error (Maranget exhaustiveness).
+// GUIDE: §Patterns (exhaustiveness)
+// EXPECT: fail non-exhaustive match
+let o: Option[Int] = Some(1)
+println(match o { Some(x) => x })

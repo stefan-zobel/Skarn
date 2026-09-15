@@ -1,0 +1,84 @@
+// How a surface answers a ray: what colour it takes away, and where the ray goes next.
+//
+// MODULE SHAPE, and why it is not the obvious one. The natural object model is mutual:
+// a `Hit` carries the material it struck, and `scatter` takes that `Hit`. In Rust's
+// "Ray Tracing in One Weekend" both live in one crate and refer to each other freely.
+// Skarn's module graph must be ACYCLIC, so `Material` cannot mention `Hit` while `Hit`
+// mentions `dyn Material`. Rather than collapse geometry and shading into one module,
+// `scatter` takes the two pieces it actually needs -- the point and the surface normal --
+// and this module stays below `hittable` in the import order. The cost is one less
+// cohesive signature; the gain is that shading knows nothing about intersection.
+
+import vec3
+import ray
+
+use vec3::*
+use ray::*
+use std::random::*
+use std::math::*
+
+// A scattered ray plus the colour filter the surface applies to whatever comes back.
+pub struct Scatter { ray: Ray, attenuation: Vec3 }
+
+// OBJECT SAFETY: `scatter` takes `self` and mentions `Self` nowhere else, so a scene can
+// hold `dyn Material` -- which is the whole point, since a scene is heterogeneous.
+// `mut rng` threads the generator through by reference: the caller's Rng is advanced in
+// place, so the whole render stays one reproducible stream from one seed.
+pub trait Material {
+    fn scatter(self, rIn: Ray, p: Vec3, normal: Vec3, mut rng: Rng) -> Option[Scatter]
+}
+
+// A point drawn uniformly from the unit ball, by rejection: generate in the enclosing cube
+// and throw away what falls outside. The cube-to-ball volume ratio is pi/6, so this
+// succeeds about half the time -- cheaper in practice than the trigonometry it replaces.
+pub fn randomInUnitSphere(mut rng: Rng) -> Vec3 {
+    loop {
+        let p = vec3(rng.nextDoubleRange(-1.0, 1.0),
+                     rng.nextDoubleRange(-1.0, 1.0),
+                     rng.nextDoubleRange(-1.0, 1.0))
+        if p.lengthSquared() < 1.0 { break p }
+    }
+}
+
+// A direction drawn uniformly from the unit SPHERE (the surface, not the ball).
+pub fn randomUnitVector(mut rng: Rng) -> Vec3 { randomInUnitSphere(rng).unit() }
+
+// ---------------------------------------------------------------- matte
+
+// A diffuse surface: light arrives and leaves in a direction clustered around the normal.
+pub struct Lambertian { albedo: Vec3 }
+pub fn lambertian(albedo: Vec3) -> Lambertian { Lambertian { albedo: albedo } }
+
+impl Material for Lambertian {
+    fn scatter(self, _rIn: Ray, p: Vec3, normal: Vec3, mut rng: Rng) -> Option[Scatter] {
+        // normal + a random unit vector gives the cosine-weighted distribution that makes
+        // a matte surface look matte, for the price of one random direction.
+        let candidate = normal.add(randomUnitVector(rng))
+        // The two vectors can cancel almost exactly. Left alone, the near-zero direction
+        // would produce infinities and NaNs a few bounces later -- a black speck in the
+        // image whose cause is nowhere near where it shows up.
+        let dir = if candidate.nearZero() { normal } else { candidate }
+        Some(Scatter { ray: ray(p, dir), attenuation: self.albedo })
+    }
+}
+
+// ---------------------------------------------------------------- metal
+
+// A mirror. `fuzz` blurs the reflection by perturbing the reflected ray: 0 is a perfect
+// mirror, 1 is barely reflective at all.
+pub struct Metal { albedo: Vec3, fuzz: Double }
+pub fn metal(albedo: Vec3, fuzz: Double) -> Metal { Metal { albedo: albedo, fuzz: clamp(fuzz, 0.0, 1.0) } }
+
+impl Material for Metal {
+    fn scatter(self, rIn: Ray, p: Vec3, normal: Vec3, mut rng: Rng) -> Option[Scatter] {
+        let reflected = rIn.dir.unit().reflect(normal)
+        let dir       = reflected.add(randomInUnitSphere(rng).scale(self.fuzz))
+        // Enough fuzz can kick the ray back INTO the surface. Absorbing it there is both
+        // physically sensible and the cheapest way to avoid a ray trapped inside a solid.
+        if dir.dot(normal) > 0.0 {
+            Some(Scatter { ray: ray(p, dir), attenuation: self.albedo })
+        } else {
+            None
+        }
+    }
+}

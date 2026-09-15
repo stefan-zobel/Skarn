@@ -1,6 +1,6 @@
 // Or-patterns: `A | B | C => body` matches an arm if ANY alternative matches.
-// v1a: top-level in a match arm / if-let, and alternatives may NOT bind variables
-// (literals / `_` / nullary constructors only). Front-end only -- no VM change.
+// Alternation nests (bare where the terminator is unambiguous, parenthesized elsewhere) and
+// alternatives MAY bind, provided every one binds the same names at the same types.
 
 // A byte classifier: the motivating use case (replaces a long `||` chain).
 fn classify(c: Int) -> String {

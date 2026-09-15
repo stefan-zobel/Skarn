@@ -1,0 +1,1 @@
+--top=6 --min-len=4 input.txt

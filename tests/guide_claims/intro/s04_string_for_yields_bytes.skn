@@ -1,0 +1,6 @@
+// CLAIM:  Iterating a String with `for` yields BYTES (Int 0..255), not characters.
+// GUIDE:  SkarnIn30Minutes.md 4 (Control flow)
+// EXPECT: ok 97 98 99
+let mut acc = ""
+for c in "abc" { acc = acc + toString(c) + " " }
+println(trim(acc))

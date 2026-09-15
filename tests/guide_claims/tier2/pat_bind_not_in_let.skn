@@ -1,0 +1,6 @@
+// CLAIM: an @-binding is rejected in an irrefutable binder position (`let` / `for`), where it
+//        would bind exactly what the bare name binds.
+// GUIDE: §Patterns (@-bindings)
+// EXPECT: fail '@' binding is not allowed in 'let'
+let n @ 5 = 5
+println(n)

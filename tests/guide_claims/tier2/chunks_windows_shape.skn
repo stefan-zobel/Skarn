@@ -1,0 +1,4 @@
+// CLAIM:  `chunks(it, n)` / `windows(it, n)` each yield a `Vec[T]` per pull (non-overlapping / overlapping windows).
+// GUIDE:  19 (Stages) / 25 (cost model: they materialize a Vec per pull, heavier than a tuple)
+// EXPECT: ok chunks=[[0, 1], [2, 3], [4]] windows=[[0, 1], [1, 2], [2, 3]]
+println("chunks=" + toString(collect(chunks(range(0, 5), 2))) + " windows=" + toString(collect(windows(range(0, 4), 2))))

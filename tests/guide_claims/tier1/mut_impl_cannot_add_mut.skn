@@ -1,0 +1,9 @@
+// CLAIM: an impl method may not ADD `mut` to a receiver/parameter the trait declares without it — callers check `mut` against the trait signature, so an impl-only `mut self` would mutate a non-`mut` binding.
+// GUIDE: SkarnGuide.md 16 (Mutating the receiver: mut self)
+// EXPECT: fail takes `mut self` but trait
+trait Reset { fn reset(self) -> () }
+struct Counter { n: Int }
+impl Reset for Counter { fn reset(mut self) -> () { self.n = 0 } }
+let c = Counter { n: 5 }
+reset(c)
+println(c.n)

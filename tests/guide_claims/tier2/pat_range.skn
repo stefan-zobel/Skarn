@@ -1,0 +1,5 @@
+// CLAIM: inclusive range patterns lo..hi match a scalar in [lo, hi].
+// GUIDE: §Patterns (range patterns)
+// EXPECT: ok hi
+let x = 5
+println(match x { 1..3 => "lo", 4..9 => "hi", _ => "other" })

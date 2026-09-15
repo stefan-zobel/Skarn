@@ -1,0 +1,4 @@
+// CLAIM: dedup collapses CONSECUTIVE equal elements.
+// GUIDE: §19 combinators
+// EXPECT: ok 3
+println(len(intoIter(toVec([1, 1, 2, 2, 2, 3])) |> dedup |> collect))

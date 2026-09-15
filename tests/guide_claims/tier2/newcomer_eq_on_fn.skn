@@ -1,0 +1,5 @@
+// CLAIM: newcomer diagnostics -- `==` on a function value is rejected with the reason.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail does not support '==' / '!='
+let f = fn(x: Int) -> Int { x }
+println(f == f)

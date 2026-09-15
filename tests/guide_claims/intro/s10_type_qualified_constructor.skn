@@ -1,0 +1,21 @@
+// CLAIM:  `Type::name(...)` reaches a constructor that belongs to the type but has no receiver
+//         yet -- the third call style, and how you obtain a std library value in the first place.
+// GUIDE:  SkarnIn30Minutes.md 10 (Three ways to call things)
+// EXPECT: ok 42 true
+use std::json::*
+use std::random::*
+
+let mut rng = Rng::fromSeed(42)
+let n = rng.nextInt(1, 7)                        // and then `.` for the type's own methods
+let doc = Json::parse("{\"answer\": 42}")
+
+match doc {
+  Ok(j) => match j.getField("answer") {
+    Some(v) => match v.asInt() {
+      Some(a) => println("${a} ${n >= 1 && n <= 6}"),
+      None    => println("not an int"),
+    },
+    None => println("no field"),
+  },
+  Err(e) => println(e),
+}

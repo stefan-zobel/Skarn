@@ -1,0 +1,13 @@
+// CLAIM: a compound assignment evaluates the place EXACTLY ONCE — `v[f()] += 1` calls `f` one time.
+//        (A desugar to `v[f()] = v[f()] + 1` would call it twice; the operator rides on the statement
+//        instead, so codegen reads and writes back through a single evaluation of the index.)
+// GUIDE: SkarnGuide.md 5 (Compound assignment)
+// EXPECT: ok 1 calls, v[0]=100
+let mut log: Vec[Int] = vec()
+fn indexWithEffect(mut sink: Vec[Int]) -> Int { push(sink, 1)
+                                                0 }
+
+let mut v = array(2, 0)
+v[indexWithEffect(log)] += 100
+
+println("${len(log)} calls, v[0]=${v[0]}")

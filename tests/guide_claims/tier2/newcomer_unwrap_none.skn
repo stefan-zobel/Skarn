@@ -1,0 +1,5 @@
+// CLAIM: newcomer diagnostics -- `unwrap` on None aborts with a located message.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail called unwrap on None
+let o: Option[Int] = None
+println(o.unwrap())

@@ -1,0 +1,5 @@
+// CLAIM: structs compare structurally — equal fields => equal.
+// GUIDE: Comparison and equality (e5)
+// EXPECT: ok true
+struct Point { x: Int, y: Int }
+println(Point { x: 1, y: 2 } == Point { x: 1, y: 2 })

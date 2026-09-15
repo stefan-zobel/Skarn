@@ -1,0 +1,9 @@
+// CLAIM: Skarn has NO truthiness -- an `if` condition must be Bool, never an Int coerced to one.
+// GUIDE: SkarnGuide.md 5 (Boolean logic); docs/Compiler.md "No truthiness"
+// EXPECT: fail expected Bool, found Int
+
+fn f(n: Int) -> Int {
+    if n { 1 } else { 0 }
+}
+
+println(toString(f(3)))

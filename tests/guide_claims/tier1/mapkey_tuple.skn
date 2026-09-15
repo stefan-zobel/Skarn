@@ -1,0 +1,5 @@
+// CLAIM: a tuple cannot be a map key (a heap value; its pointer is not GC-stable).
+// GUIDE: Maps / hash identity
+// EXPECT: fail cannot be a map key
+let m: Map[(Int, Int), Int] = #{}
+println(1)

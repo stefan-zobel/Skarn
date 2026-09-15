@@ -1,0 +1,10 @@
+// CLAIM:  Vec via vec()/push/len/index; Map via #{}, m[k] = v, and get -> Option.
+// GUIDE:  SkarnIn30Minutes.md 8 (Collections)
+// EXPECT: ok 3 20 36
+let mut xs: Vec[Int] = vec()
+push(xs, 10)  push(xs, 20)  push(xs, 30)
+let mut ages: Map[String, Int] = #{}
+ages["Ada"] = 36
+ages["Bo"]  = 29
+let found = match get(ages, "Ada") { Some(a) => a, None => -1 }
+println("${len(xs)} ${xs[1]} ${found}")

@@ -1,0 +1,7 @@
+// CLAIM: the orphan rule — an impl needs the trait OR the type local to its module.
+// GUIDE: §Modules / orphan rule
+// EXPECT: fail orphan impl
+import traits
+use traits::Loud
+impl Loud for Int { fn loud(self) -> String { "N" } }
+println(1)

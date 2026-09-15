@@ -1,0 +1,3 @@
+// Support module (no EXPECT directive): the constants the entry program's range bounds name.
+pub const MIN: Int = 10
+pub const MAX: Int = 50

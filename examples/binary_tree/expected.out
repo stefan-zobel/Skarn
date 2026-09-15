@@ -1,0 +1,20 @@
+size 10, height 4, smallest 20
+in order: [20, 30, 35, 40, 45, 50, 60, 65, 70, 80]
+        80
+    70
+            65
+        60
+50
+            45
+        40
+            35
+    30
+        20
+
+after inserting 55 (and 30 again): size 11; the original still has 10
+  35: in original true, in bigger true
+  55: in original false, in bigger true
+  99: in original false, in bigger false
+
+6 distinct words: apple < banana < cherry < fig < kiwi < pear
+first: apple

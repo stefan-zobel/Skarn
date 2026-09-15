@@ -1,0 +1,4 @@
+// CLAIM: len(String) is the BYTE length (UTF-8), not code-point count.
+// GUIDE: §Strings (byte strings)
+// EXPECT: ok 6
+println(len("héllo"))

@@ -1,0 +1,17 @@
+// CLAIM: a range-pattern bound may be the NAME of a const, mixed freely with literal bounds, and it
+//        denotes exactly the value the const holds.
+// GUIDE: SkarnGuide.md 13 (Range patterns -> Named bounds)
+// EXPECT: ok minor working retired
+
+const MIN_AGE: Int = 18
+const MAX_AGE: Int = 65
+
+fn bracket(age: Int) -> String {
+    match age {
+        0..<MIN_AGE      => "minor",
+        MIN_AGE..MAX_AGE => "working",
+        _                => "retired"
+    }
+}
+
+println(bracket(17) + " " + bracket(30) + " " + bracket(70))

@@ -1,0 +1,130 @@
+// todo_json -- a small todo list that is saved to and loaded from a JSON file.
+//
+// Shows: an inherent `impl` with an associated constructor and `mut self` methods, building and
+// reading std::json documents, file I/O with `Result` + `?`, and `if let`.
+
+use std::io::*
+use std::json::*
+
+struct Todo { id: Int, title: String, done: Bool }
+
+struct TodoList { items: Vec[Todo], nextId: Int }
+
+impl TodoList {
+    fn new() -> TodoList { TodoList { items: vec(), nextId: 1 } }
+
+    fn add(mut self, title: String) -> Int {
+        let id = self.nextId
+        push(self.items, Todo { id, title, done: false })
+        self.nextId = id + 1
+        id
+    }
+
+    // Mark a todo as done; `false` if there is no todo with that id.
+    fn complete(mut self, id: Int) -> Bool {
+        let mut i = 0
+        while i < len(self.items) {
+            if self.items[i].id == id {
+                self.items[i] = Todo { done: true, ..self.items[i] }
+                return true
+            }
+            i = i + 1
+        }
+        false
+    }
+
+    fn openCount(self) -> Int {
+        self.items |> intoIter |> filter(fn(t: Todo) -> Bool { !t.done }) |> count
+    }
+
+    fn toJson(self) -> Json {
+        let mut arr: Vec[Json] = vec()
+        for t in self.items {
+            let mut fields: Vec[JsonEntry] = vec()
+            push(fields, JsonEntry { key: "id", val: Json::Integer(t.id) })
+            push(fields, JsonEntry { key: "title", val: Json::Text(t.title) })
+            push(fields, JsonEntry { key: "done", val: Json::Boolean(t.done) })
+            push(arr, Json::Obj(fields))
+        }
+        let mut top: Vec[JsonEntry] = vec()
+        push(top, JsonEntry { key: "nextId", val: Json::Integer(self.nextId) })
+        push(top, JsonEntry { key: "items", val: Json::Arr(arr) })
+        Json::Obj(top)
+    }
+
+    fn fromJson(doc: Json) -> Result[TodoList, String] {
+        let mut list = TodoList::new()
+        list.nextId = intField(doc, "nextId")?
+        let items = match doc.getField("items") {
+            Some(Json::Arr(xs)) => xs,
+            _                   => return Err("'items' must be an array"),
+        }
+        for item in items {
+            let id = intField(item, "id")?
+            let title = okOr(optionAndThen(item.getField("title"), fn(j: Json) -> Option[String] { j.asStr() }),
+                             "todo #${id}: 'title' must be a string")?
+            let done = okOr(optionAndThen(item.getField("done"), fn(j: Json) -> Option[Bool] { j.asBool() }),
+                            "todo #${id}: 'done' must be a boolean")?
+            push(list.items, Todo { id, title, done })
+        }
+        Ok(list)
+    }
+}
+
+fn intField(j: Json, key: String) -> Result[Int, String] {
+    match j.getField(key) {
+        Some(v) => okOr(v.asInt(), "'${key}' must be an integer"),
+        None    => Err("missing field '${key}'"),
+    }
+}
+
+fn show(list: TodoList) -> () {
+    for t in list.items {
+        let mark = if t.done { "x" } else { " " }
+        println("  [${mark}] #${t.id} ${t.title}")
+    }
+    println("  ${list.openCount()} open")
+}
+
+fn save(list: TodoList, path: String) -> Result[(), String] {
+    writeTextFile(path, list.toJson().stringifyPretty(2))
+}
+
+fn load(path: String) -> Result[TodoList, String] {
+    let text = readTextFile(path)?
+    let doc = Json::parse(text)?
+    TodoList::fromJson(doc)
+}
+
+fn run() -> Result[(), String] {
+    let path = "todos.json"
+
+    let mut list = TodoList::new()
+    list.add("write the parser")
+    list.add("add error messages")
+    let tests = list.add("run the tests")
+    list.complete(tests)
+    println("before saving:")
+    show(list)
+
+    save(list, path)?
+    println("saved ${len(readTextFile(path)?)} bytes to ${path}")
+
+    let mut again = load(path)?
+    again.add("write the README")
+    again.complete(1)
+    if !again.complete(99) { println("there is no todo #99") }
+    println("after loading and editing:")
+    show(again)
+
+    if let Some(first) = get(again.items, 0) {
+        println("first todo: ${first.title} (done: ${first.done})")
+    }
+    let _ = deleteFile(path)
+    Ok(())
+}
+
+match run() {
+    Ok(_)  => {},
+    Err(e) => println("error: ${e}"),
+}

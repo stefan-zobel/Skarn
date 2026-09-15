@@ -1,0 +1,6 @@
+// CLAIM: newcomer diagnostics -- assigning to a captured variable inside a lambda explains by-value capture.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail it is captured by value
+let mut total = 0
+let add = fn(x: Int) -> () { total = total + x }
+add(1)

@@ -1,0 +1,13 @@
+// CLAIM: when the bounds are only known at run time, the GUARD is the way to say it -- the guide
+//        offers this in place of an expression range bound, so it has to actually work.
+// GUIDE: SkarnGuide.md 13 (Range patterns -> Named bounds)
+// EXPECT: ok true false
+
+fn inBand(n: Int, lo: Int, hi: Int) -> Bool {
+    match n {
+        k if k >= lo && k <= hi => true,
+        _                       => false
+    }
+}
+
+println("${inBand(5, 1, 9)} ${inBand(50, 1, 9)}")

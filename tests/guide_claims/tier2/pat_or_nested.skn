@@ -1,0 +1,9 @@
+// CLAIM: or-patterns nest. Inside a constructor the `|` needs no parentheses (the `)` delimits
+//        it), and the alternatives still COMPLETE the signature -- so no wildcard is required.
+// GUIDE: §Patterns (or-patterns)
+// EXPECT: ok 1 0 -1
+enum Colour { Red, Green, Blue }
+fn warm(c: Option[Colour]) -> Int {
+    match c { Some(Red | Green) => 1, Some(Blue) => 0, None => -1 }
+}
+println(toString(warm(Some(Green))) + " " + toString(warm(Some(Blue))) + " " + toString(warm(None)))

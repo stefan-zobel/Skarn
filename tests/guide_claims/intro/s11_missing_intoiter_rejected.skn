@@ -1,0 +1,8 @@
+// CLAIM:  A container is NOT an iterator -- omitting intoIter is a compile error.
+// GUIDE:  SkarnIn30Minutes.md 11 (Pipelines: iterators)
+// EXPECT: fail expected dyn std::iter::Iterator
+fn even(n: Int) -> Bool { n % 2 == 0 }
+let mut xs: Vec[Int] = vec()
+push(xs, 1)  push(xs, 2)
+let kept = xs |> filter(even) |> toVec
+println(toString(kept))

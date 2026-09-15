@@ -1,0 +1,8 @@
+// CLAIM:  Absence is Option[T]; Some/None are matched like any enum.
+// GUIDE:  SkarnIn30Minutes.md 7 (Option, Result, ?)
+// EXPECT: ok got 5
+fn half(n: Int) -> Option[Int] { if n % 2 == 0 { Some(n / 2) } else { None } }
+match half(10) {
+  Some(v) => println("got ${v}"),
+  None    => println("odd"),
+}

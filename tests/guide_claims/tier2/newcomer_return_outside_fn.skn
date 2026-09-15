@@ -1,0 +1,6 @@
+// CLAIM: newcomer diagnostics -- `return` at the top level is rejected instead of crashing the VM.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail 'return' outside of a function
+println(1)
+return
+println(2)

@@ -13,19 +13,20 @@ static_vmrun.exe hello.skn
 ```
 
 Every example on this page is executed by the project's test harness, so what you read here is what the
-compiler actually does.
+compiler actually does: a `// => ...` comment is a line the program prints, and a block that has them prints
+exactly those lines (text after two spaces and a `(` is a remark).
 
 ---
 
 ## 1. Hello, bindings, and comments
 
-```rust
-println("Hello, Skarn!")
+```rust group=basics
+println("Hello, Skarn!")     // => Hello, Skarn!
 
 let x = 41           // a line comment
 let mut n = 0        // opt into mutation with `mut`
 n = x + 1
-println("n = ${n}")  // string interpolation: n = 42
+println("n = ${n}")  // => n = 42   (string interpolation)
 
 /* block comments
    span lines */
@@ -41,10 +42,10 @@ where a `Double` is expected is widened for you, but you write the `.0` on a dou
 
 ```rust
 let count: Int = 10
-let ratio: Double = 3.0 / 4.0     // => 0.75
+let ratio: Double = 3.0 / 4.0     // 0.75
 let ok: Bool = count > 5
 let name: String = "Ada"
-println("${name}: ${count}, ${ratio}, ${ok}")
+println("${name}: ${count}, ${ratio}, ${ok}")   // => Ada: 10, 0.75, true
 ```
 
 Strings are text you print and concatenate with `+`; `"...${expr}..."` interpolates any value.
@@ -59,7 +60,7 @@ fn greet(who: String) -> () {     // `-> ()` means "returns nothing useful"
 }
 
 println(add(2, 3))   // => 5
-greet("Ada")
+greet("Ada")         // => hi, Ada
 ```
 
 The **last expression is the return value** — no `return` keyword needed for it (though `return` exists for
@@ -67,18 +68,25 @@ early exits). Parameter and return types are always written out; types *inside* 
 
 ## 4. Control flow (it is all expressions)
 
-```rust
+```rust group=basics
 let sign = if n > 0 { "pos" } else if n < 0 { "neg" } else { "zero" }
+println(sign)         // => pos
 
 let mut i = 0
 while i < 3 {
   println("i = ${i}")
   i = i + 1
 }
+// => i = 0
+// => i = 1
+// => i = 2
 
 for c in "abc" {      // NOTE: iterating a String yields BYTES (Int 0..255), not characters
-  println(c)          // => 97, 98, 99
+  println(c)
 }
+// => 97
+// => 98
+// => 99
 ```
 
 Because `if` is an expression, you assign its result directly — there is no ternary `?:`. For text you almost
@@ -167,6 +175,9 @@ push(xs, 10)  push(xs, 20)  push(xs, 30)
 println(len(xs))     // => 3
 println(xs[1])       // => 20
 for v in xs { println(v) }
+// => 10
+// => 20
+// => 30
 
 // A map (hash keys: Int / Double / Bool / String).
 let mut ages: Map[String, Int] = #{}
@@ -200,11 +211,17 @@ println(slice("hello world", 0, 5))   // => hello
 println(toUpper("abc"))               // => ABC
 
 for field in split(trim(raw), ",") {
-  println("[" + trim(field) + "]")    // => [Ada]  [36]  [Berlin]
+  println("[" + trim(field) + "]")
 }
+// => [Ada]
+// => [36]
+// => [Berlin]
 
 let doc = "one\ntwo\nthree"
-for ln in lines(doc) { println(ln) }  // => one  two  three
+for ln in lines(doc) { println(ln) }
+// => one
+// => two
+// => three
 ```
 
 `split` and `lines` are **lazy** — they hand back an iterator, which is exactly what `for` wants. To keep the
@@ -227,8 +244,8 @@ You will see all three, so know the split up front:
 ```rust
 fn twice(n: Int) -> Int { n * 2 }
 
-let a = twice(5)        // ordinary call
-let b = 5 |> twice      // the PIPE: same call, reads left-to-right; great for chains
+println(twice(5))       // => 10   (ordinary call)
+println(5 |> twice)     // => 10   (the PIPE: same call, reads left-to-right; great for chains)
 ```
 
 - The **pipe `|>`** threads a value into any free function: `x |> f |> g` is `g(f(x))`.
@@ -284,19 +301,19 @@ println(toString(sorted(words)))   // => ["a", "b", "c"]
 
 One `.skn` file is one **module**. Only items marked `pub` leave it; everything else is private to the file.
 
-```rust
+```rust group=geo file=geo.skn
 // geo.skn
 pub fn manhattan(x: Int, y: Int) -> Int { x + y }
 fn helper() -> Int { 1 }                          // private to geo
 ```
 
-```rust
+```rust group=geo
 // main.skn
 import geo               // load the module (geo.skn, next to this file)
 use geo::manhattan       // bring one name into scope unqualified
 
 println(manhattan(3, 4))       // => 7
-println(geo::manhattan(3, 4))  // or reach it qualified, without the `use`
+println(geo::manhattan(3, 4))  // => 7   (or reach it qualified, without the `use`)
 ```
 
 The same mechanism governs the **standard library**, and this is the part worth knowing before you need it.
@@ -316,14 +333,15 @@ println(sqrt(9.0))   // => 3.0
 Without that `use`, the same line does not compile — and the error names the module you are missing:
 
 ```
-error: native 'sqrt' requires `use std::math::*`
+error: native 'sqrt' requires `use std::math::*` or `use std::math::sqrt`
 error: unknown variable 'readTextFile'; it is in 'std::io' -- add `use std::io::*`
 error: unknown type 'DateTime'; it is in 'std::time' -- add `use std::time::*`
 ```
 
 That hint appears for functions, types, and traits alike, and for your own modules as well as `std` (where it
 tells you to `import` the module too, if you have not). It is only ever offered for a name some module really
-does export — a genuine typo stays a plain "unknown", with nothing invented.
+does export — a genuine typo stays a plain "unknown", with nothing invented. The glob is not the only way in:
+`use std::math::sqrt` brings in just that one name, exactly as for anything you import from your own modules.
 
 ## 13. Files, arguments, and the outside world
 
@@ -358,6 +376,7 @@ let _ = appendTextFile("out.txt", " again")
 println(toString(fileExists("out.txt")))
 
 let argv = toVec(args())                     // the command-line arguments
+println(len(argv))
 match getEnv("PATH") { Some(p) => println(len(p) > 0), None => println("unset") }
 ```
 

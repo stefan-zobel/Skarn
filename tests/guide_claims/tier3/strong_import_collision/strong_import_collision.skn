@@ -1,0 +1,8 @@
+// CLAIM: two explicit `use`s of the same name are a hard error (two strong bindings).
+// GUIDE: §Modules (binding precedence)
+// EXPECT: fail conflicting import
+import a
+import b
+use a::foo
+use b::foo
+println(foo())

@@ -1,0 +1,8 @@
+// CLAIM: a concrete impl wins over a blanket impl[T] Tr for T.
+// GUIDE: §16 (blanket impls)
+// EXPECT: ok concrete
+trait Nm { fn nm(self) -> String }
+impl[T] Nm for T { fn nm(self) -> String { "generic" } }
+struct P { k: Int }
+impl Nm for P { fn nm(self) -> String { "concrete" } }
+println(P { k: 1 }.nm())

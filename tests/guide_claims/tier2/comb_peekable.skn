@@ -1,0 +1,5 @@
+// CLAIM: peekable gives a cursor whose .peek() looks ahead without consuming (needs `let mut`).
+// GUIDE: §19 combinators
+// EXPECT: ok 1
+let mut p = range(1, 4) |> peekable
+println(match p.peek() { Some(x) => x, None => -1 })

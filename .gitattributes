@@ -1,1 +1,8 @@
 *.skn linguist-language=Rust
+
+# Normalize all text files to LF in the repo, but use CRLF on Windows checkout
+* text=auto
+
+# Explicitly ensure .cpp, .h and .cs files always use CRLF locally
+*.h text eol=crlf
+*.cpp text eol=crlf

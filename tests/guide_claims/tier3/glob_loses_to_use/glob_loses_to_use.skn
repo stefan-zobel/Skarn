@@ -1,0 +1,8 @@
+// CLAIM: an explicit `use` beats a glob for the same name (glob is weak).
+// GUIDE: §Modules (binding precedence)
+// EXPECT: ok 2
+import a
+import b
+use a::*
+use b::foo
+println(foo())

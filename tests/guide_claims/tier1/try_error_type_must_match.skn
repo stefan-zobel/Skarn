@@ -1,0 +1,13 @@
+// CLAIM: `?` propagates the ORIGINAL error and does NOT convert it -- the inner error type must match
+//        the function's. There is no From/Into bridging.
+// GUIDE: SkarnGuide.md 18 (The ? operator); docs/Compiler.md "Errors"
+// EXPECT: fail error type
+
+fn inner() -> Result[Int, Int] { Err(7) }
+
+fn outer() -> Result[Int, String] {
+    let v = inner()?
+    Ok(v)
+}
+
+println(toString(isOk(outer())))

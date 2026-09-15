@@ -1,0 +1,10 @@
+// CLAIM:  "leave a case out and the program does not compile".
+// GUIDE:  SkarnIn30Minutes.md 6 (Enums and match)
+// EXPECT: fail exhaustive
+enum Shape { Circle(Double), Rect(Double, Double), }
+fn area(s: Shape) -> Double {
+  match s {
+    Circle(r) => 3.14159 * r * r,
+  }
+}
+println(area(Circle(1.0)))

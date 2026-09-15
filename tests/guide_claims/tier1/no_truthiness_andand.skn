@@ -1,0 +1,10 @@
+// CLAIM: both operands of `&&` must be Bool -- they are NOT truthiness-coerced, and the lowering emits
+//        no TO_BOOL.
+// GUIDE: SkarnGuide.md 5 (Boolean logic); docs/Compiler.md "No truthiness"
+// EXPECT: fail expected Bool, found Int
+
+fn f(b: Bool, n: Int) -> Bool {
+    b && n
+}
+
+println(toString(f(true, 1)))

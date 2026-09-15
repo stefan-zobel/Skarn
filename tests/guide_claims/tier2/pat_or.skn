@@ -1,0 +1,5 @@
+// CLAIM: top-level or-patterns A | B | C share one arm body.
+// GUIDE: §Patterns (or-patterns)
+// EXPECT: ok small
+let x = 2
+println(match x { 1 | 2 | 3 => "small", _ => "big" })

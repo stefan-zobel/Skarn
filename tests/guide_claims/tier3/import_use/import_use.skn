@@ -1,0 +1,7 @@
+// CLAIM: `import` loads a module; `use mod::name` brings a name in bare.
+// GUIDE: §Modules (import / use)
+// EXPECT: ok 5
+import geo
+use geo::mag2
+use geo::Point
+println(mag2(Point { x: 1, y: 2 }))

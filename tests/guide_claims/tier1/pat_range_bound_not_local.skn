@@ -1,0 +1,17 @@
+// CLAIM: a bound names a CONSTANT, so a local binding of the same name is rejected rather than
+//        silently ignored in favour of the const -- pattern scoping never disagrees with expression
+//        scoping about what a name means.
+// GUIDE: SkarnGuide.md 13 (Range patterns -> Named bounds)
+// EXPECT: fail is a local binding
+
+const lo: Int = 3
+
+fn f(x: Int) -> Int {
+    let lo = 99
+    match x {
+        lo..7 => 1,
+        _     => 0
+    }
+}
+
+println(toString(f(5)))

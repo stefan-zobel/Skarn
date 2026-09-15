@@ -1,0 +1,5 @@
+// CLAIM: a String is not indexable with s[i] (bytes via toBytes(s)[i] / charAt).
+// GUIDE: Strings
+// EXPECT: fail cannot index a value of type String
+let s = "hi"
+println(s[0])

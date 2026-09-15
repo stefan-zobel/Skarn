@@ -1,0 +1,25 @@
+> look
+  You are in the hall. A locked door leads east.
+> go north
+  You go north to the library.
+> take book
+  Taken: book.
+> go east
+  You cannot go east from the library.
+> go south
+  You go south to the hall.
+> go down
+  You go down to the cellar.
+> take key
+  Taken: key.
+> take key
+  You already carry the key.
+> dance
+  I do not understand 'dance'.
+> go up
+  You go up to the hall.
+> use key
+  The key turns. The east door opens.
+> go east
+You step into the garden. You win in 12 moves!
+You carry: book, key

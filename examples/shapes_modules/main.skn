@@ -1,0 +1,31 @@
+// shapes_modules -- a program split into modules: `geometry/shapes.skn` defines the types,
+// `report.skn` formats them, and this file wires them together.
+//
+// Shows: `import` of a nested module path, `use` of selected names, `pub` vs private items,
+// associated constructors reached through a module, trait objects in a `Vec[dyn Shape]`,
+// and a constructor that can fail.
+
+import geometry::shapes
+import report
+use geometry::shapes::{Shape, Circle, Rect, Triangle}
+use report::share            // `table` stays qualified below, to show both forms
+
+let mut items: Vec[dyn Shape] = vec()
+push(items, Circle::new(1.5))
+push(items, Rect::new(4.0, 2.5))
+push(items, Rect::square(3.0))
+
+for sides in [(3.0, 4.0, 5.0), (1.0, 2.0, 8.0), (2.0, 2.0, 2.0)] {
+    let (a, b, c) = sides
+    match Triangle::new(a, b, c) {
+        Ok(t)  => push(items, t),
+        Err(e) => println("skipped a triangle: ${e}"),
+    }
+}
+println()
+
+let totals = report::table(items)
+println("${totals.count} shapes, total area ${totals.area:.2f}, largest: ${totals.largest}")
+println()
+println("share of the total area:")
+share(items, totals)

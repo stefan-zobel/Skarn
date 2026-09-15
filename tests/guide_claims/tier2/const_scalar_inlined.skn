@@ -1,0 +1,5 @@
+// CLAIM: a scalar const is compile-time inlined at each use.
+// GUIDE: §const item
+// EXPECT: ok 101
+const MAX: Int = 100
+println(MAX + 1)

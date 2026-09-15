@@ -1,0 +1,4 @@
+// CLAIM: bare None == None has an UNBOUNDED element type param, so it is NOT comparable (needs a concrete/annotated element type — see eq_none_typed).
+// GUIDE: Comparison and equality (an unbounded type parameter is not Eq)
+// EXPECT: fail does not support
+println(None == None)

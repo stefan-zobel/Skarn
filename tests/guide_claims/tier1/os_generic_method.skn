@@ -1,0 +1,6 @@
+// CLAIM: a trait with a generic method is not object-safe.
+// GUIDE: Traits / object safety
+// EXPECT: fail method 'g' is generic
+trait GenM { fn g[U](self, u: U) -> U }
+fn take(x: dyn GenM) -> Int { 0 }
+println(1)

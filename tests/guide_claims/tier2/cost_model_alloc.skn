@@ -1,0 +1,22 @@
+// CLAIM (§25 cost model): a lazy tuple-yielding combinator (enumerate) allocates an Option+tuple per
+// element, while `for (k, v) in m` over a map is a ZERO-ALLOC fast path. Measured via gcStats():
+// over 50 elements the map fast path stays ~O(1) objects; enumerate allocates >100.
+// GUIDE: §25 (When do you allocate?) + §19 (enumerate/zip note)
+// EXPECT: ok true
+let mut m: Map[Int, Int] = #{}
+let mut i = 0
+while i < 50 { m[i] = i * 2  i = i + 1 }
+let v = toVec(collect(range(0, 50)))
+
+gcResetStats()
+let mut a = 0
+for (k, val) in m { a = a + k + val }
+let fast = gcStats().objectsAlloced
+
+gcResetStats()
+let mut b = 0
+for (idx, _x) in enumerate(intoIter(v)) { b = b + idx }
+let heavy = gcStats().objectsAlloced
+
+// map fast path is ~O(1); enumerate is ~O(n) with a tuple+Option per element.
+println(fast < 10.0 && heavy > 100.0)

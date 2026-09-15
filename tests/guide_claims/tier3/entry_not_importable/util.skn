@@ -1,0 +1,2 @@
+// Support module (no EXPECT directive): reaches for a name the entry program defines.
+pub fn callsEntry() -> Int { entryOnly() }

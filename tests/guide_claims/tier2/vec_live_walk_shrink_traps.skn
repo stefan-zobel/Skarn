@@ -1,0 +1,11 @@
+// CLAIM:  `pop`ping a Vec BELOW the loop's current position mid-`for x in v` makes the next read a DEFINED,
+//         located "array index out of bounds" abort -- never UB or silent corruption. (Eliminates "probably".)
+// GUIDE:  14 (Growable vectors: the live-walk mutation guarantee)
+// EXPECT: fail array index out of bounds
+let mut v = toVec([10, 20, 30, 40, 50])
+let mut cnt = 0
+for x in v {
+    cnt = cnt + 1
+    if cnt == 2 { pop(v)  pop(v)  pop(v) }   // len 5 -> 2 while the cursor is at index ~2
+}
+println("unreachable cnt=" + cnt)

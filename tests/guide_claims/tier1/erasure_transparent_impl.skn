@@ -1,0 +1,7 @@
+// CLAIM: a transparent (newtype) struct erases and cannot implement a trait.
+// GUIDE: Representation erasure
+// EXPECT: fail cannot implement trait
+trait Greet { fn greet(self) -> String }
+transparent struct UserId(Int)
+impl Greet for UserId { fn greet(self) -> String { "u" } }
+println(1)

@@ -1,0 +1,5 @@
+// CLAIM: a trait method can be called as a free function or with method syntax -- also a standard-library trait method (`Unwrap`) reached ONLY through `o.unwrapOr(0)`.
+// GUIDE: SkarnGuide.md 16 (Calling a trait method)
+// EXPECT: ok 5
+let o: Option[Int] = Some(5)
+println(o.unwrapOr(0))

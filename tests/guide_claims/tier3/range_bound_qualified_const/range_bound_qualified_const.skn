@@ -1,0 +1,20 @@
+// CLAIM: a range-pattern bound may name a `pub const` of an imported module, written qualified
+//        (`limits::MIN`) or brought in bare with `use` -- both denote the module's value.
+// GUIDE: SkarnGuide.md 13 (Range patterns -> Named bounds)
+// EXPECT: ok low ok high | 2
+import limits
+use limits::MAX
+
+fn band(n: Int) -> String {
+    match n {
+        0..<limits::MIN => "low",
+        limits::MIN..MAX => "ok",
+        _ => "high"
+    }
+}
+
+// One range whose two bounds use the two different spellings -- qualified and `use`-imported --
+// which is what proves both resolve to the same module's constants.
+fn count(n: Int) -> Int { match n { limits::MIN..MAX => 1, _ => 2 } }
+
+println(band(3) + " " + band(20) + " " + band(99) + " | " + toString(count(500)))

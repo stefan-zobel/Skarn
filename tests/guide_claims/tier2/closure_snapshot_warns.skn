@@ -1,0 +1,8 @@
+// CLAIM: rebinding a `mut` binding that a let-bound lambda captured produces an advisory WARNING
+// (the lambda kept the snapshot taken at creation). Advisory only -- exit 0, the program still runs.
+// GUIDE: §10 closures ("what 'by value' precisely means")
+// EXPECT: warn reassigned after a lambda captured it
+let mut counter = 0
+let peek = fn() -> Int { counter }
+counter = 10
+println(peek())

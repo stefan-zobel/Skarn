@@ -1,0 +1,139 @@
+// priority_queue -- a generic binary min-heap, used for a task scheduler and for Dijkstra's shortest paths.
+//
+// Shows: a generic struct with an inherent `impl[T: Ord]`, `mut self` methods, implementing the
+// `Ord` trait for your own type, tuples, `Option` returns, and `while let` draining a queue.
+
+struct Heap[T] { items: Vec[T] }
+
+impl[T: Ord] Heap[T] {
+    fn new() -> Heap[T] { Heap { items: vec() } }
+
+    fn size(self) -> Int { len(self.items) }
+
+    fn push(mut self, x: T) -> () {
+        push(self.items, x)
+        let mut i = len(self.items) - 1
+        while i > 0 {
+            let parent = (i - 1) / 2
+            if !self.items[i].lessThan(self.items[parent]) { break }
+            self.swap(i, parent)
+            i = parent
+        }
+    }
+
+    fn pop(mut self) -> Option[T] {
+        let n = len(self.items)
+        if n == 0 { return None }
+        self.swap(0, n - 1)
+        let top = pop(self.items)
+        let mut i = 0
+        loop {
+            let l = 2 * i + 1
+            let r = l + 1
+            let mut smallest = i
+            if l < n - 1 && self.items[l].lessThan(self.items[smallest]) { smallest = l }
+            if r < n - 1 && self.items[r].lessThan(self.items[smallest]) { smallest = r }
+            if smallest == i { break }
+            self.swap(i, smallest)
+            i = smallest
+        }
+        top
+    }
+
+    fn swap(mut self, a: Int, b: Int) -> () {
+        let t = self.items[a]
+        self.items[a] = self.items[b]
+        self.items[b] = t
+    }
+}
+
+// ---- 1. a task scheduler: lower priority number first, then earlier arrival ----
+
+struct Task { priority: Int, seq: Int, name: String }
+
+impl Ord for Task {
+    fn lessThan(self, other: Task) -> Bool {
+        if self.priority != other.priority { self.priority < other.priority } else { self.seq < other.seq }
+    }
+}
+
+let mut tasks: Heap[Task] = Heap::new()
+let incoming = [(3, "write report"), (1, "fix production bug"), (2, "review pull request"),
+                (3, "update wiki"), (1, "answer pager"), (2, "plan sprint")]
+let mut seq = 0
+for (p, name) in incoming {
+    tasks.push(Task { priority: p, seq, name })
+    seq += 1
+}
+println("${tasks.size()} tasks queued:")
+while let Some(t) = tasks.pop() {
+    println("  p${t.priority}  ${t.name}")
+}
+
+// ---- 2. Dijkstra over a small road map ----
+
+struct Edge { to: String, km: Int }
+
+fn road(mut g: Map[String, Vec[Edge]], a: String, b: String, km: Int) -> () {
+    push(getOrPut(g, a, vec()), Edge { to: b, km })
+    push(getOrPut(g, b, vec()), Edge { to: a, km })
+}
+
+// A queue entry: the distance so far and the town, ordered by distance (then by name, for a stable order).
+struct Visit { dist: Int, town: String }
+impl Ord for Visit {
+    fn lessThan(self, other: Visit) -> Bool {
+        if self.dist != other.dist { self.dist < other.dist } else { self.town < other.town }
+    }
+}
+
+fn shortest(g: Map[String, Vec[Edge]], from: String) -> (Map[String, Int], Map[String, String]) {
+    let mut dist: Map[String, Int] = #{}
+    let mut prev: Map[String, String] = #{}
+    let mut queue: Heap[Visit] = Heap::new()
+    dist[from] = 0
+    queue.push(Visit { dist: 0, town: from })
+    while let Some(v) = queue.pop() {
+        if v.dist > getOr(dist, v.town, v.dist) { continue }    // a stale entry
+        for e in getOr(g, v.town, vec()) {
+            let d = v.dist + e.km
+            if !has(dist, e.to) || d < dist[e.to] {
+                dist[e.to] = d
+                prev[e.to] = v.town
+                queue.push(Visit { dist: d, town: e.to })
+            }
+        }
+    }
+    (dist, prev)
+}
+
+fn route(prev: Map[String, String], to: String) -> String {
+    let mut path: Vec[String] = vec()
+    let mut cur = to
+    push(path, cur)
+    while let Some(p) = get(prev, cur) {
+        push(path, p)
+        cur = p
+    }
+    let mut out: Vec[String] = vec()
+    while let Some(town) = pop(path) { push(out, town) }
+    join(out |> intoIter, " -> ")
+}
+
+let mut roads: Map[String, Vec[Edge]] = #{}
+road(roads, "Aston", "Brill", 7)
+road(roads, "Aston", "Cobb", 9)
+road(roads, "Aston", "Fenn", 14)
+road(roads, "Brill", "Cobb", 10)
+road(roads, "Brill", "Dale", 15)
+road(roads, "Cobb", "Dale", 11)
+road(roads, "Cobb", "Fenn", 2)
+road(roads, "Dale", "Eske", 6)
+road(roads, "Eske", "Fenn", 9)
+
+let (dist, prev) = shortest(roads, "Aston")
+println()
+println("shortest routes from Aston:")
+for town in sorted(toVec(keys(dist))) {
+    println("  ${town:<6} ${dist[town]:>3} km  ${route(prev, town)}")
+}

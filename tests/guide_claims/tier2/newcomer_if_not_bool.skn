@@ -1,0 +1,5 @@
+// CLAIM: newcomer diagnostics -- an `if` condition must be a Bool (no truthiness).
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail expected Bool, found Int
+let n = 3
+if n { println("yes") }

@@ -1,0 +1,114 @@
+// bank_account -- accounts, transfers and an audit log, with every failure as a typed error value.
+//
+// Shows: an error enum carried in `Result`, `?` chaining several fallible steps, an inherent `impl`
+// with `mut self`, a Map of structs, a trait implemented for the error type, and `match` on errors.
+
+enum BankError {
+    NoSuchAccount(String),
+    InsufficientFunds { account: String, needed: Int, available: Int },
+    InvalidAmount(Int),
+    SameAccount,
+}
+
+trait Describe { fn describe(self) -> String }
+
+impl Describe for BankError {
+    fn describe(self) -> String {
+        match self {
+            NoSuchAccount(id) => "no account '${id}'",
+            InsufficientFunds { account, needed, available } =>
+                "account '${account}' needs ${cents(needed)} but has ${cents(available)}",
+            InvalidAmount(a) => "invalid amount ${a}",
+            SameAccount => "cannot transfer to the same account",
+        }
+    }
+}
+
+// Money is kept in cents, so no floating point is involved.
+fn cents(amount: Int) -> String {
+    let sign = if amount < 0 { "-" } else { "" }
+    let a = if amount < 0 { -amount } else { amount }
+    "${sign}${a / 100}.${padStart(toString(a % 100), 2, '0')}"
+}
+
+struct Account { id: String, owner: String, balance: Int }
+
+struct Bank { accounts: Map[String, Account], log: Vec[String] }
+
+impl Bank {
+    fn new() -> Bank { Bank { accounts: #{}, log: vec() } }
+
+    fn open(mut self, id: String, owner: String, deposit: Int) -> Result[(), BankError] {
+        if deposit < 0 { return Err(InvalidAmount(deposit)) }
+        self.accounts[id] = Account { id, owner, balance: deposit }
+        push(self.log, "open ${id} for ${owner} with ${cents(deposit)}")
+        Ok(())
+    }
+
+    fn account(self, id: String) -> Result[Account, BankError] {
+        okOr(get(self.accounts, id), NoSuchAccount(id))
+    }
+
+    fn withdraw(mut self, id: String, amount: Int) -> Result[Int, BankError] {
+        if amount <= 0 { return Err(InvalidAmount(amount)) }
+        let acc = self.account(id)?
+        if acc.balance < amount {
+            return Err(InsufficientFunds { account: id, needed: amount, available: acc.balance })
+        }
+        self.accounts[id] = Account { balance: acc.balance - amount, ..acc }
+        push(self.log, "withdraw ${cents(amount)} from ${id}")
+        Ok(acc.balance - amount)
+    }
+
+    fn deposit(mut self, id: String, amount: Int) -> Result[Int, BankError] {
+        if amount <= 0 { return Err(InvalidAmount(amount)) }
+        let acc = self.account(id)?
+        self.accounts[id] = Account { balance: acc.balance + amount, ..acc }
+        push(self.log, "deposit ${cents(amount)} to ${id}")
+        Ok(acc.balance + amount)
+    }
+
+    // Both accounts are checked before any money moves, so a failed transfer changes nothing.
+    fn transfer(mut self, from: String, to: String, amount: Int) -> Result[(), BankError] {
+        if from == to { return Err(SameAccount) }
+        let _ = self.account(to)?
+        self.withdraw(from, amount)?
+        self.deposit(to, amount)?
+        Ok(())
+    }
+
+    fn total(self) -> Int {
+        self.accounts |> intoIter |> map(fn(e: (String, Account)) -> Int { e.1.balance }) |> sum
+    }
+}
+
+fn report(what: String, r: Result[(), BankError]) -> () {
+    match r {
+        Ok(_)  => println("ok     ${what}"),
+        Err(e) => println("FAILED ${what}: ${e.describe()}"),
+    }
+}
+
+let mut bank = Bank::new()
+report("open alice", bank.open("A-1", "Alice", 120_00))
+report("open bob", bank.open("B-7", "Bob", 15_50))
+report("open broken", bank.open("X-0", "Nobody", -5))
+
+report("alice -> bob 30.00", bank.transfer("A-1", "B-7", 30_00))
+report("bob -> alice 99.99", bank.transfer("B-7", "A-1", 99_99))
+report("alice -> carol 1.00", bank.transfer("A-1", "C-3", 1_00))
+report("bob -> bob 5.00", bank.transfer("B-7", "B-7", 5_00))
+report("alice -> bob 0.00", bank.transfer("A-1", "B-7", 0))
+
+println()
+for id in sorted(toVec(keys(bank.accounts))) {
+    let acc = bank.accounts[id]
+    println("${acc.id}  ${acc.owner:<6} ${cents(acc.balance):>8}")
+}
+println("total  ${cents(bank.total())}")
+
+println()
+println("audit log:")
+for (i, line) in bank.log |> intoIter |> enumerate {
+    println("  ${i + 1}. ${line}")
+}

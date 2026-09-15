@@ -1,0 +1,8 @@
+// CLAIM: `m[k] += 1` aborts when `k` is ABSENT — the read half is the ordinary total-or-trap `m[k]`, so
+//        compound assignment is not the way to build a counter map (that is `getOrPut` / `upsert`).
+// GUIDE: SkarnGuide.md 5 (Compound assignment)
+// EXPECT: fail map key not found
+let mut counts = #{ "a" => 1 }
+counts["a"] += 1        // fine: the key exists
+counts["b"] += 1        // aborts: no such key
+println("${counts["a"]}")

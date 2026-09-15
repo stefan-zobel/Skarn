@@ -1,0 +1,7 @@
+// CLAIM: an integer-backed enum IS a valid map key (synthesized Hashable via its erased Int).
+// GUIDE: Representation erasure; Maps
+// EXPECT: ok 7
+enum Color : Int { Red, Green }
+let mut m: Map[Color, Int] = #{}
+m[Color::Red] = 7
+println(m[Color::Red])

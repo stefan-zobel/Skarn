@@ -1,0 +1,5 @@
+// CLAIM: a tuple pattern destructures in a let binding.
+// GUIDE: §Tuples
+// EXPECT: ok 34
+let (a, b) = (3, 4)
+println(a * 10 + b)

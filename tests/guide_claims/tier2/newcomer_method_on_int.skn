@@ -1,0 +1,5 @@
+// CLAIM: newcomer diagnostics -- a method that does not exist on a type is named.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail type Int has no field or method 'len'
+let n = 5
+println(n.len())

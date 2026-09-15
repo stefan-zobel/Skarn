@@ -1,0 +1,11 @@
+// CLAIM: inlining is a codegen-only transform, but it is VISIBLE in a fault trace: a trap inside an
+//        expanded callee reports the CALL SITE in the enclosing region, and the callee's own frames
+//        are absent. Re-run with `--no-inline` to get the full trace back.
+// GUIDE: SkarnGuide.md (When something goes wrong)
+// EXPECT: fail division by zero at line 10 (in <script>)
+// NOTE: the accepted cost of inlining being on by default. The
+//       position is real source and the file is right; what is lost is the callee frame. Contrast
+//       fault_names_entry_fn.skn, where an indirect call keeps the callee visible.
+fn risky(a: Int, b: Int) -> Int { a / b }
+let t = risky(10, 0)
+println("${t}")

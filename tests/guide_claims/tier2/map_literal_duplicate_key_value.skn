@@ -1,0 +1,8 @@
+// CLAIM: the duplicate-key WARNING changes nothing about the value -- last entry still wins and the
+//        map still holds one entry. The `warn` verb checks stderr only and `ok` checks stdout only, so
+//        the sibling fixture cannot pin this half; without this one, silently turning the warning into
+//        a rejection (or altering the runtime rule) would go unnoticed.
+// GUIDE: SkarnGuide.md 8 (maps: "the last entry wins and the earlier one is simply gone")
+// EXPECT: ok 1 8
+let m: Map[Double, Int] = #{1 => 7, 1.0 => 8}
+println("${len(m)} ${m[1.0]}")

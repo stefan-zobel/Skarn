@@ -1,0 +1,24 @@
+stock:
+  bolt      750
+  brush      25
+  glue       30
+  hammer     12
+  nut       800
+
+shipping:
+  [Urgent]   20 x hammer  BACKORDER
+  [Urgent]    1 x saw     BACKORDER
+  [Normal]  700 x bolt    shipped
+  [Normal]  100 x nut     shipped
+  [Low]      30 x glue    shipped
+
+left in stock: bolt, brush, hammer, nut
+glue sold out: true
+backordered units: 21
+
+metal:          bolt, hammer, nut
+tool:           brush, hammer
+metal and tool: hammer
+metal or tool:  bolt, brush, hammer, nut
+metal, no tool: bolt, nut
+small is metal: true

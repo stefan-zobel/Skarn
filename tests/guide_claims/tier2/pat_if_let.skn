@@ -1,0 +1,5 @@
+// CLAIM: `if let` binds a pattern and runs the then-branch on a match (desugars to a 2-arm match).
+// GUIDE: §Patterns / if let
+// EXPECT: ok 7
+let o = Some(7)
+if let Some(n) = o { println(n) } else { println(-1) }

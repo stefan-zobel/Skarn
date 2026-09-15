@@ -1,0 +1,6 @@
+// CLAIM: chars(s) yields CODE POINTS — "héllo" is 5 (contrast len = 6 bytes).
+// GUIDE: §Char / UTF-8
+// EXPECT: ok 5
+let mut n = 0
+for _c in chars("héllo") { n = n + 1 }
+println(n)

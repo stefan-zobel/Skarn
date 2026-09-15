@@ -1,0 +1,7 @@
+// CLAIM: a map literal that names the same key twice WARNS -- including the case where the two keys
+//        are spelled differently, because in a `Map[Double, ...]` an `Int` key is widened and `1` and
+//        `1.0` are one key. Advisory only: exit 0, the program still runs, last entry wins.
+// GUIDE: SkarnGuide.md 8 (maps: "if a map literal names the same key twice, the last entry wins")
+// EXPECT: warn are the same key once the Int is widened to Double
+let m: Map[Double, Int] = #{1 => 7, 1.0 => 8}
+println(len(m))

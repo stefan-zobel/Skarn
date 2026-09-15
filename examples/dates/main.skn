@@ -1,0 +1,94 @@
+// dates -- date arithmetic with std::time: a project plan with working days, deadlines and a calendar.
+//
+// Shows: validated construction (`dateOnly` -> Option), Instant/Duration arithmetic, ISO-8601
+// parsing and printing, weekdays, leap years, and `?` over `Option` in a helper function.
+
+use std::time::*
+
+fn dayNames() -> Vec[String] { toVec(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]) }
+
+fn date(y: Int, m: Int, d: Int) -> Instant {
+    match dateOnly(y, m, d) {
+        Some(dt) => fromDateTime(dt),
+        None     => panic("invalid date ${y}-${m}-${d}"),
+    }
+}
+
+fn isoDay(t: Instant) -> String { slice(t.toDateTime().toIso(), 0, 10) }
+
+fn dayName(t: Instant) -> String { dayNames()[t.toDateTime().weekday() - 1] }
+
+fn isWorkday(t: Instant) -> Bool { t.toDateTime().weekday() <= 5 }
+
+// Advance by `n` working days, skipping weekends and the given holidays.
+fn addWorkdays(start: Instant, n: Int, holidays: Vec[String]) -> Instant {
+    let mut t = start
+    let mut left = n
+    while left > 0 {
+        t = t.addDuration(days(1))
+        if isWorkday(t) && !(holidays |> intoIter |> contains(isoDay(t))) { left -= 1 }
+    }
+    t
+}
+
+// `?` works on Option too: any invalid part makes the whole result None.
+fn parseDay(s: String) -> Option[Instant] {
+    let parts = s |> split("-") |> collect
+    if len(parts) != 3 { return None }
+    let y = ok(parseInt(parts[0]))?
+    let m = ok(parseInt(parts[1]))?
+    let d = ok(parseInt(parts[2]))?
+    let dt = dateOnly(y, m, d)?
+    Some(fromDateTime(dt))
+}
+
+let holidays = toVec(["2028-03-01", "2028-03-17"])
+let kickoff = date(2028, 2, 24)
+println("kickoff: ${dayName(kickoff)} ${isoDay(kickoff)}  (2028 is a leap year: ${isLeapYear(2028)}, February has ${daysInMonth(2028, 2)} days)")
+
+let phases = [("design", 5), ("build", 12), ("test", 6), ("release", 2)]
+let mut cursor = kickoff
+println()
+println("plan (working days, weekends and holidays skipped):")
+for (name, workdays) in phases {
+    let end = addWorkdays(cursor, workdays, holidays)
+    let span = cursor.durationBetween(end).inDays()
+    println("  ${name:<8} ${dayName(cursor)} ${isoDay(cursor)} -> ${dayName(end)} ${isoDay(end)}  ${workdays:>2} workdays = ${span:>2} calendar days")
+    cursor = end
+}
+
+let deadline = unwrap(parseIso("2028-04-07T17:00:00.000Z"))
+let finish = fromDateTime(deadline)
+println()
+if cursor.isAfter(finish) {
+    println("late by ${finish.durationBetween(cursor).inDays()} days")
+} else {
+    let slack = cursor.durationBetween(finish)
+    println("done ${slack.inDays()} days and ${slack.inHours() % 24} hours before the deadline ${deadline.toIso()}")
+}
+
+println()
+for s in ["2028-02-29", "2027-02-29", "2028-13-01", "next tuesday"] {
+    match parseDay(s) {
+        Some(t) => println("  ${s:<12} is a ${dayName(t)}"),
+        None    => println("  ${s:<12} is not a valid date"),
+    }
+}
+
+// A month calendar, weeks starting on Monday.
+fn calendar(y: Int, m: Int) -> () {
+    let first = date(y, m, 1)
+    println("      ${y}-${padStart(toString(m), 2, '0')}")
+    println(join(dayNames() |> intoIter |> map(fn(d: String) -> String { slice(d, 0, 2) }), " "))
+    let mut sb = stringBuilder()
+    let offset = first.toDateTime().weekday() - 1
+    sb.append(repeatStr("   ", offset))
+    for day in range(1, daysInMonth(y, m) + 1) {
+        sb.append(padStart(toString(day), 2, ' '))
+        if (offset + day) % 7 == 0 { println(sb.build())  sb = stringBuilder() } else { sb.append(" ") }
+    }
+    let last = trimEnd(sb.build())
+    if !isEmpty(last) { println(last) }
+}
+println()
+calendar(2028, 3)

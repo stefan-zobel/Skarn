@@ -1,0 +1,7 @@
+// CLAIM:  `Name { f: v, ..base }` builds a new struct copying the remaining fields from base.
+// GUIDE:  SkarnIn30Minutes.md 5 (Structs)
+// EXPECT: ok 4 4
+struct Point { x: Int, y: Int }
+let p = Point { x: 3, y: 4 }
+let moved = Point { x: p.x + 1, ..p }
+println("${moved.x} ${moved.y}")

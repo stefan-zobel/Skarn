@@ -1,0 +1,7 @@
+// CLAIM: a mut aggregate parameter mutates the caller value in place.
+// GUIDE: mutation rule
+// EXPECT: ok 9
+fn bump(mut v: Vec[Int]) -> () { push(v, 9) }
+let mut v = vec()
+bump(v)
+println(v[0])

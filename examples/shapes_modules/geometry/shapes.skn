@@ -1,0 +1,52 @@
+// geometry::shapes -- the shape types and the trait they share.
+
+use std::math::*
+
+pub trait Shape {
+    fn area(self) -> Double
+    fn perimeter(self) -> Double
+    fn name(self) -> String
+}
+
+pub struct Circle { r: Double }
+pub struct Rect { w: Double, h: Double }
+pub struct Triangle { a: Double, b: Double, c: Double }
+
+impl Circle {
+    fn new(r: Double) -> Circle { Circle { r } }
+}
+
+impl Rect {
+    fn new(w: Double, h: Double) -> Rect { Rect { w, h } }
+    fn square(side: Double) -> Rect { Rect::new(side, side) }
+}
+
+impl Triangle {
+    // A triangle only exists if every side is shorter than the other two together.
+    fn new(a: Double, b: Double, c: Double) -> Result[Triangle, String] {
+        if a <= 0.0 || b <= 0.0 || c <= 0.0 { return Err("sides must be positive") }
+        if a + b <= c || a + c <= b || b + c <= a { return Err("sides ${a}, ${b}, ${c} violate the triangle inequality") }
+        Ok(Triangle { a, b, c })
+    }
+}
+
+impl Shape for Circle {
+    fn area(self) -> Double { PI * self.r * self.r }
+    fn perimeter(self) -> Double { 2.0 * PI * self.r }
+    fn name(self) -> String { "circle r=${self.r}" }
+}
+
+impl Shape for Rect {
+    fn area(self) -> Double { self.w * self.h }
+    fn perimeter(self) -> Double { 2.0 * (self.w + self.h) }
+    fn name(self) -> String { if self.w == self.h { "square ${self.w}" } else { "rect ${self.w}x${self.h}" } }
+}
+
+impl Shape for Triangle {
+    fn area(self) -> Double {                       // Heron's formula
+        let s = self.perimeter() / 2.0
+        sqrt(s * (s - self.a) * (s - self.b) * (s - self.c))
+    }
+    fn perimeter(self) -> Double { self.a + self.b + self.c }
+    fn name(self) -> String { "triangle ${self.a}/${self.b}/${self.c}" }
+}

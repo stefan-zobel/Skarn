@@ -1,0 +1,6 @@
+// CLAIM:  One file = one module; `import` loads it, `use` unqualifies, `mod::name` qualifies.
+// GUIDE:  SkarnIn30Minutes.md 12 (Modules and use)
+// EXPECT: ok 7 7
+import geo
+use geo::manhattan
+println("${manhattan(3, 4)} ${geo::manhattan(3, 4)}")

@@ -1,0 +1,6 @@
+// CLAIM: `use mod::*` glob-imports all public names bare (a WEAK binding).
+// GUIDE: §Modules (glob import)
+// EXPECT: ok hi cy
+import util
+use util::*
+println(greet("cy"))

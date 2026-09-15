@@ -1,0 +1,2 @@
+pub fn greet(name: String) -> String { "hi " + name }
+fn secret() -> Int { 42 }

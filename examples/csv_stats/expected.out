@@ -1,0 +1,11 @@
+12 rows from data.csv
+
+temperature    n=12  min=  -4.3  max=  28.0  mean=  14.98  sd=8.92
+rain           n=12  min=   0.0  max=  99.9  mean=  43.76  sd=38.60
+
+rain per city (wettest first):
+  Lisbon    262.6 mm  *************
+  Oslo      255.7 mm  *************
+  Cairo       6.8 mm
+
+hottest month: Cairo, month 7, 28.0 C

@@ -1,0 +1,107 @@
+// log_analysis -- parse a web-server access log with regular expressions and summarize it.
+//
+//   static_vmrun main.skn <access.log>
+//
+// Shows: std::regex with named capture groups, `?` over `Result`s with different error types
+// (converted with `mapErr`), counting with Maps, `Option` chaining, and a time-bucketed histogram.
+
+use std::env::*
+use std::io::*
+use std::regex::*
+
+struct Hit { ip: String, hour: Int, method: String, path: String, status: Int, bytes: Int }
+
+struct Parser { line: Regex, query: Regex }
+
+impl Parser {
+    fn new() -> Result[Parser, String] {
+        let line = Regex::compile(
+            r#"^(?<ip>\d+\.\d+\.\d+\.\d+) - - \[\d+/\w+/\d+:(?<hour>\d\d):\d\d:\d\d\] "(?<method>[A-Z]+) (?<path>\S+) HTTP/1\.[01]" (?<status>\d{3}) (?<bytes>\d+|-)$"#)
+            |> mapErr(fn(e: RegexError) -> String { "bad line pattern: ${e}" })
+        let query = Regex::compile(r"\?.*$") |> mapErr(fn(e: RegexError) -> String { "bad query pattern: ${e}" })
+        Ok(Parser { line: line?, query: query? })
+    }
+
+    fn parse(self, text: String) -> Option[Hit] {
+        let c = self.line.captures(text)?
+        let field = fn(name: String) -> String { match c.groupNamed(name) { Some(m) => m.text, None => "" } }
+        let bytes = if field("bytes") == "-" { 0 } else { parseInt(field("bytes")).unwrapOr(0) }
+        Some(Hit {
+            ip: field("ip"),
+            hour: parseInt(field("hour")).unwrapOr(0),
+            method: field("method"),
+            path: self.query.replaceAllRe(field("path"), ""),   // strip the query string
+            status: parseInt(field("status")).unwrapOr(0),
+            bytes,
+        })
+    }
+}
+
+fn bump(mut m: Map[String, Int], key: String) -> () { m[key] = getOr(m, key, 0) + 1 }
+
+fn top(m: Map[String, Int], n: Int) -> Vec[(String, Int)] {
+    let entries = m |> intoIter |> collect
+    sortBy(entries, fn(a: (String, Int), b: (String, Int)) -> Bool { if a.1 != b.1 { a.1 > b.1 } else { a.0 < b.0 } })
+        |> intoIter |> take(n) |> collect
+}
+
+fn run() -> Result[(), String] {
+    let path = okOr(get(toVec(args()), 0), "usage: log_analysis <access.log>")?
+    let text = readTextFile(path)?
+    let parser = Parser::new()?
+
+    let mut hits: Vec[Hit] = vec()
+    let mut rejected: Vec[Int] = vec()
+    for (i, line) in text |> lines |> enumerate {
+        if isEmpty(line) { continue }
+        match parser.parse(line) {
+            Some(h) => push(hits, h),
+            None    => push(rejected, i + 1),
+        }
+    }
+    println("${len(hits)} requests parsed, ${len(rejected)} malformed (lines ${join(rejected |> intoIter |> map(fn(n: Int) -> String { toString(n) }), ", ")})")
+
+    let mut byPath: Map[String, Int] = #{}
+    let mut byIp: Map[String, Int] = #{}
+    let mut byClass: Map[String, Int] = #{}
+    let mut perHour = array(24, 0)
+    let mut totalBytes = 0
+    for h in hits {
+        bump(byPath, "${h.method} ${h.path}")
+        bump(byIp, h.ip)
+        bump(byClass, "${h.status / 100}xx")
+        perHour[h.hour] += 1
+        totalBytes += h.bytes
+    }
+
+    println("transferred: ${totalBytes / 1024} KiB")
+    println()
+    println("status classes:")
+    for (cls, n) in top(byClass, 5) { println("  ${cls}  ${n}") }
+    println()
+    println("top paths:")
+    for (p, n) in top(byPath, 3) { println("  ${n:>3}  ${p}") }
+    println()
+    println("top clients:")
+    for (ip, n) in top(byIp, 2) { println("  ${n:>3}  ${ip}") }
+
+    let errors = hits |> intoIter |> filter(fn(h: Hit) -> Bool { h.status >= 500 }) |> collect
+    if let Some(first) = get(errors, 0) {
+        println()
+        println("first server error: ${first.status} on ${first.path} from ${first.ip} at ${first.hour}:00")
+    }
+
+    println()
+    println("requests per hour:")
+    for hour in range(0, 24) {
+        if perHour[hour] > 0 {
+            println("  ${padStart(toString(hour), 2, '0')}:00 ${repeatStr("#", perHour[hour])}")
+        }
+    }
+    Ok(())
+}
+
+match run() {
+    Ok(_)  => {},
+    Err(e) => println("error: ${e}"),
+}

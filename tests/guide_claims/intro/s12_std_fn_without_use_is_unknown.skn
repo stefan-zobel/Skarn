@@ -1,0 +1,6 @@
+// CLAIM:  Without its `use`, a std fn written in Skarn is rejected -- and the message names the
+//         module to import, exactly as the native-level diagnostic does.
+// GUIDE:  SkarnIn30Minutes.md 12 (Modules and use)
+// EXPECT: fail unknown variable 'readTextFile'; it is in 'std::io' -- add `use std::io::*`
+let t = readTextFile("x.txt")
+println(toString(t))

@@ -1,0 +1,8 @@
+// CLAIM: each compound form accepts exactly what its plain operator accepts — so the bitwise/shift
+//        forms are Int-ONLY, and `d &= 1` on a Double is rejected just as `d & 1` is. The message says
+//        "integer-only", NOT the StringBuilder advice that belongs to the arithmetic forms.
+// GUIDE: SkarnGuide.md 5 (Compound assignment)
+// EXPECT: fail integer-only
+let mut d = 1.0
+d &= 1
+println(d)

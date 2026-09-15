@@ -1,0 +1,5 @@
+// CLAIM: a qualified path mod::name reaches a public item without a `use`.
+// GUIDE: §Modules (qualified paths)
+// EXPECT: ok hi bo
+import util
+println(util::greet("bo"))

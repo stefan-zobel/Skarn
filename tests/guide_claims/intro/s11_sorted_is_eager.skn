@@ -1,0 +1,5 @@
+// CLAIM:  sorted(v) returns a new sorted Vec (eager, separate from the lazy pipeline).
+// GUIDE:  SkarnIn30Minutes.md 11 (Pipelines: iterators)
+// EXPECT: ok ["a", "b", "c"]
+let words = "b a c" |> split(" ") |> collect
+println(toString(sorted(words)))

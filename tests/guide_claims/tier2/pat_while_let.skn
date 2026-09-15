@@ -1,0 +1,7 @@
+// CLAIM: `while let` loops while the pattern keeps matching.
+// GUIDE: §Patterns / while let
+// EXPECT: ok 6
+let mut v = toVec([1, 2, 3])
+let mut s = 0
+while let Some(x) = pop(v) { s = s + x }
+println(s)

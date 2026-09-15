@@ -1,0 +1,87 @@
+// A hash set: a thin, pure-Skarn wrapper over `Map[T, Bool]` (no native). The set-level
+// verbs delegate to the Map builtins applied to the `.m` field (`has`/`delete`/`len`/`keys`), which take a
+// Map -- so there is no name clash with those builtins or with the Iterator `contains`/`count` terminals.
+//
+// The element type T must be `Hashable` -- a permitted Map key: Int / Double / Bool / String.
+// The `T: Hashable` bound makes `Set[SomeStruct]` a COMPILE error (it would build a `Map[SomeStruct, Bool]`,
+// which the checker rejects at construction) rather than a runtime "Invalid map key type" trap. The struct
+// bound applies to every method, so the inherent `impl[T: Hashable] Set[T]` block carries it once.
+// T is monomorphic, so Map's int-vs-double SameValueZero hazard cannot arise. Iteration is HASH-ORDER, like Map.
+//
+// OPT-IN: reach these via `use std::set::*` (the constructors `Set::new`/`Set::fromVec`) + method
+// syntax `s.size()` etc. Tree-shaken.
+
+pub struct Set[T: Hashable] { m: Map[T, Bool] }
+
+// The set's own API -- called as `s.size()`, `a.union(b)`, `s.insert(x)`, ...
+impl[T: Hashable] Set[T] {
+  // --- construction (ASSOCIATED functions: no `self`, so `Set::new()` / `Set::fromVec(v)`) ---
+  // The head's `T` is fixed by NOTHING at a `Set::new()` call, so it needs an annotation from the
+  // context (`let s: Set[Int] = Set::new()`); an unsolved bounded parameter is rejected rather than
+  // discharging its own `Hashable` bound vacuously.
+  fn new() -> Set[T] {
+    let m0: Map[T, Bool] = #{}
+    Set { m: m0 }
+  }
+
+  // A set holding the distinct elements of `v` (here `T` comes from the argument).
+  fn fromVec(v: Vec[T]) -> Set[T] {
+    let mut s: Set[T] = Set::new()
+    for x in v { s.insert(x) }
+    s
+  }
+
+  // Membership -- O(1).
+  fn isMember(self, x: T) -> Bool { has(self.m, x) }
+
+  // Cardinality -- O(1).
+  fn size(self) -> Int { len(self.m) }
+
+  // Add `x`; returns true iff it was NOT already present. O(1).
+  fn insert(mut self, x: T) -> Bool {
+    let fresh = !has(self.m, x)
+    self.m[x] = true
+    fresh
+  }
+
+  // Remove `x`; returns true iff it WAS present. O(1).
+  fn remove(mut self, x: T) -> Bool { delete(self.m, x) }
+
+  // --- algebra (non-mutating; each returns a fresh set) ---
+
+  fn union(self, other: Set[T]) -> Set[T] {
+    let mut r: Set[T] = Set::new()
+    for x in keys(self.m)  { r.insert(x) }
+    for x in keys(other.m) { r.insert(x) }
+    r
+  }
+
+  fn intersect(self, other: Set[T]) -> Set[T] {
+    let mut r: Set[T] = Set::new()
+    for x in keys(self.m) { if other.isMember(x) { r.insert(x) } }
+    r
+  }
+
+  fn difference(self, other: Set[T]) -> Set[T] {
+    let mut r: Set[T] = Set::new()
+    for x in keys(self.m) { if !other.isMember(x) { r.insert(x) } }
+    r
+  }
+
+  // Every element of `self` is in `other`. Stops at the first counter-example.
+  fn isSubset(self, other: Set[T]) -> Bool {
+    let mut ok = true
+    for x in keys(self.m) { if !other.isMember(x) { ok = false  break } }
+    ok
+  }
+
+  // `self` and `other` share no element. Stops at the first shared element.
+  fn isDisjoint(self, other: Set[T]) -> Bool {
+    let mut ok = true
+    for x in keys(self.m) { if other.isMember(x) { ok = false  break } }
+    ok
+  }
+}
+
+// `for x in s` + the whole lazy-combinator surface, over a keys() snapshot (hash-order).
+impl[T: Hashable] IntoIterator[T] for Set[T] { fn intoIter(self) -> dyn Iterator[T] { intoIter(keys(self.m)) } }

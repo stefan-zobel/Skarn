@@ -1,0 +1,9 @@
+// CLAIM:  Int / Int stays integer division even in a Double context; `toDouble` is the named
+//         widening, is ambient (no `use`), and is exact.
+// GUIDE:  SkarnGuide.md 6 (The numeric model)
+// EXPECT: ok 1.0 | 1.7803030303030303 | 42 | -3.5
+let w = 470
+let h = 264
+let idiv: Double = toDouble(w / h)                 // divided FIRST, then widened
+let real = toDouble(w) / toDouble(h)               // widened first -- what you meant
+println("${idiv} | ${real} | ${toInt(toDouble(42))} | ${toDouble(-7) / 2.0}")

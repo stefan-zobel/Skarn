@@ -1,0 +1,5 @@
+// CLAIM: newcomer diagnostics -- a wrong argument count states expected and found.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail wrong number of arguments: expected 2, got 1
+fn add(a: Int, b: Int) -> Int { a + b }
+println(add(1))

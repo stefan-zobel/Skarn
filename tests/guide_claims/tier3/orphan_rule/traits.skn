@@ -1,0 +1,1 @@
+pub trait Loud { fn loud(self) -> String }

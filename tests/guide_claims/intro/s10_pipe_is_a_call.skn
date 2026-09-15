@@ -1,0 +1,5 @@
+// CLAIM:  `x |> f` is exactly `f(x)`, and pipes chain left-to-right.
+// GUIDE:  SkarnIn30Minutes.md 10 (Three ways to call things)
+// EXPECT: ok 10 10
+fn twice(n: Int) -> Int { n * 2 }
+println("${twice(5)} ${5 |> twice}")

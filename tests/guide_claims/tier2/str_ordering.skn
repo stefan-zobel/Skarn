@@ -1,0 +1,4 @@
+// CLAIM: String ordering is lexicographic by bytes.
+// GUIDE: §Comparison
+// EXPECT: ok true
+println("apple" < "banana")

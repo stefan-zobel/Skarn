@@ -1,0 +1,9 @@
+// CLAIM:  Collections are reference values -- an immutable binding is not a private snapshot.
+// GUIDE:  SkarnIn30Minutes.md 8 (Collections)
+// EXPECT: ok 4 3
+let mut xs: Vec[Int] = vec()
+push(xs, 1)  push(xs, 2)  push(xs, 3)
+let alias = xs
+let copy  = clone(xs)
+push(xs, 99)
+println("${len(alias)} ${len(copy)}")

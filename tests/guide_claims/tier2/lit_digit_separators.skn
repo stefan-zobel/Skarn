@@ -1,0 +1,11 @@
+// CLAIM: `_` is a digit separator in EVERY numeric form (decimal, fraction, exponent, 0x/0o/0b) and has
+//        no effect on the value — so `1_000_000` == `1000000` and `0xFFFF_FFFF_FFFF` is still -1.
+// GUIDE: §Literals
+// EXPECT: ok 1000000 | -1 | 170 | 15 | 3.141592 | true
+let million = 1_000_000
+let mask    = 0xFFFF_FFFF_FFFF
+let byte    = 0b1010_1010
+let perms   = 0o1_7
+let pi      = 3.141_592
+let same    = 1_0e1_0 == 100000000000.0
+println("${million} | ${mask} | ${byte} | ${perms} | ${pi} | ${same}")

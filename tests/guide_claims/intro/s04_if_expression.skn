@@ -1,0 +1,6 @@
+// CLAIM:  `if` is an expression, so its result is assignable (no ternary needed).
+// GUIDE:  SkarnIn30Minutes.md 4 (Control flow)
+// EXPECT: ok pos
+let n = 42
+let sign = if n > 0 { "pos" } else if n < 0 { "neg" } else { "zero" }
+println(sign)

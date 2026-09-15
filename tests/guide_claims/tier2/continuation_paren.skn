@@ -1,0 +1,7 @@
+// CLAIM:  A leading `(` does NOT continue the previous line — `f` then `(x)` is not a call (contrast a binary operator).
+// GUIDE:  5 / "How to read this guide" (the explicit non-continuation note)
+// EXPECT: ok g5=105
+fn f(x: Int) -> Int { x + 100 }
+let g = f
+(5)                 // a separate, discarded statement -- g stays the FUNCTION, not f(5)
+println("g5=" + g(5))   // calling g proves it: 5 + 100 = 105

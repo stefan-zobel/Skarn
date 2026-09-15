@@ -1,0 +1,8 @@
+// CLAIM:  A line beginning with a binary operator continues the previous line (a leading `-` is subtraction, not a new statement).
+// GUIDE:  5 (unary-minus caveat) / "How to read this guide" (newline handling)
+// EXPECT: ok c=7
+let a = 10
+let b = 3
+let c = a
+- b                 // continues the previous line: c = a - b = 7 (NOT c = a, then a separate `-b`)
+println("c=" + c)

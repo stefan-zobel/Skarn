@@ -1,0 +1,5 @@
+// CLAIM: the §16 pipe idiom compiles as written — range |> filter |> collect.
+// GUIDE: §16 (`.` vs `|>`): `range(0, n) |> filter(even) |> collect`
+// EXPECT: ok 5
+fn even(x: Int) -> Bool { x % 2 == 0 }
+println(len(range(0, 10) |> filter(even) |> collect))

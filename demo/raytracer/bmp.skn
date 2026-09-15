@@ -1,0 +1,96 @@
+// A 24-bit Windows BMP writer over `Bytes` -- the renderer's output format.
+//
+// BMP rather than PPM for two reasons: it opens on a double-click under Windows (so the
+// image can actually be LOOKED at, which is the only reliable test for a renderer), and
+// its headers are nothing but little-endian 16/32-bit words, which is exactly what
+// std::bytes already writes.
+//
+// Three details decide whether a BMP is readable at all, and all three are easy to get
+// wrong silently:
+//   1. rows are stored BOTTOM-UP (the first row in the file is the bottom of the image),
+//   2. each pixel is B, G, R -- not R, G, B,
+//   3. every row is padded to a 4-byte boundary.
+//
+// This module knows nothing about Vec3 or about colour: it takes integer components and
+// produces bytes. Keeping the boundary there means a wrong image can be attributed to
+// exactly one of "the geometry is wrong" or "the file format is wrong", never both.
+
+use std::bytes::*
+
+// Pixels are packed 0xRRGGBB into one Int -- a 48-bit Int swallows 24 bits without
+// comment, and one flat Array is both the cheapest storage and the cheapest to index.
+pub struct Canvas { width: Int, height: Int, px: Array[Int] }
+
+// A black canvas of the given size. Origin is TOP-LEFT, as every image-space convention
+// outside the BMP file itself has it; `toBmp` does the flip.
+pub fn canvas(width: Int, height: Int) -> Canvas {
+    Canvas { width: width, height: height, px: array(width * height, 0) }
+}
+
+impl Canvas {
+    // Set the pixel at (x, y). Components are masked to 0..255, so a caller whose rounding
+    // lands one over the top cannot corrupt the neighbouring channel.
+    fn set(mut self, x: Int, y: Int, r: Int, g: Int, b: Int) -> () {
+        self.px[y * self.width + x] = ((r & 255) << 16) | ((g & 255) << 8) | (b & 255)
+    }
+
+    // The packed 0xRRGGBB value at (x, y) -- for tests and for reading an image back.
+    fn pixelAt(self, x: Int, y: Int) -> Int { self.px[y * self.width + x] }
+
+    // How many bytes `toBmp` will produce. Exposed because it is the natural thing to
+    // assert a written file against.
+    fn bmpSize(self) -> Int {
+        let rowBytes = self.width * 3
+        let pad      = (4 - (rowBytes % 4)) % 4
+        54 + (rowBytes + pad) * self.height
+    }
+
+    // The complete .bmp file: 14-byte BITMAPFILEHEADER, 40-byte BITMAPINFOHEADER, pixels.
+    fn toBmp(self) -> Bytes {
+        let rowBytes = self.width * 3
+        let pad      = (4 - (rowBytes % 4)) % 4     // rows padded to a 4-byte boundary
+        let stride   = rowBytes + pad
+        let dataSize = stride * self.height
+        let mut out  = bytes(54 + dataSize)         // exact capacity: no regrow while filling
+
+        // ---- BITMAPFILEHEADER (14 bytes) ----
+        writeU8(out, 66)                            // 'B'
+        writeU8(out, 77)                            // 'M'
+        writeU32LE(out, 54 + dataSize)              // total file size
+        writeU32LE(out, 0)                          // two reserved u16 fields
+        writeU32LE(out, 54)                         // offset from file start to pixel data
+
+        // ---- BITMAPINFOHEADER (40 bytes) ----
+        writeU32LE(out, 40)                         // size of this header
+        writeI32LE(out, self.width)
+        writeI32LE(out, self.height)                // POSITIVE => bottom-up row order
+        writeU16LE(out, 1)                          // colour planes (always 1)
+        writeU16LE(out, 24)                         // bits per pixel
+        writeU32LE(out, 0)                          // BI_RGB -- no compression
+        writeU32LE(out, dataSize)
+        writeI32LE(out, 2835)                       // ~72 dpi horizontal (pixels per metre)
+        writeI32LE(out, 2835)                       // ~72 dpi vertical
+        writeU32LE(out, 0)                          // palette entries used
+        writeU32LE(out, 0)                          // palette entries required
+
+        // ---- pixel data: bottom row first, each pixel B G R ----
+        // push() rather than writeU8() in this loop: the components are already masked, so
+        // the extra call and the redundant & 255 would be paid width*height*3 times.
+        let mut y = self.height - 1
+        while y >= 0 {
+            let row = y * self.width
+            let mut x = 0
+            while x < self.width {
+                let p = self.px[row + x]
+                push(out, p & 255)                  // blue
+                push(out, (p >> 8) & 255)           // green
+                push(out, (p >> 16) & 255)          // red
+                x = x + 1
+            }
+            let mut k = 0
+            while k < pad { push(out, 0)  k = k + 1 }
+            y = y - 1
+        }
+        out
+    }
+}

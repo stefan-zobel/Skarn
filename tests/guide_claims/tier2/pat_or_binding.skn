@@ -1,0 +1,9 @@
+// CLAIM: or-pattern alternatives may bind, provided every one binds the same names -- which is what
+//        lets several shapes share a single arm body.
+// GUIDE: §Patterns (or-patterns)
+// EXPECT: ok 13
+enum Expr { Add(Int, Int), Sub(Int, Int), Mul(Int, Int) }
+fn operands(e: Expr) -> Int {
+    match e { Add(l, r) | Sub(l, r) | Mul(l, r) => l + r }
+}
+println(operands(Sub(9, 4)))

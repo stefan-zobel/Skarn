@@ -1,0 +1,8 @@
+// CLAIM:  an unknown or misused UPPERCASE name is a located type error like any other name — a
+//         record struct used as a value asks for its fields, not "undefined variable".
+// GUIDE:  SkarnGuide.md 11 (Structs)
+// EXPECT: fail needs field initializers
+struct Point { x: Int, y: Int }
+
+let p = Point                       // a record struct is a TYPE; a value needs its fields
+println(toString(p))

@@ -1,0 +1,177 @@
+// calculator -- a tokenizer, a recursive-descent parser and an evaluator for arithmetic with variables.
+//
+// Shows: a recursive enum as a syntax tree, a parser that threads its position through `mut self`,
+// `Result` + `?` for every error (with a position), `match` with guards, and a Map environment.
+//
+//   expr   := term (('+' | '-') term)*
+//   term   := factor (('*' | '/' | '%') factor)*
+//   factor := number | name | '(' expr ')' | '-' factor
+
+enum Token { Num(Int), Name(String), Op(Int), LParen, RParen, Assign }
+
+struct Lexed { tok: Token, pos: Int }
+
+fn tokenize(src: String) -> Result[Vec[Lexed], String] {
+    let mut out: Vec[Lexed] = vec()
+    let mut i = 0
+    while i < len(src) {
+        let c = charAt(src, i)
+        if isAsciiWhitespace(c) {
+            i += 1
+        } else if isAsciiDigit(c) {
+            let start = i
+            while i < len(src) && isAsciiDigit(charAt(src, i)) { i += 1 }
+            let n = parseInt(slice(src, start, i))?
+            push(out, Lexed { tok: Num(n), pos: start })
+        } else if isAsciiAlpha(c) {
+            let start = i
+            while i < len(src) && isAsciiAlphanumeric(charAt(src, i)) { i += 1 }
+            push(out, Lexed { tok: Name(slice(src, start, i)), pos: start })
+        } else {
+            let tok = match c {
+                '(' => LParen,
+                ')' => RParen,
+                '=' => Assign,
+                '+' | '-' | '*' | '/' | '%' => Op(c),
+                _ => return Err("unexpected character '${charStr(c)}' at ${i}"),
+            }
+            push(out, Lexed { tok, pos: i })
+            i += 1
+        }
+    }
+    Ok(out)
+}
+
+enum Expr {
+    Lit(Int),
+    Var(String),
+    Neg(Expr),
+    Bin(Int, Expr, Expr),
+}
+
+struct Parser { toks: Vec[Lexed], pos: Int, end: Int }
+
+impl Parser {
+    fn new(toks: Vec[Lexed], end: Int) -> Parser { Parser { toks, pos: 0, end } }
+
+    fn peek(self) -> Option[Token] { optionMap(get(self.toks, self.pos), fn(l: Lexed) -> Token { l.tok }) }
+
+    fn where(self) -> Int { if self.pos < len(self.toks) { self.toks[self.pos].pos } else { self.end } }
+
+    fn expr(mut self) -> Result[Expr, String] {
+        let mut left = self.term()?
+        while let Some(Op(op)) = self.peek() {
+            if op != '+' && op != '-' { break }
+            self.pos += 1
+            left = Bin(op, left, self.term()?)
+        }
+        Ok(left)
+    }
+
+    fn term(mut self) -> Result[Expr, String] {
+        let mut left = self.factor()?
+        while let Some(Op(op)) = self.peek() {
+            if op != '*' && op != '/' && op != '%' { break }
+            self.pos += 1
+            left = Bin(op, left, self.factor()?)
+        }
+        Ok(left)
+    }
+
+    fn factor(mut self) -> Result[Expr, String] {
+        let at = self.where()
+        self.pos += 1
+        match self.toks[self.pos - 1].tok {
+            Num(n)  => Ok(Lit(n)),
+            Name(s) => Ok(Var(s)),
+            Op(op) if op == '-' => Ok(Neg(self.factor()?)),
+            LParen => {
+                let inner = self.expr()?
+                match self.peek() {
+                    Some(RParen) => { self.pos += 1  Ok(inner) },
+                    _            => Err("expected ')' at ${self.where()}"),
+                }
+            },
+            _ => Err("unexpected token at ${at}"),
+        }
+    }
+}
+
+fn parse(toks: Vec[Lexed], end: Int) -> Result[Expr, String] {
+    if len(toks) == 0 { return Err("empty expression") }
+    let mut p = Parser::new(toks, end)
+    let e = p.expr()?
+    if p.pos < len(p.toks) { return Err("unexpected input at ${p.where()}") }
+    Ok(e)
+}
+
+fn eval(e: Expr, env: Map[String, Int]) -> Result[Int, String] {
+    match e {
+        Lit(n) => Ok(n),
+        Var(name) => okOr(get(env, name), "unknown variable '${name}'"),
+        Neg(inner) => Ok(-eval(inner, env)?),
+        Bin(op, a, b) => {
+            let x = eval(a, env)?
+            let y = eval(b, env)?
+            match op {
+                '+' => Ok(x + y),
+                '-' => Ok(x - y),
+                '*' => Ok(x * y),
+                _ if y == 0 => Err("division by zero"),
+                '/' => Ok(x / y),
+                _   => Ok(x % y),
+            }
+        },
+    }
+}
+
+fn show(e: Expr) -> String {
+    match e {
+        Lit(n) => toString(n),
+        Var(name) => name,
+        Neg(inner) => "(-${show(inner)})",
+        Bin(op, a, b) => "(${show(a)} ${charStr(op)} ${show(b)})",
+    }
+}
+
+// One input line: either `name = expr` or a bare `expr`.
+fn runLine(line: String, mut env: Map[String, Int]) -> Result[String, String] {
+    let toks = tokenize(line)?
+    match (get(toks, 0), get(toks, 1)) {
+        (Some(Lexed { tok: Name(name), pos: _ }), Some(Lexed { tok: Assign, pos: _ })) => {
+            let rest = toks |> intoIter |> drop(2) |> collect
+            let e = parse(rest, len(line))?
+            let v = eval(e, env)?
+            env[name] = v
+            Ok("${name} = ${v}")
+        },
+        _ => {
+            let e = parse(toks, len(line))?
+            let v = eval(e, env)?
+            Ok("${show(e)} = ${v}")
+        },
+    }
+}
+
+let session = [
+    "1 + 2 * 3",
+    "(1 + 2) * 3",
+    "width = 12",
+    "height = width - 4",
+    "area = width * height",
+    "area / 7 + area % 7",
+    "-(width - 20) * 2",
+    "area / (height - 8)",
+    "1 + unknown",
+    "3 + * 4",
+    "(1 + 2",
+    "7 $ 3",
+]
+
+let mut env: Map[String, Int] = #{}
+for line in session {
+    match runLine(line, env) {
+        Ok(text) => println("  ${line:<24} => ${text}"),
+        Err(e)   => println("  ${line:<24} !! ${e}"),
+    }
+}

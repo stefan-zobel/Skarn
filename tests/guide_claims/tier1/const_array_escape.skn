@@ -1,0 +1,6 @@
+// CLAIM: a const array is read-only and cannot escape its use site (no binding/passing/returning/storing).
+// GUIDE: const arrays / non-escaping
+// EXPECT: fail cannot escape its use site
+const K: Array[Int] = [1, 2, 3]
+let a = K
+println(a[0])

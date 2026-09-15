@@ -1,0 +1,11 @@
+// CLAIM:  An enum carries data per variant and `match` takes it apart.
+// GUIDE:  SkarnIn30Minutes.md 6 (Enums and match)
+// EXPECT: ok 12.0
+enum Shape { Circle(Double), Rect(Double, Double), }
+fn area(s: Shape) -> Double {
+  match s {
+    Circle(r)  => 3.14159 * r * r,
+    Rect(w, h) => w * h,
+  }
+}
+println(area(Rect(3.0, 4.0)))

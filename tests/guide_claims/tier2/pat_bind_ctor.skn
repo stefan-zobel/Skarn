@@ -1,0 +1,11 @@
+// CLAIM: an @-binding over a constructor pattern keeps the WHOLE value while destructuring it --
+//        the case a guard cannot express, since a guard cannot take a value apart.
+// GUIDE: §Patterns (@-bindings)
+// EXPECT: ok Some(50) None
+fn keepIfBig(o: Option[Int]) -> Option[Int] {
+    match o {
+        whole @ Some(n) => if n > 10 { whole } else { None },
+        None            => None
+    }
+}
+println(toString(keepIfBig(Some(50))) + " " + toString(keepIfBig(Some(1))))

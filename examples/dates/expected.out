@@ -1,0 +1,22 @@
+kickoff: Thu 2028-02-24  (2028 is a leap year: true, February has 29 days)
+
+plan (working days, weekends and holidays skipped):
+  design   Thu 2028-02-24 -> Fri 2028-03-03   5 workdays =  8 calendar days
+  build    Fri 2028-03-03 -> Wed 2028-03-22  12 workdays = 19 calendar days
+  test     Wed 2028-03-22 -> Thu 2028-03-30   6 workdays =  8 calendar days
+  release  Thu 2028-03-30 -> Mon 2028-04-03   2 workdays =  4 calendar days
+
+done 4 days and 17 hours before the deadline 2028-04-07T17:00:00.000Z
+
+  2028-02-29   is a Tue
+  2027-02-29   is not a valid date
+  2028-13-01   is not a valid date
+  next tuesday is not a valid date
+
+      2028-03
+Mo Tu We Th Fr Sa Su
+       1  2  3  4  5
+ 6  7  8  9 10 11 12
+13 14 15 16 17 18 19
+20 21 22 23 24 25 26
+27 28 29 30 31

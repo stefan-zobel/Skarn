@@ -1,0 +1,92 @@
+// csv_stats -- read a CSV file and print per-column statistics and a grouped summary.
+//
+//   static_vmrun main.skn <file.csv>
+//
+// Shows: `lines` / `split` over text, parsing numbers with `?` and a row number in the error,
+// a Double column model, grouping into a Map, sorting, and `${x:.2f}`-style formatting.
+
+use std::env::*
+use std::io::*
+use std::math::*
+
+struct Row { city: String, month: Int, tempC: Double, rainMm: Double }
+
+fn parseRow(line: String, lineNo: Int) -> Result[Row, String] {
+    let f = line |> split(",") |> map(trim) |> collect
+    if len(f) != 4 {
+        return Err("line ${lineNo}: expected 4 fields, found ${len(f)}")
+    }
+    let month = parseInt(f[1]) |> mapErr(fn(e: String) -> String { "line ${lineNo}: month: ${e}" })
+    let temp = parseDouble(f[2]) |> mapErr(fn(e: String) -> String { "line ${lineNo}: temperature: ${e}" })
+    let rain = parseDouble(f[3]) |> mapErr(fn(e: String) -> String { "line ${lineNo}: rain: ${e}" })
+    Ok(Row { city: f[0], month: month?, tempC: temp?, rainMm: rain? })
+}
+
+fn load(path: String) -> Result[Vec[Row], String] {
+    let text = readTextFile(path)?
+    let mut rows: Vec[Row] = vec()
+    for (i, line) in text |> lines |> enumerate {
+        if i == 0 || isEmpty(trim(line)) || startsWith(line, "#") { continue }   // header, blanks, comments
+        push(rows, parseRow(line, i + 1)?)
+    }
+    Ok(rows)
+}
+
+struct Stats { n: Int, min: Double, max: Double, mean: Double, stddev: Double }
+
+fn stats(xs: Vec[Double]) -> Stats {
+    let n = len(xs)
+    let total = fold(xs |> intoIter, 0.0, fn(a: Double, x: Double) -> Double { a + x })
+    let mean = total / toDouble(n)
+    let sq = fold(xs |> intoIter, 0.0, fn(a: Double, x: Double) -> Double { a + (x - mean) * (x - mean) })
+    Stats {
+        n,
+        min: (xs |> intoIter |> min).unwrapOr(0.0),
+        max: (xs |> intoIter |> max).unwrapOr(0.0),
+        mean,
+        stddev: sqrt(sq / toDouble(n)),
+    }
+}
+
+fn printStats(label: String, s: Stats) -> () {
+    println("${label:<14} n=${s.n}  min=${s.min:>6.1f}  max=${s.max:>6.1f}  mean=${s.mean:>7.2f}  sd=${s.stddev:.2f}")
+}
+
+fn run() -> Result[(), String] {
+    let argv = toVec(args())
+    let path = okOr(get(argv, 0), "usage: csv_stats <file.csv>")?
+    let rows = load(path)?
+    println("${len(rows)} rows from ${path}")
+    println()
+
+    printStats("temperature", stats(rows |> intoIter |> map(fn(r: Row) -> Double { r.tempC }) |> collect))
+    printStats("rain", stats(rows |> intoIter |> map(fn(r: Row) -> Double { r.rainMm }) |> collect))
+    println()
+
+    // Group the rain by city.
+    let mut byCity: Map[String, Vec[Double]] = #{}
+    for r in rows {
+        let mut bucket = getOrPut(byCity, r.city, vec())
+        push(bucket, r.rainMm)
+    }
+    println("rain per city (wettest first):")
+    let totals = keys(byCity) |> toVec |> intoIter
+        |> map(fn(c: String) -> (String, Double) { (c, fold(byCity[c] |> intoIter, 0.0, fn(a: Double, x: Double) -> Double { a + x })) })
+        |> collect
+    for (city, mm) in sortBy(totals, fn(a: (String, Double), b: (String, Double)) -> Bool { a.1 > b.1 }) {
+        let bar = repeatStr("*", toInt(round(mm / 20.0)))
+        println(trimEnd("  ${city:<8} ${mm:>6.1f} mm  ${bar}"))   // no trailing blanks for a dry city
+    }
+
+    let hottest = maxBy(rows |> intoIter, fn(a: Row, b: Row) -> Bool { a.tempC < b.tempC })
+    if let Some(r) = hottest {
+        println()
+        println("hottest month: ${r.city}, month ${r.month}, ${r.tempC:.1f} C")
+    }
+    Ok(())
+}
+
+match run() {
+    Ok(_)  => {},
+    Err(e) => println("error: ${e}"),
+}

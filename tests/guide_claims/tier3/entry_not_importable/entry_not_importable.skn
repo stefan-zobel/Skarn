@@ -1,0 +1,9 @@
+// CLAIM: the ENTRY program is not importable — a name defined there is unreachable from a module,
+//        even without `pub`, and the diagnostic says so instead of a bare "unknown".
+// GUIDE: SkarnGuide.md 20 (Modules — what belongs in a module)
+// EXPECT: fail defined in the entry program, which cannot be imported
+import util
+use util::callsEntry
+
+fn entryOnly() -> Int { 77 }        // an ordinary entry-file definition -- NOT nameable from `util`
+println(callsEntry())

@@ -1,0 +1,4 @@
+// CLAIM: newcomer diagnostics -- a match over an unknown name reports the unknown name, not a bogus 'non-exhaustive match'.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail unknown variable 'toIntChecked'; it is in 'std::math'
+println(match toIntChecked(3.9) { Ok(n) => n, Err(_) => 0 })

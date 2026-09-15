@@ -1,0 +1,9 @@
+// CLAIM: the captured snapshot is the value AT CREATION -- `peek()` yields 0, not the current 10.
+// The twin of closure_snapshot_warns.skn: `warn` asserts only stderr and `ok` only stdout, so the
+// warning and the value it warns about each need their own fixture.
+// GUIDE: §10 closures ("what 'by value' precisely means")
+// EXPECT: ok 0
+let mut counter = 0
+let peek = fn() -> Int { counter }
+counter = 10
+println(peek())

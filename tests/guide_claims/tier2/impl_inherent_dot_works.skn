@@ -1,0 +1,6 @@
+// CLAIM: an inherent method is reached via recv.method().
+// GUIDE: §16 method-call syntax
+// EXPECT: ok 5
+struct Counter { n: Int }
+impl Counter { fn value(self) -> Int { self.n } }
+println(Counter { n: 5 }.value())

@@ -1,0 +1,8 @@
+// CLAIM: newcomer diagnostics -- `pub fn` inside an impl says methods carry no visibility of their own (not a bare "expected 'fn'").
+// GUIDE: SkarnGuide.md §20 "Visibility: `pub`" (`pub` goes on fn / struct / enum / trait); tests/guide_claims/README.md
+// EXPECT: fail 'pub' is not allowed on a method
+pub struct Point { x: Int, y: Int }
+impl Point {
+    pub fn new(x: Int, y: Int) -> Point { Point { x, y } }
+}
+println(Point::new(1, 2).x)

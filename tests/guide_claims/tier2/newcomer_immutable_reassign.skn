@@ -1,0 +1,6 @@
+// CLAIM: newcomer diagnostics -- reassigning a plain `let` names the binding.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail cannot assign to immutable binding 'x'
+let x = 1
+x = 2
+println(x)

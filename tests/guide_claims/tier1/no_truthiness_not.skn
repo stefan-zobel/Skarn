@@ -1,0 +1,10 @@
+// CLAIM: `!` requires a Bool operand -- `!0` is a compile error. The VM's LNOT opcode exists but the
+//        Skarn front end never emits it.
+// GUIDE: SkarnGuide.md 5 (Boolean logic); docs/Compiler.md "No truthiness"
+// EXPECT: fail '!' requires a Bool operand
+
+fn f(n: Int) -> Bool {
+    !n
+}
+
+println(toString(f(0)))

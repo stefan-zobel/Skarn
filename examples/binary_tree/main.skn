@@ -1,0 +1,103 @@
+// binary_tree -- a persistent (immutable) binary search tree over a recursive generic enum.
+//
+// Shows: a recursive generic `enum` with an inherent `impl[T: Ord]`, structural recursion with
+// `match`, trees that share structure instead of being mutated, `Option` results, and folds.
+
+enum Tree[T] {
+    Leaf,
+    Node(Tree[T], T, Tree[T]),
+}
+
+impl[T: Ord] Tree[T] {
+    fn empty() -> Tree[T] { Leaf }
+
+    // Insert returns a NEW tree; the old one is unchanged and shares every untouched subtree.
+    fn insert(self, x: T) -> Tree[T] {
+        match self {
+            Leaf => Node(Leaf, x, Leaf),
+            Node(l, v, r) =>
+                if x.lessThan(v) { Node(l.insert(x), v, r) }
+                else if v.lessThan(x) { Node(l, v, r.insert(x)) }
+                else { self },                         // already present
+        }
+    }
+
+    fn contains(self, x: T) -> Bool {
+        match self {
+            Leaf => false,
+            Node(l, v, r) => if x.lessThan(v) { l.contains(x) } else if v.lessThan(x) { r.contains(x) } else { true },
+        }
+    }
+
+    fn size(self) -> Int {
+        match self { Leaf => 0, Node(l, _, r) => l.size() + 1 + r.size() }
+    }
+
+    fn height(self) -> Int {
+        match self {
+            Leaf => 0,
+            Node(l, _, r) => { let a = l.height()  let b = r.height()  1 + (if a > b { a } else { b }) },
+        }
+    }
+
+    fn min(self) -> Option[T] {
+        match self {
+            Leaf => None,
+            Node(Leaf, v, _) => Some(v),
+            Node(l, _, _) => l.min(),
+        }
+    }
+
+    // In-order traversal into a Vec, so the result comes out sorted.
+    fn toSortedVec(self) -> Vec[T] {
+        let mut out: Vec[T] = vec()
+        Tree::collectInto(self, out)
+        out
+    }
+
+    fn collectInto(t: Tree[T], mut out: Vec[T]) -> () {
+        match t {
+            Leaf => {},
+            Node(l, v, r) => {
+                Tree::collectInto(l, out)
+                push(out, v)
+                Tree::collectInto(r, out)
+            },
+        }
+    }
+}
+
+// A picture of the tree, sideways: the right subtree above, the left one below.
+fn draw(t: Tree[Int], depth: Int) -> () {
+    match t {
+        Leaf => {},
+        Node(l, v, r) => {
+            draw(r, depth + 1)
+            println("${repeatStr("    ", depth)}${v}")
+            draw(l, depth + 1)
+        },
+    }
+}
+
+let values = [50, 30, 70, 20, 40, 60, 80, 35, 45, 65]
+let noInts: Tree[Int] = Tree::empty()          // an empty generic value needs its element type named
+let tree = fold(values |> intoIter, noInts, fn(t: Tree[Int], x: Int) -> Tree[Int] { t.insert(x) })
+
+println("size ${tree.size()}, height ${tree.height()}, smallest ${tree.min().unwrapOr(-1)}")
+println("in order: ${toString(tree.toSortedVec())}")
+draw(tree, 0)
+
+let bigger = tree.insert(55).insert(30)                  // 30 is already there
+println()
+println("after inserting 55 (and 30 again): size ${bigger.size()}; the original still has ${tree.size()}")
+for probe in [35, 55, 99] {
+    println("  ${probe}: in original ${tree.contains(probe)}, in bigger ${bigger.contains(probe)}")
+}
+
+// The same tree type works for any ordered element, here Strings.
+let words = "pear fig apple kiwi banana cherry fig" |> words |> collect
+let noWords: Tree[String] = Tree::empty()
+let dictionary = fold(words |> intoIter, noWords, fn(t: Tree[String], w: String) -> Tree[String] { t.insert(w) })
+println()
+println("${dictionary.size()} distinct words: ${join(dictionary.toSortedVec() |> intoIter, " < ")}")
+println("first: ${dictionary.min().unwrapOr("-")}")

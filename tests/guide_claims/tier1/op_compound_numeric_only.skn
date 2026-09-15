@@ -1,0 +1,8 @@
+// CLAIM: the ARITHMETIC compound forms are numeric-only — `s += t` on a String is REJECTED, and the
+//        diagnostic points at StringBuilder rather than reading like an oversight (`s = s + t` still
+//        compiles). The bitwise/shift forms are stricter still: see op_compound_bitwise_int_only.skn.
+// GUIDE: SkarnGuide.md 5 (Compound assignment)
+// EXPECT: fail numeric-only
+let mut s = "ab"
+s += "cd"
+println(s)

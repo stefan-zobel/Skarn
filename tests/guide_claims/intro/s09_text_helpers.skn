@@ -1,0 +1,5 @@
+// CLAIM:  len is a BYTE count; trim/indexOf/slice/toUpper behave as shown.
+// GUIDE:  SkarnIn30Minutes.md 9 (Working with text)
+// EXPECT: ok 20|Ada, 36 , Berlin|2|hello|ABC
+let raw = "  Ada, 36 , Berlin  "
+println("${len(raw)}|${trim(raw)}|${indexOf(raw, "Ada")}|${slice("hello world", 0, 5)}|${toUpper("abc")}")

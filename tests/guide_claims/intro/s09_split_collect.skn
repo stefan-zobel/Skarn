@@ -1,0 +1,6 @@
+// CLAIM:  A lazy split is materialized with `collect`.
+// GUIDE:  SkarnIn30Minutes.md 9 (Working with text)
+// EXPECT: ok 3
+let raw = "  Ada, 36 , Berlin  "
+let fields = raw |> trim |> split(",") |> collect
+println(len(fields))

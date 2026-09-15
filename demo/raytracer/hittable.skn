@@ -1,0 +1,230 @@
+// What a ray can hit, and what comes back when it does.
+//
+// `Hittable` is the renderer's one abstraction, and it is an EXISTENTIAL one: a scene is a
+// heterogeneous `Vec[dyn Hittable]`, not a homogeneous `Vec[T]`. That is precisely the
+// shape generics cannot express, and it costs nothing here -- a `dyn` value IS the plain
+// value (no box, no vtable; the type tag it already carries drives the dispatch).
+//
+// OBJECT SAFETY: `hit` takes `self` (OS1) and mentions `Self` in no other parameter (OS2),
+// so `dyn Hittable` exists. A `Hittable` returning `Self` -- e.g. a `translated(self)` --
+// would silently make the trait unusable as `dyn`; keep new methods clear of that.
+
+import vec3
+import ray
+import material
+
+use vec3::*
+use ray::*
+use material::*
+use std::math::*
+
+// A recorded intersection. `normal` is a UNIT vector and always points AGAINST the
+// incoming ray, with `frontFace` remembering which side was actually struck -- a
+// distinction dielectrics would need and which is free to record here.
+// `mat` is what makes the scene heterogeneous in TWO dimensions at once: a `dyn Hittable`
+// carrying a `dyn Material`, neither of which costs a box or a vtable.
+pub struct Hit { t: Double, p: Vec3, normal: Vec3, frontFace: Bool, mat: dyn Material }
+
+pub trait Hittable {
+    // The nearest intersection with `r` whose parameter lies in (tMin, tMax), or None.
+    // The interval is what lets the caller shrink the search as it walks the scene, and
+    // what keeps a scattered ray from re-hitting the surface it just left.
+    fn hit(self, r: Ray, tMin: Double, tMax: Double) -> Option[Hit]
+}
+
+// Orient a surface normal against the incoming ray. `outward` must be the unit normal
+// pointing away from the solid.
+fn faceNormal(t: Double, p: Vec3, outward: Vec3, r: Ray, mat: dyn Material) -> Hit {
+    let front = r.dir.dot(outward) < 0.0
+    Hit { t: t, p: p, normal: if front { outward } else { outward.neg() }, frontFace: front, mat: mat }
+}
+
+pub struct Sphere { center: Vec3, radius: Double, mat: dyn Material }
+
+pub fn sphere(center: Vec3, radius: Double, mat: dyn Material) -> Sphere {
+    Sphere { center: center, radius: radius, mat: mat }
+}
+
+impl Hittable for Sphere {
+    // Substituting the ray into |p - c|^2 = r^2 gives a quadratic in t. Written with
+    // b = 2h, the half-b form, which cancels the 2s and the 4 out of the discriminant.
+    fn hit(self, r: Ray, tMin: Double, tMax: Double) -> Option[Hit] {
+        let oc    = r.origin.sub(self.center)
+        let a     = r.dir.lengthSquared()
+        let halfB = oc.dot(r.dir)
+        let c     = oc.lengthSquared() - self.radius * self.radius
+        let disc  = halfB * halfB - a * c
+        if disc < 0.0 { return None }
+
+        // Nearer root first; fall back to the far one when the near one is out of range
+        // (which is what happens when the ray starts inside the sphere).
+        let sqrtd    = sqrt(disc)
+        let mut root = (-halfB - sqrtd) / a
+        if root < tMin || tMax < root {
+            root = (-halfB + sqrtd) / a
+            if root < tMin || tMax < root { return None }
+        }
+
+        let p       = r.at(root)
+        let outward = p.sub(self.center).scale(1.0 / self.radius)
+        Some(faceNormal(root, p, outward, r, self.mat))
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The same sphere, with the intersection written on SCALAR locals.
+//
+// This is an experiment, not an improvement anyone should copy blindly. `Sphere.hit`
+// above builds around eight short-lived Vec3s per test and makes about as many method
+// calls; this one builds none and makes none, keeping only the two vectors the returned Hit
+// genuinely has to carry. It is deliberately UGLY -- the whole point is to price the
+// readable version, and a measurement is worth more than an opinion.
+//
+// EVERY arithmetic operation is in the same order as in `Sphere.hit`, down to hoisting
+// 1.0 / radius exactly where `scale` would have evaluated it. That is what lets the two
+// kernels produce a BIT-IDENTICAL image -- which is how the comparison is validated: if the
+// pictures differ, the two things being timed were not the same computation.
+// ---------------------------------------------------------------------------------------
+pub struct FastSphere { center: Vec3, radius: Double, mat: dyn Material }
+
+pub fn fastSphere(center: Vec3, radius: Double, mat: dyn Material) -> FastSphere {
+    FastSphere { center: center, radius: radius, mat: mat }
+}
+
+impl Hittable for FastSphere {
+    fn hit(self, r: Ray, tMin: Double, tMax: Double) -> Option[Hit] {
+        let ox = r.origin.x - self.center.x
+        let oy = r.origin.y - self.center.y
+        let oz = r.origin.z - self.center.z
+        let dx = r.dir.x
+        let dy = r.dir.y
+        let dz = r.dir.z
+
+        let a     = dx * dx + dy * dy + dz * dz
+        let halfB = ox * dx + oy * dy + oz * dz
+        let c     = ox * ox + oy * oy + oz * oz - self.radius * self.radius
+        let disc  = halfB * halfB - a * c
+        if disc < 0.0 { return None }
+
+        let sqrtd    = sqrt(disc)
+        let mut root = (-halfB - sqrtd) / a
+        if root < tMin || tMax < root {
+            root = (-halfB + sqrtd) / a
+            if root < tMin || tMax < root { return None }
+        }
+
+        let px = r.origin.x + dx * root
+        let py = r.origin.y + dy * root
+        let pz = r.origin.z + dz * root
+
+        let inv = 1.0 / self.radius              // exactly where scale() would compute it
+        let nx  = (px - self.center.x) * inv
+        let ny  = (py - self.center.y) * inv
+        let nz  = (pz - self.center.z) * inv
+
+        let front = dx * nx + dy * ny + dz * nz < 0.0
+        Some(Hit { t: root,
+                   p: vec3(px, py, pz),
+                   normal: if front { vec3(nx, ny, nz) } else { vec3(-nx, -ny, -nz) },
+                   frontFace: front,
+                   mat: self.mat })
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// THE THIRD KERNEL: what an INLINER produces, as opposed to what a human does.
+//
+// FastSphere above answers "how fast could this be", which is not the question a compiler
+// can act on: it removes the calls, the intermediate Vec3 objects AND the field reads through
+// them, all at once, so its speed-up cannot be attributed to any one of the three. This
+// kernel isolates the part a compiler could actually deliver.
+//
+// The rule followed here, line by line: every DIRECT call in Sphere.hit is replaced by its
+// body -- and NOTHING else changes. Every intermediate Vec3 is still allocated, and every
+// field is still read from the heap, because an inliner leaves both alone (the object still
+// exists; only scalar replacement removes it, and SROA is a separate, later transform).
+//
+// Two fidelity rules that decide whether this measures the right thing:
+//   1. Each inlined call's receiver and arguments are bound to a local FIRST, then the body
+//      reads fields off that local -- exactly what inlining does (the argument expression is
+//      evaluated once into a register). Writing `r.origin.x` three times instead would cost
+//      three chained GET_PROPs where an inliner pays one, and would understate the payoff.
+//   2. NO common-subexpression elimination across call sites: `r.dir` is re-read at each
+//      inlined site, because CSE is a SEPARATE transform. So this is a plain inliner, not
+//      an optimizing one -- the conservative reading, which is the right one here.
+//
+// The arithmetic order is preserved exactly, which is what lets all three kernels produce a
+// BIT-IDENTICAL image -- the check that proves the three timings measure one computation.
+// ---------------------------------------------------------------------------------------
+pub struct InlinedSphere { center: Vec3, radius: Double, mat: dyn Material }
+
+pub fn inlinedSphere(center: Vec3, radius: Double, mat: dyn Material) -> InlinedSphere {
+    InlinedSphere { center: center, radius: radius, mat: mat }
+}
+
+impl Hittable for InlinedSphere {
+    fn hit(self, r: Ray, tMin: Double, tMax: Double) -> Option[Hit] {
+        // let oc = r.origin.sub(self.center)
+        let ocSelf = r.origin
+        let ocArg  = self.center
+        let oc = Vec3 { x: ocSelf.x - ocArg.x, y: ocSelf.y - ocArg.y, z: ocSelf.z - ocArg.z }
+
+        // let a = r.dir.lengthSquared()
+        let aSelf = r.dir
+        let a     = aSelf.x * aSelf.x + aSelf.y * aSelf.y + aSelf.z * aSelf.z
+
+        // let halfB = oc.dot(r.dir)
+        let hbArg = r.dir
+        let halfB = oc.x * hbArg.x + oc.y * hbArg.y + oc.z * hbArg.z
+
+        // let c = oc.lengthSquared() - self.radius * self.radius
+        let c = oc.x * oc.x + oc.y * oc.y + oc.z * oc.z - self.radius * self.radius
+
+        let disc = halfB * halfB - a * c
+        if disc < 0.0 { return None }
+
+        let sqrtd    = sqrt(disc)
+        let mut root = (-halfB - sqrtd) / a
+        if root < tMin || tMax < root {
+            root = (-halfB + sqrtd) / a
+            if root < tMin || tMax < root { return None }
+        }
+
+        // let p = r.at(root)  ==  self.origin.add(self.dir.scale(t))  -- two nested calls,
+        // so two intermediate objects survive here, exactly as in the idiomatic kernel.
+        let atDir = r.dir
+        let scaled = Vec3 { x: atDir.x * root, y: atDir.y * root, z: atDir.z * root }
+        let atOrig = r.origin
+        let p = Vec3 { x: atOrig.x + scaled.x, y: atOrig.y + scaled.y, z: atOrig.z + scaled.z }
+
+        // let outward = p.sub(self.center).scale(1.0 / self.radius)
+        let owArg = self.center
+        let diff  = Vec3 { x: p.x - owArg.x, y: p.y - owArg.y, z: p.z - owArg.z }
+        let inv   = 1.0 / self.radius
+        let outward = Vec3 { x: diff.x * inv, y: diff.y * inv, z: diff.z * inv }
+
+        // Some(faceNormal(root, p, outward, r, self.mat)) -- a free fn, inlinable too, and its
+        // own `r.dir.dot(outward)` inlines with it.
+        let fnDir = r.dir
+        let front = fnDir.x * outward.x + fnDir.y * outward.y + fnDir.z * outward.z < 0.0
+        Some(Hit { t: root, p: p,
+                   normal: if front { outward }
+                           else { Vec3 { x: -outward.x, y: -outward.y, z: -outward.z } },
+                   frontFace: front, mat: self.mat })
+    }
+}
+
+// The nearest hit across a whole scene. `closest` shrinks as objects are tested, so each
+// later object only has to beat the best found so far -- the entire reason `hit` takes an
+// interval rather than returning every intersection.
+pub fn hitScene(world: Vec[dyn Hittable], r: Ray, tMin: Double, tMax: Double) -> Option[Hit] {
+    let mut best: Option[Hit] = None
+    let mut closest = tMax
+    for obj in world {
+        match obj.hit(r, tMin, closest) {
+            Some(h) => { closest = h.t  best = Some(h) },
+            None    => {},
+        }
+    }
+    best
+}

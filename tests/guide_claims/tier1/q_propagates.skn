@@ -1,0 +1,6 @@
+// CLAIM: ? propagates on Result — the happy path threads the unwrapped value.
+// GUIDE: Error handling / ?
+// EXPECT: ok Ok(11)
+fn parse(s: String) -> Result[Int, String] { Ok(1) }
+fn run() -> Result[Int, String] { let n = parse("x")?  Ok(n + 10) }
+println(run())

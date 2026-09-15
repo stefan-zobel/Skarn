@@ -12,18 +12,16 @@
 (* Type variables are UPPERCASE (Rust-style: `[T, E]`), NOT Haskell-style.     *)
 (*                                                                             *)
 (* Notable design points:                                                      *)
-(*   - Index syntax unified: only `a[i]` (total, bounds-checked) remains.      *)
-(*     map lookup is a normal fallible call                                    *)
-(*     `get(m, k) -> Option[V]` (pipe-friendly: `m |> get(k)`). `.` now means  *)
-(*     field access only.                                                      *)
+(*   - One index syntax, `a[i]` (bounds-checked). A map lookup that may        *)
+(*     miss is the ordinary fallible call `get(m, k) -> Option[V]`             *)
+(*     (pipe-friendly: `m |> get(k)`). `.` is field access and method call.    *)
 (*   - Aggregate literals follow "literal for the common, constructor for the  *)
-(*     rest": `[...]` sequence literal and `#{...}` map literal stay in the    *)
-(*     grammar; ARRAY and VECTOR become ordinary calls                         *)
-(*     `array([...])` / `vec([...])` -- NO grammar rule                        *)
-(*     (just an lident path + call_suffix on a `[...]` literal).               *)
-(*   - `#{` for maps is kept ON PURPOSE: in expression position a bare `{`     *)
-(*     opens a block, so the map literal needs a disambiguating prefix (LL(1); *)
-(*     also tells empty map `#{}` from empty block `{}`).                      *)
+(*     rest": the `[...]` sequence literal and the `#{...}` map literal are    *)
+(*     grammar; arrays and vectors are built by ordinary calls                 *)
+(*     (`array(n, init)`, `vec()`, `toVec([...])`) -- NO grammar rule.         *)
+(*   - `#{` for maps is deliberate: in expression position a bare `{` opens    *)
+(*     a block, so the map literal needs a disambiguating prefix (LL(1); it    *)
+(*     also tells the empty map `#{}` from the empty block `{}`).              *)
 (* =========================================================================== *)
 
 program      = { terminator } , { item , { terminator } } ;
@@ -39,7 +37,7 @@ item         = [ "pub" ] , [ "transparent" ] , ( fn_item | struct_item | enum_it
    single literal (an optional leading '-' on a number is folded in); the type is mandatory. *)
 const_item   = "const" , ( lident | uident ) , ":" , type , "=" , [ "-" ] , literal ;
 
-(* -- modules (whole-program v1; one `.skn` file = one module) ------------------- *)
+(* -- modules (whole-program; one `.skn` file = one module) ---------------------- *)
 (* `import` loads a module (runs its top-level init + makes `mod::name` reachable);*)
 (* `use` additionally binds names UNQUALIFIED (a single name, a `{ list }`, or a   *)
 (* `*` WEAK glob -- a glob is silently overridden by a local def or an explicit    *)
@@ -52,7 +50,7 @@ const_item   = "const" , ( lident | uident ) , ":" , type , "=" , [ "-" ] , lite
 (* qualifier `std::Name` reaches the ambient prelude. Same-named types / fns /     *)
 (* traits may COEXIST across modules; a trait `impl` obeys the orphan rule (the    *)
 (* trait OR the target type must be local to the impl's module). No alias /        *)
-(* re-export in v1.                                                                *)
+(* re-export.                                                                      *)
 import_item  = "import" , lident , { "::" , lident } ;
 use_item     = "use" , lident , "::" , use_rest ;
 use_rest     = ident                                         (* single: the imported name *)
@@ -107,7 +105,7 @@ enum_variant = uident , [ "(" , type , { "," , type } , [ "," ] , ")"
                         | "{" , field_defs , "}"
                         | "=" , [ "-" ] , int_literal ] ;
 
-(* -- traits / protocols (dynamic single-dispatch on arg 0 `self`). A trait    *)
+(* -- traits (dynamic single-dispatch on arg 0 `self`). A trait                *)
 (* method is callable three ways: as a free function / pipe (`show(x)` /        *)
 (* `x |> show`), as a method (`x.show()`), or qualified (`Trait::show(x)`).     *)
 (* Trait + supertrait names UPPER.                                             *)
@@ -148,11 +146,15 @@ statement    = let_stmt | assign_stmt | expr_stmt ;
 (* `let` type stays OPTIONAL -- inferred from the initializer. Case of the     *)
 (* bound name(s) is governed by `pattern` (lident = binding).                  *)
 let_stmt     = "let" , [ "mut" ] , pattern , [ ":" , type ] , "=" , expr ;
-assign_stmt  = lvalue , "=" , expr ;           (* reassign a `mut` binding *)
+assign_stmt  = lvalue , ( "=" | compound_op ) , expr ;   (* reassign a `mut` binding *)
+(* `a op= b` means exactly `a = a op b`, but the place is evaluated ONCE (not a desugar). The   *)
+(* accepted types follow the plain operator: arithmetic = Int|Double, bitwise/shift = Int only. *)
+compound_op  = "+=" | "-=" | "*=" | "/=" | "%="
+             | "&=" | "|=" | "^=" | "<<=" | ">>=" | ">>>=" ;
 expr_stmt    = expr ;
 lvalue       = expr ;                          (* a place path: ident, or any field/index      *)
 (* chain over one -- `p.x`, `a[i]`, `a[i].x`, `p.x.y`, `m[k].x`, `a[i][j]`. The ROOT binding   *)
-(* must be `mut` (M5); a non-binding root (e.g. `mk().x`) is "cannot assign to a temporary".   *)
+(* must be `mut`; a non-binding root (e.g. `mk().x`) is "cannot assign to a temporary".        *)
 
 (* -- expressions: lowest precedence (pipe) to highest (postfix) -- *)
 expr         = pipe ;
@@ -236,10 +238,14 @@ break_expr   = "break" , [ expr ] ;
 match_expr   = "match" , header_expr , "{" , { terminator } ,
                { match_arm , [ "," ] , { terminator } } , "}" ;
 match_arm    = arm_pattern , [ "if" , expr ] , "=>" , expr ;
-(* An or-pattern `A | B | C` (with an optional leading `|`) matches if ANY alternative *)
-(* matches; the `if` guard applies to the whole or-pattern. v1: TOP-LEVEL only (no `|` *)
-(* nested inside a sub-pattern) and NO bindings in the alternatives (literals / `_` /  *)
-(* nullary constructors) -- all alternatives must bind the same (empty) variable set.  *)
+(* An or-pattern `A | B | C` (with an optional leading `|`) matches if ANY alternative  *)
+(* matches; the `if` guard applies to the whole or-pattern. Alternatives MAY bind, but  *)
+(* all of them must bind the SAME variable set -- same names, same types (exactly; no   *)
+(* Int<:Double widening), same mutability. Alternation is NOT top-level-only: it is     *)
+(* also allowed                                                                          *)
+(* in every nested position whose terminator is unambiguous (nested_pattern below), and *)
+(* parenthesized `( A | B )` anywhere else. Nested OrPats are SPLICED flat, so          *)
+(* `(A|B) | C` and `A|B|C` are the same tree.                                           *)
 arm_pattern  = [ "|" ] , pattern , { "|" , pattern } ;
 (* lambda params + return stay OPTIONAL (check position supplies the expected  *)
 (* type). Uses lambda_params, not the mandatory param_list.                    *)
@@ -261,27 +267,44 @@ map_entry    = expr , "=>" , expr ;
 (* A constructor pattern (nullary / record / tuple) may carry an optional      *)
 (* module qualifier `mod::Ctor` (e.g. `pal::Red`, `geo::Point{ x, y }`).       *)
 pattern      = "_"
-             | range_pat                                   (* lo..hi -- must precede the plain-literal alt *)
+             | range_pat                                   (* lo..hi -- must precede the plain-literal and binding alts *)
              | literal | "-" , ( int | double )
-             | [ "mut" ] , lident                          (* fresh binding *)
+             | [ "mut" ] , lident , [ "@" , pattern ]      (* fresh binding, optionally bind-and-match *)
              | [ lident , "::" ] , uident                  (* nullary constructor, e.g. None *)
              | [ lident , "::" ] , uident , "{" , field_pats , "}"   (* struct pattern *)
-             | [ lident , "::" ] , uident , "(" , [ pattern , { "," , pattern } , [ "," ] ] , ")"  (* tuple-struct, e.g. Some(x) *)
-             | "(" , [ pattern , { "," , pattern } ] , ")"        (* tuple *)
+             | [ lident , "::" ] , uident , "(" , [ nested_pattern , { "," , nested_pattern } , [ "," ] ] , ")"  (* tuple-struct, e.g. Some(x) *)
+             | "(" , [ "|" ] , [ nested_pattern , { "," , nested_pattern } ] , ")"   (* tuple / grouping / ( A | B ) *)
              | "[" , [ list_pat_items ] , "]"                     (* list *)
              | "#" , "{" , { terminator } ,
                  { map_pat_entry , [ "," ] , { terminator } } , "}" ;  (* map (match-only) *)
+(* A sub-pattern in a position with an unambiguous terminator (a `,` or the closing        *)
+(* bracket): `|` needs no parentheses there, so `Some(Red | Green)` and `[1 | 2, x]` read  *)
+(* as written. Elsewhere -- notably after `@`, whose sub-pattern is undelimited -- the     *)
+(* parenthesized form `( A | B )` is required.                                             *)
+nested_pattern = pattern , { "|" , pattern } ;
+(* `n @ sub` / `mut n @ sub` -- bind the WHOLE value at this position to `n` AND require    *)
+(* `sub` to match (`n @ 1..100`, `whole @ Some(inner)`, `n @ (1..10 | 20..30)`). The name   *)
+(* takes the type of the position, not of `sub`. Refutability is entirely `sub`'s, so `@`  *)
+(* is REJECTED in the irrefutable binder positions (`let` / `for` / parameters), where it  *)
+(* would bind exactly what the bare name binds. Front end only: no VM or opcode change.    *)
 field_pats   = { terminator } , { field_pat , [ "," ] , { terminator } } ;
-field_pat    = lident , [ ":" , pattern ] ;
-(* Range pattern `lo..hi` -- INCLUSIVE, bounds are Int/Double literals (a char literal is an Int).       *)
+field_pat    = lident , [ ":" , nested_pattern ] ;
+(* Range pattern `lo..hi` -- INCLUSIVE. A bound is a numeric literal (a char literal is an Int) or the   *)
+(* NAME of a scalar `const`, possibly qualified: `LO..HI`, `util::LO..9`, `0.0..PI`. An identifier is    *)
+(* unambiguous only HERE, because a bound is never a binder -- which is why a bare `MAX` as a whole      *)
+(* pattern is NOT a constant reference. Arbitrary expressions are a deliberate non-goal. A qualified     *)
+(* bound's tail is uppercase, matching what a pattern already allows after `mod::`.                      *)
 (* Binds nothing; never completes a signature (the numeric types are unbounded), so a match built only   *)
 (* of ranges still needs a `_`. Codegen: `scrut >= lo && scrut <= hi` (BLT_NUM/BGT_NUM). No VM change.   *)
+(* Against a Char scrutinee a pair of byte-range int LITERALS retypes to Char (`'a'..'z'`).              *)
 num_lit      = [ "-" ] , ( int | double ) ;
-range_pat    = num_lit , ".." , num_lit ;
-list_pat_items = { pattern , "," } , [ pattern | ".." , [ pattern ] ] ;
+range_bound  = num_lit | [ ( lident | uident ) , "::" ] , ( lident | uident ) ;  (* literal or const name *)
+range_pat    = range_bound , ( ".." | "..<" ) , range_bound ;  (* `..` inclusive, `..<` exclusive upper *)
+(* The `..` tail binds the remaining elements and must be a plain name or `_`. *)
+list_pat_items = { nested_pattern , "," } , [ nested_pattern | ".." , [ lident | "_" ] ] ;
 (* Partial map pattern; key is a literal expr (enforced in codegen), value      *)
 (* side is a sub-pattern (`_` = presence-only).                                 *)
-map_pat_entry = expr , "=>" , pattern ;
+map_pat_entry = expr , "=>" , nested_pattern ;
 
 (* -- types; type names + type variables are UPPERCASE (uident) -- *)
 type         = named_type | fn_type | tuple_type | dyn_type ;
@@ -305,17 +328,21 @@ dyn_type     = "dyn" , [ lident , "::" ] , uident ,
 uident       = uppercase_letter , { letter | digit | "_" } ;          (* types / constructors *)
 lident       = ( lowercase_letter | "_" ) , { letter | digit | "_" } ; (* values / functions; a lone `_` is the wildcard, not lident *)
 ident        = lident | uident ;                 (* case-agnostic union; used where case is irrelevant (e.g. imported names) *)
-int          = hex_int | octal_int | binary_int | ( digit , { digit } ) ;
-(* Radix literals are a BIT PATTERN up to 48 bits, sign-extended from bit 47 (Option B): so             *)
-(* 0xFFFFFFFFFFFF == -1, 0x800000000000 == MIN_48. A plain decimal int stays a signed magnitude < 2^47. *)
-hex_int      = "0" , ( "x" | "X" ) , hex_digit , { hex_digit } ;
-octal_int    = "0" , ( "o" | "O" ) , octal_digit , { octal_digit } ;
-binary_int   = "0" , ( "b" | "B" ) , binary_digit , { binary_digit } ;
+int          = hex_int | octal_int | binary_int | dec_digits ;
+(* Radix literals are a BIT PATTERN up to 48 bits, sign-extended from bit 47: so                        *)
+(* 0xFFFF_FFFF_FFFF == -1, 0x8000_0000_0000 == MIN_48. A decimal int stays a signed magnitude < 2^47.   *)
+(* `_` is a DIGIT SEPARATOR, permitted in every form and ignored in the value. Java's rule: it must sit *)
+(* between two digits, so a run is fine (1__0 == 10) but `1_`, `1_.5` and `0x_FF` are lex errors --     *)
+(* which is why each run below is `digit , { digit | "_" }` with the separator never leading.           *)
+dec_digits   = digit , { digit | "_" } ;
+hex_int      = "0" , ( "x" | "X" ) , hex_digit , { hex_digit | "_" } ;
+octal_int    = "0" , ( "o" | "O" ) , octal_digit , { octal_digit | "_" } ;
+binary_int   = "0" , ( "b" | "B" ) , binary_digit , { binary_digit | "_" } ;
 hex_digit    = digit | "a".."f" | "A".."F" ;
 octal_digit  = "0".."7" ;
 binary_digit = "0" | "1" ;
-double       = digit , { digit } , ( ( "." , digit , { digit } , [ exponent ] ) | exponent ) ;  (* 64-bit `Double`, no `Float`; an exponent alone (1e6) makes it a Double *)
-exponent     = ( "e" | "E" ) , [ "+" | "-" ] , digit , { digit } ;
+double       = dec_digits , ( ( "." , dec_digits , [ exponent ] ) | exponent ) ;  (* 64-bit `Double`, no `Float`; an exponent alone (1e6) makes it a Double *)
+exponent     = ( "e" | "E" ) , [ "+" | "-" ] , dec_digits ;
 string       = '"' , { char } , '"' ;             (* a plain string literal (no `${` hole) *)
 (* Raw string: an `r` prefix takes the contents VERBATIM -- no backslash escapes, no `${` holes;      *)
 (* multi-line allowed. The hash form `r#"..."#` (or `r##"..."##`, ...) ends only at a `"` followed by *)

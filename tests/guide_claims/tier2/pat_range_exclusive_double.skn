@@ -1,0 +1,7 @@
+// CLAIM: on Double bounds `..<` is the only way to write a half-open range — there is no notation for
+//        the largest double below 1.0, so `0.0..<1.0` cannot be rewritten as an inclusive range.
+// GUIDE: SkarnGuide.md 13 (Range patterns)
+// EXPECT: ok true true false
+fn unitInterval(x: Double) -> Bool { match x { 0.0..<1.0 => true, _ => false } }
+
+println("${unitInterval(0.0)} ${unitInterval(0.999)} ${unitInterval(1.0)}")

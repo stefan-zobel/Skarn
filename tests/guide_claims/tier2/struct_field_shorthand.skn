@@ -1,0 +1,28 @@
+// CLAIM:  Field shorthand works in a struct LITERAL and in a PATTERN, mixes with explicit
+//         fields, combines with record update `..base`, and works inside a FUNCTION body
+//         exactly as at top level.
+// GUIDE:  SkarnGuide.md 11 (Structs) + 13 (Struct, enum, and tuple patterns)
+// EXPECT: ok 1 2 a | 1 9 a | 5 2 | 7 2 | 4 6 b
+struct P { x: Int, y: Int, label: String }
+
+// Regression: the inliner scans every function body, and a shorthand field carries a NULL
+// value node. Top-level shorthand is not scanned, so only a fn body exercises that path.
+fn mkP(x: Int, y: Int, label: String) -> P { P { x, y, label } }
+
+let x = 1
+let y = 2
+let label = "a"
+
+let all   = P { x, y, label }        // every field by shorthand
+let mixed = P { x, y: 9, label }     // shorthand and explicit side by side
+let upd   = P { x: 5, ..all }        // record update, no shorthand
+let both  = P { x: 7, ..all }        // record update after an explicit field
+
+// Pattern shorthand binds each field to a name equal to the field.
+let s1 = match all   { P { x, y, label } => "${x} ${y} ${label}" }
+// ... and mixes with explicit field patterns just like the literal does.
+let s2 = match mixed { P { x: a, y, label: b } => "${a} ${y} ${b}" }
+
+let inFn = mkP(4, 6, "b")
+
+println("${s1} | ${s2} | ${upd.x} ${upd.y} | ${both.x} ${both.y} | ${inFn.x} ${inFn.y} ${inFn.label}")

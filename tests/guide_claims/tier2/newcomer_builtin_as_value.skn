@@ -1,0 +1,5 @@
+// CLAIM: newcomer diagnostics -- passing a built-in function as a value says it is call-only and to wrap it in a lambda (not "unknown variable").
+// GUIDE: SkarnGuide.md §10 "Closures and function values"; tests/guide_claims/README.md
+// EXPECT: fail built-in function 'toString' can only be called, not used as a value
+let labels = toVec([1, 2, 3]) |> intoIter |> map(toString) |> collect
+println(len(labels))

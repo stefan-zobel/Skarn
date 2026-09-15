@@ -1,0 +1,4 @@
+// CLAIM: String + number coerces the number to text (Java-style +).
+// GUIDE: §Operators / string concat
+// EXPECT: ok v=5
+println("v=" + 5)

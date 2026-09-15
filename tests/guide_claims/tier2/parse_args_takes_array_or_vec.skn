@@ -1,0 +1,16 @@
+// CLAIM:  `CliArgs::parse` accepts anything iterable of String -- the `Array[String]` that `args()`
+//         returns as well as a `Vec[String]` assembled by the caller.
+// GUIDE:  SkarnGuide.md 26 (std::cli)
+// EXPECT: ok array=0 vec=true 1
+use std::cli::*
+use std::env::*
+
+// args() hands back an Array[String]; with no script arguments it is empty.
+let fromArray = CliArgs::parse(args())
+
+let mut v: Vec[String] = vec()
+push(v, "--fast")
+push(v, "file.txt")
+let fromVec = CliArgs::parse(v)
+
+println("array=${fromArray.numPositionals()} vec=${fromVec.hasFlag("fast")} ${fromVec.numPositionals()}")

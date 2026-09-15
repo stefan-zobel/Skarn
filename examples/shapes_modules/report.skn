@@ -1,0 +1,34 @@
+// report -- turns a list of shapes into a formatted table. Knows nothing about the concrete types:
+// it works on `dyn Shape`, so a new shape needs no change here.
+
+import geometry::shapes
+use geometry::shapes::Shape
+
+pub struct Totals { count: Int, area: Double, largest: String }
+
+pub fn table(items: Vec[dyn Shape]) -> Totals {
+    println("${"shape":<22} ${"area":>9} ${"perimeter":>10}")
+    println(repeatStr("-", 43))
+    let mut total = 0.0
+    let mut largest = ""
+    let mut largestArea = -1.0
+    for s in items {
+        println("${s.name():<22} ${s.area():>9.2f} ${s.perimeter():>10.2f}")
+        total = total + s.area()
+        if s.area() > largestArea {
+            largestArea = s.area()
+            largest = s.name()
+        }
+    }
+    println(repeatStr("-", 43))
+    Totals { count: len(items), area: total, largest }
+}
+
+// Private helper: not visible outside this module.
+fn percent(part: Double, whole: Double) -> String { format(100.0 * part / whole, ".1f") + "%" }
+
+pub fn share(items: Vec[dyn Shape], totals: Totals) -> () {
+    for s in items {
+        println("  ${s.name():<22} ${percent(s.area(), totals.area):>6}")
+    }
+}

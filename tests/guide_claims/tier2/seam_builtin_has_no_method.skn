@@ -1,0 +1,7 @@
+// CLAIM: the other half of the same rule — a builtin receiver has NO methods, so `v.len()` is rejected.
+//        This is what makes `len(v)` a free function rather than a style choice, and it is the reason the
+//        std types Skarn defines itself (`Set`, `Json`, `Rng`, …) read differently from `Vec`/`Map`.
+// GUIDE: SkarnGuide.md 16 (the standard library reads in two styles, and the split is principled)
+// EXPECT: fail has no field or method 'len'
+let v = toVec([1, 2, 3])
+println("${v.len()}")

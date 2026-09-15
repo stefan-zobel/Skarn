@@ -4,8 +4,12 @@
 use std::net::*
 
 fn echo() -> Result[(), String] {
-  let lst = listen(48080)?                       // dual-stack listener on a high port
-  let mut cli = connect("127.0.0.1", 48080)?     // client connects (IPv4 -> v4-mapped)
+  // Port 0 = "any free port, chosen by the OS", read back with localPort(). Nothing here needs a
+  // PARTICULAR port, and a hardcoded one can already be taken by an unrelated connection -- on
+  // Windows the ephemeral range is 1024-60000, so even an unusual-looking high port is fair game.
+  let lst = listen(0)?                           // dual-stack listener on an OS-assigned port
+  let port = lst.localPort()?
+  let mut cli = connect("127.0.0.1", port)?      // client connects (IPv4 -> v4-mapped)
   let mut srv = lst.accept()?                    // server side of the same connection
 
   cli.sendStr("ping\n")?                         // client -> server

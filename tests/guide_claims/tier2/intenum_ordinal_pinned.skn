@@ -1,0 +1,9 @@
+// CLAIM: ordinal() on an int-backed enum yields the DISCRIMINANT, not the declaration position --
+//        with a pinned `Teapot = 418` it is 418, where Java's ordinal() would say 3. It is the claim
+//        most likely to rot, because the two numbers coincide for every UNPINNED enum, so a
+//        position-based implementation would pass every other test in the suite. The auto-counter
+//        resuming from a pin (Created => 201) is the same distinction in its subtler form.
+// GUIDE: SkarnGuide.md 12 (int-backed enums: "the pinned value, not the position")
+// EXPECT: ok 200 201 404 418 Teapot
+enum Status : Int { Ok = 200, Created, NotFound = 404, Teapot = 418 }
+println("${ordinal(Ok)} ${ordinal(Created)} ${ordinal(NotFound)} ${ordinal(Teapot)} ${Teapot}")

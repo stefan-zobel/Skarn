@@ -1,0 +1,5 @@
+// CLAIM: newcomer diagnostics -- an opt-in std type without `use` names the module.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail unknown type 'DateTime'; it is in 'std::time'
+use std::env::*
+let d: DateTime = now()

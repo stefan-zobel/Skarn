@@ -1,0 +1,7 @@
+// CLAIM: Trait::method(x) is the qualified escape hatch for naming a trait method.
+// GUIDE: §16 (Trait::method escape hatch)
+// EXPECT: ok p
+trait Show2 { fn show2(self) -> String }
+struct P { k: Int }
+impl Show2 for P { fn show2(self) -> String { "p" } }
+println(Show2::show2(P { k: 1 }))

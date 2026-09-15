@@ -1,0 +1,4 @@
+// CLAIM: ${e:.N} sets Double precision.
+// GUIDE: §Format specifiers (precision)
+// EXPECT: ok 3.14
+println("${3.14159:.2}")

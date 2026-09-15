@@ -1,0 +1,5 @@
+// CLAIM: newcomer diagnostics -- a qualified variant of an un-imported enum names the missing `use`, not 'is not an enum'.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail unknown type 'Json'; it is in 'std::json'
+let j = Json::Integer(3)
+println(match j { Json::Integer(n) => n, _ => 0 })

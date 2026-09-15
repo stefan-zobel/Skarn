@@ -1,0 +1,6 @@
+// CLAIM: a const array element must be a scalar LITERAL (no fn call / expression).
+// GUIDE: §const arrays
+// EXPECT: fail a const array element must be a scalar literal
+fn f() -> Int { 3 }
+const K: Array[Int] = [1, f(), 3]
+println(K[0])

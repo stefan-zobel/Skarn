@@ -1,0 +1,5 @@
+// CLAIM: items are DEFAULT-PRIVATE — a non-pub item is unreachable from another module.
+// GUIDE: §Modules / visibility (default private)
+// EXPECT: fail is private in module
+import util
+println(util::secret())

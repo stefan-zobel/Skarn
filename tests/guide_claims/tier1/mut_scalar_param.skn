@@ -1,0 +1,5 @@
+// CLAIM: a mut PARAMETER requires a mutable aggregate — a scalar mut x: Int param is rejected. (Contrast: let mut reassigns any type — see cond/eq examples.)
+// GUIDE: mutation rule
+// EXPECT: fail cannot be declared
+fn f(mut x: Int) -> Int { x + 1 }
+println(f(3))

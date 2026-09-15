@@ -1,0 +1,10 @@
+// CLAIM: `has_self` decides reachability — a method answers to `.` and to `::`, an associated
+//        function to `::` alone. So `p.make(2)` does not resolve, and the diagnostic names the
+//        associated function rather than claiming the type has no such member.
+// GUIDE: SkarnGuide.md 16 (method-call syntax and inherent methods)
+// EXPECT: fail is an associated function of 'P' (it takes no `self`)
+struct P { n: Int }
+impl P { fn make(k: Int) -> P { P { n: k } } }
+
+let p = P { n: 1 }
+println("${p.make(2).n}")

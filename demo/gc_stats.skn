@@ -3,8 +3,7 @@
 //
 // gcResetStats() clears the VM's live GC counters; gcStats() reads them back as
 // a struct. Bracketing a region between the two measures its GC activity from
-// inside the language -- e.g. a benchmark harness written in Skarn, or (later)
-// the self-hosting compiler reporting its own GC load.
+// inside the language -- e.g. a benchmark harness written in Skarn.
 //
 // The counters are uint64 in the VM but surface as Double (a Double carries a
 // 53-bit exact integer -- more than a 48-bit Int -- so byte/nanosecond counters

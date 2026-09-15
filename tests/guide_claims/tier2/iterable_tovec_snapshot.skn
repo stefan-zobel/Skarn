@@ -1,0 +1,11 @@
+// CLAIM:  toVec over a user Iterable delegates to `iter`; `clone(self.items)` keeps the snapshot isolated.
+// GUIDE:  19 (Iterable: the eager bridge) / the corrected `toVec` "gathers, only copies if iter is fresh" note
+// EXPECT: ok bag intact = 3
+struct Bag { items: Vec[Int] }
+impl Iterable[Int] for Bag {
+    fn iter(self) -> Vec[Int] { clone(self.items) }   // hand back a COPY, not the internal Vec
+}
+let b = Bag { items: toVec([3, 1, 2]) }
+let mut snap = toVec(b)      // goes through `iter` -> a fresh Vec, not an alias to b.items
+push(snap, 99)               // mutate the snapshot
+println("bag intact = " + len(b.items))   // isolated: still 3

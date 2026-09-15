@@ -143,26 +143,27 @@
     },
 
     "numbers": {
+      "comment": "`_` is a digit separator (between digits only), so every digit class admits a trailing `[0-9..._]*`. The leading character stays a bare digit class, which is what keeps `_1` an identifier.",
       "patterns": [
         {
           "name": "constant.numeric.hex.skarn",
-          "match": "\\b0[xX][0-9a-fA-F]+\\b"
+          "match": "\\b0[xX][0-9a-fA-F][0-9a-fA-F_]*\\b"
         },
         {
           "name": "constant.numeric.octal.skarn",
-          "match": "\\b0[oO][0-7]+\\b"
+          "match": "\\b0[oO][0-7][0-7_]*\\b"
         },
         {
           "name": "constant.numeric.binary.skarn",
-          "match": "\\b0[bB][01]+\\b"
+          "match": "\\b0[bB][01][01_]*\\b"
         },
         {
           "name": "constant.numeric.float.skarn",
-          "match": "\\b\\d+(?:\\.\\d+(?:[eE][+-]?\\d+)?|[eE][+-]?\\d+)\\b"
+          "match": "\\b\\d[\\d_]*(?:\\.\\d[\\d_]*(?:[eE][+-]?\\d[\\d_]*)?|[eE][+-]?\\d[\\d_]*)\\b"
         },
         {
           "name": "constant.numeric.integer.skarn",
-          "match": "\\b\\d+\\b"
+          "match": "\\b\\d[\\d_]*\\b"
         }
       ]
     },
@@ -219,7 +220,7 @@
     "builtin-functions": {
       "comment": "Builtins, natives and prelude free functions the static compiler recognizes.",
       "name": "support.function.builtin.skarn",
-      "match": "\\b(abs|absInt|accept|acos|add|addDuration|all|any|append|appendByte|appendBytes|appendCodePoint|appendFile|appendTextFile|args|array|asArr|asBool|asDouble|asin|asInt|asMap|asObj|assert|asStr|at|atan|atan2|atEnd|build|bytes|captures|capturesAll|capturesFrom|cbrt|ceil|chain|charAt|charCount|chars|charStr|choice|choiceWeighted|chunks|clamp|clone|close|codePoint|codePointToStr|collect|compile|compileWith|connect|contains|copyFile|cos|count|crc32|crc32Str|dateOnly|dateTime|days|daysInMonth|dedup|delete|deleteFile|difference|drop|dropWhile|durationBetween|elapsedMillis|elapsedNanos|empty|emptyArray|endsWith|enumerate|exp|expect|f64ToBytes|fileExists|fileSize|fillDoubles|fillU32|filter|find|flatMap|floor|fold|forEach|format|fromBytes|fromChars|fromDateTime|fromHex|fromSeed|fromState|fromVec|gcd|gcResetStats|gcStats|get|getEnv|getField|getOpt|getOptOr|getOr|getOrElse|getOrPut|group|groupNamed|has|hasControl|hasFlag|hasSubstr|hours|httpGet|hypot|inDays|indexOf|inHours|inMillis|inMinutes|inSeconds|insert|inspect|instantFromMillis|intersect|intoIter|isAfter|isAsciiAlpha|isAsciiAlphanumeric|isAsciiControl|isAsciiDigit|isAsciiLower|isAsciiPrintable|isAsciiUpper|isAsciiWhitespace|isBefore|isDir|isDisjoint|isEmpty|isErr|isFile|isInfinite|isLeapYear|isMatch|isMember|isNaN|isNone|isNull|isOk|isSome|isSubset|iter|iterate|join|jump|keys|lastIndexOf|lcm|len|lessThan|lines|listDir|listen|ln|log10|log2|map|mapErr|max|maxBy|maxOf|millis|millisTime|min|minBy|minOf|minutes|mkdir|murmur3|murmur3Str|nanoTime|negate|new|next|nextBool|nextDouble|nextDoubleRange|nextGaussian|nextGaussianMS|nextInt|nextInt48|nextIntBounded|nextU32|now|nthChar|numPositionals|ok|okOr|once|optionAndThen|optionMap|padEnd|padStart|panic|parse|parseDouble|parseInt|parseIso|partition|peek|peekable|pop|position|positionalAt|pow|print|println|product|push|range|rawGcStats|rawRun|readAllStdin|readBytes|readFile|readI32LE|readLine|readStr|readTextFile|readU16LE|readU32LE|readU8|readVarI|readVarU|recv|recvAll|recvLine|reduce|remaining|remove|rename|repeat|repeatStr|replace|replaceAllRe|replaceRe|resultAndThen|resultMap|round|roundHalfToEven|run|runText|runWith|sample|scale|scan|search|searchAll|searchFrom|seconds|send|sendStr|setTimeout|sh|sha256|sha256Hex|sha256HexStr|sha256Str|shuffle|sign|signInt|sin|size|slice|sliceBytes|sort|sortBy|sorted|split|splitRe|splitRng|sqrt|startStopwatch|startsWith|stepBy|stringBuilder|stringBuilderCap|stringify|stringifyChecked|stringifyPretty|sub|subDuration|sum|take|takeWhile|tan|tcpAccept|tcpClose|tcpConnect|tcpListen|tcpRecv|tcpSend|tcpSetTimeout|toBytes|toDateTime|toDouble|toEpochMillis|toHex|toInt|toIntChecked|toIso|toLower|toMap|toString|toUpper|toVec|trim|trimEnd|trimStart|trunc|union|unwrap|unwrapErr|unwrapOr|unzip|upsert|values|vec|weekday|windows|writeBytes|writeFile|writeI32LE|writeStr|writeTextFile|writeU16LE|writeU32LE|writeU8|writeVarI|writeVarU|zip)\\b(?=\\s*\\()"
+      "match": "\\b(abs|absInt|accept|acos|add|addDuration|all|any|append|appendByte|appendBytes|appendCodePoint|appendFile|appendTextFile|args|array|asArr|asBool|asDouble|asin|asInt|asMap|asObj|assert|asStr|at|atan|atan2|atEnd|build|bytes|captures|capturesAll|capturesFrom|cbrt|ceil|chain|charAt|charCount|chars|charStr|choice|choiceWeighted|chunks|clamp|clone|close|codePoint|codePointToStr|collect|compile|compileWith|connect|contains|copyFile|cos|count|crc32|crc32Str|dateOnly|dateTime|days|daysInMonth|dedup|delete|deleteFile|difference|drop|dropWhile|durationBetween|elapsedMillis|elapsedNanos|empty|emptyArray|endsWith|enumerate|exp|expect|f64ToBytes|fileExists|fileSize|fillDoubles|fillU32|filter|find|flatMap|floor|fold|forEach|format|fromBytes|fromChars|fromDateTime|fromHex|fromSeed|fromState|fromVec|gcd|gcResetStats|gcStats|get|getEnv|getField|getOpt|getOptOr|getOr|getOrElse|getOrPut|group|groupNamed|has|hasControl|hasFlag|hasSubstr|hours|httpGet|hypot|inDays|indexOf|inHours|inMillis|inMinutes|inSeconds|insert|inspect|instantFromMillis|intersect|intoIter|isAfter|isAsciiAlpha|isAsciiAlphanumeric|isAsciiControl|isAsciiDigit|isAsciiLower|isAsciiPrintable|isAsciiUpper|isAsciiWhitespace|isBefore|isDir|isDisjoint|isEmpty|isErr|isFile|isInfinite|isLeapYear|isMatch|isMember|isNaN|isNone|isNull|isOk|isSome|isSubset|iter|iterate|join|jump|keys|lastIndexOf|lcm|len|lessThan|lines|listDir|listen|ln|log10|log2|map|mapErr|max|maxBy|maxOf|millis|millisTime|min|minBy|minOf|minutes|mkdir|murmur3|murmur3Str|nanoTime|negate|new|next|nextBool|nextDouble|nextDoubleRange|nextGaussian|nextGaussianMS|nextInt|nextInt48|nextIntBounded|nextU32|now|nthChar|numPositionals|ok|okOr|once|optionAndThen|optionMap|ordinal|padEnd|padStart|panic|parse|parseDouble|parseInt|parseIso|partition|peek|peekable|pop|position|positionalAt|pow|print|println|product|push|range|rawGcStats|rawRun|readAllStdin|readBytes|readFile|readI32LE|readLine|readStr|readTextFile|readU16LE|readU32LE|readU8|readVarI|readVarU|recv|recvAll|recvLine|reduce|remaining|remove|rename|repeat|repeatStr|replace|replaceAllRe|replaceRe|resultAndThen|resultMap|round|roundHalfToEven|run|runText|runWith|sample|scale|scan|search|searchAll|searchFrom|seconds|send|sendStr|setTimeout|sh|sha256|sha256Hex|sha256HexStr|sha256Str|shuffle|sign|signInt|sin|size|slice|sliceBytes|sort|sortBy|sorted|split|splitRe|splitRng|sqrt|startStopwatch|startsWith|stepBy|stringBuilder|stringBuilderCap|stringify|stringifyChecked|stringifyPretty|sub|subDuration|sum|take|takeWhile|tan|tcpAccept|tcpClose|tcpConnect|tcpListen|tcpRecv|tcpSend|tcpSetTimeout|toBytes|toDateTime|toDouble|toEpochMillis|toHex|toInt|toIntChecked|toIso|toLower|toMap|toString|toUpper|toVec|trim|trimEnd|trimStart|trunc|union|unwrap|unwrapErr|unwrapOr|unzip|upsert|values|vec|weekday|windows|words|writeBytes|writeFile|writeI32LE|writeStr|writeTextFile|writeU16LE|writeU32LE|writeU8|writeVarI|writeVarU|zip)\\b(?=\\s*\\()"
     },
 
     "constructors-and-types": {
@@ -248,6 +249,11 @@
           "match": "&&|\\|\\||!"
         },
         {
+          "comment": "Compound assignment, longest-first. Must precede the comparison and bitwise rules: those match a single `<`/`>`/`&` at the same position and would split `>>>=` (the language's only four-character token) into three operators.",
+          "name": "keyword.operator.assignment.compound.skarn",
+          "match": ">>>=|<<=|>>=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^="
+        },
+        {
           "name": "keyword.operator.comparison.skarn",
           "match": "==|!=|<=|>=|<|>"
         },
@@ -266,6 +272,11 @@
         {
           "name": "keyword.operator.try.skarn",
           "match": "\\?"
+        },
+        {
+          "comment": "Pattern binding `n @ sub`. Shares no prefix with any other lexeme, so its position in this list carries no ordering obligation.",
+          "name": "keyword.operator.binding.skarn",
+          "match": "@"
         },
         {
           "name": "keyword.operator.range.skarn",

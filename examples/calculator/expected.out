@@ -1,0 +1,12 @@
+  1 + 2 * 3                => (1 + (2 * 3)) = 7
+  (1 + 2) * 3              => ((1 + 2) * 3) = 9
+  width = 12               => width = 12
+  height = width - 4       => height = 8
+  area = width * height    => area = 96
+  area / 7 + area % 7      => ((area / 7) + (area % 7)) = 18
+  -(width - 20) * 2        => ((-(width - 20)) * 2) = 16
+  area / (height - 8)      !! division by zero
+  1 + unknown              !! unknown variable 'unknown'
+  3 + * 4                  !! unexpected token at 4
+  (1 + 2                   !! expected ')' at 6
+  7 $ 3                    !! unexpected character '$' at 2

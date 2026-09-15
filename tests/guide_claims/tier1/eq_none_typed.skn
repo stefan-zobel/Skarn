@@ -1,0 +1,6 @@
+// CLAIM: None == None is true WHEN the element type is known (annotated) — the correct form of guide e7.
+// GUIDE: Comparison and equality (e7, corrected)
+// EXPECT: ok true
+let a: Option[Int] = None
+let b: Option[Int] = None
+println(a == b)

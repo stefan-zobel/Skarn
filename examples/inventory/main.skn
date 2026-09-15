@@ -1,0 +1,98 @@
+// inventory -- a warehouse inventory: stock levels in a Map, tags in Sets, and a stream of orders.
+//
+// Shows: Map helpers (`getOr`, `upsert`, `has`, `delete`), std::set operations (union, intersect,
+// difference, subset), an int-backed enum, iterator pipelines over map entries, and generic helpers.
+
+use std::set::*
+
+enum Priority : Int { Low = 1, Normal = 5, Urgent = 9 }
+
+struct Order { item: String, qty: Int, priority: Priority }
+
+struct Warehouse {
+    stock: Map[String, Int],
+    tags: Map[String, Set[String]],
+    backorders: Vec[Order],
+}
+
+impl Warehouse {
+    fn new() -> Warehouse { Warehouse { stock: #{}, tags: #{}, backorders: vec() } }
+
+    fn receive(mut self, item: String, qty: Int, tagList: Vec[String]) -> () {
+        upsert(self.stock, item, qty, fn(n: Int) -> Int { n + qty })   // insert qty, or add to the stock
+        let mut tags = getOrPut(self.tags, item, Set::new())
+        for t in tagList { tags.insert(t) }
+    }
+
+    // Ship an order if there is enough stock; otherwise keep it as a backorder.
+    fn ship(mut self, o: Order) -> Bool {
+        let have = getOr(self.stock, o.item, 0)
+        if have >= o.qty {
+            self.stock[o.item] = have - o.qty
+            if self.stock[o.item] == 0 { delete(self.stock, o.item) }
+            true
+        } else {
+            push(self.backorders, o)
+            false
+        }
+    }
+
+    fn tagged(self, tag: String) -> Set[String] {
+        let mut out: Set[String] = Set::new()
+        for (item, tags) in self.tags {
+            if tags.isMember(tag) { out.insert(item) }
+        }
+        out
+    }
+}
+
+// The names of a stream of items, sorted and comma-separated.
+fn sortedList(mut xs: dyn Iterator[String]) -> String { join(sorted(collect(xs)) |> intoIter, ", ") }
+
+let mut w = Warehouse::new()
+w.receive("bolt", 500, toVec(["metal", "small"]))
+w.receive("nut", 800, toVec(["metal", "small"]))
+w.receive("hammer", 12, toVec(["metal", "tool"]))
+w.receive("glue", 30, toVec(["chemical"]))
+w.receive("brush", 25, toVec(["tool", "wood"]))
+w.receive("bolt", 250, toVec(["bulk"]))
+
+println("stock:")
+for item in sorted(toVec(keys(w.stock))) {
+    println("  ${item:<8} ${w.stock[item]:>4}")
+}
+
+let orders = toVec([
+    Order { item: "bolt", qty: 700, priority: Normal },
+    Order { item: "hammer", qty: 20, priority: Urgent },
+    Order { item: "glue", qty: 30, priority: Low },
+    Order { item: "saw", qty: 1, priority: Urgent },
+    Order { item: "nut", qty: 100, priority: Normal },
+])
+
+// Urgent orders first; `ordinal` reads an int-backed enum's pinned value.
+let queue = sortBy(orders, fn(a: Order, b: Order) -> Bool { ordinal(a.priority) > ordinal(b.priority) })
+println()
+println("shipping:")
+for o in queue {
+    let shipped = w.ship(o)
+    let status = if shipped { "shipped" } else { "BACKORDER" }
+    println("  ${padEnd("[${o.priority}]", 8, ' ')} ${o.qty:>4} x ${o.item:<7} ${status}")
+}
+
+println()
+println("left in stock: ${sortedList(keys(w.stock) |> toVec |> intoIter)}")
+println("glue sold out: ${!has(w.stock, "glue")}")
+let missing = w.backorders |> intoIter |> map(fn(o: Order) -> Int { o.qty }) |> sum
+println("backordered units: ${missing}")
+
+let metal = w.tagged("metal")
+let tools = w.tagged("tool")
+let small = w.tagged("small")
+println()
+println("metal:          ${sortedList(metal |> intoIter)}")
+println("tool:           ${sortedList(tools |> intoIter)}")
+println("metal and tool: ${sortedList(metal.intersect(tools) |> intoIter)}")
+println("metal or tool:  ${sortedList(metal.union(tools) |> intoIter)}")
+println("metal, no tool: ${sortedList(metal.difference(tools) |> intoIter)}")
+println("small is metal: ${small.isSubset(metal)}")

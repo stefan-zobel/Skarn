@@ -1,0 +1,12 @@
+// CLAIM:  The `run() -> Result` + top-level `match` shape is how ? reaches the outside world.
+// GUIDE:  SkarnIn30Minutes.md 13 (Files, arguments, and the outside world)
+// EXPECT: ok error reported
+use std::io::*
+fn run() -> Result[Int, String] {
+  let text = readTextFile("no_such_file_for_a_guide_claim.txt")?
+  Ok(len(text))
+}
+match run() {
+  Ok(n)  => println("${n} lines"),
+  Err(_) => println("error reported"),
+}

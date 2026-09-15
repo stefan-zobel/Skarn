@@ -1,0 +1,7 @@
+// CLAIM: a local definition shadows a glob import (weak-glob shadowing).
+// GUIDE: §Modules (weak-glob shadowing)
+// EXPECT: ok LOCAL x
+import util
+use util::*
+fn greet(name: String) -> String { "LOCAL " + name }
+println(greet("x"))

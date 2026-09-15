@@ -1,0 +1,4 @@
+// CLAIM: newcomer diagnostics -- `for` over an Int says it cannot iterate it.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail cannot iterate over a value of type Int
+for i in 10 { println(i) }

@@ -1,0 +1,7 @@
+// CLAIM: record update Name { f: v, ..base } copies base then overrides f.
+// GUIDE: §Records (record update)
+// EXPECT: ok 303
+struct Cfg { a: Int, b: Int, c: Int }
+let base = Cfg { a: 1, b: 2, c: 3 }
+let up = Cfg { b: 20, ..base }
+println(up.a * 100 + up.b * 10 + up.c)

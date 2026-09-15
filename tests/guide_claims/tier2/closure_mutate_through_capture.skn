@@ -1,0 +1,13 @@
+// CLAIM: mutating THROUGH a captured name stays legal and is visible outside -- the capture copies a
+// POINTER, so it is the same object. This is the positive control for the lambda write barrier: the
+// discriminator is the assignment TARGET FORM (`o.f =` / `a[i] =` / a `mut` argument), not its root.
+// GUIDE: §10 closures ("a capture shares the pointed-to object, never the variable binding")
+// EXPECT: ok 7 1 9
+let mut p = #{ "k" => 0 }
+let mut xs: Vec[Int] = vec()
+let touch = fn() -> () {
+  p["k"] = 7
+  push(xs, 9)
+}
+touch()
+println("${p["k"]} ${len(xs)} ${xs[0]}")

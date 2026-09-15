@@ -1,0 +1,9 @@
+// CLAIM: `Head::m(x)` is REJECTED when a trait and a type share the name `Head` and both declare a
+//        method `m` — the compiler names both candidates instead of silently picking one.
+// GUIDE: 16 (method-call syntax — qualified inherent call)
+// EXPECT: fail is ambiguous
+trait Foo { fn bar(self) -> Int }
+struct Foo { n: Int }
+impl Foo { fn bar(self) -> Int { 1 } }
+
+println(Foo::bar(Foo { n: 3 }))

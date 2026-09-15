@@ -1,0 +1,4 @@
+// CLAIM: ${e:0N} zero-pads to width N.
+// GUIDE: §Format specifiers (fill)
+// EXPECT: ok 007
+println("${7:03}")

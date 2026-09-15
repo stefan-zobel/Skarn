@@ -1,0 +1,14 @@
+10.0.0.5 - - [12/Mar/2026:08:01:12] "GET /index.html HTTP/1.1" 200 5120
+10.0.0.5 - - [12/Mar/2026:08:01:13] "GET /style.css HTTP/1.1" 200 2048
+10.0.0.9 - - [12/Mar/2026:08:15:40] "GET /index.html HTTP/1.1" 200 5120
+192.168.1.20 - - [12/Mar/2026:09:02:03] "POST /api/login HTTP/1.1" 401 128
+192.168.1.20 - - [12/Mar/2026:09:02:09] "POST /api/login HTTP/1.1" 200 256
+192.168.1.20 - - [12/Mar/2026:09:03:00] "GET /api/items?page=2&sort=name HTTP/1.1" 200 8900
+this line is not a log entry
+10.0.0.9 - - [12/Mar/2026:09:30:31] "GET /api/items?page=1 HTTP/1.1" 200 9100
+10.0.0.5 - - [12/Mar/2026:11:45:00] "GET /missing.png HTTP/1.0" 404 -
+192.168.1.20 - - [12/Mar/2026:11:46:10] "DELETE /api/items/17 HTTP/1.1" 500 64
+10.0.0.7 - - [12/Mar/2026:13:00:59] "GET /index.html HTTP/1.1" 304 -
+192.168.1.20 - - [12/Mar/2026:13:05:00] "GET /api/items HTTP/1.1" 200 9050
+10.0.0.5 - - [12/Mar/2026:13:07:22] "GET /index.html HTTP/2" 200 5120
+192.168.1.20 - - [12/Mar/2026:17:59:59] "POST /api/logout HTTP/1.1" 200 32

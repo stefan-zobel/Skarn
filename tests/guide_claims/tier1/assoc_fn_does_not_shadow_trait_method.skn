@@ -1,0 +1,14 @@
+// CLAIM: an associated function never shadows a same-named TRAIT method for `.` — it has no
+//        receiver to dispatch on, so `p.make()` is the trait method. Tier 1 because the failure
+//        mode is a silently DIFFERENT function being called, not a diagnostic: the checker, codegen
+//        and the reference oracle each decide `.`-reachability from the same `has_self` fact.
+// GUIDE: SkarnGuide.md 16 (resolution order for x.name(...): field, then inherent method, then trait)
+// EXPECT: ok 7 | 99
+trait Mk { fn make(self) -> Int }
+
+struct P { n: Int }
+impl Mk for P { fn make(self) -> Int { 7 } }
+impl P { fn make() -> Int { 99 } }        // associated: no self
+
+let p = P { n: 1 }
+println("${p.make()} | ${P::make()}")

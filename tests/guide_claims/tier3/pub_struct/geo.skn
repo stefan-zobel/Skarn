@@ -1,0 +1,2 @@
+pub struct Point { x: Int, y: Int }
+pub fn mag2(p: Point) -> Int { p.x * p.x + p.y * p.y }

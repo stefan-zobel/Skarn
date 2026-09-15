@@ -1,0 +1,5 @@
+// CLAIM: method syntax chains straight off an associated function of a standard-library type -- `Json::parse(s).unwrap()` resolves `unwrap` as the trait method on the returned `Result`.
+// GUIDE: SkarnGuide.md 16 (Method-call syntax and inherent methods)
+// EXPECT: ok [1,2]
+use std::json::*
+println(Json::parse("[1,2]").unwrap().stringify())

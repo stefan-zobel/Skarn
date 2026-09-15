@@ -1,0 +1,6 @@
+// CLAIM: == on a type that stores a function value is a COMPILE error (not a silent wrong answer).
+// GUIDE: Comparison and equality
+// EXPECT: fail does not support
+struct Box { f: fn(Int) -> Int }
+let a = Box { f: fn(x: Int) -> Int { x } }
+println(a == a)

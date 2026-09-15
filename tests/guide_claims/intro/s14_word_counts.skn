@@ -1,0 +1,17 @@
+// CLAIM:  The closing program: split + Map with getOr + sorted keys + interpolation.
+// GUIDE:  SkarnIn30Minutes.md 14 (A tiny complete program)
+// EXPECT: ok dog: 1, fox: 2, lazy: 1, quick: 1, the: 3
+fn wordCounts(text: String) -> Map[String, Int] {
+  let mut counts: Map[String, Int] = #{}
+  for w in split(text, " ") {
+    let word = trim(w)
+    if len(word) > 0 {
+      counts[word] = getOr(counts, word, 0) + 1
+    }
+  }
+  counts
+}
+let counts = wordCounts("the quick fox the lazy dog the fox")
+let mut out = ""
+for w in sorted(toVec(keys(counts))) { out = out + "${w}: ${counts[w]}, " }
+println(trim(slice(out, 0, len(out) - 2)))

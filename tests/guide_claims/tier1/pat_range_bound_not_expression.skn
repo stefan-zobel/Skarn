@@ -1,0 +1,15 @@
+// CLAIM: a range-pattern bound is a literal or a constant name and NOTHING else -- an arbitrary
+//        expression is rejected, so matching can never depend on when a bound is evaluated.
+// GUIDE: SkarnGuide.md 13 (Range patterns -> Named bounds)
+// EXPECT: fail a pattern literal must be a number, character, string, or boolean literal
+
+fn seven() -> Int { 7 }
+
+fn f(x: Int) -> Int {
+    match x {
+        1..(seven()) => 1,
+        _            => 0
+    }
+}
+
+println(toString(f(3)))

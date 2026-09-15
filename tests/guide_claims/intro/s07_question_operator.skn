@@ -1,0 +1,8 @@
+// CLAIM:  `?` unwraps the success value or returns the failure from the enclosing function.
+// GUIDE:  SkarnIn30Minutes.md 7 (Option, Result, ?)
+// EXPECT: ok Ok(5)
+fn parseAndHalf(s: String) -> Result[Int, String] {
+  let n = parseInt(s)?
+  Ok(n / 2)
+}
+println(toString(parseAndHalf("10")))

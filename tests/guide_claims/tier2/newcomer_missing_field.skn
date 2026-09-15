@@ -1,0 +1,6 @@
+// CLAIM: newcomer diagnostics -- a struct literal missing a field names it.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail missing field 'y'
+struct P { x: Int, y: Int }
+let p = P { x: 1 }
+println(p.x)

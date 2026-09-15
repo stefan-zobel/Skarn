@@ -1,0 +1,49 @@
+// The camera: turns a point on the image plane into a ray to trace.
+//
+// A pinhole camera aimed by `lookFrom` -> `lookAt`, with `vup` fixing the roll. The
+// vertical field of view is given in degrees, which is the only figure anyone has an
+// intuition for; everything else is derived once, at construction, so the per-pixel work
+// is three multiply-adds and no trigonometry.
+
+import vec3
+import ray
+
+use vec3::*
+use ray::*
+use std::math::*
+
+// The precomputed viewport. `lowerLeft` is its bottom-left CORNER, and `horizontal` /
+// `vertical` span the whole viewport, so a ray is addressed by two fractions in 0..1.
+pub struct Camera { origin: Vec3, lowerLeft: Vec3, horizontal: Vec3, vertical: Vec3 }
+
+pub fn camera(lookFrom: Vec3, lookAt: Vec3, vup: Vec3, vfovDegrees: Double, aspect: Double) -> Camera {
+    // Half the vertical field of view, as the tangent of half the angle: the viewport is
+    // one unit in front of the eye, so that tangent IS half the viewport height.
+    let h              = tan(vfovDegrees * PI / 180.0 / 2.0)
+    let viewportHeight = 2.0 * h
+    let viewportWidth  = aspect * viewportHeight
+
+    // An orthonormal frame for the camera. `w` points BACKWARDS (from the target toward
+    // the eye), which is the convention that makes the viewport sit at origin - w.
+    let w = lookFrom.sub(lookAt).unit()
+    let u = vup.cross(w).unit()
+    let v = w.cross(u)
+
+    let horizontal = u.scale(viewportWidth)
+    let vertical   = v.scale(viewportHeight)
+    Camera {
+        origin:     lookFrom,
+        lowerLeft:  lookFrom.sub(horizontal.scale(0.5)).sub(vertical.scale(0.5)).sub(w),
+        horizontal: horizontal,
+        vertical:   vertical,
+    }
+}
+
+impl Camera {
+    // The ray through the viewport point (s, t), both in 0..1, with t measured UPWARDS
+    // from the bottom. Image space runs downwards, so the caller flips.
+    fn rayAt(self, s: Double, t: Double) -> Ray {
+        let target = self.lowerLeft.add(self.horizontal.scale(s)).add(self.vertical.scale(t))
+        ray(self.origin, target.sub(self.origin))
+    }
+}

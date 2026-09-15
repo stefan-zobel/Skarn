@@ -1,0 +1,4 @@
+// CLAIM: chunks(n) yields non-overlapping Vec blocks — range(0,7)/3 => 3 chunks (last shorter).
+// GUIDE: §19 combinators
+// EXPECT: ok 3
+println(len(range(0, 7) |> chunks(3) |> collect))

@@ -1,0 +1,4 @@
+// CLAIM: ${e:x} formats an Int in lowercase hex.
+// GUIDE: §Format specifiers (base)
+// EXPECT: ok ff
+println("${255:x}")

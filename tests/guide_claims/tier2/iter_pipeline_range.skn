@@ -1,0 +1,5 @@
+// CLAIM: a lazy range |> map |> filter |> sum pipeline computes the fold.
+// GUIDE: §19 iterators
+// EXPECT: ok 50
+let r = range(1, 6) |> map(fn(x) { x * x }) |> filter(fn(x) { x > 4 }) |> sum
+println(r)

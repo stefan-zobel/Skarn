@@ -1,0 +1,8 @@
+// CLAIM: an inherent method is never a free function — a BARE `value(c)` does not resolve. It is
+//        reached as `c.value()` or, qualified, as `Counter::value(c)`.
+// GUIDE: §16 method-call syntax (inherent methods are not free functions)
+// EXPECT: fail unknown variable
+struct Counter { n: Int }
+impl Counter { fn value(self) -> Int { self.n } }
+let c = Counter { n: 5 }
+println(value(c))

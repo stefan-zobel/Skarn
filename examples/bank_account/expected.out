@@ -1,0 +1,18 @@
+ok     open alice
+ok     open bob
+FAILED open broken: invalid amount -5
+ok     alice -> bob 30.00
+FAILED bob -> alice 99.99: account 'B-7' needs 99.99 but has 45.50
+FAILED alice -> carol 1.00: no account 'C-3'
+FAILED bob -> bob 5.00: cannot transfer to the same account
+FAILED alice -> bob 0.00: invalid amount 0
+
+A-1  Alice     90.00
+B-7  Bob       45.50
+total  135.50
+
+audit log:
+  1. open A-1 for Alice with 120.00
+  2. open B-7 for Bob with 15.50
+  3. withdraw 30.00 from A-1
+  4. deposit 30.00 to B-7

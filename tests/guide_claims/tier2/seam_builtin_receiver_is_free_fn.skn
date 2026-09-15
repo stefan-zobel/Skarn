@@ -1,0 +1,13 @@
+// CLAIM: the two library call styles are ONE rule, not drift — a verb whose RECEIVER is a builtin
+//        (`Vec`/`Map`/`String`/`Bytes`) is a free function, because the orphan rule bars an inherent impl
+//        on a type no module owns; a verb on a type the library DEFINES is a method.
+// GUIDE: SkarnGuide.md 16 (the standard library reads in two styles, and the split is principled)
+// EXPECT: ok 3 | 3 | true
+use std::set::*
+
+let v = toVec([1, 2, 3])
+let s = Set::fromVec(v)
+let m = #{ "a" => 1 }
+
+// builtin receivers -> free functions;  std-defined receiver (Set) -> a method
+println("${len(v)} | ${s.size()} | ${has(m, "a")}")

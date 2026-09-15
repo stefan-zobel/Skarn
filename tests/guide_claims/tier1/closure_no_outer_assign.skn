@@ -1,0 +1,6 @@
+// CLAIM: captures are BY VALUE -- a closure cannot ASSIGN to an outer binding, and the CHECKER says so.
+// GUIDE: §10 closures ("by value")
+// EXPECT: fail cannot assign to 'hits' inside a lambda
+let mut hits = 0
+let f = fn(x: Int) -> Int { hits = hits + 1  x }
+println(f(5))

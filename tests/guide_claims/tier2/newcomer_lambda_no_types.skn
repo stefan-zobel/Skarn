@@ -1,0 +1,5 @@
+// CLAIM: newcomer diagnostics -- a bare `let f = fn(x)` asks for the parameter annotation.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail cannot infer the type of lambda parameter 'x'
+let f = fn(x) { x + 1 }
+println(f(1))

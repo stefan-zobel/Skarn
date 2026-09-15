@@ -1,0 +1,4 @@
+// CLAIM: stepBy(n) keeps the first element then every n-th — range(0,10) step 3 => 4 elements.
+// GUIDE: §19 combinators
+// EXPECT: ok 4
+println(len(range(0, 10) |> stepBy(3) |> collect))

@@ -1,0 +1,11 @@
+// CLAIM:  `for x in v` over a Vec is bounded by the elements present when it began -- a mid-walk `push`
+//         does NOT extend the current walk (memory-safe, defined; the new element is simply not visited).
+// GUIDE:  14 (Growable vectors: the live-walk mutation guarantee)
+// EXPECT: ok cnt=3 len=4
+let mut v = toVec([1, 2, 3])
+let mut cnt = 0
+for x in v {
+    cnt = cnt + 1
+    if cnt == 1 { push(v, 99) }   // grow mid-walk -- the 99 is NOT visited
+}
+println("cnt=" + cnt + " len=" + len(v))   // 3 visited; final length 4

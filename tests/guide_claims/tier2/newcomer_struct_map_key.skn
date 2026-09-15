@@ -1,0 +1,5 @@
+// CLAIM: newcomer diagnostics -- a plain struct as a map key names the `Hashable` rule.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail cannot be a map key
+struct Point { x: Int, y: Int }
+let m: Map[Point, Int] = #{}

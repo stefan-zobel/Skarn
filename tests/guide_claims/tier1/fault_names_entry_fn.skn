@@ -1,0 +1,11 @@
+// CLAIM: a runtime fault names the enclosing function as the user WROTE it — the entry program's
+//        internal module prefix never surfaces in a trace.
+// GUIDE: SkarnGuide.md (When something goes wrong)
+// EXPECT: fail division by zero at line 9 (in boom)
+// NOTE: `boom` is reached through a function VALUE on purpose. A direct call to a body this small
+//       is INLINED (on by default), and an expanded body has no frame of its own, so the trace
+//       would name the call site instead — see fault_inlined_names_call_site.skn, which locks
+//       that. An indirect call is never inlined, so this claim still exercises the naming path.
+fn boom(n: Int) -> Int { n / 0 }
+let f: fn(Int) -> Int = boom
+println("${f(3)}")

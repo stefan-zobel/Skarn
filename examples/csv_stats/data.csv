@@ -1,0 +1,15 @@
+city, month, temp_c, rain_mm
+# sample climate data (invented)
+Oslo, 1, -4.3, 49.0
+Oslo, 4, 4.5, 41.5
+Oslo, 7, 16.4, 81.0
+Oslo, 10, 6.3, 84.2
+Lisbon, 1, 11.6, 99.9
+Lisbon, 4, 15.2, 64.6
+Lisbon, 7, 23.0, 3.8
+Lisbon, 10, 18.9, 94.3
+
+Cairo, 1, 14.0, 5.0
+Cairo, 4, 21.8, 1.1
+Cairo, 7, 28.0, 0.0
+Cairo, 10, 24.3, 0.7

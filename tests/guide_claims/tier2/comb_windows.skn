@@ -1,0 +1,4 @@
+// CLAIM: windows(n) yields overlapping views — range(0,5) win 3 => 3 windows.
+// GUIDE: §19 combinators
+// EXPECT: ok 3
+println(len(range(0, 5) |> windows(3) |> collect))

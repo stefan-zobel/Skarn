@@ -1,0 +1,26 @@
+12 requests parsed, 2 malformed (lines 7, 13)
+transferred: 38 KiB
+
+status classes:
+  2xx  8
+  4xx  2
+  3xx  1
+  5xx  1
+
+top paths:
+    3  GET /api/items
+    3  GET /index.html
+    2  POST /api/login
+
+top clients:
+    6  192.168.1.20
+    3  10.0.0.5
+
+first server error: 500 on /api/items/17 from 192.168.1.20 at 11:00
+
+requests per hour:
+  08:00 ###
+  09:00 ####
+  11:00 ##
+  13:00 ##
+  17:00 #

@@ -1,0 +1,7 @@
+// CLAIM:  `let` binds, `let mut` reassigns, and "${e}" interpolates.
+// GUIDE:  SkarnIn30Minutes.md 1 (Hello, bindings, and comments)
+// EXPECT: ok n = 42
+let x = 41
+let mut n = 0
+n = x + 1
+println("n = ${n}")

@@ -1,0 +1,7 @@
+// CLAIM:  The last expression of a body is the return value; `-> ()` returns nothing useful.
+// GUIDE:  SkarnIn30Minutes.md 3 (Functions)
+// EXPECT: ok 5
+fn add(a: Int, b: Int) -> Int { a + b }
+fn greet(who: String) -> () { let _ = who }
+greet("Ada")
+println(add(2, 3))

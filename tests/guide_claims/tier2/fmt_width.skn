@@ -1,0 +1,4 @@
+// CLAIM: ${e:N} right-aligns in a field of width N.
+// GUIDE: §Format specifiers
+// EXPECT: ok [   42]
+println("[${42:5}]")

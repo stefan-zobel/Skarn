@@ -1,0 +1,6 @@
+// CLAIM: record-style enum variants match with field patterns V { f }.
+// GUIDE: §Enums (record variants)
+// EXPECT: ok 4
+enum Shape { Circle { r: Int }, Sq { s: Int } }
+let sh = Shape::Circle { r: 4 }
+println(match sh { Shape::Circle { r } => r, Shape::Sq { s } => s })

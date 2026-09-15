@@ -1,0 +1,4 @@
+// CLAIM: conditions must be Bool — there is NO C++-style truthiness at the Skarn surface (if 0 is a type error).
+// GUIDE: Boolean logic (conditions must be Bool)
+// EXPECT: fail expected Bool, found Int
+if 0 { println("t") } else { println("f") }

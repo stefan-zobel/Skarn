@@ -1,0 +1,4 @@
+// CLAIM:  A name no module declares gets NO import hint -- the suggestion is never invented.
+// GUIDE:  SkarnIn30Minutes.md 12 (Modules and use)
+// EXPECT: fail unknown variable 'totallyMadeUpName'
+println(totallyMadeUpName(1))

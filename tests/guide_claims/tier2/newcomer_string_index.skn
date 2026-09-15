@@ -1,0 +1,5 @@
+// CLAIM: newcomer diagnostics -- indexing a String names the byte and code-point alternatives.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail use `charAt(s, i)`
+let s = "hello"
+println(s[0])

@@ -1,0 +1,7 @@
+// CLAIM: newcomer diagnostics -- a function without `-> T` says the return type is mandatory.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail return type is mandatory
+fn greet(name: String) {
+  println("hi " + name)
+}
+greet("Ada")

@@ -1,0 +1,9 @@
+// CLAIM:  `Point { x, y }` is field shorthand for `Point { x: x, y: y }`, taking the values
+//         from same-named local bindings.
+// GUIDE:  SkarnIn30Minutes.md 5 (Structs)
+// EXPECT: ok 10 20
+struct Point { x: Int, y: Int }
+let x = 10
+let y = 20
+let p = Point { x, y }
+println("${p.x} ${p.y}")

@@ -1,0 +1,22 @@
+// CLAIM: an `Int` used where a `Double` is expected is widened FOR YOU -- at every position, not
+//        just the ones codegen happened to have a parameter type for. Tier 1 because the failure
+//        mode is a silently wrong NUMBER: an un-widened Int in a Double slot is a perfectly valid
+//        48-bit integer at run time, so nothing traps and nothing is reported -- `dv(1, 2)` simply
+//        took the VM's integer DIV and returned 0 instead of 0.5. The erased runtime has no second
+//        chance here; the checker's record (`Expr::widen_double`) is the only guard.
+//        The `.0` in every line of expected output IS the assertion: it is the tag, and the tag is
+//        the whole difference between right and wrong.
+// GUIDE: SkarnIn30Minutes.md 2 (an `Int` used where a `Double` is expected is widened for you)
+// EXPECT: ok 0.5 | 1.0 | 1.0 | 1.0 | 1.0 | [1.0, 2.0] | 1.0
+fn dv(a: Double, b: Double) -> Double { a / b }
+fn ret(x: Int) -> Double { x }                    // return boundary
+
+let arg   = dv(1, 2)                              // call argument
+let cond  = if true { 1 } else { 2 }              // `if` as a checked value
+let arm: Double  = match 0 { 0 => 1, _ => 2 }     // `match` arm
+let brk: Double  = loop { break 1 }               // `break` value
+let lst: List[Double] = [1, 2]                    // list-literal element
+let map: Map[String, Double] = #{"a" => 1}        // map-literal value
+
+let c: Double = cond
+println("${arg} | ${ret(1)} | ${c} | ${arm} | ${brk} | ${toString(lst)} | ${map["a"]}")

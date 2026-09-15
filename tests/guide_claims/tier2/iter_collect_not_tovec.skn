@@ -1,0 +1,4 @@
+// CLAIM: an Iterator materializes with `collect`; `toVec` is for an Iterable and REJECTS an Iterator.
+// GUIDE: §19 terminals
+// EXPECT: fail does not satisfy the bound
+println(len(range(0, 10) |> stepBy(2) |> toVec))

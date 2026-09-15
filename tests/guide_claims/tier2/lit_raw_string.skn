@@ -1,0 +1,4 @@
+// CLAIM: raw strings r"..." are verbatim — no escapes, no interpolation.
+// GUIDE: §Strings / raw strings
+// EXPECT: ok a\nb${x}
+println(r"a\nb${x}")

@@ -1,0 +1,4 @@
+// CLAIM: r#"..."# raw strings may contain unescaped double quotes.
+// GUIDE: §Strings / raw strings
+// EXPECT: ok has "quotes" inside
+println(r#"has "quotes" inside"#)

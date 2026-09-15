@@ -1,0 +1,5 @@
+// CLAIM: newcomer diagnostics -- reading a missing map key with `m[k]` aborts with a located message.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail map key not found
+let m: Map[String, Int] = #{}
+println(m["a"])

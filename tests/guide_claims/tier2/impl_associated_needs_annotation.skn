@@ -1,0 +1,14 @@
+// CLAIM: an associated function on a GENERIC head has no receiver to solve the type parameter, so
+//        it must be fixed by an argument, an annotation, or the enclosing return type. When nothing
+//        fixes it, the call is rejected — Skarn has no turbofish to name it explicitly.
+// GUIDE: SkarnGuide.md 16 (method-call syntax and inherent methods)
+// EXPECT: fail cannot infer the type argument 'T' of 'Bag::empty'
+struct Bag[T] { items: Vec[T] }
+
+impl[T] Bag[T] {
+    fn empty() -> Bag[T] { Bag { items: vec() } }
+    fn size(self) -> Int { len(self.items) }
+}
+
+let b = Bag::empty()
+println("${b.size()}")

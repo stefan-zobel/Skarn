@@ -1,0 +1,4 @@
+// CLAIM: enum payloads compare structurally — Some(1) == Some(1).
+// GUIDE: Comparison and equality (e6)
+// EXPECT: ok true
+println(Some(1) == Some(1))

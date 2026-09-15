@@ -1,0 +1,6 @@
+// CLAIM: newcomer diagnostics -- a list pattern on a Vec is rejected (it matches a cons List only), naming the indexing alternative.
+// GUIDE: SkarnGuide.md §13 "List patterns" (a `List` can be matched); tests/guide_claims/README.md
+// EXPECT: fail a list pattern matches a List, not a Vec[String]
+let parts = "go north" |> split(" ") |> collect
+let dir = match parts { ["go", d] => d, _ => "nowhere" }
+println(dir)

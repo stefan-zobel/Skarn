@@ -1,5 +1,5 @@
 // Table-driven CRC-32 (IEEE 802.3 / zlib), driven by a `const` lookup table -- the motivating
-// use case for const arrays (Route 2). The 256-entry table is built ONCE at startup
+// use case for const arrays. The 256-entry table is built ONCE at startup
 // (LOAD_CONST_ARRAY, a shared immutable instance), so the inner loop is a single table lookup per
 // byte instead of the 8 shift/xor steps of the bitwise form -- the whole table-driven class
 // (S-boxes, parser transition tables, char-class maps) that a scalar `const` cannot express.

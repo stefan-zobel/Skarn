@@ -1,0 +1,7 @@
+// CLAIM:  A struct pattern must name EVERY field -- there is no `..` rest pattern, so adding
+//         a field makes the compiler point at each pattern that needs updating.
+// GUIDE:  SkarnGuide.md 13 (Struct, enum, and tuple patterns)
+// EXPECT: fail expected field name
+struct P { x: Int, y: Int, label: String }
+let p = P { x: 1, y: 2, label: "a" }
+println(match p { P { x, .. } => x })

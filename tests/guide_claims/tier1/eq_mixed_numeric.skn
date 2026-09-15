@@ -1,0 +1,4 @@
+// CLAIM: == does NOT coerce across numeric types — 1 == 1.0 is rejected (unlike the VM promoting EQ opcode). Contrast ord_mixed_numeric.
+// GUIDE: Comparison and equality
+// EXPECT: fail cannot compare Int with Double
+println(1 == 1.0)

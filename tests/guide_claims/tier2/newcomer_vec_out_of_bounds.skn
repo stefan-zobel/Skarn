@@ -1,0 +1,5 @@
+// CLAIM: newcomer diagnostics -- an out-of-range index aborts with a located message.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail array index out of bounds
+let v = toVec([1, 2])
+println(v[5])

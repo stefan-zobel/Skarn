@@ -1,0 +1,4 @@
+// CLAIM: newcomer diagnostics -- `break` outside a loop is rejected.
+// GUIDE: SkarnIn30Minutes.md (the everyday surface); tests/guide_claims/README.md
+// EXPECT: fail 'break' outside of a loop
+break

@@ -1,0 +1,9 @@
+// CLAIM: an or-pattern alternative that binds a different set of names is rejected, and the
+//        diagnostic names the alternative that is out of step.
+// GUIDE: §Patterns (or-patterns)
+// EXPECT: fail does not bind 'r'
+enum Expr { Add(Int, Int), Sub(Int, Int) }
+fn operands(e: Expr) -> Int {
+    match e { Add(l, r) | Sub(l, _) => l + r }
+}
+println(operands(Sub(9, 4)))

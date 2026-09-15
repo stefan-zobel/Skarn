@@ -1,0 +1,15 @@
+// CLAIM: Type::method(x) calls an INHERENT method — the twin of Trait::method(x). It is the only
+//        way in when a same-named FIELD shadows the method for `.` (dot resolution is field-first).
+// GUIDE: 16 (method-call syntax — qualified inherent call)
+// EXPECT: ok 7 | 1 | 10
+struct Point { x: Int, y: Int }
+impl Point { fn sum(self) -> Int { self.x + self.y } }
+
+// A field named exactly like the method: `c.value` is the FIELD, so `c.value()` cannot reach the
+// method at all — `Counter::value(c)` can.
+struct Counter { n: Int, value: Int }
+impl Counter { fn value(self) -> Int { self.n * 2 } }
+
+let p = Point { x: 3, y: 4 }
+let c = Counter { n: 5, value: 1 }
+println("${Point::sum(p)} | ${c.value} | ${Counter::value(c)}")

@@ -1,0 +1,4 @@
+// CLAIM: a bare char literal 'A' is an Int byte (65), not a distinct printed glyph at top level.
+// GUIDE: §Char / literals
+// EXPECT: ok 65
+println('A')

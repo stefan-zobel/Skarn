@@ -1,0 +1,5 @@
+// CLAIM: map/filter take a dyn Iterator — a raw Vec is NOT one; lift it with intoIter first.
+// GUIDE: §19 iterators (Iterator vs Iterable)
+// EXPECT: fail expected dyn std::iter::Iterator
+fn f(x: Int) -> Int { x + 1 }
+println(len(toVec([1, 2, 3]) |> map(f) |> collect))

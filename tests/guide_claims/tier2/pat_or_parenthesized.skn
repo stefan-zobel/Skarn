@@ -1,0 +1,11 @@
+// CLAIM: `( A | B )` groups alternatives anywhere a pattern is allowed -- needed after `@`, whose
+//        sub-pattern has no delimiter of its own, and where a bare `|` would bind at arm level.
+// GUIDE: §Patterns (or-patterns)
+// EXPECT: ok 25 -1
+fn band(n: Int) -> Int {
+    match n {
+        k @ (1..10 | 20..30) => k,
+        _                    => -1
+    }
+}
+println(toString(band(25)) + " " + toString(band(15)))

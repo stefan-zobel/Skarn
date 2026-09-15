@@ -1,0 +1,4 @@
+// CLAIM: different variants are unequal — Some(1) == None is false (None gets its element type from Some).
+// GUIDE: Comparison and equality (e8)
+// EXPECT: ok false
+println(Some(1) == None)

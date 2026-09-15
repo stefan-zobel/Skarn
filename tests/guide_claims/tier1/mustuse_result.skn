@@ -1,0 +1,6 @@
+// CLAIM: dropping a Result in statement position emits a must-use warning (hard error under --strict).
+// GUIDE: Error handling / must-use warning tier
+// EXPECT: warn unused std::core::Result
+fn mk() -> Result[Int, String] { Ok(1) }
+fn f() -> Int { mk()  0 }
+println(f())

@@ -1,0 +1,8 @@
+// CLAIM:  range is already an iterator, so it needs no intoIter.
+// GUIDE:  SkarnIn30Minutes.md 11 (Pipelines: iterators)
+// EXPECT: ok 5 [2, 4, 6]
+fn even(n: Int) -> Bool { n % 2 == 0 }
+fn dbl(n: Int) -> Int { n * 2 }
+let c = range(0, 10) |> filter(even) |> count
+let m = range(1, 4) |> map(dbl) |> collect
+println("${c} ${toString(m)}")

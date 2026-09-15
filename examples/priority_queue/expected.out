@@ -1,0 +1,15 @@
+6 tasks queued:
+  p1  fix production bug
+  p1  answer pager
+  p2  review pull request
+  p2  plan sprint
+  p3  write report
+  p3  update wiki
+
+shortest routes from Aston:
+  Aston    0 km  Aston
+  Brill    7 km  Aston -> Brill
+  Cobb     9 km  Aston -> Cobb
+  Dale    20 km  Aston -> Cobb -> Dale
+  Eske    20 km  Aston -> Cobb -> Fenn -> Eske
+  Fenn    11 km  Aston -> Cobb -> Fenn

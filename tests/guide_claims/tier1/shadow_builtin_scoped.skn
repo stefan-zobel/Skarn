@@ -1,0 +1,20 @@
+// CLAIM: shadowing a builtin/native/trait-method name is MODULE-SCOPED — the definition wins in
+//        its own scope and never reaches inside the standard library (which keeps the real one).
+// GUIDE: SkarnGuide.md 25 (Modules — name resolution)
+// EXPECT: ok 999 | Ok(3) | 42 | 3 | 0 | 6
+use std::math::*
+
+fn toInt(x: Double) -> Int { 999 }     // shadows the builtin (D2I)
+fn next(x: Int) -> Int { x + 1 }       // shadows the Iterator trait method
+fn sum(xs: Vec[Int]) -> Int { 0 }      // shadows a LIBRARY function
+
+// Left of each pair: this file's own call, which resolves to the definition above.
+// Right: std code calling the same name, which must still get the ambient one --
+// toIntChecked really converts, and the lazy pipeline's internal next() really iterates.
+let mine  = toInt(3.9)
+let their = toIntChecked(3.9)
+let mineN = next(41)
+let theirN = len([1, 2, 3] |> intoIter |> map(fn(x: Int) -> Int { x * 2 }) |> collect)
+// A shadowed LIBRARY function stays reachable by name through the `std::` alias.
+let v: Vec[Int] = [1, 2, 3] |> intoIter |> collect
+println("${mine} | ${their} | ${mineN} | ${theirN} | ${sum(v)} | ${std::sum(v |> intoIter)}")

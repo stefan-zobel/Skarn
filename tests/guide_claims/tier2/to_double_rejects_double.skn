@@ -1,0 +1,4 @@
+// CLAIM:  `toDouble` takes an Int. A Double argument is an error, not a silent no-op.
+// GUIDE:  SkarnGuide.md 6 (The numeric model)
+// EXPECT: fail expected Int, found Double
+println(toDouble(3.5))

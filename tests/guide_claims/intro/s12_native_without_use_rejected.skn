@@ -1,0 +1,4 @@
+// CLAIM:  Without its `use`, a gated NATIVE is rejected -- and the message names the module.
+// GUIDE:  SkarnIn30Minutes.md 12 (Modules and use)
+// EXPECT: fail native 'sqrt' requires
+println(sqrt(9.0))

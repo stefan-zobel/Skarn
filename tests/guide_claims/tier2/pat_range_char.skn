@@ -1,0 +1,18 @@
+// CLAIM: character ranges work against a Char scrutinee, and `'a'..'z'` is the same range as
+//        `97..122` because a character literal IS an Int.
+// GUIDE: SkarnGuide.md 13 (Range patterns -> Character ranges)
+// EXPECT: ok digit lower upper other | same
+
+fn kind(c: Char) -> String {
+    match c {
+        '0'..'9' => "digit",
+        'a'..'z' => "lower",
+        'A'..'Z' => "upper",
+        _        => "other"
+    }
+}
+
+fn numeric(c: Char) -> String { match c { 97..122 => "lower", _ => "other" } }
+
+println(kind('7') + " " + kind('m') + " " + kind('Q') + " " + kind('!') + " | " +
+        (if kind('m') == numeric('m') { "same" } else { "differs" }))

@@ -1,0 +1,6 @@
+// CLAIM: `use m::name` of a name the module does not have is reported as missing -- not as "private".
+// GUIDE: SkarnGuide.md 20 (Visibility: pub)
+// EXPECT: fail module 'util' has no item 'nosuch'
+import util
+use util::nosuch
+println(util::shown())

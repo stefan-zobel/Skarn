@@ -1,0 +1,96 @@
+// game_of_life -- Conway's Game of Life on a small wrapping board.
+//
+// Shows: a fixed-size `Array[Bool]` as a 2D grid, an inherent `impl` with an associated
+// constructor, index arithmetic with `%`, `const` settings, and building text with a StringBuilder.
+
+const WIDTH: Int = 12
+const HEIGHT: Int = 8
+
+struct Board { cells: Array[Bool], generation: Int }
+
+impl Board {
+    fn empty() -> Board { Board { cells: array(WIDTH * HEIGHT, false), generation: 0 } }
+
+    // Build a board from rows of text, '#' = alive, placed at (left, top).
+    fn fromPicture(rows: Vec[String], left: Int, top: Int) -> Board {
+        let mut b = Board::empty()
+        for (y, row) in rows |> intoIter |> enumerate {
+            for (x, c) in row |> intoIter |> enumerate {
+                if c == '#' { b.cells[Board::index(left + x, top + y)] = true }
+            }
+        }
+        b
+    }
+
+    // The board wraps around at the edges (a torus).
+    fn index(x: Int, y: Int) -> Int {
+        let wx = ((x % WIDTH) + WIDTH) % WIDTH
+        let wy = ((y % HEIGHT) + HEIGHT) % HEIGHT
+        wy * WIDTH + wx
+    }
+
+    fn alive(self, x: Int, y: Int) -> Bool { self.cells[Board::index(x, y)] }
+
+    fn neighbours(self, x: Int, y: Int) -> Int {
+        let mut n = 0
+        for dy in [-1, 0, 1] {
+            for dx in [-1, 0, 1] {
+                if (dx != 0 || dy != 0) && self.alive(x + dx, y + dy) { n += 1 }
+            }
+        }
+        n
+    }
+
+    fn step(self) -> Board {
+        let mut next = array(WIDTH * HEIGHT, false)
+        for y in range(0, HEIGHT) {
+            for x in range(0, WIDTH) {
+                let n = self.neighbours(x, y)
+                next[Board::index(x, y)] = match (self.alive(x, y), n) {
+                    (true, 2) | (true, 3) => true,
+                    (false, 3)            => true,
+                    _                     => false,
+                }
+            }
+        }
+        Board { cells: next, generation: self.generation + 1 }
+    }
+
+    fn population(self) -> Int {
+        self.cells |> intoIter |> filter(fn(c: Bool) -> Bool { c }) |> count
+    }
+
+    fn render(self) -> String {
+        let mut sb = stringBuilder()
+        for y in range(0, HEIGHT) {
+            for x in range(0, WIDTH) { sb.append(if self.alive(x, y) { "#" } else { "." }) }
+            sb.append("\n")
+        }
+        sb.build()
+    }
+}
+
+let glider = toVec([
+    ".#.",
+    "..#",
+    "###",
+])
+let blinker = toVec(["###"])
+
+let mut board = Board::fromPicture(glider, 1, 1)
+let other = Board::fromPicture(blinker, 7, 5)
+for i in range(0, len(board.cells)) {
+    if other.cells[i] { board.cells[i] = true }
+}
+
+let mut seen: Vec[Int] = vec()
+while board.generation <= 4 {
+    println("generation ${board.generation}, population ${board.population()}")
+    print(board.render())
+    push(seen, board.population())
+    board = board.step()
+}
+
+// A glider and a blinker keep their size forever.
+let stable = seen |> intoIter |> all(fn(p: Int) -> Bool { p == 8 })
+println("population stayed at 8: ${stable}")

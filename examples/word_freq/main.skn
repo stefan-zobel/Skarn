@@ -1,0 +1,67 @@
+// word_freq -- count the words of a text file and print the most frequent ones.
+//
+//   static_vmrun main.skn [--top=N] [--min-len=N] <file>
+//
+// Shows: command-line parsing with std::cli, reading a file, `?` in a `run` function,
+// a Map as a counter, sorting with a comparator, and format specifiers.
+
+use std::cli::*
+use std::env::*
+use std::io::*
+
+struct Options { path: String, top: Int, minLen: Int }
+
+fn parseOptions(argv: Array[String]) -> Result[Options, String] {
+    let cli = CliArgs::parse(argv)
+    let path = match cli.positionalAt(0) {
+        Some(p) => p,
+        None    => return Err("usage: word_freq [--top=N] [--min-len=N] <file>"),
+    }
+    let top = parseInt(cli.getOptOr("top", "5"))?
+    let minLen = parseInt(cli.getOptOr("min-len", "1"))?
+    Ok(Options { path, top, minLen })
+}
+
+// Lower-case a word and keep only its letters ("Don't," -> "dont").
+fn normalize(word: String) -> String {
+    let mut sb = stringBuilder()
+    for c in toLower(word) {
+        if isAsciiAlpha(c) { sb.appendByte(c) }
+    }
+    sb.build()
+}
+
+fn countWords(text: String, minLen: Int) -> Map[String, Int] {
+    let mut counts: Map[String, Int] = #{}
+    for raw in words(text) {
+        let w = normalize(raw)
+        if len(w) >= minLen {
+            counts[w] = getOr(counts, w, 0) + 1
+        }
+    }
+    counts
+}
+
+// Most frequent first; equal counts in alphabetical order, so the output is stable.
+fn byCountThenWord(a: (String, Int), b: (String, Int)) -> Bool {
+    if a.1 != b.1 { a.1 > b.1 } else { a.0 < b.0 }
+}
+
+fn run() -> Result[(), String] {
+    let opts = parseOptions(args())?
+    let text = readTextFile(opts.path)?
+    let counts = countWords(text, opts.minLen)
+    let total = counts |> intoIter |> map(fn(e: (String, Int)) -> Int { e.1 }) |> sum
+    println("${len(counts)} distinct words, ${total} in total (length >= ${opts.minLen})")
+
+    let ranked = sortBy(counts |> intoIter |> collect, byCountThenWord)
+    for (word, n) in ranked |> intoIter |> take(opts.top) {
+        println("${word:<12} ${n:>3}  ${repeatStr("#", n)}")
+    }
+    Ok(())
+}
+
+match run() {
+    Ok(_)  => {},
+    Err(e) => println("error: ${e}"),
+}

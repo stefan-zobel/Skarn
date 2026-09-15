@@ -1,6 +1,6 @@
 // json.skn -- using the std::json LIBRARY (parse -> navigate -> re-serialize).
 // Contrast demo/json_parser.skn, which builds a parser FROM SCRATCH; here we just
-// `use` the shipped module. Serialization runs through the StringBuilder (O(n)) with
+// `use` the standard-library module. Serialization runs through the StringBuilder (O(n)) with
 // correct escaping.
 use std::json::*
 

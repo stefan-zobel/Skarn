@@ -1,0 +1,7 @@
+// CLAIM: words(s) separates on RUNS of whitespace and never yields an empty field, which is the one
+//        way it differs from split(s, " ") -- and therefore the only reason it exists. Both counts are
+//        printed from the SAME input, so the two can never quietly converge onto one behaviour.
+//        Leading/trailing whitespace contributing nothing is the other half of the same rule.
+// GUIDE: SkarnGuide.md 19 (Streaming text: "its separator is a run of whitespace")
+// EXPECT: ok 3 2 2 0
+println("${count(split("a  b", " "))} ${count(words("a  b"))} ${count(words("   a b   "))} ${count(words("  "))}")

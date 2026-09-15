@@ -1,0 +1,5 @@
+// CLAIM:  The missing-`use` hint covers TYPES too, not just functions.
+// GUIDE:  SkarnIn30Minutes.md 12 (Modules and use)
+// EXPECT: fail unknown type 'DateTime'; it is in 'std::time' -- add `use std::time::*`
+fn f(d: DateTime) -> Int { 1 }
+println(f)

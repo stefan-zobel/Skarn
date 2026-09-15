@@ -1,0 +1,6 @@
+// CLAIM:  args() gives the command-line arguments once std::env is in scope.
+// GUIDE:  SkarnIn30Minutes.md 13 (Files, arguments, and the outside world)
+// EXPECT: ok true
+use std::env::*
+let argv = toVec(args())
+println(len(argv) >= 0)
