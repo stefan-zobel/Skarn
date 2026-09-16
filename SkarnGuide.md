@@ -1193,6 +1193,29 @@ let mut xs: Vec[Int] = vec()
 let push1 = fn() -> () { push(xs, 1) }    // fine: the same Vec, and the caller sees it
 ```
 
+### Lambdas cannot call themselves
+
+A lambda has no name of its own, and a `let` binds its name only *after* the value is built. Inside the body
+the name is therefore not yet in scope:
+
+```rust fail
+let fact = fn(n: Int) -> Int { if n <= 1 { 1 } else { n * fact(n - 1) } }   // error: unknown variable 'fact'
+```
+
+Recursion goes through a named `fn` instead. Named functions may call themselves and each other in any order,
+and get proper tail calls ([Recursion and tail calls](#recursion-and-tail-calls)). When the recursive helper
+needs a value from the enclosing scope, pass it as a parameter and let a lambda capture it:
+
+```rust
+fn digitSum(n: Int, base: Int) -> Int {
+    if n == 0 { 0 } else { n % base + digitSum(n / base, base) }
+}
+
+let base = 16
+let sumDigits = fn(n: Int) -> Int { digitSum(n, base) }   // captures `base`, recursion stays in the fn
+println("digits=" + sumDigits(255))                       // => digits=30
+```
+
 ### Type inference for lambdas
 
 A lambda's parameter and return types are **inferred from context** whenever the surrounding code already fixes

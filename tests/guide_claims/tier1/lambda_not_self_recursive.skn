@@ -1,0 +1,5 @@
+// CLAIM: a lambda cannot call itself -- the `let` name is not in scope inside its own initializer.
+// GUIDE: §10 closures ("Lambdas cannot call themselves")
+// EXPECT: fail unknown variable 'fact'
+let fact = fn(n: Int) -> Int { if n <= 1 { 1 } else { n * fact(n - 1) } }
+println(fact(5))
