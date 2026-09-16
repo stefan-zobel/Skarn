@@ -1,0 +1,18 @@
+// CLAIM: a MustUse value that is used, or discarded with let _, draws no warning -- and neither does a wrapper
+//        whose type argument is not marked. The program runs clean under --strict.
+// GUIDE: SkarnGuide.md 23 (advisory warnings)
+// EXPECT: ok ok
+enum Outcome { Accepted, Rejected(String) }
+impl MustUse for Outcome {}
+
+struct Timed[T] { value: T, ms: Int }
+impl[T: MustUse] MustUse for Timed[T] {}
+
+fn validate(n: Int) -> Outcome { if n > 0 { Outcome::Accepted } else { Outcome::Rejected("negative") } }
+
+let _ = validate(-1)
+Timed { value: 5, ms: 3 }
+match validate(2) {
+    Outcome::Accepted => println("ok"),
+    Outcome::Rejected(why) => println(why)
+}

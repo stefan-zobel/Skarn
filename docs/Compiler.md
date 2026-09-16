@@ -165,7 +165,7 @@ branch types (in `if`, `match`, or the `break` values of a `loop`) is exact.
 - **`dyn Trait`** values are the plain values themselves: no box, no vtable. A method may appear in a `dyn`
   type only if it takes `self` and does not mention `Self` in another parameter.
 - **Sealed marker traits.** `Eq` and `Hashable` are derived by the compiler and cannot be implemented by
-  users; see "Language semantics" below.
+  users; see "Language semantics" below. The third marker, `MustUse`, is open; see "Warnings and diagnostics".
 
 Higher-kinded types, higher-rank polymorphism and `where` clauses beyond a parameter's own bounds are not
 part of the language.
@@ -191,8 +191,14 @@ List patterns apply to `List` only.
 
 ### Warnings and diagnostics
 
-The advisory tier warns about an unused binding, an ignored `Result` or `Option`, and a duplicate literal key
-in a map literal. An ignored `Result` or `Option` at the end of a `-> ()` body is an error rather than a warning. `--strict` makes every warning fatal.
+The advisory tier warns about an unused binding, an ignored `Result` or `Option`, an ignored value of a type
+marked `MustUse`, and a duplicate literal key in a map literal. An ignored `Result` or `Option` at the end of a
+`-> ()` body is an error rather than a warning. `--strict` makes every warning fatal.
+
+`MustUse` is an open marker trait in `std::core`: `impl MustUse for Outcome {}` makes a dropped `Outcome` warn,
+and `impl[T: MustUse] MustUse for Timed[T] {}` passes the mark through a wrapper. Erasure types may implement
+it, because nothing dispatches through it; for the same reason it cannot be used as `dyn` or as the bound that
+selects a blanket impl.
 
 Diagnostics carry a caret into the right file and module. Several carry more:
 

@@ -3882,8 +3882,9 @@ fine — each element is converted at the point you add it.)
 
 ### Built-in traits at a glance
 
-Four traits are built into the standard library, and they split **2 + 2** — two are sealed, two are ordinary,
-and the split is *reasoned*, not arbitrary. **Two are sealed compile-time markers** you never implement (the
+Five traits are built into the standard library. Four split **2 + 2** — two are sealed, two are ordinary, and
+the split is *reasoned*, not arbitrary; the fifth, **`MustUse`**, is an open marker for a warning (see
+[Advisory warnings](#advisory-warnings)). **Two are sealed compile-time markers** you never implement (the
 checker decides membership and discharges the bound statically, no dispatch): **`Eq`** — sealed because equality
 is **structural by construction**, so there is nothing to implement — and **`Hashable`** — sealed because a heap
 object's **pointer bits are not stable under the moving GC**, so only the primitive-backed types can be keys.
@@ -3897,10 +3898,11 @@ impls for `Int`/`Double`/`String`; add your own with `impl Ord` — the one exce
 | `Hashable` | map keys / set elements (see [§14](#14-collections)) | `Int`, `Double`, `Bool`, `String`, and erasure types that wrap one of those (`Char`, integer-backed `enum`s, `transparent` newtypes over these) | no (fixed marker) | no |
 | `Ord` | `sort` / `sorted` / `min` / `max` (ring, `std::iter`) and `minOf` / `maxOf` / `clamp` (opt-in `std::math` — needs `use std::math`); see [§19](#19-iterators) | `Int` / `Double` / `String` built in; **user types may `impl Ord`** (write `fn lessThan`). The one exception is **erasure types** (`Char` / `transparent` newtypes / integer-backed `enum`s) — a method trait can't dispatch on them; a `Char` compares with `<` but is not `Ord` | **yes** (like `Clone`; erasure types excepted) | no |
 | `Clone` | `clone(x)` (see [§14](#14-collections)) | built-in for the containers; **user-extensible** — write `impl Clone for MyType` | **yes** | no (returns `Self`) |
+| `MustUse` | the unused-value warning (see [Advisory warnings](#advisory-warnings)) | none built in; **any type the program owns**, erasure types included — write `impl MustUse for MyType {}` | **yes** (empty impl) | no |
 
-The two markers (`Eq`, `Hashable`) cost nothing at run time; `==` on a leaf is a single instruction and on a
-composite a structural walk. None of the four is usable as `dyn T`, but for two different reasons: `Eq` and
-`Hashable` are **compile-time markers** — there is nothing to dispatch, so a `dyn` of them is meaningless and
+The three markers (`Eq`, `Hashable`, `MustUse`) cost nothing at run time; `==` on a leaf is a single instruction
+and on a composite a structural walk. None of the five is usable as `dyn T`, but for two different reasons: the
+markers are **compile-time only** — there is nothing to dispatch, so a `dyn` of them is meaningless and
 rejected; `Ord` and `Clone` fail **object safety** (`Ord` takes `Self` as a second parameter, `Clone` returns
 `Self` — see [§17](#17-trait-objects-dyn-trait)).
 
@@ -3941,14 +3943,15 @@ instantiation, which the compiler does not do.
 
 ### Advisory warnings
 
-Beyond type errors (which stop compilation), the checker emits **advisory warnings** for two easy-to-miss
+Beyond type errors (which stop compilation), the checker emits **advisory warnings** for easy-to-miss
 mistakes. They do not stop the program, but they are worth fixing:
 
 - **An unused binding** — you introduced a `let` and never read it.
 - **An ignored `Result`/`Option`** — you called something that returns one and threw the answer away, which
   usually means you forgot to handle a possible failure.
+- **An ignored value of a type marked `MustUse`** — the same rule for your own types (below).
 
-Both are silenced by making your intent explicit: prefix a name with `_` to say "deliberately unused", or
+All of them are silenced by making your intent explicit: prefix a name with `_` to say "deliberately unused", or
 assign to the throwaway pattern `_`:
 
 ```rust
@@ -3956,6 +3959,28 @@ let mut someVec = toVec([1, 2, 3])
 let _scratch = 1 + 1        // intentionally unused: no warning
 let _ = pop(someVec)        // deliberately discard the returned Option
 ```
+
+Your own types opt into the `Result`/`Option` rule by implementing the empty marker trait **`MustUse`** — useful
+for a result type of your own, or for an immutable value whose methods return a changed copy:
+
+```rust
+enum Outcome { Accepted, Rejected(String) }
+impl MustUse for Outcome {}
+
+fn validate(n: Int) -> Outcome { if n > 0 { Outcome::Accepted } else { Outcome::Rejected("negative") } }
+
+validate(-1)       // warning: unused Outcome: its type is marked MustUse -- use the value, or discard it explicitly with `let _ = ...`
+let _ = validate(-2)                        // deliberate: no warning
+match validate(3) {
+    Outcome::Accepted => println("ok"),     // => ok
+    Outcome::Rejected(why) => println(why)
+}
+```
+
+Any type the program owns can be marked, the erasure types included. A generic wrapper passes the mark on when
+its impl says so — with `impl[T: MustUse] MustUse for Timed[T] {}`, a `Timed[Outcome]` is must-use and a
+`Timed[Int]` is not. Unlike an ignored `Result`/`Option`, an ignored marked value at the end of a `-> ()` body
+stays a warning.
 
 The runner can be asked to treat these warnings as hard errors, which is useful in a CI setting.
 

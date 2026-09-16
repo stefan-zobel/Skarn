@@ -1,0 +1,8 @@
+// CLAIM: MustUse is a compile-time marker, not a trait object.
+// GUIDE: SkarnGuide.md 23 (built-in traits at a glance)
+// EXPECT: fail 'MustUse' is a compile-time marker, not usable as a trait object
+enum Outcome { Accepted, Rejected(String) }
+impl MustUse for Outcome {}
+
+let d: dyn MustUse = Outcome::Accepted
+println("unreachable")

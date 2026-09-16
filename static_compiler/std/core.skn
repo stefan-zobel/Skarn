@@ -60,6 +60,14 @@ impl Hashable for String {}
 // At run time `==` on a leaf is the EQ opcode; on a composite it is the structural EQ_DEEP opcode.
 pub trait Eq {}
 
+// A method-less MARKER trait a program implements to make a value of its type MUST-USE: discarding one
+// (a statement whose value is dropped, or a binding never read) is a WARNING, as for Result and Option.
+// `let _ = value` discards it on purpose. OPEN, unlike Hashable and Eq: `impl MustUse for Outcome {}` on any
+// type the program owns, including a transparent struct or an int-backed enum. Bounds carry it through a
+// wrapper: `impl[T: MustUse] MustUse for Timed[T] {}` makes Timed[Outcome] must-use and Timed[Int] not.
+// Compile-time only -- no methods, no runtime cost, not a trait object, and not a blanket-impl bound.
+pub trait MustUse {}
+
 // Map ergonomics -- pure helpers over the `get` builtin + the `m[k] = v` index-assign. `getOr`/`getOrElse`
 // are non-mutating (a fallback for an absent key); `getOrPut`/`upsert` mutate `m` in place (caller-visible,
 // since a Map is a heap object and `mut m` is a valid assignment root). The element V must match the map's

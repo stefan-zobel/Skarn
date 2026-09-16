@@ -699,24 +699,41 @@ private:
                                        std::move(labels) });
     }
 
-    // A discarded value of one of these types is almost always a bug (Track 1 must-use).
-    // Keyed by NAME, exactly as `infer_try` recognizes Result/Option (no static prelude,
-    // and no `#[must_use]` attribute -- these two are the hardcoded must-use universe).
-    bool is_must_use_type(const TyPtr& t) {
+    // A Result/Option CARRIER: a discarded one is almost always a forgotten failure (Track 1 must-use), and in
+    // `-> ()` tail position it is a hard error. Keyed by NAME, exactly as `infer_try` recognizes Result/Option
+    // (no static prelude needed).
+    bool is_result_carrier(const TyPtr& t) {
         if (!t) return false;
         TyPtr a = apply(t);
-        // must-use recognizes a Result/Option carrier by SHORT name -- the ring's std::core::Result
-        // OR a user's own `Result` (a program may define its own without the prelude).
+        // A carrier is recognized by SHORT name -- the ring's std::core::Result OR a user's own `Result`
+        // (a program may define its own without the prelude).
         return a && a->kind == TyKind::Named &&
                (short_name(a->name) == "Result" || short_name(a->name) == "Option");
     }
 
-    // must-use: warn when a Result/Option-typed expression's value is thrown away (a
-    // statement-position expression / a loop body). `e.ty` is already filled by `infer`.
+    // A type the program marked with `impl MustUse for T {}` (std::core's open marker). Only the WARNING follows
+    // from it. Absent without the prelude; an unsolved var is not judged, and a wrapper whose argument is still
+    // open does not warn (nothing collects an obligation here: a warning is advice, not a soundness check).
+    bool is_marked_must_use(const TyPtr& t) {
+        if (!t || traits_.find(std_MustUse()) == traits_.end()) return false;
+        TyPtr a = apply(t);
+        if (a->kind == TyKind::Var && !a->rigid) return false;
+        if (a->kind == TyKind::Error || a->kind == TyKind::Never) return false;
+        return satisfies_bound(a, std_MustUse());
+    }
+
+    // A discarded value of this type draws the must-use warning.
+    bool is_must_use_type(const TyPtr& t) { return is_result_carrier(t) || is_marked_must_use(t); }
+
+    // must-use: warn when a must-use expression's value is thrown away (a statement-position expression / a
+    // loop body). `e.ty` is already filled by `infer`.
     void check_discarded(const Expr& e) {
-        if (is_must_use_type(e.ty))
+        if (is_result_carrier(e.ty))
             warn(e.line, e.col, "unused " + apply(e.ty)->name +
                  ": handle it (match / unwrap / `?`), or discard it explicitly with `let _ = ...`");
+        else if (is_marked_must_use(e.ty))
+            warn(e.line, e.col, "unused " + describe(apply(e.ty)) +
+                 ": its type is marked MustUse -- use the value, or discard it explicitly with `let _ = ...`");
     }
 
     bool is_type_name(const std::string& n) const {
@@ -2097,6 +2114,7 @@ private:
         // Reject both uniformly (distinct from the method-based object-safety failures of Ord/Clone).
         if (is_eq_trait(trait))       return "'Eq' is a compile-time marker, not usable as a trait object";
         if (trait == std_Hashable())  return "'Hashable' is a compile-time marker, not usable as a trait object";
+        if (trait == std_MustUse())   return "'MustUse' is a compile-time marker, not usable as a trait object";
 
         // OS5: a supertrait's methods are reachable through the object, so they must be
         // dispatchable too. (Checked first: it names the real culprit.)
@@ -2220,13 +2238,16 @@ private:
             // as the primitive), so it carries no distinct identity through dynamic dispatch / dyn /
             // an erased bound -- a user impl would collide with the primitive's row. Forbid it;
             // transparent types dispatch statically only.
-            if (auto sit = structs_.find(im.head); sit != structs_.end() && sit->second.is_transparent)
+            // The one exception is `MustUse`: it has no methods, is never a trait object and never selects a
+            // blanket impl (register_blanket), so nothing ever dispatches through it -- it is read statically.
+            const bool erasure_ok = im.trait_name == std_MustUse();
+            if (auto sit = structs_.find(im.head); !erasure_ok && sit != structs_.end() && sit->second.is_transparent)
                 error(im.line, im.col, "cannot implement trait '" + im.trait_name +
                       "' for the transparent struct '" + im.head +
                       "' (transparent structs erase at runtime and dispatch statically only)");
             // Same reason for an int-backed enum: it erases to a bare Int (shares TID_INT), so it
             // carries no distinct identity through dynamic dispatch / dyn / an erased bound.
-            if (auto eit = enums_.find(im.head); eit != enums_.end() && eit->second.is_int_backed)
+            if (auto eit = enums_.find(im.head); !erasure_ok && eit != enums_.end() && eit->second.is_int_backed)
                 error(im.line, im.col, "cannot implement trait '" + im.trait_name +
                       "' for the int-backed enum '" + im.head +
                       "' (int-backed enums erase at runtime and dispatch statically only)");
@@ -2265,6 +2286,13 @@ private:
     // provides/inherits every trait method; and (soundness) require its bounds to cover Tr's
     // supertrait closure, so a type gaining Tr through it also satisfies every supertrait.
     void register_blanket(const ImplInfo& im, const TraitInfo& ti) {
+        // An erasure type may implement `MustUse`, so a blanket selected by it would reach such a type -- and a
+        // call through the blanket dispatches on the erased runtime tag, the primitive's column.
+        for (const auto& b : im.blanket_bounds)
+            if (b.trait == std_MustUse()) {
+                error(im.line, im.col, "'MustUse' marks values for a warning; it cannot select a blanket impl");
+                return;
+            }
         auto ins = blanket_impls_.emplace(im.trait_name, BlanketInfo{ im.blanket_bounds, im.line, im.col });
         if (!ins.second) {
             error(im.line, im.col, "duplicate blanket impl of trait '" + im.trait_name + "'");
@@ -2700,9 +2728,12 @@ private:
             const ScopeVar& v = kv.second;
             if (!v.track || v.used) continue;
             if (!kv.first.empty() && kv.first[0] == '_') continue;   // `_name` opts out
-            if (v.carrier)
+            if (v.carrier && is_result_carrier(v.ty))
                 warn(v.line, v.col, "unused " + apply(v.ty)->name + " '" + kv.first +
                      "' -- use it (match / unwrap / `?`), or discard it with `let _ = ...`");
+            else if (v.carrier)
+                warn(v.line, v.col, "unused " + describe(apply(v.ty)) + " '" + kv.first +
+                     "' -- its type is marked MustUse; use it, or discard it with `let _ = ...`");
             else
                 warn(v.line, v.col, "unused variable '" + kv.first + "' (prefix with '_' to silence)");
         }
@@ -2827,7 +2858,7 @@ private:
         }
         default: {
             TyPtr t = apply(infer(e));           // sets e.ty
-            if (tail && is_must_use_type(t))     // a dropped Result/Option in return position -> hard error
+            if (tail && is_result_carrier(t))    // a dropped Result/Option in return position -> hard error
                 error(e.line, e.col, "type mismatch: expected (), found " + describe(t));
             else
                 check_discarded(e);              // statement discard -> advisory must-use warning

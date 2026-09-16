@@ -463,6 +463,7 @@ inline std::string std_IntoIterator() { return mangle_name(STD_ITER, "IntoIterat
 inline std::string std_Iterable()     { return mangle_name(STD_ITER, "Iterable"); }
 inline std::string std_Eq()           { return mangle_name(STD_CORE, "Eq"); }        // the sealed structural-== marker
 inline std::string std_Hashable()     { return mangle_name(STD_CORE, "Hashable"); }  // the map-key marker
+inline std::string std_MustUse()      { return mangle_name(STD_CORE, "MustUse"); }   // the open must-use marker
 inline std::string std_ProcessOutput(){ return mangle_name(STD_PROCESS, "ProcessOutput"); }
 inline std::string std_Char()          { return mangle_name(STD_STRING, "Char"); }
 inline std::string std_codePointToStr(){ return mangle_name(STD_STRING, "codePointToStr"); }

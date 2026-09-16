@@ -1,0 +1,15 @@
+// CLAIM: a type marked with the MustUse marker draws the unused-value warning when a value of it is dropped,
+//        and a bounded wrapper impl passes the mark on.
+// GUIDE: SkarnGuide.md 23 (advisory warnings)
+// EXPECT: warn unused Outcome: its type is marked MustUse
+enum Outcome { Accepted, Rejected(String) }
+impl MustUse for Outcome {}
+
+struct Timed[T] { value: T, ms: Int }
+impl[T: MustUse] MustUse for Timed[T] {}
+
+fn validate(n: Int) -> Outcome { if n > 0 { Outcome::Accepted } else { Outcome::Rejected("negative") } }
+
+validate(-1)
+Timed { value: validate(1), ms: 3 }
+println("done")

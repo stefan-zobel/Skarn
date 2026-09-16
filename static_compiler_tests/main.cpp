@@ -861,6 +861,18 @@ bool check_warn_has(const std::string& src, const std::string& substr) {
 int check_warnc_p(const std::string& src) {
     return static_cast<int>(svc::compile(src.c_str(), svc::builtin_prelude()).warnings.size());
 }
+// PRELUDE-LINKED warning search, for a warning that needs a std item (the `MustUse` marker). A program that
+// does not compile has no warnings to find: false, and -1 for the count.
+bool check_warn_has_p(const std::string& src, const std::string& substr) {
+    try {
+        for (const auto& w : svc::compile(src.c_str(), svc::builtin_prelude()).warnings)
+            if (w.message.find(substr) != std::string::npos) return true;
+    } catch (const std::exception&) {}
+    return false;
+}
+int check_warnc_p_or_fail(const std::string& src) {
+    try { return check_warnc_p(src); } catch (const std::exception&) { return -1; }
+}
 
 void test_check_signatures() {
     std::cout << "[check: signatures]\n";
@@ -6069,6 +6081,67 @@ void test_generic_method_bounds() {
 
 }
 
+// The `MustUse` marker: a user type opts into the must-use WARNING with `impl MustUse for T {}`. Warning only
+// (the tail-position error stays Result/Option's), open to erasure types, propagated through bounded impls,
+// never a trait object and never a blanket selector. MU occupies lines 1-6.
+void test_must_use_marker() {
+    std::cout << "[MustUse marker: user-extensible must-use warning]\n";
+    const char* MU = "enum Outcome { Accepted, Rejected(String) }\n"
+                     " impl MustUse for Outcome {}\n"
+                     " fn validate(n: Int) -> Outcome { if n > 0 { Outcome::Accepted } else { Outcome::Rejected(\"neg\") } }\n"
+                     " struct Timed[T] { value: T, ms: Int }\n"
+                     " impl[T: MustUse] MustUse for Timed[T] {}\n"
+                     " trait Describe { fn describe(self) -> Int }\n";   // lines 1-6
+    auto mu = [&](const char* rest) { return std::string(MU) + rest; };
+
+    // Warns.
+    check_true("mu_enum", check_warn_has_p(mu("validate(-1)\n 0"), "unused Outcome"));
+    check_true("mu_struct", check_warn_has_p(mu(
+        "struct P { x: Int }\n impl MustUse for P {}\n impl P { fn withX(self, x: Int) -> P { P { x: x } } }\n"
+        " let p = P { x: 1 }\n p.withX(5)\n p.x"), "unused P"));
+    check_true("mu_int_enum", check_warn_has_p(mu(
+        "enum Code : Int { Good, Bad = 7 }\n impl MustUse for Code {}\n fn code() -> Code { Code::Bad }\n code()\n 0"),
+        "unused Code"));
+    check_true("mu_transparent", check_warn_has_p(mu(
+        "transparent struct Id(Int)\n impl MustUse for Id {}\n fn mkId() -> Id { Id(3) }\n mkId()\n 0"), "unused Id"));
+    check_true("mu_wrapper", check_warn_has_p(mu("Timed { value: validate(1), ms: 2 }\n 0"), "unused Timed"));
+    check_true("mu_generic_body", check_warn_has_p(mu("fn keep[T: MustUse](x: T) -> Int { x\n 1 }\n keep(validate(1))"),
+                                                   "unused T"));
+    check_true("mu_unused_binding", check_warn_has_p(mu("fn f() -> Int { let r = validate(1)\n 0 }\n f()"),
+                                                     "unused Outcome 'r'"));
+    check_true("mu_unit_tail_warns", check_warn_has_p(mu("fn f() -> () { validate(1) }\n f()\n 0"), "unused Outcome"));
+    check_true("mu_unit_tail_not_error", !check_has_p(mu("fn f() -> () { validate(1) }\n f()\n 0"), "type mismatch"));
+    // Silent.
+    check_true("mu_let_underscore", check_warnc_p_or_fail(mu("let _ = validate(-1)\n 0")) == 0);
+    check_true("mu_unmarked", check_warnc_p_or_fail(
+        "enum Plain { A, B }\n fn pick() -> Plain { Plain::A }\n pick()\n 0") == 0);
+    check_true("mu_wrapper_unmarked_inner", check_warnc_p_or_fail(mu("Timed { value: 5, ms: 2 }\n 0")) == 0);
+    check_true("mu_std_clean", check_warnc_p_or_fail("0") == 0);
+    // Rejected.
+    check_true("mu_dyn_rejected", check_has_p(mu("let d: dyn MustUse = validate(1)\n 0"),
+                                              "'MustUse' is a compile-time marker, not usable as a trait object"));
+    check_true("mu_blanket_bound_rejected", check_has_p(mu(
+        "impl[T: MustUse] Describe for T { fn describe(self) -> Int { 1 } }\n 0"), "cannot select a blanket impl"));
+    check_true("mu_erasure_other_trait_still_rejected", check_has_p(mu(
+        "transparent struct Id(Int)\n impl Describe for Id { fn describe(self) -> Int { 1 } }\n 0"),
+        "cannot implement trait"));
+    // Runs: marked struct, int enum, transparent struct and a bounded wrapper impl all lower and execute.
+    check_int_p("mu_runs", mu(
+        "struct P { x: Int }\n impl MustUse for P {}\n"
+        " enum Code : Int { Good, Bad = 7 }\n impl MustUse for Code {}\n"
+        " transparent struct Id(Int)\n impl MustUse for Id {}\n"
+        " let t = Timed { value: validate(1), ms: 2 }\n let p = P { x: 3 }\n let c = Code::Bad\n let i = Id(4)\n"
+        " let o = match t.value { Outcome::Accepted => 10, Outcome::Rejected(_) => 20 }\n"
+        " o + t.ms + p.x + ordinal(c) + i.0"), 26);
+    // The marker KEPT by a bound in live code, so its impls on erased heads reach the trait-table build.
+    check_int_p("mu_runs_kept_bound", mu(
+        "enum Code : Int { Good, Bad = 7 }\n impl MustUse for Code {}\n"
+        " transparent struct Id(Int)\n impl MustUse for Id {}\n"
+        " fn keep[T: MustUse](x: T) -> T { x }\n"
+        " let c = keep(Code::Bad)\n let i = keep(Id(4))\n let t = keep(Timed { value: validate(1), ms: 5 })\n"
+        " ordinal(c) + i.0 + t.ms"), 16);
+}
+
 // A generic impl carries its OWN bounds: `impl[T: Named] Named for Timed[T]` makes `Timed[X]` satisfy
 // `Named` only when `X` does. Every path that decides "type satisfies trait" must check them -- a bound,
 // method syntax, a qualified or piped call, a `dyn` coercion, a blanket keyed on the trait, a supertrait --
@@ -10239,6 +10312,7 @@ int main(int argc, char** argv) {
     test_associated_fn();
     test_impl_bounds();
     test_generic_method_bounds();
+    test_must_use_marker();
     test_char_utf8();
     test_char_literals();
     test_asi();
