@@ -648,6 +648,17 @@ private:
     };
     std::vector<PendingGeneric> pending_generics_;
 
+    // A bound on a generic impl's type parameter that `impl_bounds_hold` could not decide because the parameter
+    // matched a still-unsolved var (`check(t)` with `t: Timed[?]`). Collected only while a user-facing site has
+    // set `impl_obligations_`; that site turns each one into a `PendingGeneric`.
+    struct ImplObligation {
+        TyPtr var;
+        Bound bound;
+        std::string generic;   // the impl's type parameter, for the diagnostic
+        std::string impl;      // the impl it belongs to (`Named for Timed`), for the diagnostic
+    };
+    std::vector<ImplObligation>* impl_obligations_ = nullptr;
+
     // `display_name` (Naming.h) is applied HERE -- the one choke point every checker diagnostic
     // passes through -- rather than at each of the ~40 sites that interpolate a possibly-mangled
     // name. The per-site version is whack-a-mole: the next message added would leak the entry
@@ -2239,6 +2250,13 @@ private:
                 if (!seen.count(s + "\x1f" + im.head))
                     error(im.line, im.col, "type '" + im.head + "' implements '" + im.trait_name +
                                            "' but not its supertrait '" + s + "'");
+                // Both impls exist, but a generic one must not promise more than the supertrait impl delivers:
+                // the target's type parameters carry this impl's bounds, so the supertrait impl's bounds have to
+                // follow from them (`impl[T] Loud for W[T]` over `impl[T: Named] Named for W[T]` fails for W[Int]).
+                else if (!im.generics.empty() && !satisfies_bound(im.target, s))
+                    error(im.line, im.col, "impl of '" + im.trait_name + "' for '" + im.head +
+                                           "' does not guarantee its supertrait '" + s +
+                                           "': add the bounds of that impl's type parameters to this impl");
             }
         }
     }
@@ -3991,7 +4009,14 @@ private:
             return satisfies_via_blanket(ty, b);   // a var may satisfy `b` via a blanket keyed on its other bounds
         }
         std::string head = type_head(ty);
-        if (!head.empty() && impl_keys_.count(b + "\x1f" + head) > 0) return true;   // concrete impl wins
+        if (!head.empty()) {
+            const std::string key = b + "\x1f" + head;
+            // A concrete impl for the head DECIDES alone -- its own bounds included. No blanket fallback when
+            // those bounds fail: the dispatch-table column for the head belongs to that impl at run time.
+            if (auto iit = impl_index_.find(key); iit != impl_index_.end())
+                return impl_bounds_hold(impls_[iit->second], ty);
+            if (impl_keys_.count(key) > 0) return true;   // a synthesized marker key (no impl declaration)
+        }
         return satisfies_via_blanket(ty, b);       // else a blanket `impl[T: reqs] b for T` whose reqs `ty` meets
     }
 
@@ -4006,6 +4031,132 @@ private:
             if (!satisfies_bound(ty, req.trait)) { ok = false; break; }
         blanket_in_progress_.erase(b);
         return ok;
+    }
+
+    // Does the generic impl `im` apply to `ty` -- its target matches AND every bound on its own type parameters
+    // holds for what they matched? `impl[T: Named] Named for Timed[T]` covers `Timed[Str]` but not `Timed[Int]`.
+    // Pure: matching binds a local map, never the substitution, so a failed probe leaves nothing behind.
+    //
+    // A matched type parameter that is still an unsolved flexible var cannot be decided yet. At a user-facing
+    // site `impl_obligations_` is set, and the bound is recorded there for `drain_pending_generics` to check
+    // against the type fixed later; anywhere else (speculative `dyn` probes, internal discharges) the var is
+    // judged by its own bounds, which rejects rather than accepts what it cannot prove.
+    bool impl_bounds_hold(const ImplInfo& im, const TyPtr& ty) {
+        if (im.generics.empty()) return true;
+        if (bound_depth_ > 64) return false;                           // recursion safety net (sound over-reject)
+        std::unordered_map<uint32_t, TyPtr> m;
+        if (!match_impl_pattern(im, im.target, ty, m)) return false;
+        struct Pending { const GenericInfo* g; const Bound* b; };
+        std::vector<Pending> checks;
+        // Pass 1: a parametric bound's arguments may bind further impl parameters (`[I: Iterable[E], E]`), so
+        // solve those before any parameter's own bounds are judged.
+        for (const auto& g : im.generics)
+            for (const auto& b : g.bounds) {
+                auto it = m.find(g.id);
+                if (it == m.end()) continue;   // not in the target: fixed through the trait's arguments instead
+                TyPtr sub = apply(it->second);
+                if (sub->kind == TyKind::Var && !sub->rigid) { checks.push_back({ &g, &b }); continue; }
+                if (!b.args.empty()) {
+                    std::vector<TyPtr> args;
+                    ++bound_depth_;
+                    const bool found = pure_trait_args(b.trait, sub, args);
+                    --bound_depth_;
+                    if (!found || args.size() != b.args.size()) return false;
+                    for (size_t i = 0; i < args.size(); ++i)
+                        if (!match_impl_pattern(im, b.args[i], args[i], m)) return false;
+                }
+                checks.push_back({ &g, &b });
+            }
+        // Pass 2: every bound against what its parameter matched.
+        for (const auto& c : checks) {
+            TyPtr sub = apply(m[c.g->id]);
+            if (sub->kind == TyKind::Var && !sub->rigid && impl_obligations_) {
+                std::unordered_map<uint32_t, TyPtr> full = m;
+                for (const auto& g : im.generics)
+                    if (!full.count(g.id)) full[g.id] = tc_.fresh_var(g.name);
+                Bound bi;
+                bi.trait = c.b->trait;
+                for (const auto& a : c.b->args) bi.args.push_back(tc_.substitute(a, full));
+                impl_obligations_->push_back(ImplObligation{ sub, std::move(bi), c.g->name,
+                                                             "impl " + im.trait_name + " for " + im.head });
+                continue;
+            }
+            ++bound_depth_;
+            const bool ok = satisfies_bound(sub, c.b->trait);
+            --bound_depth_;
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    // Structural match of `pat` -- an impl target or bound argument whose leaves may be `im`'s own type
+    // parameters -- against `ty`, binding those parameters in `m`. A parameter met twice must match the same
+    // shape both times. An unsolved flexible var in `ty` matches anything: it is decided where it gets fixed.
+    bool match_impl_pattern(const ImplInfo& im, const TyPtr& pat, const TyPtr& tyIn,
+                            std::unordered_map<uint32_t, TyPtr>& m) {
+        TyPtr ty = apply(tyIn);
+        if (pat->kind == TyKind::Var && pat->rigid) {
+            for (const auto& g : im.generics)
+                if (g.id == pat->var_id) {
+                    auto it = m.find(g.id);
+                    if (it == m.end()) { m.emplace(g.id, ty); return true; }
+                    return shapes_agree(it->second, ty);
+                }
+        }
+        if (ty->kind == TyKind::Var && !ty->rigid) return true;
+        if (ty->kind == TyKind::Error || ty->kind == TyKind::Never) return true;
+        if (pat->kind != ty->kind) return false;
+        if (pat->kind == TyKind::Var) return pat->var_id == ty->var_id;
+        if ((pat->kind == TyKind::Named || pat->kind == TyKind::Dyn) && pat->name != ty->name) return false;
+        if (pat->args.size() != ty->args.size()) return false;
+        for (size_t i = 0; i < pat->args.size(); ++i)
+            if (!match_impl_pattern(im, pat->args[i], ty->args[i], m)) return false;
+        if (pat->kind == TyKind::Fn && pat->ret && ty->ret) return match_impl_pattern(im, pat->ret, ty->ret, m);
+        return true;
+    }
+
+    // Two types of the same shape, where an unsolved flexible var (or poison) agrees with anything.
+    bool shapes_agree(const TyPtr& aIn, const TyPtr& bIn) {
+        TyPtr a = apply(aIn), b = apply(bIn);
+        if ((a->kind == TyKind::Var && !a->rigid) || (b->kind == TyKind::Var && !b->rigid)) return true;
+        if (a->kind == TyKind::Error || b->kind == TyKind::Error) return true;
+        if (a->kind != b->kind) return false;
+        if (a->kind == TyKind::Var) return a->var_id == b->var_id;
+        if ((a->kind == TyKind::Named || a->kind == TyKind::Dyn) && a->name != b->name) return false;
+        if (a->args.size() != b->args.size()) return false;
+        for (size_t i = 0; i < a->args.size(); ++i)
+            if (!shapes_agree(a->args[i], b->args[i])) return false;
+        if (a->kind == TyKind::Fn && a->ret && b->ret) return shapes_agree(a->ret, b->ret);
+        return true;
+    }
+
+    // The trait arguments `sub` implements `trait` with, WITHOUT unifying anything: from a var's or trait
+    // object's own bound, else from the matching impl. An impl parameter the target does not fix comes back as a
+    // fresh var, which `match_impl_pattern` accepts.
+    bool pure_trait_args(const std::string& trait, const TyPtr& subIn, std::vector<TyPtr>& out) {
+        TyPtr sub = apply(subIn);
+        if (sub->kind == TyKind::Var) {
+            for (const auto& bd : sub->bounds)
+                if (bd.trait == trait) { out = bd.args; return true; }
+            return false;
+        }
+        if (sub->kind == TyKind::Dyn) {
+            if (sub->name != trait) return false;
+            out = sub->args;
+            return true;
+        }
+        const std::string head = type_head(sub);
+        if (head.empty()) return false;
+        auto iit = impl_index_.find(trait + "\x1f" + head);
+        if (iit == impl_index_.end()) return false;
+        const ImplInfo& im = impls_[iit->second];
+        std::unordered_map<uint32_t, TyPtr> m;
+        if (!match_impl_pattern(im, im.target, sub, m)) return false;
+        for (const auto& g : im.generics)
+            if (!m.count(g.id)) m[g.id] = tc_.fresh_var(g.name);
+        out.clear();
+        for (const auto& a : im.trait_args) out.push_back(tc_.substitute(a, m));
+        return true;
     }
 
     // Enforce `K: Hashable` at a Map CONSTRUCTION site (the only place a Map value is minted -- a
@@ -4208,6 +4359,7 @@ private:
     // own words.
     bool dyn_coercible(const TyPtr& sub, const std::string& trait, const std::vector<TyPtr>& args) {
         QuietGuard q(quiet_depth_);
+        ObligationScope noSink(impl_obligations_, nullptr);   // a probe: nothing it cannot prove is deferred
         if (!satisfies_bound(sub, trait)) return false;
         if (args.empty()) return true;
         std::vector<TyPtr> solved;
@@ -4271,11 +4423,37 @@ private:
                     defer_generic(it->second, std::move(bi), g.name, *what, line, col);
                     continue;
                 }
-                if (!discharge_parametric_bound(solved, bi, line, col))
+                const bool ok = with_impl_obligations(what, line, col,
+                    [&] { return discharge_parametric_bound(solved, bi, line, col); });
+                if (!ok)
                     error(line, col, "type " + describe(solved) +
                           " does not satisfy the bound '" + describe_bound(bi) + "'");
             }
         }
+    }
+
+    // Installs an impl-obligation sink for one scope and restores the previous one on exit.
+    struct ObligationScope {
+        std::vector<ImplObligation>*& slot;
+        std::vector<ImplObligation>* saved;
+        ObligationScope(std::vector<ImplObligation>*& s, std::vector<ImplObligation>* now) : slot(s), saved(s) { s = now; }
+        ~ObligationScope() { slot = saved; }
+    };
+
+    // Runs `probe` -- a bound check at the site named by `what` -- collecting the impl bounds it could not decide
+    // yet, and defers each to `drain_pending_generics` if the probe succeeded. No `what` (an internal discharge)
+    // or a speculative region: nothing is collected, so an undecidable bound fails instead of being deferred.
+    template <class Probe>
+    bool with_impl_obligations(const std::string* what, uint32_t line, uint32_t col, Probe&& probe) {
+        std::vector<ImplObligation> obs;
+        bool ok;
+        {
+            ObligationScope scope(impl_obligations_, (what && quiet_depth_ == 0) ? &obs : nullptr);
+            ok = probe();
+        }
+        if (ok)
+            for (auto& o : obs) defer_generic(o.var, std::move(o.bound), o.generic, o.impl, line, col);
+        return ok;
     }
 
     // Record a generic argument to re-examine after all bodies are checked. Not inside a speculative
@@ -4496,7 +4674,8 @@ private:
             TyPtr selfTy = pre_self ? apply(pre_self) : apply(infer(*args[0]));
             tc_.unify(fresh_self, selfTy);
             TyPtr rs = apply(fresh_self);
-            if (!satisfies_bound(rs, traitName))
+            if (!with_impl_obligations(&methodName, node.line, node.col,
+                                       [&] { return satisfies_bound(rs, traitName); }))
                 error(node.line, node.col, "type " + describe(rs) +
                       " does not implement trait '" + traitName + "'");
             // Solve the trait's own type params (`Iterable[T]`) from the receiver's impl, so

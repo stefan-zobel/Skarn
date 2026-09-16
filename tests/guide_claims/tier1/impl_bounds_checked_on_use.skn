@@ -1,0 +1,11 @@
+// CLAIM: an impl for a generic type with bounds of its own applies only where they hold -- a Pair[Int]
+//        is not Named when Int is not, so it does not meet a `T: Named` bound.
+// GUIDE: SkarnGuide.md 16 (blanket and parametric impls)
+// EXPECT: fail type Pair[Int] does not satisfy the bound 'Named'
+trait Named { fn name(self) -> String }
+struct Pair[T] { a: T, b: T }
+impl[T: Named] Named for Pair[T] { fn name(self) -> String { self.a.name() + self.b.name() } }
+
+fn describe[T: Named](x: T) -> String { "named " + x.name() }
+
+println(describe(Pair { a: 1, b: 2 }))

@@ -68,6 +68,9 @@ struct Binding   { std::string name; GType ty; bool is_mut = false; };
 struct FnSig     { std::string name; std::vector<GType> params; GType ret; bool first_mut = false; };
 struct HofSig    { std::string name; GType a; GType b; };          // fn hN(f: fn(a)->b, x: a) -> b { f(x) }
 struct TraitDef  { std::string name, method, wrapper; GType ret; int sid; };  // one method, one impl struct
+// A CONDITIONAL impl over a generic wrapper (gen_conditional_impls): `struct CwK[T] { inner: T, k: Int }`,
+// `impl CtK for S`, `impl[T: CtK] CtK for CwK[T]`, and a bounded wrapper fn `cfK[X: CtK]`.
+struct CondImplDef  { std::string wrap, trait, method, fn; int sid; };
 struct MutatorDef   { std::string name; int sid; std::string field; };   // fn mN(mut p0: S, p1: Int) -> Int
 struct MutMethodDef { std::string method; int sid; std::string field; std::string trait; };  // trait+impl: fn bN(mut self) -> Int
 // A traitless `impl S { .. }` block (gen_inherent). Every member is optional (an empty name = absent):
@@ -92,6 +95,7 @@ struct Gen {
     std::vector<FnSig>     funcs;
     std::vector<HofSig>    hofs;
     std::vector<TraitDef>  traits;
+    std::vector<CondImplDef>  conds;
     std::vector<MutatorDef>   mutators;
     std::vector<MutMethodDef> mut_methods;
     std::vector<InherentDef>  inherents;
@@ -1407,6 +1411,40 @@ struct Gen {
         }
         return src;
     }
+    // Conditional impls: the wrapper satisfies the trait only because its type argument does, so every call
+    // below makes the checker prove the impl's OWN bound (`T: CtK`) through 1..3 wrapper layers. Only
+    // satisfying instantiations are generated, so a spurious rejection surfaces as a GEN-BUG.
+    std::string gen_conditional_impls() {
+        std::string src;
+        for (int s = 0; s < (int)structs.size(); ++s) {
+            if (!chance(25)) continue;
+            const std::string k = std::to_string(conds.size());
+            const std::string wrap = "Cw" + k, tn = "Ct" + k, mn = "cm" + k, fnw = "cf" + k;
+            const std::string fld = int_field_of(s);
+            src += "struct " + wrap + "[T] { inner: T, k: Int }\n";
+            src += "trait " + tn + " { fn " + mn + "(self) -> Int }\n";
+            src += "impl " + tn + " for " + structs[s].name + " { fn " + mn + "(self) -> Int { " +
+                   (fld.empty() ? std::string("0") : "self." + fld) + " } }\n";
+            src += "impl[T: " + tn + "] " + tn + " for " + wrap + "[T] { fn " + mn +
+                   "(self) -> Int { self.inner." + mn + "() + self.k } }\n";
+            src += "fn " + fnw + "[X: " + tn + "](x: X) -> Int { x." + mn + "() }\n";
+            conds.push_back({ wrap, tn, mn, fnw, s });
+        }
+        return src;
+    }
+    std::string cond_call(int depth) {
+        const CondImplDef& c = conds[pick((uint32_t)conds.size())];
+        std::string v = gen_expr(struct_ty(c.sid), depth - 1);
+        const int layers = 1 + (int)pick(3);
+        for (int i = 0; i < layers; ++i) v = c.wrap + " { inner: " + v + ", k: " + int_lit() + " }";
+        switch (pick(5)) {
+            case 0:  return "((" + v + ")." + c.method + "())";
+            case 1:  return c.trait + "::" + c.method + "(" + v + ")";
+            case 2:  return c.fn + "(" + v + ")";
+            case 3:  return "((" + v + ") |> " + c.fn + ")";
+            default: return c.method + "(" + v + ")";
+        }
+    }
     // `gtw(fn(a: T) -> T { body }, arg)` -- apply a lambda twice through the generic helper (scalar T).
     std::string gen_gtw(const GType& t, int depth) {
         const std::string ap = "a" + std::to_string(name_counter++);
@@ -1899,6 +1937,7 @@ struct Gen {
         src += gen_inherent();
         src += gen_traits();
         src += gen_blankets();
+        src += gen_conditional_impls();
         src += gen_generic_fns();
         if (prelude_mode) src += gen_prelude_helpers();
         src += gen_functions();
@@ -1974,6 +2013,7 @@ std::string Gen::gen_expr(const GType& t, int depth) {
     if (struct_has_field(t) && chance(20)) return struct_project(t, depth);
     if (chance(12)) return tuple_project(t, depth);
     if (trait_returns(t) && chance(20)) return trait_call(t, depth);
+    if (t.kind == GType::Int && !conds.empty() && chance(20)) return cond_call(depth);
     if (inherent_returns(t) && chance(20)) return inherent_call(t, depth);
     if (has_enum() && chance(18)) return gen_enum_match(t, depth);
     if (has_struct() && chance(12)) return gen_struct_match(t, depth);

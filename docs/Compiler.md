@@ -147,6 +147,11 @@ branch types (in `if`, `match`, or the `break` values of a `loop`) is exact.
 - **Traits** may be generic (`trait Iterable[T]`). A trait's type parameter can be solved as an output from the
   matching impl, which gives associated-type-like inference. Blanket impls (`impl[T: Show] Tr for T`) are
   allowed; a concrete impl wins over a blanket one.
+  - An impl for a generic type may carry bounds of its own (`impl[T: Show] Show for Box[T]`). It applies only
+    to the instantiations that meet them, at every place a type is asked to satisfy a trait: a bound, a method
+    call, a `dyn` coercion, a blanket built on top. When the wrapped type is still open at that place, the
+    bound is settled later, like a deferred type argument. An impl of a subtrait must require at least what
+    the supertrait's impl for the same type requires.
 - **Inherent impls** give a type its own methods and associated functions. A method call `recv.m()` resolves
   field first, then inherent method, then trait method. `Type::m(x)` and `Trait::m(x)` reach a method
   explicitly.

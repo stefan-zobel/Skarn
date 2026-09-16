@@ -6011,6 +6011,96 @@ void test_associated_fn() {
         " impl P { fn make() -> Int { 99 } }\n P { n: 1 }.make()", false);
 }
 
+// A generic impl carries its OWN bounds: `impl[T: Named] Named for Timed[T]` makes `Timed[X]` satisfy
+// `Named` only when `X` does. Every path that decides "type satisfies trait" must check them -- a bound,
+// method syntax, a qualified or piped call, a `dyn` coercion, a blanket keyed on the trait, a supertrait --
+// otherwise the program type-checks and traps at run time ("no trait implementation"). IB occupies lines 1-6.
+void test_impl_bounds() {
+    std::cout << "[test_impl_bounds: a generic impl's own bounds gate trait satisfaction]\n";
+    const char* IB = "trait Named { fn name(self) -> Int }\n"
+                     " struct Str { n: Int }\n"
+                     " impl Named for Str { fn name(self) -> Int { self.n } }\n"
+                     " struct Timed[T] { value: T, ms: Int }\n"
+                     " impl[T: Named] Named for Timed[T] { fn name(self) -> Int { self.value.name() + self.ms } }\n"
+                     " fn check[T: Named](x: T) -> Int { x.name() }\n";   // lines 1-6
+    auto ib = [&](const char* rest) { return std::string(IB) + rest; };
+
+    // Rejected: `Int` does not implement `Named`, so neither does `Timed[Int]`.
+    check_true("ib_generic_bound", check_has_on_line(
+        ib("check(Timed { value: 5, ms: 1 })"), "does not satisfy the bound 'Named'", 7));
+    check_true("ib_method_syntax", check_has_on_line(
+        ib("let t = Timed { value: 5, ms: 1 }\n t.name()"), "does not implement trait 'Named'", 8));
+    check_true("ib_qualified_call", check_has(
+        ib("Named::name(Timed { value: 5, ms: 1 })"), "does not implement trait 'Named'"));
+    check_true("ib_pipe_call", check_has(
+        ib("Timed { value: 5, ms: 1 } |> name"), "does not implement trait 'Named'"));
+    check_true("ib_dyn_coercion", check_has(
+        ib("let d: dyn Named = Timed { value: 5, ms: 1 }\n d.name()"), "expected dyn Named, found Timed[Int]"));
+    check_true("ib_nested", check_has(
+        ib("check(Timed { value: Timed { value: 5, ms: 1 }, ms: 1 })"), "does not satisfy the bound 'Named'"));
+    check_true("ib_blanket_on_top", check_has(ib(
+        "trait Loud { fn loud(self) -> Int }\n impl[T: Named] Loud for T { fn loud(self) -> Int { self.name() * 2 } }\n"
+        " loud(Timed { value: 5, ms: 1 })"), "does not implement trait 'Loud'"));
+    check_true("ib_marker_trait", check_has(ib(
+        "trait Mark {}\n impl[T: Named] Mark for Timed[T] {}\n fn m[T: Mark](x: T) -> Int { 1 }\n"
+        " m(Timed { value: 5, ms: 1 })"), "does not satisfy the bound 'Mark'"));
+    check_true("ib_unbounded_generic_body", check_has(
+        ib("fn g[T](x: Timed[T]) -> Int { x.name() }\n 0"), "does not implement trait 'Named'"));
+    // The wrapped type is fixed only AFTER the call: the impl bound is still checked against it.
+    check_true("ib_late_type", check_has(ib(
+        "fn dflt[T]() -> T { dflt() }\n let t = Timed { value: dflt(), ms: 1 }\n check(t)\n let i: Int = t.value\n 0"),
+        "does not satisfy the bound 'Named'"));
+    // Never fixed at all: rejected like any other type argument nothing determines, naming the impl it belongs to.
+    check_true("ib_never_solved", check_has_on_line(ib(
+        "fn dflt[T]() -> T { dflt() }\n let t = Timed { value: dflt(), ms: 1 }\n check(t)\n 0"),
+        "cannot infer the type argument 'T' of 'impl Named for Timed'", 9));
+    // A supertrait impl with STRONGER bounds than the subtrait impl: `W[Int]` would be `Loud` but not `Named`.
+    check_true("ib_supertrait_bounds", check_has_on_line(ib(
+        "trait Loud: Named { fn loud(self) -> Int }\n struct W[T] { v: T }\n"
+        " impl[T: Named] Named for W[T] { fn name(self) -> Int { self.v.name() } }\n"
+        " impl[T] Loud for W[T] { fn loud(self) -> Int { 1 } }\n 0"),
+        "does not guarantee its supertrait 'Named'", 10));
+    // A PARAMETRIC trait with a conditional impl.
+    const char* PB = "trait It[E] { fn first(self) -> E }\n struct Bx[T] { v: T }\n"
+                     " impl[T: Named] It[Int] for Bx[T] { fn first(self) -> Int { self.v.name() } }\n"
+                     " fn f[I: It[E], E](x: I) -> E { x.first() }\n";
+    check_true("ib_parametric_bound", check_has(ib(PB) + "f(Bx { v: 5 })", "does not satisfy the bound 'Named'"));
+    check_true("ib_parametric_method", check_has(ib(PB) + "Bx { v: 5 }.first()", "does not satisfy the bound 'Named'"));
+    // An impl parameter bounded by a PARAMETRIC trait: the trait's arguments must match too, not just the impl's
+    // existence -- `Src` yields Strings, the impl asks for Ints.
+    const char* PA = "struct Src { n: Int }\n impl It[String] for Src { fn first(self) -> String { \"s\" } }\n"
+                     " struct Sum[I] { src: I }\n impl[I: It[Int]] Named for Sum[I] { fn name(self) -> Int { self.src.first() } }\n";
+    check_true("ib_parametric_arg_mismatch", check_has(ib(PB) + PA + "check(Sum { src: Src { n: 1 } })",
+                                                       "does not satisfy the bound 'Named'"));
+    check_int("ib_ok_parametric_arg", ib(PB) + PA + "check(Sum { src: Bx { v: Str { n: 6 } } })", 6);
+
+    // Accepted: the bound holds.
+    check_int("ib_ok_direct", ib("check(Timed { value: Str { n: 3 }, ms: 4 })"), 7);
+    check_int("ib_ok_method", ib("let t = Timed { value: Str { n: 3 }, ms: 4 }\n t.name()"), 7);
+    check_int("ib_ok_rigid", ib("fn f[T: Named](x: Timed[T]) -> Int { x.name() }\n f(Timed { value: Str { n: 1 }, ms: 1 })"), 2);
+    check_int("ib_ok_marker_trait", ib(
+        "trait Mark {}\n impl Mark for Str {}\n impl[T: Mark] Mark for Timed[T] {}\n fn m[T: Mark](x: T) -> Int { 1 }\n"
+        " m(Timed { value: Str { n: 1 }, ms: 1 })"), 1);
+    check_int("ib_ok_nested",ib("check(Timed { value: Timed { value: Str { n: 1 }, ms: 2 }, ms: 3 })"), 6);
+    check_int("ib_ok_dyn", ib("let d: dyn Named = Timed { value: Str { n: 2 }, ms: 2 }\n d.name()"), 4);
+    check_int("ib_ok_blanket", ib(
+        "trait Loud { fn loud(self) -> Int }\n impl[T: Named] Loud for T { fn loud(self) -> Int { self.name() * 2 } }\n"
+        " loud(Timed { value: Str { n: 1 }, ms: 1 })"), 4);
+    check_true("ib_ok_late_type", check_errc(ib(
+        "fn dflt[T]() -> T { dflt() }\n let t = Timed { value: dflt(), ms: 1 }\n check(t)\n let s: Str = t.value\n 0")) == 0);
+    check_int("ib_ok_parametric", ib(PB) + "f(Bx { v: Str { n: 9 } })", 9);
+    check_int("ib_ok_supertrait_same_bounds", ib(
+        "trait Loud: Named { fn loud(self) -> Int }\n struct W[T] { v: T }\n"
+        " impl[T: Named] Named for W[T] { fn name(self) -> Int { self.v.name() } }\n"
+        " impl[T: Named] Loud for W[T] { fn loud(self) -> Int { self.name() + 1 } }\n"
+        " W { v: Str { n: 4 } }.loud()"), 5);
+    // The conditional impls std itself relies on.
+    check_int_p("ib_ok_std_map_clone", "let m: Map[String, Int] = #{\"a\" => 1, \"b\" => 2}\n len(clone(m))", 2);
+    check_int_p("ib_ok_std_dedup", "len(intoIter(toVec([1, 1, 2, 2, 3])) |> dedup |> collect)", 3);
+    check_int_p("ib_ok_std_set_iter",
+        "use std::set::Set\n let s = Set::fromVec(toVec([1, 2, 2]))\n let mut n = 0\n for x in s { n += x }\n n", 3);
+}
+
 void test_enum_variant_coexist() {
     std::cout << "[test_enum_variant_coexist: same-module same-name variants (S2)]\n";
 
@@ -10089,6 +10179,7 @@ int main(int argc, char** argv) {
     test_receiver_inferred_once();
     test_measure_linear();
     test_associated_fn();
+    test_impl_bounds();
     test_char_utf8();
     test_char_literals();
     test_asi();

@@ -2747,6 +2747,36 @@ println(Dog {}.greet())     // => Hi, Rex
 A concrete `impl` always wins over a blanket one for the same trait; there is at most one blanket impl per
 trait.
 
+An impl for a **generic type** can carry bounds of its own. Then it applies only to the instantiations that meet
+them — a `Pair` is `Named` when what it holds is:
+
+```rust
+trait Named { fn name(self) -> String }
+struct Dog {}
+impl Named for Dog { fn name(self) -> String { "Rex" } }
+
+struct Pair[T] { a: T, b: T }
+impl[T: Named] Named for Pair[T] {           // only for pairs of Named things
+    fn name(self) -> String { self.a.name() + " & " + self.b.name() }
+}
+
+println(Pair { a: Dog {}, b: Dog {} }.name())   // => Rex & Rex
+```
+
+A `Pair[Int]` is not `Named`, and the compiler says so wherever it would be used as one — a method call, a
+bound, a `dyn Named`:
+
+```rust fail
+trait Named { fn name(self) -> String }
+struct Pair[T] { a: T, b: T }
+impl[T: Named] Named for Pair[T] { fn name(self) -> String { self.a.name() } }
+
+println(Pair { a: 1, b: 2 }.name())   // error: type Pair[Int] does not implement trait 'Named'
+```
+
+The same holds across a supertrait: an impl of `trait Loud: Named` for `Pair[T]` must require at least what
+`Pair[T]`'s `Named` impl requires, or some `Pair` would be `Loud` without being `Named`.
+
 A **parametric trait** carries its own type parameter, and the implementing type supplies it — the parameter is
 an *output* of the impl, solved from the head:
 

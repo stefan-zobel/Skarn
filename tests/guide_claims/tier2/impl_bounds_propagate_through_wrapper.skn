@@ -1,0 +1,17 @@
+// CLAIM: a conditional impl reaches through nested wrappers, and a trait bound, method syntax and a
+//        dyn value all see it: Pair[Pair[Dog]] is Named because Pair[Dog] is, because Dog is.
+// GUIDE: SkarnGuide.md 16 (blanket and parametric impls)
+// EXPECT: ok Rex+Rex+Rex+Rex / Rex+Rex+Rex+Rex
+trait Named { fn name(self) -> String }
+struct Dog {}
+impl Named for Dog { fn name(self) -> String { "Rex" } }
+
+struct Pair[T] { a: T, b: T }
+impl[T: Named] Named for Pair[T] { fn name(self) -> String { self.a.name() + "+" + self.b.name() } }
+
+fn describe[T: Named](x: T) -> String { x.name() }
+
+let inner = Pair { a: Dog {}, b: Dog {} }
+let outer = Pair { a: inner, b: inner }
+let d: dyn Named = outer
+println(describe(outer) + " / " + d.name())
