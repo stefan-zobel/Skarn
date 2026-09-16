@@ -1,0 +1,8 @@
+// CLAIM: an impl of a generic trait method may not change a bound's arguments -- the caller proves only
+//        the trait's Src[String], so a body assuming Src[Int] is rejected.
+// GUIDE: SkarnGuide.md 16 (trait bounds on generics)
+// EXPECT: fail declares bound 'Src[Int]' but the trait 'Pick' requires 'Src[String]'
+trait Src[T] { fn first(self) -> T }
+trait Pick { fn pick[I: Src[String]](self, i: I) -> Int }
+impl Pick for Int { fn pick[I: Src[Int]](self, i: I) -> Int { i.first() } }
+println(0)

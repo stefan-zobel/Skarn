@@ -152,6 +152,10 @@ branch types (in `if`, `match`, or the `break` values of a `loop`) is exact.
     call, a `dyn` coercion, a blanket built on top. When the wrapped type is still open at that place, the
     bound is settled later, like a deferred type argument. An impl of a subtrait must require at least what
     the supertrait's impl for the same type requires.
+  - A trait method may have its own bounded type parameters. An impl must match the trait's signature; it may
+    drop a bound or narrow it to a supertrait the trait's bound implies, but not add one or change a bound's
+    type arguments, since callers prove only the trait's bounds. A trait with a generic method cannot be used
+    as `dyn`.
 - **Inherent impls** give a type its own methods and associated functions. A method call `recv.m()` resolves
   field first, then inherent method, then trait method. `Type::m(x)` and `Trait::m(x)` reach a method
   explicitly.

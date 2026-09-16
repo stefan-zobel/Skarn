@@ -6011,6 +6011,64 @@ void test_associated_fn() {
         " impl P { fn make() -> Int { 99 } }\n P { n: 1 }.make()", false);
 }
 
+// A generic trait method's bounds, checked for conformance in a COMPILED (module-prefixed) program.
+void test_generic_method_bounds() {
+    std::cout << "[generic trait method bounds: conformance through a real compile]\n";
+    // `check_errc` (the `mgen_*` checker tests) sees an unprefixed program, where a
+    // bound written in the impl and the trait's resolved bound are spelled alike; a compiled program mangles
+    // (`$entry::Plain`), so a comparison against the impl's raw AST name rejected every bounded generic method.
+    const char* MB = "trait Plain { fn one(self) -> Int }\n"
+                     " trait Loud: Plain { fn loud(self) -> Int }\n"
+                     " trait Src[T] { fn first(self) -> T }\n"
+                     " struct Ints { n: Int }\n"
+                     " impl Plain for Ints { fn one(self) -> Int { self.n } }\n"
+                     " impl Loud for Ints { fn loud(self) -> Int { self.n * 10 } }\n"
+                     " impl Src[Int] for Ints { fn first(self) -> Int { self.n + 100 } }\n";
+    auto mb = [&](const char* rest) { return std::string(MB) + rest; };
+    check_int("mgen_bound_same_ok", mb(
+        "trait W { fn pk[I: Plain](self, i: I) -> Int }\n"
+        " impl W for Int { fn pk[I: Plain](self, i: I) -> Int { self + i.one() } }\n 7.pk(Ints { n: 2 })"), 9);
+    check_int("mgen_bound_param_ok", mb(
+        "trait W { fn pk[I: Src[Int]](self, i: I) -> Int }\n"
+        " impl W for Int { fn pk[I: Src[Int]](self, i: I) -> Int { i.first() } }\n 7.pk(Ints { n: 2 })"), 102);
+    check_int("mgen_bound_sibling_ok", mb(
+        "trait W { fn pk[T, I: Src[T]](self, i: I) -> T }\n"
+        " impl W for Int { fn pk[T, I: Src[T]](self, i: I) -> T { i.first() } }\n 7.pk(Ints { n: 3 })"), 103);
+    check_int("mgen_bound_sibling_later_ok", mb(
+        "trait W { fn pk[I: Src[T], T](self, i: I) -> T }\n"
+        " impl W for Int { fn pk[I: Src[T], T](self, i: I) -> T { i.first() } }\n 7.pk(Ints { n: 4 })"), 104);
+    check_int("mgen_bound_dropped_ok", mb(
+        "trait W { fn pk[I: Plain](self, i: I) -> Int }\n"
+        " impl W for Int { fn pk[I](self, i: I) -> Int { self } }\n 7.pk(Ints { n: 2 })"), 7);
+    check_int("mgen_bound_super_ok", mb(
+        "trait W { fn pk[I: Loud](self, i: I) -> Int }\n"
+        " impl W for Int { fn pk[I: Plain](self, i: I) -> Int { i.one() } }\n 7.pk(Ints { n: 5 })"), 5);
+    check_int("mgen_bound_generic_caller_ok", mb(
+        "trait W { fn pk[I: Plain](self, i: I) -> Int }\n"
+        " impl W for Int { fn pk[I: Plain](self, i: I) -> Int { self + i.one() } }\n"
+        " fn via[X: W](x: X) -> Int { x.pk(Ints { n: 1 }) }\n via(40)"), 41);
+    check_int_modules("mgen_bound_module",
+        "import shapes\n use shapes::{Plain, W}\n struct Ints { n: Int }\n"
+        " impl Plain for Ints { fn one(self) -> Int { self.n } }\n"
+        " impl W for Ints { fn pk[I: Plain](self, i: I) -> Int { self.n + i.one() } }\n Ints { n: 7 }.pk(Ints { n: 6 })",
+        std::unordered_map<std::string, std::string>{{ "shapes",
+            "pub trait Plain { fn one(self) -> Int }\n pub trait W { fn pk[I: Plain](self, i: I) -> Int }" }}, 13);
+    // Rejected: a bound the trait does not guarantee, or the same trait with different arguments -- the caller
+    // proves `Src[String]`, so a body assuming `Src[Int]` would read a String as an Int.
+    check_true("mgen_extra_bound_prefixed", check_has_p(mb(
+        "trait W { fn pk[I](self, i: I) -> Int }\n"
+        " impl W for Int { fn pk[I: Plain](self, i: I) -> Int { i.one() } }\n 0"), "does not require"));
+    check_true("mgen_bound_arg_mismatch", check_has_p(mb(
+        "trait W { fn pk[I: Src[String]](self, i: I) -> Int }\n"
+        " impl W for Int { fn pk[I: Src[Int]](self, i: I) -> Int { i.first() } }\n 0"),
+        "declares bound 'Src[Int]' but the trait 'W' requires 'Src[String]'"));
+    check_true("mgen_bound_sibling_mismatch", check_has_p(mb(
+        "trait W { fn pk[T, I: Src[T]](self, i: I) -> T }\n"
+        " impl W for Int { fn pk[T, I: Src[Int]](self, i: I) -> T { i.first() } }\n 0"),
+        "declares bound 'Src[Int]' but the trait 'W' requires 'Src[T]'"));
+
+}
+
 // A generic impl carries its OWN bounds: `impl[T: Named] Named for Timed[T]` makes `Timed[X]` satisfy
 // `Named` only when `X` does. Every path that decides "type satisfies trait" must check them -- a bound,
 // method syntax, a qualified or piped call, a `dyn` coercion, a blanket keyed on the trait, a supertrait --
@@ -10180,6 +10238,7 @@ int main(int argc, char** argv) {
     test_measure_linear();
     test_associated_fn();
     test_impl_bounds();
+    test_generic_method_bounds();
     test_char_utf8();
     test_char_literals();
     test_asi();

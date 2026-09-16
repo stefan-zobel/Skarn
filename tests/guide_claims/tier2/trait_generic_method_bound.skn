@@ -1,0 +1,17 @@
+// CLAIM: a trait method may carry its own bounded type parameters, and an impl that repeats the bound
+//        (or refines it to a supertrait the trait's bound implies) compiles and runs.
+// GUIDE: SkarnGuide.md 16 (trait bounds on generics)
+// EXPECT: ok first: widget#7 / 7
+trait Show { fn show(self) -> String }
+trait Loud: Show { fn shout(self) -> String }
+struct Widget { id: Int }
+impl Show for Widget { fn show(self) -> String { "widget#" + self.id } }
+impl Loud for Widget { fn shout(self) -> String { "WIDGET" } }
+
+trait Label { fn label[T: Show](self, item: T) -> String }
+impl Label for String { fn label[T: Show](self, item: T) -> String { self + ": " + item.show() } }
+
+trait Count { fn count[T: Loud](self, item: T) -> Int }
+impl Count for Int { fn count[T: Show](self, item: T) -> Int { self } }
+
+println("first".label(Widget { id: 7 }) + " / " + 7.count(Widget { id: 1 }))

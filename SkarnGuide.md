@@ -2518,6 +2518,33 @@ println(showAll(ws))   // => widget#1 widget#2
 Because `T` is a single type parameter, `showAll` requires a `Vec[Widget]` — every element the same type. When
 you genuinely want a mixed collection, use a trait object; see [§17](#17-trait-objects-dyn-trait).
 
+A trait **method** can have type parameters and bounds of its own. The impl writes the same bounds — it may
+leave one out, but never add a bound or change a bound's arguments, because a caller only proves what the trait
+promises:
+
+```rust
+trait Show { fn show(self) -> String }
+struct Widget { id: Int }
+impl Show for Widget { fn show(self) -> String { "widget#" + self.id } }
+
+trait Label { fn label[T: Show](self, item: T) -> String }
+impl Label for String {
+    fn label[T: Show](self, item: T) -> String { self + ": " + item.show() }
+}
+
+println("first".label(Widget { id: 7 }))   // => first: widget#7
+```
+
+```rust fail
+trait Show { fn show(self) -> String }
+trait Label { fn label[T](self, item: T) -> String }
+impl Label for String {   // error: type parameter 'T' declares bound 'Show' that the trait 'Label' does not require
+    fn label[T: Show](self, item: T) -> String { self + item.show() }
+}
+```
+
+A trait with such a generic method cannot be used as `dyn` ([§17](#17-trait-objects-dyn-trait)).
+
 ### Multiple bounds
 
 A parameter can require several traits at once, joined with `+`. Inside the function every method from every

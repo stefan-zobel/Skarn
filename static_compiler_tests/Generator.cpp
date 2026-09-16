@@ -69,8 +69,9 @@ struct FnSig     { std::string name; std::vector<GType> params; GType ret; bool 
 struct HofSig    { std::string name; GType a; GType b; };          // fn hN(f: fn(a)->b, x: a) -> b { f(x) }
 struct TraitDef  { std::string name, method, wrapper; GType ret; int sid; };  // one method, one impl struct
 // A CONDITIONAL impl over a generic wrapper (gen_conditional_impls): `struct CwK[T] { inner: T, k: Int }`,
-// `impl CtK for S`, `impl[T: CtK] CtK for CwK[T]`, and a bounded wrapper fn `cfK[X: CtK]`.
-struct CondImplDef  { std::string wrap, trait, method, fn; int sid; };
+// `impl CtK for S`, `impl[T: CtK] CtK for CwK[T]`, a bounded wrapper fn `cfK[X: CtK]`, and a bounded GENERIC
+// trait method on Int (`trait GbK { fn gbK[X: CtK](self, x: X) -> Int }`) whose impl repeats the bound.
+struct CondImplDef  { std::string wrap, trait, method, fn, gtrait, gmethod; int sid; };
 struct MutatorDef   { std::string name; int sid; std::string field; };   // fn mN(mut p0: S, p1: Int) -> Int
 struct MutMethodDef { std::string method; int sid; std::string field; std::string trait; };  // trait+impl: fn bN(mut self) -> Int
 // A traitless `impl S { .. }` block (gen_inherent). Every member is optional (an empty name = absent):
@@ -1428,7 +1429,10 @@ struct Gen {
             src += "impl[T: " + tn + "] " + tn + " for " + wrap + "[T] { fn " + mn +
                    "(self) -> Int { self.inner." + mn + "() + self.k } }\n";
             src += "fn " + fnw + "[X: " + tn + "](x: X) -> Int { x." + mn + "() }\n";
-            conds.push_back({ wrap, tn, mn, fnw, s });
+            const std::string gtn = "Gb" + k, gmn = "gb" + k;
+            src += "trait " + gtn + " { fn " + gmn + "[X: " + tn + "](self, x: X) -> Int }\n";
+            src += "impl " + gtn + " for Int { fn " + gmn + "[X: " + tn + "](self, x: X) -> Int { self + x." + mn + "() } }\n";
+            conds.push_back({ wrap, tn, mn, fnw, gtn, gmn, s });
         }
         return src;
     }
@@ -1437,7 +1441,8 @@ struct Gen {
         std::string v = gen_expr(struct_ty(c.sid), depth - 1);
         const int layers = 1 + (int)pick(3);
         for (int i = 0; i < layers; ++i) v = c.wrap + " { inner: " + v + ", k: " + int_lit() + " }";
-        switch (pick(5)) {
+        switch (pick(6)) {
+            case 5:  return "((" + int_lit() + ")." + c.gmethod + "(" + v + "))";
             case 0:  return "((" + v + ")." + c.method + "())";
             case 1:  return c.trait + "::" + c.method + "(" + v + ")";
             case 2:  return c.fn + "(" + v + ")";

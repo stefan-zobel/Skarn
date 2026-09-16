@@ -2590,15 +2590,43 @@ private:
             TyPtr sk = tc_.rigid_var(ms.generics[i].name, {});
             sub[ms.generics[i].id]        = sk;
             e2[mth.generics[i].name]      = sk;
-            // Soundness: a caller discharges only the TRAIT method's bounds, so
-            // the impl method may not ASSUME a bound the trait does not guarantee -- an
-            // extra impl bound would let the body use an operation the caller never
-            // proved. (Dropping a trait bound is safe; only ADDING one is unsound.)
-            for (const auto& ib : mth.generics[i].bounds) {
+        }
+        // Soundness: a caller discharges only the TRAIT method's bounds, so the impl method may not ASSUME a
+        // bound the trait does not guarantee -- an extra impl bound would let the body use an operation the caller
+        // never proved. (Dropping a trait bound is safe; only ADDING or CHANGING one is unsound.)
+        // Compared only once every shared skolem is bound, so a bound argument naming a sibling (`I: Src[T]`)
+        // resolves on both sides. The impl's bounds are RESOLVED here, not read off the AST: the AST still holds
+        // the name as written (`Plain`) until the body check resolves it, while the trait's are mangled
+        // (`$entry::Plain`), so a raw comparison rejected every bounded generic method of a compiled program.
+        for (size_t i = 0; i < ms.generics.size(); ++i) {
+            for (const Bound& ib : resolve_bounds(mth.generics[i].bounds, e2)) {
                 bool guaranteed = false;
-                for (const auto& tb : ms.generics[i].bounds)
-                    if (ib.trait == tb.trait || supertrait_closure(tb.trait).count(ib.trait)) { guaranteed = true; break; }
-                if (!guaranteed)
+                const Bound* same_trait = nullptr;
+                Bound same_trait_sub;
+                for (const auto& tb : ms.generics[i].bounds) {
+                    if (tb.trait == ib.trait) {
+                        Bound tsub;
+                        tsub.trait = tb.trait;
+                        for (const auto& a : tb.args) tsub.args.push_back(apply(tc_.substitute(a, sub)));
+                        bool args_equal = tsub.args.size() == ib.args.size();
+                        for (size_t k = 0; args_equal && k < ib.args.size(); ++k)
+                            args_equal = equals(apply(ib.args[k]), tsub.args[k]);
+                        if (args_equal) { guaranteed = true; break; }
+                        same_trait = &tb;
+                        same_trait_sub = std::move(tsub);
+                    } else if (ib.args.empty() && supertrait_closure(tb.trait).count(ib.trait)) {
+                        // A supertrait reached through a bound: only a NON-parametric one, since a var's
+                        // parametric supertrait arguments are not solved (see `trait_args_for`).
+                        guaranteed = true;
+                        break;
+                    }
+                }
+                if (guaranteed) continue;
+                if (same_trait)
+                    error(im.line, im.col, "method '" + mth.name + "' type parameter '" + mth.generics[i].name +
+                          "' declares bound '" + describe_bound(ib) + "' but the trait '" + im.trait_name +
+                          "' requires '" + describe_bound(same_trait_sub) + "'");
+                else
                     error(im.line, im.col, "method '" + mth.name + "' type parameter '" +
                           mth.generics[i].name + "' declares bound '" + ib.trait +
                           "' that the trait '" + im.trait_name + "' does not require");
