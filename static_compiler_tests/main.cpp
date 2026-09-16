@@ -1,7 +1,7 @@
 // =============================================================================
 // static_compiler_tests -- test executable for the Skarn front end.
 //
-// Links the `static_compiler` static library. For now it exercises the lexer
+// Links the `static_compiler` static library. It exercises the lexer
 // (Lexer.h): the case-based uident/lident split, keyword classification (incl.
 // `self`, and NO `nil`), numeric/string literals, longest-match operators, and
 // Swift/Go automatic statement termination (ASI) -- then the parser, typed AST,
@@ -17,9 +17,9 @@
 #include <functional>   // std::function -- the shrinker's failure predicate
 #include <filesystem>   // temp dir for the native file-I/O tests
 #include <cstdlib>      // _putenv_s -- set a deterministic var for the getEnv test
-#include <chrono>       // steady_clock -- Phase-0 GC benchmark wall-clock timing
-#include <format>       // std::format -- Phase-0 GC benchmark table formatting
-#include <algorithm>    // std::fill -- Phase-0 barrier probe state reset
+#include <chrono>       // steady_clock -- GC benchmark wall-clock timing
+#include <format>       // std::format -- GC benchmark table formatting
+#include <algorithm>
 
 #include "Lexer.h"
 #include "Token.h"
@@ -144,7 +144,7 @@ void test_numbers() {
     check_str("exp_no_digit",  kinds_str("1e+"),     "Int LIdent + <eof>");
     // A tuple index stays an integer -- no exponent there either.
     check_str("exp_after_dot", kinds_str("t.0e5"),   "LIdent . Int LIdent <eof>");
-    // Radix-prefixed integer literals (Option B: a bit pattern up to 48 bits, sign-extended from bit 47).
+    // Radix-prefixed integer literals (a bit pattern up to 48 bits, sign-extended from bit 47).
     check_str("hex_kind",    kinds_str("0xFF"), "Int <eof>");
     check_true("hex_val",    first_tok("0xFF").int_val == 255);
     check_true("hex_u32",    first_tok("0xFFFFFFFF").int_val == 4294967295LL);
@@ -180,9 +180,9 @@ void test_numbers() {
     // Java's rule, so a RUN of separators between two digits is fine (`1__0` == 10).
     check_true("sep_run",       first_tok("1__0").int_val == 10);
     check_true("sep_run_hex",   first_tok("0xF__F").int_val == 255);
-    // ... but the run must be flanked by digits on BOTH sides. Each of these used to lex as a number
-    // followed by an identifier (`1_x` -> `1` + `_x`), reporting an unknown variable instead of the
-    // actual mistake -- the reason this rejects rather than merely stopping the run.
+    // ... but the run must be flanked by digits on BOTH sides. Merely stopping the run would lex each
+    // of these as a number followed by an identifier (`1_x` -> `1` + `_x`) and report an unknown
+    // variable instead of the actual mistake, so the lexer rejects them.
     check_true("sep_trailing",   lex_throws("1_"));
     check_true("sep_trailing2",  lex_throws("1__"));
     check_true("sep_before_dot", lex_throws("1_.5"));
@@ -246,7 +246,7 @@ void test_colons() {
     std::cout << "[colons]\n";
     check_str("annotation_colon", kinds_str("x: Int"),    "LIdent : UIdent <eof>");
     check_str("qualified_path",   kinds_str("Trait::m"),  "UIdent :: LIdent <eof>");
-    // Atoms were removed from Skarn: a leading `:name` is now just a colon + ident (no Atom token).
+    // Skarn has no atoms: a leading `:name` is just a colon + ident (no Atom token).
     check_str("no_atom_token",    kinds_str("f(:ok)"),    "LIdent ( : LIdent ) <eof>");
 }
 
@@ -309,8 +309,8 @@ void test_errors() {
     std::cout << "[errors]\n";
     check_true("unterminated_string",  lex_throws("\"abc"));
     check_true("unterminated_comment", lex_throws("/* abc"));
-    // `@` used to be the stray character here; it is a real token now (pattern binding), so the
-    // test moved to one that is still genuinely unlexable.
+    // `@` is a real token (pattern binding), so the stray characters are ones that are genuinely
+    // unlexable.
     check_true("stray_char",           lex_throws("$"));
     check_true("stray_char_backtick",  lex_throws("`"));
     check_true("at_lexes",            !lex_throws("@"));
@@ -561,7 +561,7 @@ void test_parser_expr() {
     check_str("record_update_copy", expr_dump("Point { ..p }"),
               "(struct-lit Point (.. p))");
     check_true("record_update_base_not_last", parse_throws("Point { ..p, y: 2 }"));
-    // Qualified `mod::Name` in the three positions that previously did not parse.
+    // Qualified `mod::Name` in a struct literal, a constructor pattern and a struct pattern.
     check_str("qual_struct_lit", expr_dump("geo::Point { x: 1, y: 2 }"),
               "(struct-lit geo::Point (x 1) (y 2))");
     check_str("qual_ctor_pat", expr_dump("match p { geo::Wrap(n) => n, _ => 0 }"),
@@ -610,7 +610,7 @@ void test_parser_items() {
     check_str("pipe_multiline", prog_dump("x\n|> f"), "(|> x f)");
     check_str("if_header", prog_dump("if c { 1 } else { 2 }"),
               "(if c (block 1) (block 2))");
-    // Modules (Slice 1a): import + use parsing. Structure only -- resolution is Slice 2.
+    // Modules: import + use parsing. Structure only -- resolution is tested with the checker.
     check_str("import_single",  prog_dump("import util"),          "(import util)");
     check_str("import_path",    prog_dump("import net::http"),     "(import net::http)");
     check_str("use_single",     prog_dump("use util::helper"),     "(use util {helper})");
@@ -656,10 +656,10 @@ void test_parser_errors() {
     check_true("unterminated_struct_lit", parse_throws("Point { x: 1"));
 }
 
-// ---- multi-module loader (Slice 1b) -----------------------------------------
+// ---- multi-module loader -----------------------------------------------------
 // The loader is filesystem-free: it takes a resolver `path segments -> source`. These
 // tests drive it with an in-memory module map, so the DAG / cycle / topological-order
-// logic is exercised without touching disk. static_vmrun's real FS resolver is Slice 6.
+// logic is exercised without touching disk (static_vmrun supplies the real FS resolver).
 
 svc::ModuleResolver mem_resolver(const std::unordered_map<std::string, std::string>& mods) {
     return [mods](const std::vector<std::string>& path) -> std::optional<std::string> {
@@ -829,6 +829,16 @@ bool check_has(const std::string& src, const std::string& substr) {
         if (e.message.find(substr) != std::string::npos) return true;
     return false;
 }
+// `check_has` that also pins the LINE the diagnostic carets on -- for a rule whose point is WHERE
+// it reports (a deferred check must still name the call that introduced the problem).
+bool check_has_on_line(const std::string& src, const std::string& substr, uint32_t line) {
+    svc::Lexer lex(src);
+    svc::Parser p(lex.tokenize());
+    auto prog = p.parse_program();
+    for (const auto& e : svc::check(prog).errors)
+        if (e.message.find(substr) != std::string::npos && e.line == line) return true;
+    return false;
+}
 // Advisory-tier helpers (must-use / unused): warnings live in a SEPARATE list, so they
 // never affect the error count above.
 int check_warnc(const std::string& src) {
@@ -877,7 +887,7 @@ void test_check_signatures() {
     check_true("dup_type_param", check_has("fn f[T, T](x: T) -> T { x }", "duplicate type parameter"));
 
     // A lambda's explicitly-annotated return type is reconciled with the EXPECTED return (covariant).
-    // Regression for the closed soundness hole: a `fn(Int)->Int` must NOT satisfy `fn(Int)->String`.
+    // Soundness lock: a `fn(Int)->Int` must NOT satisfy `fn(Int)->String`.
     check_true("lambda_ret_mismatch",
         check_has("let f: fn(Int) -> String = fn(x: Int) -> Int { x * 10 }", "lambda returns"));
     check_true("lambda_ret_mismatch_arg",
@@ -943,10 +953,10 @@ void test_check_bodies() {
     std::cout << "[check: bodies]\n";
 
     // --- an UPPERCASE name in value position must be REPORTED by the checker ---
-    // It used to return an error type without recording a diagnostic, so the program passed the
-    // checker and died in codegen as an unlocated `CodegenError: undefined variable`. A
-    // CodegenError carries no module id, so in a multi-module program its caret landed on the
-    // WRONG FILE. Each shape gets the message that actually helps:
+    // An error type without a recorded diagnostic would let the program pass the checker and die
+    // in codegen as an unlocated `CodegenError: undefined variable`. A CodegenError carries no
+    // module id, so in a multi-module program its caret would land on the WRONG FILE. Each shape
+    // gets the message that actually helps:
     check_true("upper_unknown_reported",
         check_has("println(toString(NOSUCHNAME))", "unknown constant or constructor 'NOSUCHNAME'"));
     check_true("upper_record_struct_needs_fields",
@@ -1115,10 +1125,9 @@ void test_check_match() {
         std::string(OPT) + "fn f(o: Option[Int]) -> Int { match o { Nope => 0, _ => 1 } }",
         "unknown constructor"));
     // --- a refutable pattern in a BINDER position names the construct it is in ---
-    // `let` and `for` share bind_pattern, which used to hard-code "'let'" in all three of its
-    // rejection messages -- so a bad `for` pattern advised the user about a construct they had not
-    // written. Both directions are pinned, since the fix is a defaulted parameter and a missed call
-    // site silently reverts to "let".
+    // `let` and `for` share bind_pattern, whose rejection messages name the construct through a
+    // defaulted parameter -- a missed call site silently says "let" for a `for` pattern. Both
+    // directions are pinned.
     check_true("refutable_in_let_says_let", check_has(
         std::string(OPT) + "fn f(o: Option[Int]) -> Int { let Some(x) = o\n x }",
         "not allowed in 'let'"));
@@ -1168,10 +1177,10 @@ void test_check_match() {
         "fn f(xs: List[Int]) -> Int { match xs { [] => 0, [h, ..t] => h } }") == 0);
     check_true("list_nonexhaustive", check_has(
         "fn f(xs: List[Int]) -> Int { match xs { [h, ..t] => h } }", "non-exhaustive"));
-    // A list pattern matches a cons `List` only. The checker used to accept it on a Vec / Array too, where
-    // codegen's cons-cell test can never succeed: `match toVec([1, 5]) { [1, d] => d, _ => 0 }` returned 0
-    // with no diagnostic (the RefEval oracle matched positionally and would have said 5), and a second
-    // same-length arm was reported "unreachable" because exhaustiveness modelled the Vec as a cons list.
+    // A list pattern matches a cons `List` only, so it is rejected on a Vec / Array: there codegen's
+    // cons-cell test can never succeed (`match toVec([1, 5]) { [1, d] => d, _ => 0 }` would return 0
+    // with no diagnostic, while the RefEval oracle matches positionally and says 5), and exhaustiveness
+    // would call a second same-length arm "unreachable" by modelling the Vec as a cons list.
     check_true("list_pattern_on_vec_rejected", check_has(
         "fn f(v: Vec[Int]) -> Int { match v { [1, d] => d, _ => 0 } }", "a list pattern matches a List"));
     check_true("list_pattern_on_array_rejected", check_has(
@@ -1253,7 +1262,7 @@ void test_check_generics() {
     check_true("bound_forward", check_errc(   // a bounded param forwards to a bounded call
         std::string(DISP) + "fn q[U: Display](y: U) -> String { p(y) }") == 0);
     // H0 soundness: an UNBOUNDED generic forwarded to a Display-bound call cannot be
-    // proven to satisfy the bound -> reject (the old leniency accepted this silently).
+    // proven to satisfy the bound -> reject (accepting it would be unsound).
     check_true("bound_forward_unbounded", check_has(
         std::string(DISP) + "fn q[U](y: U) -> String { p(y) }", "does not satisfy the bound"));
 
@@ -1274,7 +1283,7 @@ void test_check_generics() {
 
     // H2: a BOUNDED generic fn used as a value in an INFER position (un-annotated `let`) is
     // rejected -- the bare `fn` type has no slot for the bound. But at a CONCRETE `fn(...)->R`
-    // expected type it is now monomorphized + discharged (see test_check_bounded_fn_values), so
+    // expected type it is monomorphized + discharged (see test_check_bounded_fn_values), so
     // `ap(p, 1)` -- p flowing into a concrete `fn(Int)->String` param, Int: Display -- is CLEAN.
     check_true("bounded_fn_value_let", check_has(
         std::string(DISP) + "fn g() -> String { let f = p\n f(1) }", "first-class value"));
@@ -1357,7 +1366,7 @@ void test_check_traits_use() {
         "trait Eq { fn eq(self, other: Self) -> Bool }\nstruct P { x: Int }\n"
         "impl Eq for P { fn eq(self, other: P) -> Bool { true } }") == 0);
 
-    // H4: conformance now also checks methods with their OWN generics (was skipped).
+    // H4: conformance also checks methods with their OWN generics.
     check_true("mgen_ret_conformance", check_has(   // impl returns U, trait promises List[U]
         "trait Wrap { fn wrap[U](self, u: U) -> List[U] }\n"
         "impl Wrap for Int { fn wrap[U](self, u: U) -> U { u } }", "requires List"));
@@ -1512,7 +1521,7 @@ void test_check_corpus() {
     auto es = check_errs(
         "struct Point { x: Int, y: Int }\n"
         "fn bad(p: Point) -> Int {\n"
-        "    let a = \"s\" - 1\n"       // String - Int: still a numeric-op error (`+` now concatenates)
+        "    let a = \"s\" - 1\n"       // String - Int: a numeric-op error (only `+` concatenates)
         "    let b = p.z\n"
         "    zzz\n"
         "}\n");
@@ -1615,7 +1624,7 @@ void test_structured_diagnostics() {
         }
     }
 
-    // (7) a BUILTIN has no source parameters to point at, so it keeps the historical single caret
+    // (7) a BUILTIN has no source parameters to point at, so it keeps a single caret
     //     rather than inventing a position. Same for a first-class function VALUE, which has only a
     //     `Fn` type and no declaration at all.
     {
@@ -1952,7 +1961,7 @@ void test_check_generic_traits() {
         parse_throws("trait X: Iterable[T] { fn m(self) -> Int }"));
 }
 
-// ---- codegen (P0 + P1): compile -> run -> read register 0 -------------------
+// ---- codegen: compile -> run -> read register 0 ------------------------------
 
 // The empty prelude (the core-language path) -- the default for the harness helpers below.
 static const std::vector<svc::PreludeModule> kNoPrelude{};
@@ -2017,7 +2026,7 @@ bool cg_faults_msg(const std::string& src, const char* needle) {
 std::string cg_run_native(const std::string& src,
                           const std::vector<std::string>& args = {},
                           const std::string& stdin_text = "") {
-    // The I/O / env / process natives are now opt-in modules (stdlib split S3). A native-exercising
+    // The I/O / env / process natives live in opt-in modules. A native-exercising
     // test program pulls all three in; an unused `use` is harmless.
     const std::string full = "use std::io::*\nuse std::env::*\nuse std::process::*\n" + src;
     svc::Module m = svc::compile(full.c_str(), svc::builtin_prelude());
@@ -2128,7 +2137,7 @@ bool cg_check_fails_p(const std::string& src) {
     catch (...) { return false; }
 }
 
-// --- multi-module compile+run (Slice 2a) ---
+// --- multi-module compile+run ---
 // Load `entry` + the in-memory `mods` map into a ModuleSet, compile the whole set (with the
 // prelude, if any) and run it, returning register 0 -- the module-set sibling of cg_run.
 Value cg_run_modules(const std::string& entry,
@@ -2172,9 +2181,9 @@ void check_int_modules(const char* name, const std::string& entry,
 }
 
 // The import MATRIX: every way a newcomer can try to reach an item, for every kind of item, pinned in one
-// table so a rule that holds for one kind but not another shows up as one wrong cell. (It did: until
-// earlier `use std::math::sqrt` was rejected while `use std::math::PI` was fine, and any use of a module
-// unlocked all its natives.) The rule it pins: an item is reachable bare through `use m::*`, `use m::name`
+// table so a rule that holds for one kind but not another shows up as one wrong cell (e.g. `use
+// std::math::sqrt` rejected while `use std::math::PI` is fine, or any use of a module unlocking all its
+// natives). The rule it pins: an item is reachable bare through `use m::*`, `use m::name`
 // or `use m::{name, ..}` -- never through `import m` alone or a `use` of another name; a user module's pub
 // item is also reachable qualified as `m::name` once `m` is imported; a private item through nothing. The
 // std rows cover a native per gated module, a Skarn fn, a const, a type with an associated fn, and an enum.
@@ -2259,9 +2268,9 @@ void test_import_matrix() {
 }
 
 // Newcomer diagnostics that a message-substring claim cannot pin: the COUNT of errors. A follow-on error
-// printed before (or instead of) the real one sends a newcomer after the wrong line -- earlier a
-// match over an unknown name opened with "non-exhaustive match", and `Json::Integer(3)` without its `use`
-// produced four errors, none naming the missing import. The wording itself is pinned by the
+// printed before (or instead of) the real one sends a newcomer after the wrong line -- e.g. a match
+// over an unknown name opening with "non-exhaustive match", or `Json::Integer(3)` without its `use`
+// producing four errors, none naming the missing import. The wording itself is pinned by the
 // tier2/newcomer_* claims.
 void test_newcomer_diagnostics() {
     std::cout << "[test_newcomer_diagnostics: one mistake, one error]\n";
@@ -2292,7 +2301,8 @@ void test_newcomer_diagnostics() {
     // A failed pipe argument must not add an operator error about the lambda's unsolved parameter.
     check_true("newcomer_pipe_without_intoiter_one_error",
         errc_p("let xs = toVec([1, 2, 3])\n let ys = xs |> map(fn(x) { x * 2 }) |> collect\n len(ys)") == 1);
-    // `return` belongs to a function; at the top level it used to compile and crash the VM.
+    // `return` belongs to a function; at the top level it is a checker error (compiled, it would crash
+    // the VM).
     check_true("newcomer_return_toplevel_rejected", check_has("return\n 1", "'return' outside of a function"));
     check_true("newcomer_return_in_toplevel_block_rejected", check_has("if true { return }\n 1", "'return' outside of a function"));
     check_int("newcomer_return_in_toplevel_lambda_ok",
@@ -2314,7 +2324,7 @@ void test_newcomer_diagnostics() {
             modules_error_has("import m\nsecret()", LIB, "'secret' is declared in 'm' but is not `pub`"));
     }
 
-    // `pub fn` on a method (the Rust habit) used to be a bare "expected 'fn'".
+    // `pub fn` on a method (the Rust habit) gets an explanation, not a bare "expected 'fn'".
     {
         auto parse_msg = [](const std::string& src) -> std::string {
             try { svc::Lexer lex(src); svc::Parser p(lex.tokenize()); p.parse_program(); return ""; }
@@ -2329,7 +2339,8 @@ void test_newcomer_diagnostics() {
             parse_msg("struct P { x: Int }\nimpl P { fn new(x: Int) -> P { P { x } } }").empty());
     }
 
-    // A builtin / native passed as a function value is call-only; it used to say "unknown variable".
+    // A builtin / native passed as a function value is call-only, and the message says so (not
+    // "unknown variable").
     check_true("newcomer_builtin_as_value",
         check_has_p("let f = toString\n 0", "built-in function 'toString' can only be called"));
     check_true("newcomer_builtin_as_map_arg",
@@ -2447,7 +2458,7 @@ void test_modules() {
                cg_modules_check_fails("util::add(1, 2)",
                    M{{"util", "pub fn add(a: Int, b: Int) -> Int { a + b }"}}));
 
-    // --- Slice 4: the orphan rule (impl allowed iff trait OR type is local to the module) ---
+    // --- the orphan rule (impl allowed iff trait OR type is local to the module) ---
     // ALLOWED: the trait is local (impl'd for a foreign/builtin type in the trait's own module).
     check_int_modules("mod_orphan_trait_local",
                       "use gfx::run\n run()",
@@ -2455,7 +2466,7 @@ void test_modules() {
                                 "impl Show for Int { fn show(self) -> Int { 42 } }\n"
                                 "pub fn run() -> Int { show(5) }"}}, 42);
     // ALLOWED: the type is local (impl a foreign trait for the module's own struct). The foreign
-    // trait is brought in with `use` (trait names are module-scoped now, like structs/fns).
+    // trait is brought in with `use` (trait names are module-scoped, like structs/fns).
     check_int_modules("mod_orphan_type_local",
                       "use a::T\n struct Local { x: Int }\n"
                       "impl T for Local { fn m(self) -> Int { 42 } }\n m(Local { x: 0 })",
@@ -2474,7 +2485,7 @@ void test_modules() {
                                 "trait Show { fn show(self) -> Int }\n"
                                 "impl Show for P { fn show(self) -> Int { self.v } }\n"
                                 "pub fn run() -> Int { show(P { v: 42 }) }"}}, 42);
-    // --- Slice 3: `std::` reaches the ambient/prelude namespace ---
+    // --- `std::` reaches the ambient/prelude namespace ---
     // A prelude constructor via `std::` (always available, no import).
     check_int_modules("mod_std_ctor",
                       "match std::Some(42) { Some(n) => n, None => 0 }",
@@ -2550,7 +2561,7 @@ void test_modules() {
                cg_modules_check_fails("import geo\n fn f(n: geo::Int) -> Int { n }\n 1",
                    M{{"geo", "fn dummy() -> Int { 0 }"}}));
 
-    // --- S4: visibility (DEFAULT PRIVATE; `pub` exports; cross-module only) ---
+    // --- visibility (DEFAULT PRIVATE; `pub` exports; cross-module only) ---
     // A `pub` fn is reachable cross-module; its private sibling is not.
     check_int_modules("vis_pub_cross_ok",
                       "use lib::exposed\n exposed()",
@@ -2633,8 +2644,8 @@ void test_codegen_core() {
     check_bool_p("eq_enum_nullary_f","enum Dir{North,East,South}\n North==East", false);
     check_bool_p("eq_some_true",     "let a:Option[Int]=Some(1)\n let b:Option[Int]=Some(1)\n a==b", true);
     check_bool_p("eq_some_false",    "let a:Option[Int]=Some(1)\n let b:Option[Int]=Some(2)\n a==b", false);
-    check_bool_p("eq_none_none",     "let n:Option[Int]=None\n n==None", true);          // was always false
-    check_bool_p("eq_some_none",     "let a:Option[Int]=Some(1)\n a==None", false);       // was always false
+    check_bool_p("eq_none_none",     "let n:Option[Int]=None\n n==None", true);          // structural, not a reference compare
+    check_bool_p("eq_some_none",     "let a:Option[Int]=Some(1)\n a==None", false);       // structural, not a reference compare
     check_bool_p("eq_result",        "let a:Result[Int,String]=Ok(1)\n let b:Result[Int,String]=Ok(1)\n a==b", true);
     check_bool_p("eq_result_err",    "let a:Result[Int,String]=Ok(1)\n let b:Result[Int,String]=Err(\"x\")\n a==b", false);
     check_bool_p("eq_vec_true",      "toVec([1,2,3])==toVec([1,2,3])", true);
@@ -2718,7 +2729,7 @@ void test_codegen_core() {
     // Type errors are rejected BEFORE codegen (CheckFailure, no bytecode).
     check_true("check_rejects_bad_add", cg_check_fails("1 + true"));
 
-    // impl for Vec/Bytes now lowers (TID_VEC/TID_BYTES dense columns) and blanket impls now lower
+    // impl for Vec/Bytes lowers (TID_VEC/TID_BYTES dense columns) and blanket impls lower
     // (bound-satisfying types' columns filled) -- see test_codegen_traits (devirt_vec / blanket_*).
 }
 
@@ -2768,7 +2779,7 @@ void test_codegen_functions() {
     // A unit-returning fn called for effect, then a value.
     check_int("unit_fn", "fn noop() -> () { }\n noop()\n 5", 5);
 
-    // A lambda value now lowers (P6) -> it runs (see test_codegen_closures).
+    // A lambda value lowers and runs (see test_codegen_closures).
     check_int("lambda_basic", "let f = fn(x: Int) -> Int { x + 1 }\n f(41)", 42);
 }
 
@@ -2850,7 +2861,7 @@ void test_codegen_structs() {
     check_true("let_destr_mismatch",
         cg_check_fails("struct P { x: Int }\n struct Q { y: Int }\n let Q { y } = P { x: 1 }\n y"));
 
-    // Enum + tuple-struct CONSTRUCTION compiles and runs (payload reading needs `match` -> P4).
+    // Enum + tuple-struct CONSTRUCTION compiles and runs (payload reading is tested with `match`).
     check_int("enum_construct",
         "enum Opt { Non, Som(Int) }\n let a = Som(7)\n let b = Non\n 1", 1);
     check_int("tuple_struct_construct",
@@ -2879,8 +2890,8 @@ void test_codegen_structs() {
 
     // Field access through a TYPE-ERASING call. infer() stores the APPLIED Expr::ty, so the
     // result of a generic / higher-order / unwrap call carries a concrete struct type and .field
-    // resolves its slot statically. These once hit "the receiver's struct type is not statically
-    // known" -- they are the regression net for that (now-closed) codegen path.
+    // resolves its slot statically. These guard against "the receiver's struct type is not
+    // statically known" on that codegen path.
     check_int("field_through_generic",   // generic id erased to one body; call result is concrete P
         "struct P { x: Int, y: Int }\n fn idf[T](v: T) -> T { v }\n"
         " idf(P { x: 30, y: 12 }).x + idf(P { x: 1, y: 99 }).y", 129);
@@ -2964,7 +2975,7 @@ void test_codegen_containers() {
     check_int("map_for_pair",
         "let m = #{5 => 100}\n let mut s = 0\n for p in m { s = s + p.0 + p.1 }\n s", 105);
 
-    // `while` + `break` (this also completes while's break/continue, unreachable before P3b).
+    // `while` + `break` / `continue`.
     check_int("while_break",
         "let mut i = 0\n while true { if i == 5 { break }\n i = i + 1 }\n i", 5);
     check_int("while_continue",
@@ -2975,7 +2986,7 @@ void test_codegen_containers() {
 void test_codegen_match() {
     std::cout << "[codegen: match P4]\n";
 
-    // Enum variant match + PAYLOAD extraction (the headline P4 win).
+    // Enum variant match + PAYLOAD extraction.
     check_int("match_enum_some",
         "enum Opt { Non, Som(Int) }\n let o = Som(7)\n match o { Som(x) => x, Non => 0 }", 7);
     check_int("match_enum_none",
@@ -3187,7 +3198,7 @@ void test_codegen_dyn_traits() {
     check_int("dyn_join_via_annotation",
         shw + "let d: dyn Show = P { v: 1 }\n let c = 1 < 2\n let y: dyn Show = if c { d } else { 2 }\n shw(y)", 1);
 
-    // --- OBJECT SAFETY (v1 rules) ---
+    // --- OBJECT SAFETY ---
     // OS2 -- the SOUNDNESS rule: two `dyn Eq` may hide different types, so a `Self` parameter
     // would reach an impl body expecting the receiver's type.
     check_true("dyn_os_self_param",
@@ -3198,7 +3209,7 @@ void test_codegen_dyn_traits() {
     // OS1 -- nothing to dispatch on without a receiver.
     check_true("dyn_os_no_self",
         check_has("trait Mk { fn mk() -> Int }\n fn f(x: dyn Mk) -> Int { 0 }\n 0", "takes no 'self'"));
-    // OS3 / OS4 -- v1 conservatism (both are sound here; see the v2 backlog).
+    // OS3 / OS4 -- deliberately conservative (allowing either would be sound; neither is supported).
     check_true("dyn_os_self_return",
         check_has("trait Cl { fn cl(self) -> Self }\n fn f(x: dyn Cl) -> Int { 0 }\n 0", "returns 'Self'"));
     check_true("dyn_os_generic_method",
@@ -3261,9 +3272,9 @@ void test_codegen_closures() {
 
 // ---- the LAMBDA WRITE BARRIER (checker) ------------------------------------
 // A capture is a by-value copy of the BINDING, so assigning to a captured NAME inside a lambda has
-// no code to generate -- it used to reach codegen and abort there with "assignment to undefined
-// variable", a CodegenError raised from checker-accepted source, naming a binding that is in scope
-// and `mut`. The rule now lives in `check_assign` (Check.cpp) behind `lambda_floor_`.
+// no code to generate -- accepted by the checker, it would abort in codegen with "assignment to
+// undefined variable", naming a binding that is in scope and `mut`. The rule lives in `check_assign`
+// (Check.cpp) behind `lambda_floor_`.
 //
 // The discriminator is the TARGET FORM: a captured copy of a HEAP value is a pointer, so `o.f = v`
 // and `a[i] = v` through a captured name reach the one shared object and stay legal.
@@ -3341,15 +3352,15 @@ void test_check_lambda_capture() {
 // ---- the SNAPSHOT WARNING (the outward half of the same rule) ---------------
 // A capture is taken at closure-CREATION time, so REBINDING the outer name afterwards leaves the
 // lambda holding the old value. That is well defined and documented (SkarnGuide.md section 10 turns
-// on it), so it is advisory -- but earlier nothing was said at all, which made it the
-// silent twin of the write barrier above.
+// on it), so it is advisory -- the warning keeps it from being the silent twin of the write
+// barrier above.
 //
 // Armed only by a lambda bound to a `let`: such a lambda outlives its statement. One passed straight
 // to a call is consumed within it, so a later rebinding cannot surprise anyone and must stay quiet.
 void test_check_capture_snapshot_warning() {
     std::cout << "[check: capture snapshot warning]\n";
 
-    // The guide's own section 10 example. `peek()` still yields 0, and now says why.
+    // The guide's own section 10 example. `peek()` yields 0, and the warning says why.
     // The tail is `peek()` itself, so the program's VALUE is the snapshot the claim is about.
     const char* SNAP = "let mut counter = 0\n let peek = fn() -> Int { counter }\n"
                        " counter = 10\n peek()";
@@ -3410,23 +3421,23 @@ void test_check_capture_snapshot_warning() {
 //
 //   (1) SOUND: an incompatible pair must be REPORTED. `join` yields `Error` on a mismatch and
 //       `Error` subsumes everything, so an unreported Error type reaching an accepted program
-//       silences every later check on that value. `infer_map` folded keys AND values with a bare
-//       `join` and no report at all, which made `let s: String = m[1]` compile against a
-//       `#{1 => 7, 2 => 8.0}` -- an Int in a String binding on an erased runtime.
+//       silences every later check on that value. An unreported map fold would let
+//       `let s: String = m[1]` compile against a `#{1 => 7, 2 => 8.0}` -- an Int in a String
+//       binding on an erased runtime.
 //   (2) ONE report per construct, INDEPENDENT OF ORDER. A failed join does not advance the
-//       accumulator, so every later element of the offending type used to collide with it again:
-//       the diagnostic COUNT depended on whether the odd element came first or last.
+//       accumulator, so without a latch every later element of the offending type collides with it
+//       again and the diagnostic COUNT depends on whether the odd element comes first or last.
 void test_check_join_fold() {
     std::cout << "[check: multi-element join fold]\n";
 
     // --- (1) soundness: the map fold reports at all ---
 
-    // The hole itself: values disagree, and the binding downstream is a different type again.
-    // Before the fix this whole program was ACCEPTED and printed an Int for `s`.
+    // Values disagree, and the binding downstream is a different type again. Accepted, this program
+    // would print an Int for `s`.
     check_true("joinfold_map_value_mismatch_rejected",
         check_has("let m = #{1 => 7, 2 => 8.0}\n let s: String = m[1]\n println(s)",
                   "map values have incompatible types"));
-    // ... and the Error type no longer papers over the annotation mismatch either.
+    // ... and the Error type does not paper over the annotation mismatch either.
     check_true("joinfold_map_value_no_error_leak",
         check_has("let m = #{1 => 7, 2 => 8.0}\n let s: String = m[1]\n println(s)",
                   "expected String"));
@@ -3443,7 +3454,7 @@ void test_check_join_fold() {
         check_errc("let a = [1, 2.0, 3]\n println(len(a))") == 1);
     check_true("joinfold_list_odd_first_one_error",
         check_errc("let a = [2.0, 1, 3]\n println(len(a))") == 1);
-    // Three trailing Int arms after a Double one reported three times before the latch.
+    // Three trailing Int arms after a Double one: without the latch, three reports.
     check_true("joinfold_match_odd_first_one_error",
         check_errc("fn f(n: Int) -> Int {\n"
                    " let x = match n { 1 => 2.0, 2 => 2, 3 => 3, _ => 4 }\n 1\n}\n println(f(1))") == 1);
@@ -3474,15 +3485,15 @@ void test_check_join_fold() {
         check_errc("let c = true\n let x: Double = if c { 1 } else { 2.0 }\n println(x)") == 0);
 }
 
-// The `Int -> Double` COERCION, which used to be re-derived per emit site and was therefore simply
-// MISSING at nine of the twenty-six sites -- `fn dv(a: Double, b: Double)` called as `dv(1, 2)`
-// divided two raw Ints and returned 0, with no diagnostic and no trap. The checker records the edge
-// on the node (`Expr::widen_double`) and `compile_expr` is the ONE place that honors it.
+// The `Int -> Double` COERCION. The checker records the edge on the node (`Expr::widen_double`) and
+// `compile_expr` is the ONE place that honors it; codegen alone lacks the callee parameter type at
+// many sites, and a missed widening makes `fn dv(a: Double, b: Double)` called as `dv(1, 2)` divide
+// two raw Ints and return 0, with no diagnostic and no trap.
 //
 // Every case below asserts `isDouble()`, which is the whole point: an un-widened Int in a Double slot
 // is still a perfectly fine 48-bit integer at run time, so only the TAG distinguishes right from
 // wrong. Two failure directions are locked, and they need different cases:
-//   (a) NO widening   -- the original hole. The value arrives as an Int and `check_dbl` fails on the
+//   (a) NO widening   -- the value arrives as an Int and `check_dbl` fails on the
 //                        tag even when the numeric value looks right.
 //   (b) TWICE widened -- what a central hook costs if a site that derives the coercion ITSELF (the
 //                        return boundary, `toInt`/`floor`/`toDouble`, `compile_coerced`) also routes
@@ -3520,8 +3531,7 @@ void test_codegen_widen_double() {
     // Unary producer straight into `dst` and never reach `compile_expr`. With the guard gone,
     // `id(a + b)` yields a raw `3` -- but only with inlining ON, since a real call compiles its
     // arguments through `compile_expr`. The `widen_if_*` pair above does NOT reach the fast paths (an
-    // `if` branch tail is compiled as a block value), so it is no falsifier for the guard: that was
-    // this change's own mistaken claim, caught by running the negative control instead of asserting it.
+    // `if` branch tail is compiled as a block value), so it is no falsifier for the guard.
     check_dbl ("widen_inline_arg_binary", "fn id(x: Double) -> Double { x }\n let a = 1\n let b = 2\n id(a + b)", 3.0);
     check_dbl ("widen_inline_arg_unary",  "fn id(x: Double) -> Double { x }\n let a = 1\n id(-a)", -1.0);
     // A marked leaf that is a LOCAL sits in no temp, so the coercion must allocate one -- the case
@@ -3623,12 +3633,12 @@ void test_codegen_arrays() {
 void test_codegen_prelude() {
     std::cout << "[codegen: static prelude P7c]\n";
 
-    // Option/Result come from the prelude now -- the user program does NOT declare them.
+    // Option/Result come from the prelude -- the user program does NOT declare them.
     // Construct + match a prelude Option.
     check_int_p("some_match", "match Some(41) { Some(x) => x + 1, None => 0 }", 42);
     check_int_p("none_match", "let o: Option[Int] = None\n match o { Some(x) => x, None => 99 }", 99);
 
-    // `?` works against the prelude's Option/Result (recognized by name, now actually declared).
+    // `?` works against the prelude's Option/Result.
     check_int_p("try_prelude",
         "fn firstPos(x: Int) -> Option[Int] { if x > 0 { Some(x) } else { None } }\n"
         "fn inc(x: Int) -> Option[Int] { let v = firstPos(x)?\n Some(v + 1) }\n"
@@ -3719,9 +3729,9 @@ void test_ambient_shadowing() {
         "fn sqrt(x: Double) -> Double { 7.0 }\n"
         "sqrt(9.0) == 7.0", true);
 
-    // A TRAIT METHOD (next). The same hole reached trait dispatch: a bare `next` in std::iter's
-    // combinator bodies resolved to the user fn, which used to bury the build in type errors
-    // caretting into std/string.skn.
+    // A TRAIT METHOD (next). The same rule covers trait dispatch: a bare `next` in std::iter's
+    // combinator bodies must not resolve to the user fn (that buries the build in type errors
+    // caretting into std).
     check_int_p("shadow_trait_method_std_unaffected",
         "fn next(x: Int) -> Int { x + 1 }\n"
         "len([1, 2, 3] |> intoIter |> map(fn(x: Int) -> Int { x * 2 }) |> collect)", 3);
@@ -3729,10 +3739,9 @@ void test_ambient_shadowing() {
         "fn next(x: Int) -> Int { x + 1 }\n"
         "next(41)", 42);
 
-    // The other half of the same accident: the ENTRY program used to share the bare namespace, so
-    // EVERY name it declared -- `pub` or not -- was reachable from any imported module, although
-    // nothing can `import` the entry. It now carries an ordinary module prefix
-    // (ENTRY_MODULE_PREFIX), so a module reaching for an entry name is a clean rejection.
+    // The other half: the ENTRY program carries an ordinary module prefix (ENTRY_MODULE_PREFIX)
+    // instead of sharing the bare namespace, so its names -- `pub` or not -- are not reachable from
+    // an imported module (nothing can `import` the entry); reaching for one is a clean rejection.
     check_true("entry_fn_not_importable", cg_modules_check_fails(
         "import util\nuse util::callsEntry\nfn entryOnly() -> Int { 77 }\ncallsEntry()",
         { { "util", "pub fn callsEntry() -> Int { entryOnly() }" } }));
@@ -3759,7 +3768,7 @@ void test_ambient_shadowing() {
         { { "util", "pub fn twice(n: Int) -> Int { n * 2 }" } }, 42);
 }
 
-// Prelude tree-shaking now reaches Struct / Trait / Impl items (not just Fn / Enum). These tests use
+// Prelude tree-shaking reaches Struct / Trait / Impl items (not just Fn / Enum). These tests use
 // a SYNTHETIC prelude (via compile(src, prelude)) to prove shake-out precisely, inspecting the Module:
 // a shaken trait contributes 0 rows (trait_method_count) and a shaken struct is absent from struct_types.
 void test_tree_shake_prelude() {
@@ -3903,7 +3912,7 @@ void test_tree_shake_prelude() {
         "impl Iterable[Int] for Bag { fn iter(self) -> Vec[Int] { self.items } }\n";
 
     // (4a) `for x in bag` over a USER type that impls the RING Iterable (the iteration protocol is the
-    // std::iter ring trait; a synthetic parallel trait no longer drives `for`). Uses the real prelude.
+    // std::iter ring trait; a synthetic parallel trait does not drive `for`). Uses the real prelude.
     const std::string bag_src =
         "struct Bag { items: Vec[Int] }\n"
         "impl Iterable[Int] for Bag { fn iter(self) -> Vec[Int] { self.items } }\n"
@@ -3935,7 +3944,7 @@ void test_tree_shake_prelude() {
         return m.trait_method_count == 0 && !has_struct(m, "Bag");
     });
 
-    // (5) Default-prelude regressions (builtin_prelude): the process structs now shake too.
+    // (5) Default prelude (builtin_prelude): the process structs shake too.
     try_bool("shake_default_drops_process", [&] {
         svc::Module m = svc::compile("42", svc::builtin_prelude());
         return !has_struct(m, "ProcessOutput") && !has_struct(m, "ProcessText");
@@ -3956,7 +3965,7 @@ void test_tree_shake_prelude() {
     });
 }
 
-// `trait Iterable[T]` + impls for every builtin container + `toVec` are now baked into
+// `trait Iterable[T]` + impls for every builtin container + `toVec` are baked into
 // builtin_prelude() (tree-shaken out when unused). These run against the REAL prelude (check_int_p).
 void test_codegen_iterable() {
     std::cout << "[codegen: prelude Iterable[T]]\n";
@@ -4054,21 +4063,21 @@ void test_codegen_iterator_for() {
         COUNTER + STAGE + "let src = Counter { i: 0, n: 4 }\n let d = Doubler { up: src }\n"
         "let mut s = 0\n for x in d { s = s + x }\n s", 12);   // (0+1+2+3)*2
 
-    // The built-in container `for` is UNCHANGED (its fast path wins even though the traits now exist).
+    // The built-in container `for` keeps its fast path (it wins even though the traits exist).
     check_int_p("foriter_builtin_unaffected",
         "let mut v: Vec[Int] = vec()\n push(v, 10)\n push(v, 32)\n let mut s = 0\n for x in v { s = s + x }\n s", 42);
 
-    // for over a lazy Stream (which now impls Iterator via the bridge) -- the headline `for x in stream`.
+    // for over a lazy iterator source -- the headline `for x in range(..)`.
     check_int_p("foriter_stream", "let mut s = 0\n for x in range(0, 5) { s = s + x }\n s", 10);
     // filter's element type solves from `range` directly (single param T), so no annotation is needed.
     check_int_p("foriter_stream_filter",
         "let mut s = 0\n for x in filter(range(0, 10), fn(x: Int) -> Bool { x % 2 == 0 }) { s = s + x }\n s", 20);
-    // `map` introduces a fresh OUTPUT param U. Now that a lambda's annotated return is unified with
-    // the expected slot, U solves from the lambda even in inference position -- `for x in map(..)`
-    // type-checks WITHOUT an annotation (the closed generic-of-generic gap).
+    // `map` introduces a fresh OUTPUT param U. A lambda's annotated return is unified with the
+    // expected slot, so U solves from the lambda even in inference position -- `for x in map(..)`
+    // type-checks WITHOUT an annotation.
     check_int_p("foriter_stream_map",
         "let mut s = 0\n for x in map(range(0, 4), fn(x: Int) -> Int { x * 10 }) { s = s + x }\n s", 60);
-    // A bare `let w = collect(map(..))` (generic-of-generic, still nested) likewise now solves.
+    // A bare `let w = collect(map(..))` (generic-of-generic, still nested) likewise solves.
     check_int_p("foriter_collect_map_no_annot",
         "let w = collect(map(range(0, 4), fn(x: Int) -> Int { x + 1 }))\n w[0] + w[3]", 5);   // 1 + 4
     // for over intoIter(container) explicitly (the fresh-cursor entry the container fast path bypasses).
@@ -4090,13 +4099,13 @@ void test_codegen_iterator_for() {
     });
 }
 
-// Combinators round 2 (flatMap/zip/enumerate/takeWhile/dropWhile/scan/chain + the trivial terminals +
+// Iterator combinators (flatMap/zip/enumerate/takeWhile/dropWhile/scan/chain + the trivial terminals +
 // the Ord trait). All pure prelude on the Iterator base -- no compiler/VM change. Value checks against the
 // real prelude (check_int_p); the differential diff_comb_* live in the corpus below.
 void test_codegen_combinators() {
     std::cout << "[codegen: iterator combinators round 2]\n";
 
-    // -- Slice A: Tier-1 stages --
+    // -- stages --
     check_int_p("comb_takeWhile", "sum(takeWhile(range(0, 10), fn(x: Int) -> Bool { x < 4 }))", 6);   // 0+1+2+3
     // takeWhile latches: a later element that would pass is NOT resumed after the first reject.
     check_int_p("comb_takeWhile_latch",
@@ -4109,7 +4118,7 @@ void test_codegen_combinators() {
     // scan yields the running accumulator after each element: sums 1,3,6,10 over 1..4.
     check_int_p("comb_scan", "sum(scan(range(1, 5), 0, fn(a: Int, x: Int) -> Int { a + x }))", 20);
 
-    // -- Slice B: two-upstream + nested stages --
+    // -- two-upstream + nested stages --
     check_int_p("comb_zip",
         "let mut s = 0\n for (a, b) in zip(range(0, 3), range(10, 100)) { s = s + a * 100 + b }\n s", 333);
     check_int_p("comb_zip_stops_short", "count(zip(range(0, 3), range(0, 10)))", 3);
@@ -4121,7 +4130,7 @@ void test_codegen_combinators() {
     check_int_p("comb_flatMap_len",
         "len(collect(flatMap(range(1, 4), fn(x: Int) -> dyn Iterator[Int] { range(0, x) })))", 6);
 
-    // -- Slice C: Ord + terminals --
+    // -- Ord + terminals --
     check_int_p("comb_reduce",
         "unwrapOr(reduce(range(1, 5), fn(a: Int, b: Int) -> Int { a + b }), -1)", 10);   // 1+2+3+4
     check_int_p("comb_reduce_empty",
@@ -4155,7 +4164,7 @@ void test_codegen_combinators() {
     check_int_p("comb_toMap",
         "let m = toMap(map(range(0, 4), fn(x: Int) -> (Int, Int) { (x, x * x) }))\n m[3]", 9);
 
-    // -- Slice A extra combinators: stepBy / inspect / dedup (pure lazy) --
+    // -- more stages: stepBy / inspect / dedup (pure lazy) --
     check_int_p("comb_stepBy_sum",   "sum(stepBy(range(0, 10), 3))", 18);         // 0+3+6+9
     check_int_p("comb_stepBy_count", "count(stepBy(range(0, 10), 2))", 5);        // 0,2,4,6,8
     check_int_p("comb_stepBy_one",   "sum(stepBy(range(0, 5), 1))", 10);          // step 1 == identity
@@ -4168,7 +4177,7 @@ void test_codegen_combinators() {
     check_true("comb_inspect_out",
         cg_run_out("count(inspect(range(0, 3), fn(x: Int) -> () { print(x) }))") == "012");
 
-    // -- Slice B combinators: chunks / windows / peekable (lazy per pull, buffering) --
+    // -- buffering stages: chunks / windows / peekable (lazy per pull) --
     check_int_p("comb_chunks_count",  "count(chunks(range(0, 7), 3))", 3);              // [0,1,2][3,4,5][6]
     check_int_p("comb_chunks_exact",  "count(chunks(range(0, 6), 3))", 2);              // exact division
     check_int_p("comb_chunks_last",   "let v = collect(chunks(range(0, 7), 3))  len(v[2])", 1);   // short last
@@ -4182,7 +4191,7 @@ void test_codegen_combinators() {
     // a peeked cursor coerces to dyn Iterator and still yields the buffered element first.
     check_int_p("comb_peekable_pipe", "let mut p = peekable(range(0, 5))  let pk = unwrapOr(p.peek(), -1)  pk * 100 + sum(p)", 10);
 
-    // -- Slice D: String streaming (split / lines / words) --
+    // -- String streaming (split / lines / words) --
     // split: N separators -> N+1 fields, empties kept.
     check_int_p("comb_split_count", "count(split(\"a,b,c\", \",\"))", 3);
     check_int_p("comb_split_field_lens",
@@ -4241,7 +4250,7 @@ void test_codegen_combinators() {
     check_int_p("comb_words_local_shadows",
         "let mut words: Vec[String] = vec()  push(words, \"a\")  len(words)", 1);
 
-    // -- std::string helpers (round 1): search / trim / case / companions. BYTE-level; ASCII case.
+    // -- std::string helpers: search / trim / case / companions. BYTE-level; ASCII case.
     check_int_p("str_indexOf",            "indexOf(\"hello world\", \"o\")", 4);
     check_int_p("str_indexOf_miss",       "indexOf(\"abc\", \"z\")", -1);
     check_int_p("str_indexOf_empty",      "indexOf(\"abc\", \"\")", 0);          // "" matches at 0
@@ -4268,11 +4277,11 @@ void test_codegen_combinators() {
     check_int_p("str_charAt",             "charAt(\"ABC\", 1)", 66);
     check_bool_p("str_isEmpty",           "isEmpty(\"\")", true);
     check_bool_p("str_isEmpty_no",        "isEmpty(\"x\")", false);
-    // split with an EMPTY separator now yields the whole string as one field ([s]) -- no longer a panic.
+    // split with an EMPTY separator yields the whole string as one field ([s]) -- not a panic.
     check_int_p("str_split_empty_sep_count",    "count(split(\"abc\", \"\"))", 1);
     check_bool_p("str_split_empty_sep_field",   "collect(split(\"abc\", \"\"))[0] == \"abc\"", true);
     check_bool_p("str_split_empty_sep_rndtrip", "join(split(\"abc\", \"\"), \"\") == \"abc\"", true);
-    // -- std::string round 2: replace (all occurrences; empty `from` = no-op) / pad / repeatStr.
+    // -- std::string: replace (all occurrences; empty `from` = no-op) / pad / repeatStr.
     check_bool_p("str_replace",         "replace(\"a.b.c\", \".\", \"-\") == \"a-b-c\"", true);
     check_bool_p("str_replace_multi",   "replace(\"aXXbXXc\", \"XX\", \"_\") == \"a_b_c\"", true);
     check_bool_p("str_replace_delete",  "replace(\"hello\", \"l\", \"\") == \"heo\"", true);
@@ -4320,11 +4329,9 @@ void test_codegen_combinators() {
         "let mut m: Map[Int, Int] = #{}\n m[1] = 1  m[2] = 2  m[3] = 3\n delete(m, 2)\n let mut s = 0\n for (k, v) in m { s = s + v }\n s", 4);
 }
 
-// Lazy iteration (v1): the Iterator / IntoIterator cursor pipeline in the tree-shakeable prelude --
+// Lazy iteration: the Iterator / IntoIterator cursor pipeline in the tree-shakeable prelude --
 // mut-cursor sources (RangeCursor), stateless stages (MapStage, ...) and tail-recursive terminals.
 // These run against the REAL prelude (check_int_p).
-// (This shipped first as a closure-field `Stream[T]` struct, since dissolved into the Iterator /
-// IntoIterator traits -- which is where the function name and the `stream_*` case names come from.)
 void test_codegen_stream() {
     std::cout << "[codegen: lazy Iterator pipeline v1]\n";
 
@@ -4338,7 +4345,7 @@ void test_codegen_stream() {
                                                     << "   (threw: " << e.what() << ")\n"; }
     };
 
-    // Slice 1 -- the tracer bullet: a mut-cursor source driven from inside a closure, consumed by a
+    // Sources + terminals: a mut-cursor source driven from inside a closure, consumed by a
     // tail-recursive fold. `sum(range(0, 10))` = 0+1+..+9 = 45.
     check_int_p("stream_range_sum", "sum(range(0, 10))", 45);
     check_int_p("stream_fold_direct",
@@ -4358,14 +4365,14 @@ void test_codegen_stream() {
         return has_struct(m, "RangeCursor");
     });
 
-    // Slice 2 -- stateless stages + terminals + iterate.
+    // Stateless stages + terminals + iterate.
     check_int_p("stream_map", "sum(map(range(0, 5), fn(x: Int) -> Int { x * 10 }))", 100);       // (0+1+2+3+4)*10
     check_int_p("stream_filter", "sum(filter(range(0, 10), fn(x: Int) -> Bool { x % 2 == 0 }))", 20); // 0+2+4+6+8
     check_int_p("stream_pipeline",  // filter |> map |> sum -- the probe computation via encoding C
         "sum(map(filter(range(0, 20), fn(x: Int) -> Bool { x % 2 == 0 }), fn(x: Int) -> Int { x * 3 }))", 270);
     check_int_p("stream_count", "count(range(3, 9))", 6);
     check_int_p("stream_collect_len", "len(collect(range(0, 4)))", 4);
-    // `collect(map(..))` (generic-of-generic) now solves WITHOUT an annotation: the lambda's annotated
+    // `collect(map(..))` (generic-of-generic) solves WITHOUT an annotation: the lambda's annotated
     // return drives `map`'s output param, then `collect`'s. (An annotation is still accepted.)
     check_int_p("stream_collect_elems", "let w = collect(map(range(0, 4), fn(x: Int) -> Int { x + 1 }))\n w[0] + w[3]", 5); // 1 + 4
     // iterate is infinite -> pull a few by hand (proves the generic IterCursor mut-advance): 1, 2, 4.
@@ -4375,7 +4382,7 @@ void test_codegen_stream() {
     // count shares fold's tail-recursive shape -> O(1) stack at N=100000.
     check_int_p("stream_count_deep", "count(range(0, 100000))", 100000);
 
-    // Slice 3 -- zero-copy container sources (intoIter) + take + eager Iterable snapshot.
+    // Zero-copy container sources (intoIter) + take + eager Iterable snapshot.
     check_int_p("stream_vec", "let mut v: Vec[Int] = vec()\n push(v, 5)\n push(v, 7)\n sum(intoIter(v))", 12);
     check_int_p("stream_array", "sum(intoIter(array(3, 4)))", 12);              // [4,4,4]
     check_int_p("stream_bytes", "sum(intoIter(toBytes(\"abc\")))", 294);        // 97+98+99
@@ -4386,7 +4393,7 @@ void test_codegen_stream() {
     // take stops early over a large array source without consuming it all.
     check_int_p("stream_take_early", "sum(take(intoIter(array(1000000, 1)), 3))", 3);
     // Streaming an eager source: a Map (live cursor via intoIter) and an Iterable-only user type
-    // (intoIter over an explicit toVec snapshot -- the copy is now visible at the call site).
+    // (intoIter over an explicit toVec snapshot -- the copy is visible at the call site).
     check_int_p("stream_map_intoiter",
         "let mut m: Map[Int, Int] = #{}\n m[1] = 10\n m[2] = 20\n count(intoIter(m))", 2);
     check_int_p("stream_user_intoiter_tovec",
@@ -4440,7 +4447,7 @@ void test_codegen_builtins() {
     check_true("print_multi_three", cg_run_out("print(1, 2, 3)") == "123");
     check_true("println_multi",     cg_run_out("println(\"a\", \"b\")") == "ab\n");
     check_true("println_multi_mixed", cg_run_out("println(\"n=\", 42, \" b=\", true)") == "n=42 b=true\n");
-    // print requires >= 1 arg (a type error otherwise); println(a, b, ...) now type-checks.
+    // print requires >= 1 arg (a type error otherwise); println(a, b, ...) type-checks.
     check_true("print_zero_arg_rejected", cg_check_fails("print()"));
     check_true("println_multi_ok",        !cg_check_fails("println(1, 2)"));
 
@@ -4545,11 +4552,11 @@ void test_codegen_vec_bytes() {
     // pop composes with unwrapOr.
     check_int_p("pop_unwrap_or",
         "let mut v = push(vec(), 7)\n unwrapOr(pop(v), 0)", 7);
-    // Regression: pop() whose ARGUMENT is a field access (a real temp), not a bare local. The Option-
-    // wrapping holds THREE scratch temps (LEN/VEC_POP/zero) ABOVE the result AND the arg register; the
-    // old +2 under-measured the frame by one for a non-local arg (a bare-local arg hid it). Found via
-    // the language guide's generic Stack example; fixed in builtin_extra_slots(pop). Both a concrete
-    // and a generic receiver -- the generic body is where the guide first hit it.
+    // pop() whose ARGUMENT is a field access (a real temp), not a bare local. The Option-wrapping
+    // holds THREE scratch temps (LEN/VEC_POP/zero) ABOVE the result AND the arg register, which
+    // builtin_extra_slots(pop) must reserve; one slot fewer under-measures the frame for a non-local
+    // arg (a bare-local arg hides it). Both a concrete and a generic receiver (the guide's generic
+    // Stack example).
     check_int_p("pop_field_option",
         "struct Stk { xs: Vec[Int] }\n let mut s = Stk { xs: push(push(vec(), 1), 2) }\n"
         " match pop(s.xs) { Some(x) => x, None => 0 - 1 }", 2);
@@ -4568,7 +4575,7 @@ void test_codegen_vec_bytes() {
     check_int_p("bytes_pop",      "match pop(push(push(bytes(), 65), 66)) { Some(x) => x, None => -1 }", 66);
     check_int_p("bytes_pop_empty","match pop(bytes()) { Some(x) => x, None => -1 }", -1);
     check_true("bytes_push_bad",  cg_check_fails("push(bytes(), \"x\")"));   // a byte must be an Int
-    // Bytes index read + assign (already supported; regression). Assign needs a `mut` root (M5).
+    // Bytes index read + assign. Assign needs a `mut` root (M5).
     check_int("bytes_index_set",  "let mut b = toBytes(\"AAA\")\n b[1] = 66\n b[1]", 66);
     check_bool("bytes_index_roundtrip", "let mut b = toBytes(\"cat\")\n b[0] = 98\n fromBytes(b) == \"bat\"", true);
     check_true("bytes_index_set_immut", cg_check_fails("let b = toBytes(\"AAA\")\n b[0] = 66\n b[0]"));
@@ -4578,7 +4585,7 @@ void test_codegen_vec_bytes() {
     check_bool_p("slice_clamp",   "slice(\"abc\", 1, 99) == \"bc\"", true);
     check_bool_p("slice_empty",   "slice(\"abc\", 2, 1) == \"\"", true);
     // sliceBytes: byte-range substring over an ALREADY-materialized Bytes (slice delegates to it) --
-    // the O(range) primitive for a byte-scanner that holds one Bytes and slices many ranges (P2 finding).
+    // the O(range) primitive for a byte-scanner that holds one Bytes and slices many ranges.
     check_bool_p("sliceBytes",       "sliceBytes(toBytes(\"hello world\"), 6, 11) == \"world\"", true);
     check_bool_p("sliceBytes_clamp", "sliceBytes(toBytes(\"abc\"), 0 - 5, 99) == \"abc\"", true);
     check_bool_p("sliceBytes_empty", "sliceBytes(toBytes(\"abc\"), 2, 1) == \"\"", true);
@@ -4738,7 +4745,7 @@ void test_codegen_vec_bytes() {
     // Checker: the argument must be a String.
     check_true("parseint_bad_arg",   cg_check_fails("parseInt(42)"));
 
-    // ---- const item feature (S0): `[pub] const NAME: Type = <literal>`, compile-time inlined ----
+    // ---- const item: `[pub] const NAME: Type = <literal>`, compile-time inlined ----
     {
         auto no_compile = [](const std::string& s) { try { svc::compile(s.c_str()); return false; } catch (...) { return true; } };
         check_int ("const_int",       "const N: Int = 42\n N", 42);
@@ -4756,7 +4763,7 @@ void test_codegen_vec_bytes() {
         check_true("const_pub_let",       no_compile("pub let X = 5\n X"));             // parse: pub only on fn/type/const
     }
 
-    // ---- std::math library (S1 libm natives + S2 prelude helpers + PI/E consts) ----
+    // ---- std::math library (libm natives + prelude helpers + PI/E consts) ----
     // Gating: a math native needs `use std::math` (else the checker rejects on the gate).
     check_true("m_gate_rejects",  cg_check_fails("sqrt(2.0)"));
     check_true("m_gate_ok",      !cg_check_fails("use std::math::*\n sqrt(2.0)"));
@@ -4905,15 +4912,15 @@ void test_codegen_natives() {
         check_true("native_mustuse_warns", !m.warnings.empty());
     }
 
-    // Native gating (S3): a gated native is REJECTED without its `use` (a CheckFailure carrying a
+    // Native gating: a gated native is REJECTED without its `use` (a CheckFailure carrying a
     // `use std::io` hint), even when everything else is fine.
     check_true("native_gate_rejects_without_use", cg_check_fails("let _ = fileExists(\"x\")"));
     check_true("native_gate_ok_with_use",         !cg_check_fails("use std::io::*\nlet _ = fileExists(\"x\")"));
 
     // Natives by NAME, like every other item. A native is reachable from its own module, through
-    // `use M::*`, or through `use M::name` -- and through nothing else. Earlier an explicit
-    // `use std::math::sqrt` was rejected as "private" (natives are not module declarations), while ANY
-    // `use`/`import` of the module unlocked all of its natives (`use std::math::PI` made `cos` callable).
+    // `use M::*`, or through `use M::name` -- and through nothing else: an explicit
+    // `use std::math::sqrt` must not be rejected as "private" (natives are not module declarations), and
+    // a `use`/`import` of the module must not unlock all of its natives (`use std::math::PI` -> `cos`).
     // Prelude-linked: only then do std::math / std::io declare Skarn items of their own.
     check_int_p("native_use_by_name",        "use std::math::sqrt\n toInt(sqrt(9.0))", 3);
     check_int_p("native_use_by_name_braces", "use std::math::{sqrt, PI}\n toInt(sqrt(9.0) + PI)", 6);
@@ -5039,7 +5046,7 @@ void test_codegen_process() {
         "fn b() -> String { unwrap(runText([\"x\"])).stdout }\n"));
 
     // Prelude gate: the direct rawRun native needs the prelude (Ok/Err/ProcessOutput) to reshape the
-    // result -> a clean CodegenError without it (the `use` passes the S3 native gate first); and
+    // result -> a clean CodegenError without it (the `use` passes the native gate first); and
     // `run` (a prelude fn) is undefined without the prelude regardless.
     check_true("process_rawrun_no_prelude_rejects", cg_rejects("use std::process::*\nlet _ = rawRun(vec(), bytes())"));
     check_true("process_run_needs_prelude",        cg_check_fails("let _ = run([\"x\"])"));
@@ -5261,8 +5268,8 @@ void test_hashable() {
     check_true("hash_map_enum_key",
         cg_check_fails_p("enum E { A, B }\n let m: Map[E, Int] = #{}\n 0"));
 
-    // Set of a heap type -- via Set::fromVec (arg-pinned) AND via nullary Set::new() (return-pinned; needs the
-    // general return-type-directed bound discharge, else this leaks to a runtime trap).
+    // Set of a heap type -- via Set::fromVec (arg-pinned) AND via nullary Set::new() (return-pinned: the
+    // expected type fixes T, and the bound must be checked against it, not against T's own bound).
     check_true("hash_set_struct_setof",
         cg_check_fails_p("use std::set::*\n struct P { x: Int }\n let v: Vec[P] = vec()\n push(v, P { x: 1 })\n let s = Set::fromVec(v)\n 0"));
     check_true("hash_set_struct_nullary",
@@ -5283,8 +5290,7 @@ void test_hashable() {
 
 // Transparent (erased) newtypes: `transparent struct UserId(Int)` is a distinct type in the checker
 // but IS the bare Int/Double/Bool immediate at runtime -- construction/`.0`/pattern are no-ops, no
-// heap object. #0 (mechanism) + #T (RefEval + generator learn it) -- toString still lossy (prints
-// the bare value); the name table is the follow-up slice #1.
+// heap object. Covers the mechanism plus the RefEval oracle and the generator.
 void test_transparent_structs() {
     std::cout << "[test_transparent_structs: erased newtype #0]\n";
 
@@ -5301,12 +5307,12 @@ void test_transparent_structs() {
 
     // ---- a transparent ctor NESTED in another pattern ----
     // Every nesting parent fetches the field into a TEMP and frees it right after the sub-test, so
-    // binding the erased element by register ALIAS left the name pointing at a register the arm body
-    // immediately reallocated -- a silent wrong VALUE (`g(3) + n` read the call result twice: 600,
-    // not 307). Invisible to the emitter self-check: measure_pattern's Ctor case already reserved
-    // the local, emit just never allocated it. The top-level form (`ts_match` above) and the
-    // irrefutable `let` binder were always correct, which is why nothing caught it.
-    // The arm body MUST allocate a temp before reading the binding, or the bug does not show.
+    // binding the erased element by register ALIAS would leave the name pointing at a register the
+    // arm body immediately reallocates -- a silent wrong VALUE (`g(3) + n` reads the call result
+    // twice: 600, not 307). Invisible to the emitter self-check: measure_pattern's Ctor case reserves
+    // the local either way. The top-level form (`ts_match` above) and the irrefutable `let` binder
+    // copy regardless, so only the nested shapes below exercise it.
+    // The arm body MUST allocate a temp before reading the binding, or the defect does not show.
     {
         const std::string pre = "transparent struct W(Int)\n fn g(x: Int) -> Int { x * 100 }\n";
         check_int_p("ts_nested_enum_payload", pre +
@@ -5322,12 +5328,12 @@ void test_transparent_structs() {
         check_int_p("ts_nested_map_value", pre +
             "fn f(m: Map[Int, W]) -> Int { match m { #{ 1 => W(n) } => g(3) + n, _ => -1 } }\n"
             " f(#{ 1 => W(7) })", 307);
-        // The two shapes that were always right -- keep them beside the six that were not.
+        // The two non-nested shapes, beside the six nested ones.
         check_int_p("ts_nested_toplevel_ok", pre +
             "fn f(w: W) -> Int { match w { W(n) => g(3) + n } }\n f(W(7))", 307);
         check_int_p("ts_nested_let_binder_ok", pre + "struct P { a: W, b: Int }\n"
             "fn f(p: P) -> Int { let P { a: W(n), b: _ } = p\n g(3) + n }\n f(P { a: W(7), b: 0 })", 307);
-        // Differential: the oracle is blind to codegen, so it is what would have caught this class.
+        // Differential: the oracle is blind to codegen, so it catches this class.
         check_same("ts_diff_nested_payload", pre +
             "fn f(o: Option[W]) -> Int { match o { Some(W(n)) => g(3) + n, None => -1 } }\n"
             " f(Some(W(7))) + f(None)", true);
@@ -5525,7 +5531,7 @@ void test_enum_qualified_path() {
     check_true  ("eq_pat_bad",     cg_check_fails_p("enum Color { Red, Green }\n match Red { Color::Blue => 0, _ => 1 }"));
     check_true  ("eq_call_bad",    cg_check_fails_p("enum Box { Wrap(Int) }\n let x = Box::Nope(1)\n 0"));
 
-    // ---- differentials: qualified must lower identically to bare (no RefEval change in S1) ----
+    // ---- differentials: qualified must lower identically to bare ----
     check_same("eq_diff_match",    "enum Color { Red, Green, Blue }\n match Color::Green { Color::Red => 0, Color::Green => 5, Color::Blue => 9 }", false);
     check_same("eq_diff_payload",  "enum Box { Wrap(Int), Empty }\n match Box::Wrap(3) { Box::Wrap(x) => x + 1, Box::Empty => 0 }", false);
     check_same("eq_diff_option",   "match Option::Some(7) { Option::Some(x) => x, Option::None => 0 }", true);
@@ -5595,7 +5601,7 @@ void test_method_call_syntax() {
         "trait Sh { fn sh(self) -> Int }\n struct P { v: Int }\n"
         " impl Sh for P { fn sh(self) -> Int { self.v } }\n"
         " let d: dyn Sh = P { v: 9 }\n d.sh()", 9);
-    // Regression: a fn-valued FIELD is still callable via `.f()` (field-first).
+    // A fn-valued FIELD is callable via `.f()` (field-first).
     check_int_p ("mc_field_fn",
         "struct Holder { f: fn(Int) -> Int }\n"
         " let h = Holder { f: fn(x: Int) -> Int { x + 1 } }\n h.f(41)", 42);
@@ -5648,8 +5654,8 @@ void test_inherent_impl() {
 
     // Negatives.
     check_true("ii_orphan",   cg_check_fails_p("impl Vec[Int] { fn foo(self) -> Int { 0 } }"));            // foreign type
-    // A member without `self` is no longer an error -- it is an ASSOCIATED FUNCTION, reachable only
-    // as `P::ok()`. What must still hold is that it is NOT reachable through `.` (test_associated_fn
+    // A member without `self` is not an error -- it is an ASSOCIATED FUNCTION, reachable only
+    // as `P::ok()`. It is NOT reachable through `.` (test_associated_fn
     // covers both halves); here we only pin that the declaration itself is accepted.
     check_int_p("ii_no_self_is_assoc",
         "struct P { x: Int }\n impl P { fn ok() -> Int { 3 } }\n P::ok()", 3);
@@ -5751,13 +5757,13 @@ void test_qualified_inherent_call() {
 }
 
 // A method-syntax receiver must be inferred ONCE. Inferring `Type::fn(..)` writes the resolved head back
-// (`Json` -> `std::json::Json`), and that writeback is not idempotent: a second inference read the
-// lowercase mangled head as a MODULE path and reported "module 'std::json::Json' is not imported".
-// The frame measure must be linear in nesting depth. It re-walked each call argument for `.local_peak`,
-// again in need_call for `.temp`, and once more at an inline site, and every re-walk recursed through the
-// whole subtree: n nested calls cost 2^n measure steps, 3^n with the inliner (sixteen nested `inc(..)` =
-// 387 million; a 24-link method chain did not compile within five minutes). Each shape below reaches the
-// measure's Call/Pipe cases by a different route; before the memo every one of them effectively hangs.
+// (`Json` -> `std::json::Json`), and that writeback is not idempotent: a second inference reads the
+// lowercase mangled head as a MODULE path and reports "module 'std::json::Json' is not imported".
+// The frame measure must be linear in nesting depth. A call's argument is measured for `.local_peak`,
+// in need_call for `.temp`, and at an inline site; without the per-node memo each of those walks
+// recurses through the whole subtree, so n nested calls cost 2^n measure steps, 3^n with the inliner
+// (sixteen nested `inc(..)` = 387 million). Each shape below reaches the measure's Call/Pipe cases by a
+// different route; without the memo every one of them effectively hangs.
 // Depth 50 stays inside the 63-register frame for all four (the measure's temp bound grows with depth).
 void test_measure_linear() {
     std::cout << "[test_measure_linear: deeply nested calls compile in linear measure time]\n";
@@ -5807,16 +5813,16 @@ void test_receiver_inferred_once() {
     check_int_modules("rio_field_first", "import m\n use m::*\n F::new(3).f(2)", M{{"m", MOD}}, 5);
     // Inside the module that declares the type (its own head mangles to `m::P` too).
     check_int_modules("rio_own_module", "use m::run\n run()", M{{"m", MOD_RUN}}, 6);
-    // Re-inferring each receiver doubled the checker's work per link: a 24-link chain took 10.5 s to
-    // type-check. Inferred once, 40 links are instant; a regression hangs here instead of
-    // passing. Checker only (check_errc) -- codegen of a deep NESTED call has its own, separate cost.
+    // Re-inferring each receiver would double the checker's work per link (2^n). Inferred once,
+    // 40 links are instant; an exponential checker hangs here instead of passing. Checker only
+    // (check_errc) -- codegen of a deep NESTED call has its own, separate cost.
     {
         std::string chain = "trait Inc { fn inc(self) -> Int }\n impl Inc for Int { fn inc(self) -> Int { self + 1 } }\n 0";
         for (int i = 0; i < 40; ++i) chain += ".inc()";
         check_true("rio_chain_linear", check_errc(chain) == 0);
     }
     // Control: an entry-program type mangles to `$entry::P`, and a `$`-led head is never read as a module
-    // path, so this never hit the bug.
+    // path, so this shape is unaffected by the writeback.
     check_int_p("rio_entry_type",
         "struct P { x: Int }\n impl P { fn new(x: Int) -> P { P { x: x } } }\n"
         " trait T { fn get(self) -> Int }\n impl T for P { fn get(self) -> Int { self.x } }\n"
@@ -5878,15 +5884,14 @@ void test_associated_fn() {
         " C::count(200000, 0)", 200000);
 
     // Negatives.
-    // The type argument is fixed by NOTHING (T is absent from the args and from the return type),
-    // so the call is rejected rather than silently leaking an unsolved var -- see
-    // reject_unsolved_generics: a BOUNDED param would otherwise satisfy its own bound vacuously.
+    // The type argument is fixed by NOTHING (T is absent from the args, from the return type and
+    // from every later use), so the call is rejected rather than leaving an unsolved var -- see
+    // drain_pending_generics.
     check_true("af_cannot_infer_ret", check_has(
         "struct H[T] { v: T }\n impl[T] H[T] { fn one() -> H[Int] { H { v: 1 } } }\n H::one()\n 0",
         "cannot infer the type argument 'T' of 'H::one'"));
-    // The `Set::empty()` shape, and the reason the rejection is a SOUNDNESS matter rather than
-    // tidiness: with a BOUNDED head param, an unsolved var discharges against its own bound
-    // vacuously (satisfies_bound), so the real type argument would never be checked.
+    // The `Set::new()` shape with a BOUNDED head param and nothing that fixes T: rejected, never
+    // accepted on the strength of the unsolved var's own bound (satisfies_bound).
     const char* SB = "struct S[T: Hashable] { m: Map[T, Bool] }\n"
                      " impl[T: Hashable] S[T] { fn empty() -> S[T] { S { m: #{} } }"
                      "                          fn size(self) -> Int { len(self.m) } }\n";
@@ -5894,6 +5899,54 @@ void test_associated_fn() {
         std::string(SB) + "let s = S::empty()\n 0", "cannot infer the type argument 'T' of 'S::empty'"));
     check_int_p("af_bounded_annotated",
         std::string(SB) + "let s: S[Int] = S::empty()\n s.size()", 0);
+
+    // DEFERRED generic arguments: a type argument nothing has fixed AT the call is not an error
+    // yet -- a later argument or a later statement may fix it, and the bound is then checked
+    // against the real type, reported at the ORIGINAL call. DG occupies lines 1-7.
+    const char* DG = "trait K {}\n impl K for Int {}\n struct Q { n: Int }\n"
+                     " struct B[T: K] { n: Int }\n"
+                     " impl[T: K] B[T] { fn empty() -> B[T] { B { n: 0 } }  fn size(self) -> Int { self.n + 7 } }\n"
+                     " fn mk[T: K]() -> B[T] { B { n: 1 } }\n"
+                     " fn fold1[T, U](x: T, init: U, f: fn(U, T) -> U) -> U { f(init, x) }\n";   // lines 1-7
+    // Fixed by a LATER argument of the enclosing call (the `fold(xs, Tree::empty(), lambda)` shape).
+    check_int("dg_assoc_later_arg",
+        std::string(DG) + "fold1(1, B::empty(), fn(acc: B[Int], x: Int) -> B[Int] { acc }).size()", 7);
+    // Fixed by a LATER statement.
+    check_int("dg_assoc_later_stmt",
+        std::string(DG) + "let s = B::empty()\n let t: B[Int] = s\n t.size()", 7);
+    // Fixed by a later method call's argument -- the reason the drain runs after the whole body.
+    check_int_p("dg_set_new_then_insert",
+        "use std::set::Set\n let mut s = Set::new()\n s.insert(3)\n s.insert(3)\n s.size()", 1);
+    check_int_p("dg_set_new_in_fold",
+        "use std::set::Set\n"
+        " let s = fold(toVec([1, 2, 2, 3]) |> intoIter, Set::new(), fn(acc: Set[Int], x: Int) -> Set[Int] {"
+        "     let mut a = acc  a.insert(x)  a })\n s.size()", 3);
+    // Deferred is not skipped: the bound is still checked against the type fixed later, and the
+    // caret stays on the call that introduced the type argument (line 8), not on the fixing site.
+    check_true("dg_assoc_bound_checked_late", check_has_on_line(
+        std::string(DG) + "let s = B::empty()\n let t: B[Q] = s\n 0", "does not satisfy the bound 'K'", 8));
+    check_true("dg_assoc_bound_checked_later_arg", check_has_on_line(
+        std::string(DG) + "fold1(1, B::empty(), fn(acc: B[Q], x: Int) -> B[Q] { acc })\n 0",
+        "does not satisfy the bound 'K'", 8));
+    // THE soundness lock -- the same shape through a FREE generic fn: `Q` is fixed only after `mk()`,
+    // and the bound must still be checked against it. With std's Map, missing this check lets a
+    // non-Hashable key through the checker and into a runtime trap "invalid map key type".
+    check_true("dg_free_bound_checked_late", check_has_on_line(
+        std::string(DG) + "let s = mk()\n let t: B[Q] = s\n 0", "does not satisfy the bound 'K'", 8));
+    check_true("dg_free_map_key_leak_closed", check_has_p(
+        "struct P { name: String }\n fn mkMap[K: Hashable, V]() -> Map[K, V] { #{} }\n"
+        " let m0 = mkMap()\n let mut m: Map[P, Int] = m0\n m[P { name: \"a\" }] = 1\n len(m)",
+        "does not satisfy the bound 'std::core::Hashable'"));
+    // Never fixed at all: a free bounded generic is rejected exactly like an associated fn -- and
+    // reported ONCE, although `s.size()` re-instantiates the impl's `T` and unifies it with the same
+    // unsolved var.
+    check_true("dg_free_never_solved", check_has_on_line(
+        std::string(DG) + "let s = mk()\n s.size()", "cannot infer the type argument 'T' of 'mk'", 8));
+    check_true("dg_free_never_solved_once", check_errc(std::string(DG) + "let s = mk()\n s.size()") == 1);
+    check_true("dg_assoc_never_solved_once", check_errc(std::string(DG) + "let s = B::empty()\n s.size()") == 1);
+    // An UNBOUNDED free generic is not recorded: its unsolved type argument stays legal.
+    check_int("dg_free_unbounded_unsolved_ok",
+        "struct W[T] { n: Int }\n fn mkw[T]() -> W[T] { W { n: 5 } }\n let w = mkw()\n w.n", 5);
     // The std::set migration shape: an associated fn AND a method, both inside a BOUNDED generic
     // impl, calling another associated fn on their OWN head against the impl's rigid `T`.
     // `af_generic_rigid` above covers a rigid var from an enclosing FN; this is the impl-generic
@@ -5930,7 +5983,7 @@ void test_associated_fn() {
         "struct P { n: Int }\n impl P { fn make() -> P { P { n: 1 } } }\n let f = P::make\n 0",
         "can only be used as a call target"));
 
-    // THE Slice-4 lock: a type with an associated `make()` AND a trait method `make(self)`. `.`
+    // THE dot-resolution lock: a type with an associated `make()` AND a trait method `make(self)`. `.`
     // must reach the TRAIT method. Nothing else in the suite would notice if codegen's dot branch
     // picked the associated body instead -- it would just call a different function.
     check_int_p("af_no_dot_shadow",
@@ -5961,8 +6014,8 @@ void test_associated_fn() {
 void test_enum_variant_coexist() {
     std::cout << "[test_enum_variant_coexist: same-module same-name variants (S2)]\n";
 
-    // Two enums in one module SHARE a variant short name (`X`) -- previously a hard "duplicate
-    // constructor" error; now they coexist and are disambiguated by `Enum::X`.
+    // Two enums in one module SHARE a variant short name (`X`) -- they coexist and are
+    // disambiguated by `Enum::X`.
     const char* AB = "enum A { X, Y }\n enum B { X, Z }\n";
     check_int_p ("co_match_a",   std::string(AB) + "match A::X { A::X => 1, A::Y => 2 }", 1);
     check_int_p ("co_match_b",   std::string(AB) + "match B::X { B::X => 7, B::Z => 8 }", 7);
@@ -6173,8 +6226,8 @@ void test_batch_round2() {
 
     // ---- the Maranget con id for a Double must be INJECTIVE (double_con, not std::to_string) ----
     // `std::to_string` is `%f` -- six fractional digits -- so two arms differing past the 6th digit
-    // shared one con and the second was falsely reported "unreachable match arm". Pure literals; this
-    // was reachable long before range bounds could name anything.
+    // would share one con and the second would be falsely reported "unreachable match arm". Pure
+    // literals are enough to reach it.
     check_true("dblcon_near_lits_ok",   !cg_check_fails("match 1.0 { 1.0000001 => 1, 1.0000002 => 2, _ => 0 }"));
     check_int ("dblcon_near_lits_value", "match 1.0000002 { 1.0000001 => 1, 1.0000002 => 2, _ => 0 }", 2);
     check_true("dblcon_near_range_ok",
@@ -6185,7 +6238,7 @@ void test_batch_round2() {
     check_true("dblcon_dup_still_caught",  cg_check_fails("match 1.5 { 1.5 => 1, 1.5 => 2, _ => 0 }"));
     check_true("dblcon_dup_range_caught",  cg_check_fails("match 1.5 { 1.5..2.5 => 1, 1.5..2.5 => 2, _ => 0 }"));
 
-    // ---- #4 `%g` float formatter (shortest round-trip; precision ignored in v1) ----
+    // ---- `%g` float formatter (shortest round-trip; precision ignored) ----
     check_true("g_basic",   cg_run_out("println(\"${3.14159:g}\")")   == "3.14159\n");
     check_true("g_width",   cg_run_out("println(\"[${3.14:>8g}]\")")  == "[    3.14]\n");
     check_true("g_big",     cg_run_out("println(\"${1000000.5:g}\")") == "1000000.5\n");
@@ -6441,10 +6494,8 @@ void test_pattern_alt() {
 
     // --- bindings in alternatives: LEGAL, provided every alternative binds the same set ---
     //
-    // Each of these was a rejection earlier. Two became legal; two stay rejections but
-    // under a DIFFERENT rule, which is why every rejection below is pinned by MESSAGE as well as by
-    // outcome -- asserting only "it fails" would have let them read green whether the feature works
-    // or was never built.
+    // Every rejection below is pinned by MESSAGE as well as by outcome -- asserting only "it fails"
+    // would read green whether the binding rule works or the construct is refused for another reason.
     check_int_p("or_binding_ident_first",
         "enum E { A(Int), B(Int) }\n match A(1) { A(x) | B(x) => x }", 1);
     check_int_p("or_binding_ident_second",
@@ -6456,13 +6507,13 @@ void test_pattern_alt() {
         "fn f(e: E3) -> Int { match e { A(x) | B(x) | C(x) => x * 10 } }\n"
         " f(A(1)) + f(B(2)) + f(C(3))", 60);
     // A record-variant shorthand binds too. NOT `P { x } | P { x }` -- identical alternatives are
-    // now legal AND redundant, so that would trip the unreachable-alternative WARNING instead.
+    // legal AND redundant, so that would trip the unreachable-alternative WARNING instead.
     check_int_p("or_binding_struct_shorthand",
         "enum R { L { x: Int }, M { x: Int } }\n"
         "fn f(r: R) -> Int { match r { L { x } | M { x } => x } }\n"
         " f(L { x: 3 }) * 10 + f(M { x: 4 })", 34);
 
-    // The two that stay rejections, now for "alternatives must bind the same set".
+    // Rejections for "alternatives must bind the same set".
     const std::string or_bind_mut = "match 5 { mut x | 2 => x, _ => 0 }";
     check_true("or_binding_mut_rejected", cg_check_fails(or_bind_mut));
     check_true("or_binding_mut_message",  check_has(or_bind_mut, "does not bind 'x'"));
@@ -6589,8 +6640,8 @@ void test_pattern_alt() {
         "enum C { Red, Green, Blue }\n"
         "fn w(x: C) -> Int { match x { Red | Blue => 1, Green => 0 } }\n w(Red) * 10 + w(Green)", true);
 
-    // ---- NESTED / parenthesized alternation (shipped with @-bindings) ----------------------
-    // Alternation is no longer top-level-only. Two spellings: bare where the terminator is
+    // ---- NESTED / parenthesized alternation -------------------------------------------------
+    // Alternation is not top-level-only. Two spellings: bare where the terminator is
     // unambiguous (a ctor / tuple / list element, a struct field, a map value), parenthesized
     // anywhere else.
     check_int_p("or_nested_ctor",  "enum C { Red, Green, Blue }\n"
@@ -6618,7 +6669,7 @@ void test_pattern_alt() {
     // `(A|B) | C` must NOT be reported unreachable. Without the parser-side FLATTENING it is:
     // check_match_coverage peels one level of Or into rows, the inner OrPat reaches lower_pat,
     // which lowers only its first alternative -- so the row set under-approximates and a legal
-    // arm is rejected. This is the regression lock for that.
+    // arm is rejected. This locks the flattening.
     check_int_p("or_paren_then_bar", "match 3 { (1 | 2) | 3 => 1, _ => 0 }", 1);
     check_true("or_paren_then_bar_ok", !cg_check_fails_p("match 3 { (1 | 2) | 3 => 1, _ => 0 }"));
     // Each source alternative still gets its own redundancy warning after expansion.
@@ -6693,8 +6744,8 @@ void test_at_bindings() {
     check_true("at_in_let_rejected",  cg_check_fails_p("let n @ 5 = 5\n n"));
     check_true("at_in_let_message",   check_has("let n @ 5 = 5\n n", "'@' binding is not allowed in 'let'"));
     check_true("at_in_for_message",   check_has("for n @ 1 in [1, 2] { }\n 0", "'@' binding is not allowed in 'for'"));
-    // A list `..` tail must stay a plain name or `_` -- previously only enforced by a CodegenError
-    // AFTER the checker had accepted the program.
+    // A list `..` tail must stay a plain name or `_` -- enforced by the checker, not left to a
+    // CodegenError after the checker accepted the program.
     check_true("at_in_list_rest_rejected", cg_check_fails_p("match [1, 2] { [a, ..r @ [2]] => a, _ => 0 }"));
     check_true("at_list_rest_message",     check_has("match [1, 2] { [a, ..r @ [2]] => a, _ => 0 }",
                                                     "list '..' tail must be a name or '_'"));
@@ -6837,10 +6888,9 @@ void test_range_const_bounds() {
         check_errc("match 5 { 1..zz => 1, 1..yy => 2, _ => 0 }") == 2);
 
     // ---- Char ranges: `'a'..'z'` against a Char scrutinee -------------------------------------
-    // The literal pattern has had the byte-int -> Char retyping since Char shipped; the RANGE did
-    // not, so the single most idiomatic use of the feature was the one that did not work. These are
-    // RUN checks: Char erases to the code-point Int, so the whole claim is that no VM, codegen or
-    // oracle change is needed -- only the checker learning to say yes.
+    // A range of byte-int literals retypes to Char like a literal pattern does. These are RUN
+    // checks: Char erases to the code-point Int, so no VM, codegen or oracle support is needed --
+    // only the checker accepting it.
     check_int_p("rcbc_lower",   "fn f(c: Char) -> Int { match c { 'a'..'z' => 1, _ => 0 } }\n f('a')", 1);
     check_int_p("rcbc_middle",  "fn f(c: Char) -> Int { match c { 'a'..'z' => 1, _ => 0 } }\n f('m')", 1);
     check_int_p("rcbc_upper",   "fn f(c: Char) -> Int { match c { 'a'..'z' => 1, _ => 0 } }\n f('z')", 1);
@@ -6859,7 +6909,7 @@ void test_range_const_bounds() {
     // `'a'..'z'` and `97..122` are the same SET, so they must share a con and be caught as duplicates.
     check_true("rcbc_dup_caught", cg_check_fails_p(
         "fn f(c: Char) -> Int { match c { 'a'..'z' => 1, 97..122 => 2, _ => 0 } }\n f('a')"));
-    // Out of byte range, and a NAMED bound, both stay type errors (v1: literal bounds only).
+    // Out of byte range, and a NAMED bound, both stay type errors (the Char retyping applies to literal bounds only).
     check_true("rcbc_out_of_range_rejected",
         cg_check_fails_p("fn f(c: Char) -> Int { match c { 256..300 => 1, _ => 0 } }\n f('a')"));
     check_true("rcbc_const_bound_rejected", cg_check_fails_p(
@@ -6938,7 +6988,7 @@ void test_std_set() {
     check_true("set_gate_rejects", p_fails("let s: Set[Int] = Set::new()\n s.size()"));
     check_true("set_gate_ok",     !p_fails(U + "let s: Set[Int] = Set::new()\n s.size()"));
 
-    // insert / dedup / size / membership / remove (method syntax, S2).
+    // insert / dedup / size / membership / remove (method syntax).
     check_int_p("set_insert_dedup",
         U + "let mut s: Set[Int] = Set::new()\n s.insert(1)\n s.insert(2)\n s.insert(2)\n s.insert(3)\n s.size()", 3);
     check_bool_p("set_insert_new", U + "let mut s: Set[Int] = Set::new()\n s.insert(5)", true);
@@ -7130,7 +7180,7 @@ void test_std_random() {
         catch (...) { return false; }
     };
     // Gating: `Rng` without `use std::random` is out of scope -> a CheckFailure. The constructor is
-    // now an associated fn, so the gate is on the TYPE name rather than a bare fn name.
+    // an associated fn, so the gate is on the TYPE name rather than a bare fn name.
     check_true("random_gate_rejects", p_fails("let mut r = Rng::fromSeed(1)\n r.nextU32()"));
     check_true("random_gate_ok",     !p_fails(U + "let mut r = Rng::fromSeed(1)\n r.nextU32()"));
 
@@ -7218,7 +7268,7 @@ void test_std_random() {
             "push(v, 1) push(v, 2) push(v, 3) push(v, 4) push(v, 5) push(v, 6)\n r.shuffle(v)\n"
             "let mut s = 0\n let mut i = 0\n while i < len(v) { s = s + v[i] * (i + 1)\n i = i + 1 }\n s", true);
 
-    // ---- v1.1: nextGaussian (couples std::math) / choiceWeighted / sample ----
+    // ---- nextGaussian (couples std::math) / choiceWeighted / sample ----
     // nextGaussian: deterministic per seed; both signs occur; the scaled variant composes.
     check_int_p("random_gaussian_det",
         U + "let mut a = Rng::fromSeed(5)\n let mut b = Rng::fromSeed(5)\n if a.nextGaussian() == b.nextGaussian() { 1 } else { 0 }", 1);
@@ -7333,7 +7383,7 @@ void test_std_cli() {
 }
 
 // =============================================================================
-// std::hash -- opt-in non-crypto hashing. v1: CRC-32 (IEEE/zlib). Pure Skarn, deterministic; KATs are
+// std::hash -- opt-in non-crypto hashing: CRC-32 (IEEE/zlib). Pure Skarn, deterministic; KATs are
 // the canonical CRC-32 check values.
 // =============================================================================
 void test_std_hash() {
@@ -7412,11 +7462,10 @@ void test_std_net() {
     //
     // The port is **chosen by the OS** (`tcpListen(0)` + `tcpLocalPort`), never hardcoded. Windows
     // hands out 1024-60000 as the dynamic/ephemeral range (`netsh int ipv4 show dynamicport tcp`),
-    // so ANY fixed number here can already be held by an unrelated outbound connection -- observed
-    // as an intermittent `tcpListen: bind failed (WSA error 10013)` on the old port 47812,
-    // with an unrelated HTTPS socket sitting in TIME_WAIT on it. That made the suite randomly red for
-    // a reason having nothing to do with the code under test. Asking the OS is not a smaller race, it
-    // is no race: bind succeeds, THEN we read back the port it granted.
+    // so ANY fixed number here can already be held by an unrelated outbound connection (e.g. an HTTPS
+    // socket in TIME_WAIT), which fails intermittently with `tcpListen: bind failed (WSA error 10013)`
+    // for a reason having nothing to do with the code under test. Asking the OS is not a smaller race,
+    // it is no race: bind succeeds, THEN we read back the port it granted.
     const std::string prog =
         "use std::net::*\n"
         "fn roundtrip() -> Result[String, String] {\n"
@@ -7470,8 +7519,8 @@ void test_std_net() {
 }
 
 // =============================================================================
-// std::regex -- the opt-in byte-level Pike-VM regex engine, pure prelude (S1: compile / isMatch /
-// find / findFrom). A `use std::regex::*` prefix + gate pair, then KAT triples. isMatch cases use
+// std::regex -- the opt-in byte-level Pike-VM regex engine, pure prelude (compile / isMatch /
+// find / findFrom first). A `use std::regex::*` prefix + gate pair, then KAT triples. isMatch cases use
 // check_bool_p; find cases encode start*1000+end as an Int (-1 = no match); plus check_same diffs.
 // =============================================================================
 void test_std_regex() {
@@ -7545,7 +7594,7 @@ void test_std_regex() {
     check_same("rx_diff_anchored",
         U + "match Regex::compile(\"^[A-Za-z_][A-Za-z0-9_]*$\") { Ok(r) => if r.isMatch(\"valid_ID9\") { 1 } else { 0 }, Err(_) => 0 - 1 }", true);
 
-    // ---- S2: captures / named groups / lazy iterators / replace -------------
+    // ---- captures / named groups / lazy iterators / replace -----------------
     // Capture spans, encoded start*1000 + end (-1 unmatched / -2 no match).
     auto capg = [&](const char* re, const char* s, int g) {
         return U + "match Regex::compile(\"" + re + "\") { Ok(r) => match r.captures(\"" + s +
@@ -7601,7 +7650,7 @@ void test_std_regex() {
     check_same("rx_diff_splitcount",
         U + "match Regex::compile(\"[ ]+\") { Ok(r) => count(r.splitRe(\"the  quick brown   fox\")), Err(_) => 0 - 1 }", true);
 
-    // ---- S3: non-greedy / counted / shorthands / word boundary / flags ------
+    // ---- non-greedy / counted / shorthands / word boundary / flags ----------
     // `im` (above) folds a pattern+text -> Bool; `imf` adds a flags string.
     auto imf = [&](const char* re, const char* fl, const char* s) {
         return U + "match Regex::compileWith(\"" + re + "\", \"" + fl + "\") { Ok(r) => r.isMatch(\"" + s + "\"), Err(_) => false }";
@@ -7780,7 +7829,7 @@ void test_codegen_generic_traits() {
     // materializes `iter(b)` to a Vec and index-walks it.
     // NOTE: `for` drives the RING iteration protocol (std::iter Iterator/IntoIterator/Iterable), so a
     // user type opts in by implementing the RING `Iterable` (Rust's model). These use the real prelude
-    // (check_int_p) and impl the ring trait -- a user's own parallel `trait Iterable` no longer drives `for`.
+    // (check_int_p) and impl the ring trait -- a user's own parallel `trait Iterable` does not drive `for`.
     check_int_p("gtrait_for_user",
         "struct Bag { items: Vec[Int] }\n"
         "impl Iterable[Int] for Bag { fn iter(self) -> Vec[Int] { self.items } }\n"
@@ -7802,10 +7851,10 @@ void test_codegen_generic_traits() {
         "len(toVec([7, 8, 9]))", 3);
 }
 
-// ---- regression: checker forward-ref to a generic type's arity --------------
+// ---- checker forward-ref to a generic type's arity ---------------------------
 // A generic type referenced by an EARLIER-declared type must see the right arity.
-// register_names pre-sizes the arity in pass 1a (syntactic); before the fix a forward
-// reference saw arity 0 ("type 'Stream' expects 0 type argument(s), got 1").
+// register_names pre-sizes the arity in pass 1a (syntactic); otherwise a forward
+// reference sees arity 0 ("type 'Stream' expects 0 type argument(s), got 1").
 void test_check_forward_generic() {
     std::cout << "[check: forward-ref generic arity]\n";
     // Mutually recursive GENERIC types: Step[T] references Stream[T] declared AFTER it.
@@ -7819,15 +7868,15 @@ void test_check_forward_generic() {
         "struct Stream[T] { x: T }", "type argument"));
 
     // Part B: a generic-param bound may reference a LATER sibling type param
-    // (`I`'s bound names `T`, declared after) -- order-independent, previously over-rejected.
+    // (`I`'s bound names `T`, declared after) -- order-independent.
     check_true("sibling_bound_forward_ref", check_errc(
         "trait Iterable[T] { fn iter(self) -> Vec[T] }\n"
         "fn f[I: Iterable[T], T](x: I) -> Int { 0 }") == 0);
-    // The already-working direction (earlier sibling) stays green.
+    // The other direction (earlier sibling).
     check_true("sibling_bound_backward_ref", check_errc(
         "trait Iterable[T] { fn iter(self) -> Vec[T] }\n"
         "fn g[T, I: Iterable[T]](x: I) -> Int { 0 }") == 0);
-    // Part A: an impl referencing a LATER-declared trait resolves clean (regression lock).
+    // Part A: an impl referencing a LATER-declared trait resolves clean.
     check_true("forward_trait_in_impl", check_errc(
         "impl[X] Iterable[X] for List[X] { fn iter(self) -> Vec[X] { let mut v: Vec[X] = vec()\n for x in self { push(v, x) }\n v } }\n"
         "trait Iterable[T] { fn iter(self) -> Vec[T] }") == 0);
@@ -7838,11 +7887,11 @@ void test_check_forward_generic() {
         "fn f[T, T](x: Int) -> Int { 0 }", "duplicate type parameter"));
 }
 
-// ---- regression: 0-argument indirect call return-value frame slot -----------
+// ---- 0-argument indirect call return-value frame slot ------------------------
 // A non-tail 0-arg indirect call (e.g. a `next()` on a fn-valued field) reads its
-// result at r[frame_size]; validate_frames used to widen only by nargs, so nargs==0
-// left the result read one register out of bounds ("touches rN, frame_size N"). This
-// blocked EVERY heap-value-through-a-loop/TCO shape (the whole lazy-stream pattern).
+// result at r[frame_size], so validate_frames widens by max(nargs, 1); widening by nargs
+// alone leaves the result read one register out of bounds ("touches rN, frame_size N")
+// and blocks EVERY heap-value-through-a-loop/TCO shape (the whole lazy-iterator pattern).
 void test_codegen_indirect_return() {
     std::cout << "[codegen: 0-arg indirect call return slot]\n";
 
@@ -7896,9 +7945,9 @@ void test_codegen_indirect_return() {
         "sum_if(range_s(0, 100000).next(), 0)", 4999950000LL);
 }
 
-// Register-pressure "torture" cluster for the frame-sizing emitter self-check (Tier-1 item 2).
-// These exercise the local-allocation paths that were previously UNGUARDED (the `for`-loop
-// cursor/len/idx/(k,v) slot locals) plus heap values held across a loop and a many-binding match.
+// Register-pressure "torture" cluster for the frame-sizing emitter self-check.
+// These exercise the guarded local-allocation paths (the `for`-loop cursor/len/idx/(k,v) slot
+// locals) plus heap values held across a loop and a many-binding match.
 // Correct results here prove the guards/asserts do not mis-fire and the walkers match the emitter;
 // a future walker under-count would trip either the alloc_local/alloc_temp guard (at the site) or
 // the result comparison.
@@ -7906,7 +7955,7 @@ void test_codegen_frame_selfcheck() {
     std::cout << "[codegen: frame-sizing emitter self-check]\n";
 
     // (1) `for (k, v) in map` -- the Map for-branch allocates mapl/karr/varr/len/idx + the (k,v)
-    //     slot locals (all previously unguarded). Sum is iteration-order-independent.
+    //     slot locals. Sum is iteration-order-independent.
     check_int("selfcheck_map_kv",
         "let m = #{1 => 10, 2 => 20, 3 => 30}\n"
         "let mut s = 0\n"
@@ -7941,8 +7990,8 @@ void test_codegen_frame_selfcheck() {
         "len(v)", 4);
 
     // Int->Double coercion boundaries (each widens a NON-temp Int -- a local/param -- via an extra
-    // I2D temp; these previously under-sized the frame at the unvalidated top level). The results
-    // prove the measure now matches the emitter at every boundary.
+    // I2D temp, which the measure must reserve even at the top level). The results prove the measure
+    // matches the emitter at every boundary.
     check_dbl("selfcheck_coerce_mixed",  "let n = 3\n n + 0.5", 3.5);          // arithmetic operand
     check_dbl("selfcheck_coerce_let",    "let n = 3\n let d: Double = n\n d", 3.0);   // let boundary
     check_dbl("selfcheck_coerce_assign",                                        // ident-assign boundary
@@ -8167,7 +8216,7 @@ struct DiffOutcome {
         Unsupported,  // the oracle declines BY DESIGN (map dump order / a non-differentiable native)
                       //   -> honest skip, not a pass
         OracleGap     // the oracle LACKS the construct -> a failure: the differential silently stopped
-                      //   covering it, which is how the old reference-`==` bug survived (RefEval.h)
+                      //   covering it, so a defect there would survive unnoticed (RefEval.h)
     } kind;
     std::string vm_desc;   // "<value>  out=..." or "<fault> msg"  (for Agree/Disagree)
     std::string rf_desc;
@@ -8176,8 +8225,8 @@ struct DiffOutcome {
 
 // A COMPILE failure (svc::compile / parse_check throws) is kept SEPARATE from a runtime fault:
 // a program that does not type-check cannot be differentially tested at run time. Scoring "both
-// paths fail to compile" as agreement is a false green (it once masked trait method-dot corpus
-// entries that never compiled), so a compile failure is its own outcome, never Agree.
+// paths fail to compile" as agreement is a false green (it would mask corpus entries that never
+// compile), so a compile failure is its own outcome, never Agree.
 // Fixed, deterministic fixtures for the differentiable natives (refeval::NativeEnv). The SAME values
 // feed the VM (args/stdin via execute(); env via the process) and the oracle, so a native call agrees
 // iff the codegen lowering is correct. The env var is set once on first use.
@@ -8270,7 +8319,7 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
     return o;
 }
 
-// ---- Shrinker (Slice 2c) -----------------------------------------------------------------
+// ---- Shrinker ----------------------------------------------------------------------------
 // A greedy line-deletion minimizer: given a source that FAILS a predicate, repeatedly try
 // deleting each single line and keep any deletion that STILL fails, to a fixpoint. It reduces
 // a random generator monster to a small repro a human can paste into test_torture.
@@ -8315,8 +8364,8 @@ std::string shrink_failure(const std::string& src, bool with_prelude, DiffOutcom
 }
 
 // String interpolation (`"…${e}…"`) -- a pure parser desugar to a `toString`/`+` chain. Scalar holes
-// are already differentially covered (RefEval handles scalar `toString`/`+`); container-hole dumps get
-// their own RefEval mirror in S2. These smoke tests lock the lexer/parser end-to-end incl. recursion.
+// are already differentially covered (RefEval handles scalar `toString`/`+`); container-hole dumps have
+// their own RefEval mirror. These smoke tests lock the lexer/parser end-to-end incl. recursion.
 void test_interpolation() {
     std::cout << "\n[test_interpolation]\n";
     auto throws = [](const std::string& s) {
@@ -8356,7 +8405,7 @@ void test_interpolation() {
     check_same("diff_interp_nested", "let x = 3\n\"a ${ \"b${x}\" } c\"", false);
     check_same("diff_interp_mix",    "let a = 1\nlet b = true\n\"a=${a} b=${b}\"", false);
 
-    // S2 -- container-hole differentials (graded-(c) render_dump vs the VM TO_STRING dump). check_same
+    // Container-hole differentials (graded-(c) render_dump vs the VM TO_STRING dump). check_same
     // asserts the two backends AGREE, so these self-validate the ordered-dump mirror (Maps excluded).
     check_same("diff_interp_struct",   "struct P { a: Int, b: Int }\nlet p = P { a: 1, b: 2 }\n\"${p}\"", false);
     check_same("diff_interp_strfield", "struct S { name: String, n: Int }\nlet s = S { name: \"hi\", n: 4 }\n\"${s}\"", false);
@@ -8397,7 +8446,7 @@ void test_interpolation() {
     check_str("interp_spec_strlit", cg_run_out("println(\"${\"hi\":s}\")"),                   "hi\n");
     check_str("interp_spec_strhex", cg_run_out("println(\"${\"hi\":>5}\")"),                  "   hi\n");
 
-    // v2 spec holes through the desugar (sign '+', '#' alt-form, scientific 'e')
+    // More spec holes through the desugar (sign '+', '#' alt-form, scientific 'e')
     check_str("interp_spec_plus", cg_run_out("let n = 7\nprintln(\"${n:+}\")"),               "+7\n");
     check_str("interp_spec_alt",  cg_run_out("let n = 255\nprintln(\"${n:#x}\")"),            "0xff\n");
     check_str("interp_spec_sci",  cg_run_out("let d = 1234.5\nprintln(\"${d:.2e}\")"),        "1.23e3\n");
@@ -8417,8 +8466,9 @@ void test_interpolation() {
 }
 
 // ---- format specifiers: the `Format` trait behind `${e:spec}` (and the direct `format(x, spec)` call).
-// v1 grammar [[fill]align]['0'][width]['.'precision][type]; scalars only; inapplicable field ignored;
-// negative non-decimal bases are sign-magnitude. Pure prelude Skarn -> the oracle runs it as-is (S3). ----
+// Grammar [[fill]align]['+']['#']['0'][width]['.'precision][type]; scalars only; inapplicable field
+// ignored; negative non-decimal bases are sign-magnitude. Pure prelude Skarn -> the oracle runs it
+// as-is. ----
 void test_format() {
     std::cout << "\n[test_format]\n";
     auto fmt = [](const char* v, const char* s) {
@@ -8459,7 +8509,7 @@ void test_format() {
     // empty spec on a scalar = identity-ish (no width) -- callable directly
     check_str("fmt_empty",    fmt("7", ""),       "7\n");
 
-    // ---- v2: sign '+', '#' alternate form, scientific 'e'/'E' ----
+    // ---- sign '+', '#' alternate form, scientific 'e'/'E' ----
     // sign flag '+' (force a leading '+' on non-negatives; '-' still wins)
     check_str("fmt_plus_pos",  fmt("42",   "+"),    "+42\n");
     check_str("fmt_plus_neg",  fmt("-42",  "+"),    "-42\n");
@@ -8531,12 +8581,12 @@ void test_string_iter() {
 // ---- growable register + return stacks: deep NON-TAIL recursion ----
 // Runs through execute(), which enables growth (vm.resources). `n + sumTo(n-1)` is non-tail
 // (the add happens AFTER the call returns) -> no TCO -> real register + return stack growth.
-// Depths far past the old fixed ~16384-frame cap must now succeed with the exact value; a
+// Depths far past the initial 16384-frame commit must succeed with the exact value; a
 // mis-committed base or a stale root during a grow would corrupt the result or crash.
 void test_deep_recursion() {
     std::cout << "\n[test_deep_recursion]\n";
     const std::string sumTo = "fn sumTo(n: Int) -> Int { if n <= 0 { 0 } else { n + sumTo(n - 1) } }\n";
-    // 20000 > the old 16384 return-frame cap -> forces grow_ret (and grow_reg). n*(n+1)/2.
+    // 20000 > the initial 16384 return frames -> forces grow_ret (and grow_reg). n*(n+1)/2.
     check_int_p("deep_rec_20k",  sumTo + "sumTo(20000)",  200010000LL);
     // 100000 -> several doublings of BOTH stacks; the exact value proves no corruption.
     check_int_p("deep_rec_100k", sumTo + "sumTo(100000)", 5000050000LL);
@@ -8778,8 +8828,8 @@ void test_mut_receiver() {
         cg_check_fails("struct P { x: Int }\n trait S { fn m(self) -> Int }\n"
                        " impl S for P { fn m(self) -> Int { self.x = 1\n self.x } }\n m(P { x: 0 })"));
 
-    // -- Route B (mut-in-signature): a `mut` parameter is ENFORCED at the CALL SITE. Passing a NAMED
-    //    binding to a mutating builtin/fn/`mut self` method now requires that binding be `mut` --
+    // -- mut-in-signature: a `mut` parameter is ENFORCED at the CALL SITE. Passing a NAMED
+    //    binding to a mutating builtin/fn/`mut self` method requires that binding be `mut` --
     //    unifying push with the `a[i] = v` rule. A temporary/rvalue argument stays exempt. --
 
     // A mutating builtin (`push`) demands a `mut` receiver binding; the non-`mut` form is rejected.
@@ -8824,7 +8874,7 @@ void test_mut_receiver() {
         check_has("trait N { fn nm(self) -> Int }\n trait B { fn bump(self) -> Int }\n"
                   " impl[T: N] B for T { fn bump(mut self) -> Int { nm(self) } }",
                   "takes `mut self` but trait 'B' declares `self`"));
-    // The original hole, end to end: this used to compile and print 2.
+    // End to end: accepted, this would print 2 (a non-`mut` `s` mutated through the impl).
     check_true("mut_impl_adds_mut_hole_closed",
         cg_check_fails("struct S { x: Int }\n trait T { fn f(self) -> () }\n"
                        " impl T for S { fn f(mut self) -> () { self.x = 2 } }\n"
@@ -8873,12 +8923,11 @@ void test_torture() {
     check_same("torture_nested_for",
         "let mut total = 0\n"
         " for i in [1, 2, 3] { for j in [10, 20] { for k in [100, 200] { total = total + i * j + k } } }\n total");
-    // Regression: a closure LITERAL directly as a call argument inside a `for` body, its result
-    // consumed by the enclosing expression. This once crashed the CHECKER -- a use-after-free:
-    // check_expr held `expected` BY REFERENCE into the scope vector, and inferring the closure
-    // define()d its param, reallocating that vector and dangling the reference (fixed by taking
-    // `expected` by value in Check.cpp). Capturing + non-capturing, List + Array below; the
-    // differential oracle cross-checks each value.
+    // A closure LITERAL directly as a call argument inside a `for` body, its result consumed by the
+    // enclosing expression. Inferring the closure define()s its param and may reallocate the scope
+    // vector, so check_expr must not hold `expected` BY REFERENCE into it (a use-after-free in the
+    // checker). Capturing + non-capturing, List + Array below; the differential oracle cross-checks
+    // each value.
     check_same("torture_closure_in_for",
         "let base = 100\n fn ap(f: fn(Int) -> Int, x: Int) -> Int { f(x) }\n"
         " let mut s = 0\n for i in [1, 2, 3, 4] { s = s + ap(fn(n: Int) -> Int { n + base }, i) }\n s");
@@ -8912,15 +8961,15 @@ void test_torture() {
         "impl IntoIterator[Int] for Bag { fn intoIter(self) -> dyn Iterator[Int] { BagCur { v: self.items, i: 0 } } }\n"
         "let mut v: Vec[Int] = vec()\n push(v, 3)\n push(v, 4)\n push(v, 5)\n"
         "let b = Bag { items: v }\n let mut s = 0\n for x in b { s = s + x }\n for x in b { s = s + x }\n s", true);
-    // The dissolved prelude combinators (range/map/filter/sum/collect over dyn Iterator), cross-checked
-    // against the reference interpreter -- which now drives the Iterator protocol on the runtime head.
+    // The prelude combinators (range/map/filter/sum/collect over dyn Iterator), cross-checked
+    // against the reference interpreter -- which drives the Iterator protocol on the runtime head.
     check_same("diff_stream_pipeline",
         "sum(map(filter(range(0, 20), fn(x: Int) -> Bool { x % 2 == 0 }), fn(x: Int) -> Int { x * 3 }))", true);
     check_same("diff_stream_collect",
         "let w: Vec[Int] = collect(map(range(0, 5), fn(x: Int) -> Int { x + 1 }))\n w[0] + w[4]", true);
     check_same("diff_stream_take_drop",
         "sum(take(drop(range(0, 100), 3), 4))", true);   // 3+4+5+6 = 18
-    // -- combinators round 2, cross-checked against the reference interpreter --
+    // -- more combinators, cross-checked against the reference interpreter --
     check_same("diff_comb_takeWhile",
         "sum(takeWhile(range(0, 20), fn(x: Int) -> Bool { x < 5 }))", true);
     check_same("diff_comb_dropWhile",
@@ -8981,14 +9030,13 @@ void test_torture() {
         "count(words(\"  a  bb   ccc \")) * 10 + count(split(\"a  b\", \" \"))", true);
     check_same("diff_words_for",
         "let mut n = 0\n for w in words(\" \\t a bb \\n ccc \") { n = n + len(w) }\n n", true);
-    // Regression: pop() on a field argument (frame under-measure fixed in builtin_extra_slots).
+    // pop() on a field argument (the frame measure in builtin_extra_slots must cover it).
     check_same("diff_pop_field",
         "struct Stk { xs: Vec[Int] }\n let mut s = Stk { xs: push(push(vec(), 3), 4) }\n"
         " match pop(s.xs) { Some(x) => x, None => 0 - 1 }", true);
-    // Regression (found by the generator): a lambda body that references a BUILTIN (`len`/`array`)
-    // while also capturing an outer local. The capture analysis's `is_global_name` omitted builtins,
-    // so it tried to capture `len` as a local and aborted codegen. Fixed by adding builtins to the
-    // globals set. The lambda here uses len+array AND captures `n`.
+    // A lambda body that references a BUILTIN (`len`/`array`) while also capturing an outer local.
+    // The capture analysis's `is_global_name` must count builtins as globals, or it tries to capture
+    // `len` as a local and aborts codegen. The lambda here uses len+array AND captures `n`.
     check_same("torture_lambda_uses_builtin",
         "fn ap(f: fn(Int) -> Int, x: Int) -> Int { f(x) }\n"
         " let n = 3\n ap(fn(k: Int) -> Int { len(array(5, n)) + k }, 7)");
@@ -8999,10 +9047,9 @@ void test_torture() {
         "enum T { A(Int), B(Int, Int), C }\n"
         " fn f(t: T) -> Int { match t { A(x) => match x { 0 => 100, _ => x * 2 }, B(x, y) => x + y, C => match 1 { _ => 7 } } }\n"
         " f(A(0)) + f(A(5)) + f(B(3, 4)) + f(C)");
-    // Regression (found by the generator, seed 34): a `match` whose SCRUTINEE is itself a match
-    // stacks scrutinee locals, but the measure_* walk measured the scrutinee at `base` instead of
-    // `base+1` (the scrutinee local is allocated first) -> frame under-count -> emitter self-check
-    // abort. Fixed in the Match measure. Nested 3 deep here.
+    // A `match` whose SCRUTINEE is itself a match stacks scrutinee locals, so the measure_* walk
+    // must measure the scrutinee at `base+1` (the scrutinee local is allocated first); at `base` the
+    // frame is under-counted and the emitter self-check aborts. Nested 3 deep here.
     check_same("torture_match_scrutinee_nested",
         "let x: Int = (match (match (match 0 { _ => 7 }) { _ => 8 }) { _ => 9 })\n x");
 
@@ -9102,11 +9149,11 @@ void test_torture() {
         " while k < 5 { push(items, Item { v: next(c) })\n k = k + 1 }\n"
         " let mut s = 0\n for it in items { s = s + wt(it) }\n s");
 
-    // -- regression: `for` over a CONTAINER expression that itself needs a local (a match/if element).
+    // -- `for` over a CONTAINER expression that itself needs a local (a match/if element).
     // compile_for allocates the loop-var slots + the destination local (cur/mapl/arr) BEFORE compiling
-    // the iterable into it, so the iterable's own transient locals sit above them; measure_for used to
-    // measure the iterable at plain `base`, under-counting the frame by nvars+1 (nvars+3 for Iterable).
-    // Found by the generator (31/1000 seeds). Fixed in measure_expr(For)'s `pre_iter` offset. --
+    // the iterable into it, so the iterable's own transient locals sit above them; measure_expr(For)
+    // measures the iterable at a `pre_iter` offset -- at plain `base` it would under-count the frame by
+    // nvars+1 (nvars+3 for Iterable). --
     check_same("torture_for_list_match_elem",   // List path (cursor)
         "struct S1 { f0: Int }\n let mut a = 0\n"
         " for x in [S1 { f0: (match 1 { 0 => 10, _ => 20 }) }, S1 { f0: 5 }] { a = a + x.f0 }\n a");
@@ -9118,11 +9165,10 @@ void test_torture() {
         "struct S1 { f0: Int }\n let b = 1\n let c = 2\n let d = 3\n let mut a = 0\n"
         " for x in [S1 { f0: (match b { 0 => c, _ => d }) }] { a = a + x.f0 }\n a");
 
-    // -- Slice B (full pattern surface). The generator emitted a bare struct-literal MATCH SCRUTINEE
-    // (`match S { .. } { .. }`) which collides with the arm `{` (the Rust-style restriction) -- a
-    // generator syntax bug, fixed by parenthesizing the scrutinee. These pin the compiler+oracle on
-    // the parenthesized-scrutinee, guarded, nested-pattern, and destructuring-let shapes the corpus
-    // previously only exercised over VARIABLE scrutinees. --
+    // -- Full pattern surface. A bare struct-literal MATCH SCRUTINEE (`match S { .. } { .. }`)
+    // collides with the arm `{` (the Rust-style restriction), so the scrutinee is parenthesized.
+    // These pin the compiler+oracle on the parenthesized-scrutinee, guarded, nested-pattern, and
+    // destructuring-let shapes, beyond VARIABLE scrutinees. --
     check_same("torture_match_structlit_scrut",
         "struct S1 { f0: Int, f1: Double }\n"
         " (match (S1 { f0: 7, f1: 2.5 }) { S1 { f0: a, f1: b } => a })");
@@ -9136,7 +9182,7 @@ void test_torture() {
     check_same("torture_destructure_let_tuple",
         "let (a, b) = (11, 22)\n a * 10 + b");
 
-    // -- Slice C (mut self / mut param): mutate a heap struct in place through a mut param and a
+    // -- mut self / mut param: mutate a heap struct in place through a mut param and a
     // devirtualized mut-self method, then OBSERVE the caller-visible effect. Pins the generated shape. --
     check_same("torture_mut_param_observe",
         "struct S1 { f0: Int }\n fn setf(mut p: S1, v: Int) -> Int { p.f0 = v\n v }\n"
@@ -9146,19 +9192,19 @@ void test_torture() {
         " impl Bump for S1 { fn bump(mut self) -> Int { self.f0 = self.f0 + 1\n self.f0 } }\n"
         " let mut s = S1 { f0: 10 }\n let mut a = 0\n for i in [0, 1, 2] { bump(s)\n a = a + s.f0 }\n a");
 
-    // -- Slice F (generics breadth). A TAIL call whose args are bare locals FOLLOWED by an aggregate
-    // literal with a temp-needing element (`take(a, a, (S1 { f0: 5 }, 7))`). The tail path forces every
-    // arg into a held temp, so the aggregate stacks above the two held local-copies; need_call used to
-    // count only na>0 args as held, under-measuring the frame -> emitter self-check CodegenFail. Found
-    // by the property generator (seed 48474); fixed by need_call's tail-safe `++held` bound. --
+    // -- Generics breadth. A TAIL call whose args are bare locals FOLLOWED by an aggregate literal
+    // with a temp-needing element (`take(a, a, (S1 { f0: 5 }, 7))`). The tail path forces every arg
+    // into a held temp, so the aggregate stacks above the two held local-copies; need_call's tail-safe
+    // `++held` bound counts them -- counting only na>0 args under-measures the frame and the emitter
+    // self-check reports a CodegenFail. --
     check_same("torture_tail_call_aggregate_arg",
         "struct S1 { f0: Int }\n fn take(a: Int, b: Int, p: (S1, Int)) -> Int { a + b + (p.0).f0 + p.1 }\n"
         " fn g(a: Int) -> Int { take(a, a, (S1 { f0: 5 }, 7)) }\n g(3)");
 
     // -- Struct-literal SHORTHAND inside a FUNCTION body. `FieldInit::value` is null for shorthand,
-    // and the inliner's body scan dereferenced it unguarded -> a hard CRASH of the compiler on any
-    // fn containing `S { x }`. It never fired because both guide-claim fixtures use shorthand only
-    // at TOP LEVEL, which build_inline_targets does not scan. Mixed with an explicit field and with
+    // so the inliner's body scan must guard it -- unguarded, it crashes the compiler on any fn
+    // containing `S { x }`. Shorthand at TOP LEVEL does not reach it, because build_inline_targets
+    // does not scan top-level code. Mixed with an explicit field and with
     // `..base`, so a future scan that walks the field list learns all three shapes at once.
     // These are value checks against the RefEval oracle,
     // so they are meaningful in BOTH modes; run the suite with `--sroa` to exercise the transform.
@@ -9189,7 +9235,7 @@ void test_torture() {
 
     // ESCAPE: read inside a LAMBDA body. `p.f0` there LOOKS like a field read, but the body is
     // lifted into its own function where `p` arrives as a by-value capture -- emit_capture_source
-    // MOVs the whole register. Found by the dissolved-binding guard on the probe's first run.
+    // MOVs the whole register.
     check_same("torture_sroa_escape_lambda_capture",
         "struct S3 { f0: Int, f1: Int }\n"
         " fn q() -> Int { let p = S3 { f0: 5, f1: 6 }\n let g = fn() -> Int { p.f0 + p.f1 }\n g() }\n q()");
@@ -9227,40 +9273,41 @@ void test_torture() {
         "struct SD { f0: Double, f1: Double }\n"
         " fn q() -> Double { let p = SD { f0: 3, f1: 4 }\n p.f0 * p.f0 + p.f1 * p.f1 }\n q()");
 
-    // -- SROA slices S2 (an expansion as a dissolvable PRODUCER) and S3 (a dissolved argument
-    // bound to a FIELD-ONLY parameter). Both are only reachable with inlining on, which is the
+    // -- SROA across inlining: an expansion as a dissolvable PRODUCER, and a dissolved argument
+    // bound to a FIELD-ONLY parameter. Both are only reachable with inlining on, which is the
     // shipping default; `--sroa` turns the transform itself on. --
 
-    // S2: the initializer is a CALL whose callee body ENDS in a struct literal, so the expansion
+    // Producer: the initializer is a CALL whose callee body ENDS in a struct literal, so the expansion
     // writes the caller's field registers and the callee's result object is never built.
     check_same("torture_sroa_producer_is_expansion",
         "struct S3 { f0: Int, f1: Int, f2: Int }\n"
         " fn mk(a: Int) -> S3 { S3 { f0: a, f1: a * 2, f2: a * 3 } }\n"
         " fn q() -> Int { let p = mk(4)\n p.f0 + p.f1 + p.f2 }\n q()");
 
-    // S2's EXPLODE fallback: the callee has an early `return`, so it has two exits and cannot feed
+    // The producer's EXPLODE fallback: the callee has an early `return`, so it has two exits and cannot feed
     // N destinations. The binding must fall back to an ordinary object, not miscompile.
     check_same("torture_sroa_producer_two_exits",
         "struct S3 { f0: Int, f1: Int }\n"
         " fn mk(a: Int) -> S3 { if a < 0 { return S3 { f0: 0, f1: 0 } }\n S3 { f0: a, f1: a + 1 } }\n"
         " fn q() -> Int { let p = mk(7)\n p.f0 + p.f1 }\n q()");
 
-    // S3: the dissolved binding is passed to a method whose `self` is only ever field-read, so the
-    // parameter is bound to the same field registers instead of an object being rebuilt.
+    // Field-only parameter: the dissolved binding is passed to a method whose `self` is only ever
+    // field-read, so the parameter is bound to the same field registers instead of an object being
+    // rebuilt.
     check_same("torture_sroa_param_field_only",
         "struct S3 { f0: Int, f1: Int, f2: Int }\n"
         " impl S3 { fn tot(self) -> Int { self.f0 + self.f1 + self.f2 } }\n"
         " fn q() -> Int { let p = S3 { f0: 1, f1: 2, f2: 3 }\n p.tot() + p.f0 }\n q()");
 
-    // S3 in TAIL position. `p.tot()` as the body's tail takes the TCO path, so the expansion is
-    // declined and the binding must be REBUILT there. This is the case the dissolved-binding guard
-    // caught; without the rebuild it is a hard compile error, with a wrong rebuild a wrong value.
+    // Field-only parameter in TAIL position. `p.tot()` as the body's tail takes the TCO path, so the
+    // expansion is declined and the binding must be REBUILT there; without the rebuild it is a hard
+    // compile error (the dissolved-binding guard), with a wrong rebuild a wrong value.
     check_same("torture_sroa_param_tail_position",
         "struct S3 { f0: Int, f1: Int }\n"
         " impl S3 { fn tot(self) -> Int { self.f0 + self.f1 } }\n"
         " fn q() -> Int { let p = S3 { f0: 11, f1: 12 }\n p.tot() }\n q()");
 
-    // S2+S3 together, the measured shape: build by expansion, then consume by expansion.
+    // Both together, the measured shape: build by expansion, then consume by expansion.
     check_same("torture_sroa_producer_then_consumer",
         "struct V { f0: Int, f1: Int }\n"
         " impl V { fn add(self, b: V) -> V { V { f0: self.f0 + b.f0, f1: self.f1 + b.f1 } }\n"
@@ -9284,7 +9331,7 @@ void test_torture() {
         " a.f0 + a.f1 + b.f0 + b.f1 + c.f0 + c.f1");
 }
 
-// The shrinker (Slice 2c). Its reduction ENGINE is tested against simple substring predicates
+// The shrinker. Its reduction ENGINE is tested against simple substring predicates
 // (independent of run_diff, so it is exercised even when no live compiler bug exists), plus one
 // end-to-end check that it integrates with run_diff without wandering off a passing program.
 void test_shrinker() {
@@ -9518,7 +9565,7 @@ void test_construct_coverage() {
 // The oracle's TWO ways of declining a program must stay apart -- that split is what stops the
 // differential from failing by silence (see the RefEval.h header comment). These lock the FAMILY-A
 // set: the only declines allowed to stay silent. A genuine gap needs no fixture of its own, because
-// it now turns the whole suite red by construction -- which is precisely the property being bought.
+// it turns the whole suite red by construction -- which is precisely the property being bought.
 void test_oracle_decline_categories() {
     std::cout << "\n[oracle decline categories]\n";
     auto kind = [](const std::string& src, bool pre) { return run_diff(src, pre).kind; };
@@ -9542,7 +9589,7 @@ void test_oracle_decline_categories() {
 
 void test_differential() {
     std::cout << "\n[test_differential]\n";
-    // Slice 1 -- core: literals, arithmetic + Int->Double coercion, control flow, let/mut/
+    // Core: literals, arithmetic + Int->Double coercion, control flow, let/mut/
     // assign, fns + recursion (small N). Each program returns a scalar the VM and the oracle
     // must agree on.
     check_same("diff_int_arith",       "1 + 2 * 3 - 4");
@@ -9585,7 +9632,7 @@ void test_differential() {
     check_same("diff_ret_double",      "fn g(n: Int) -> Double { n }\n g(3) + 0.25");
     check_same("diff_block_value",     "let r = { let a = 4\n let b = 5\n a * b }\n r + 1");
 
-    // Slice 2 -- data, patterns, containers, for.
+    // Data, patterns, containers, for.
     check_same("diff_struct_field",    "struct P { x: Int, y: Int }\n let p = P { x: 7, y: 9 }\n p.x + p.y");
     check_same("diff_struct_result",   "struct P { x: Int, y: Int }\n P { x: 1, y: 2 }");
     check_same("diff_struct_double",   "struct P { x: Double }\n let n = 3\n P { x: n }");
@@ -9715,7 +9762,7 @@ void test_differential() {
         "struct P { x: Int, y: Int }\n unwrap(Some(P { x: 5, y: 6 })).x", true);
     check_same("diff_panic_div0",      "let a = 10\n let b = 0\n a / b");
 
-    // Slice 3 -- closures, pipe, traits, `?`, prelude combinators, print.
+    // Closures, pipe, traits, `?`, prelude combinators, print.
     check_same("diff_lambda_nocap",    "fn ap(f: fn(Int) -> Int, x: Int) -> Int { f(x) }\n ap(fn(n: Int) -> Int { n * n }, 7)");
     check_same("diff_lambda_capture",  "let k = 10\n fn ap(f: fn(Int) -> Int, x: Int) -> Int { f(x) }\n ap(fn(n: Int) -> Int { n + k }, 5)");
     check_same("diff_lambda_ret_dbl",  "fn ap(f: fn(Int) -> Double, x: Int) -> Double { f(x) }\n ap(fn(n: Int) -> Double { n }, 4)");
@@ -9764,7 +9811,7 @@ void test_differential() {
     // Unwrap trait dispatched on a Result receiver -- the oracle must resolve the Result impl too.
     check_same("diff_unwrap_result",     "let r: Result[Int, Int] = Ok(88)\n unwrap(r)", true);
     check_same("diff_unwrapor_result",   "let a: Result[Int, Int] = Ok(4)\n let b: Result[Int, Int] = Err(1)\n unwrapOr(a, 0) + unwrapOr(b, 100)", true);
-    // Lazy Stream[T] (v1) -- the pull pipeline must agree with the tree-walking oracle (closures +
+    // Lazy iterators -- the pull pipeline must agree with the tree-walking oracle (closures +
     // mut-cursor source + tail-recursive fold). The oracle drives the SAME prelude source.
     check_same("diff_stream_range_sum", "sum(range(0, 10))", true);
     check_same("diff_stream_fold",
@@ -9851,15 +9898,13 @@ void test_differential() {
 } // namespace
 
 // =============================================================================
-// Phase-0 generational-GC benchmark (measurement only; `static_compiler_tests --bench [N]`).
+// GC benchmark (measurement only; `static_compiler_tests --bench [N]`).
 //
 // Runs a set of allocation-churn workloads on a fresh Heap and reports the GC
 // profile from Heap::GcStats: allocation volume, #collections, GC time / max
-// pause, and -- the decisive generational metric -- the AVERAGE SURVIVOR RATIO
-// per collection (low => most garbage dies young => a nursery pays off). It
-// changes NO collector behaviour; it only reads the counters. Run in RELEASE
-// (Debug adds verify_heap() to every collect(), inflating GC time). This is the
-// "measure-before-decide" gate for the write-barrier fork -- see the plan.
+// pause, and the AVERAGE SURVIVOR RATIO per collection (low => most garbage
+// dies young). It changes NO collector behaviour; it only reads the counters.
+// Run in RELEASE (Debug adds verify_heap() to every collect(), inflating GC time).
 // =============================================================================
 void bench_gc_one(const char* name, const std::string& src, uint32_t n) {
     (void)n; // reserved for a future per-workload N column
@@ -9946,8 +9991,8 @@ int main(int argc, char** argv) {
     // The banner records the mode so a stored sweep log cannot be compared against a run of the
     // other mode by accident.
     bool inline_mode = true;
-    // SROA is the same shape of knob but the opposite default: OFF is the shipping configuration
-    // while its slices land, so `--sroa` is what runs the load-bearing sweep for it. Scanned, not
+    // SROA is the same shape of knob but the opposite default: OFF is the shipping configuration,
+    // so `--sroa` is what runs the load-bearing sweep for it. Scanned, not
     // parsed positionally, for the same reason as the inline flags.
     bool sroa_mode = false;
     for (int i = 1; i < argc; ++i) {
@@ -9962,10 +10007,7 @@ int main(int argc, char** argv) {
     std::cout << "[codegen inlining: " << (inline_mode ? "ON (shipping default)" : "off")
               << " | sroa: " << (sroa_mode ? "ON" : "off (shipping default)") << "]\n";
 
-    // (The Phase-0 throwaway `--bench-barrier` per-store cost probe was removed after P4 --
-    // it had served its purpose: the precise remembered-set barrier it modelled is now the
-    // shipping generational barrier, validated by the GC-active differential sweep + vm_tests.)
-    // Phase-0 GC benchmark entry: `static_compiler_tests --bench [N]` (measurement only, no
+    // GC benchmark entry: `static_compiler_tests --bench [N]` (measurement only, no
     // collector change; run in Release). Separate from the gated test suite -- returns 0.
     if (argc > 1 && std::string(argv[1]) == "--bench") {
         uint32_t n = 1000000;

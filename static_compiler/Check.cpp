@@ -1,19 +1,22 @@
 // =============================================================================
 // Check.cpp -- the Skarn typechecker.
 //
-// STAGE 1 (this slice): signature collection + `resolve_type` + declaration-level
-// coherence. Two sub-passes over the item list:
-//   1a register_names   -- record every type / constructor / trait / function name
-//                          (duplicate detection), so mutually-recursive signatures
-//                          can refer to each other.
-//   1b resolve_signatures -- resolve every field / param / return `Type` to a
-//                          semantic `Ty` in the item's generic (+ `Self`) scope,
-//                          catching unknown-type / generic-arity errors.
-// Then check_traits (supertrait existence + acyclicity) and check_impls (coherence:
-// one impl per (trait,type), method presence/arity/self-ness, supertrait closure).
+// Two stages over the item list (`Checker::run`):
 //
-// No body checking yet -- fn/method bodies parse but are ignored until Stage 2.
-// The signature tables built here are members of `Checker`, reused by later stages.
+// SIGNATURES: module name mangling (`mangle_declarations`), then
+//   register_names     -- record every type / constructor / trait / function name
+//                         (duplicate detection), so mutually-recursive signatures
+//                         can refer to each other.
+//   resolve_signatures -- resolve every field / param / return `Type` to a
+//                         semantic `Ty` in the item's generic (+ `Self`) scope,
+//                         catching unknown-type / generic-arity errors.
+// Then check_traits (supertrait existence + acyclicity), check_impls (coherence:
+// one impl per (trait,type), method presence/arity/self-ness, supertrait closure)
+// and check_orphan.
+//
+// BODIES: check_bodies -- bidirectional, local checking of every fn / method / trait
+// default / const body and the top-level statements -- then drain_pending_generics.
+// The signature tables are members of `Checker`, shared by both stages.
 // =============================================================================
 
 #include "Check.h"
@@ -85,7 +88,7 @@ struct ParamOrigin {
 struct FnSig {
     std::vector<GenericInfo> generics;
     std::vector<TyPtr> params;
-    std::vector<bool> params_mut;   // per-param `mut` (Route B: enforced at the call site); empty = none
+    std::vector<bool> params_mut;   // per-param `mut` (enforced at the call site); empty = none
     TyPtr ret;
     ParamOrigin origin;             // declaration site of the params (diagnostics only)
     uint32_t line = 0, col = 0;
@@ -94,7 +97,7 @@ struct FnSig {
 struct MethodSig {
     std::string name;
     bool has_self = false;
-    bool self_mut = false;     // `mut self` receiver (Route B: enforced at the call site)
+    bool self_mut = false;     // `mut self` receiver (enforced at the call site)
     size_t param_count = 0;    // non-self params
     bool has_default = false;  // trait: a default body is present
     std::vector<GenericInfo> generics;
@@ -116,7 +119,7 @@ struct TraitInfo {
 
 struct ImplInfo {
     const ImplDecl* ast = nullptr;
-    std::string module;        // the impl's home module prefix (Slice 4 orphan rule; "" for root/prelude)
+    std::string module;        // the impl's home module prefix (orphan rule)
     std::string trait_name;
     std::vector<TyPtr> trait_args;   // the trait's type arguments (`impl[X] Iterable[X] for …`)
     std::vector<GenericInfo> generics;   // the impl's own type params (for matching: instantiate + unify target)
@@ -172,7 +175,7 @@ bool is_bitwise_op(TokKind op) {
 }
 
 // The VM's Int is 48-bit signed: [-2^47, 2^47 - 1]. A literal exceeding this wraps at
-// runtime, so the checker must reject it (H6). The negative bound is one larger in
+// runtime, so the checker must reject it. The negative bound is one larger in
 // magnitude, so a negative literal `-N` is validated against 2^47 (see infer_unary).
 static constexpr int64_t INT48_MAX     = 140737488355327LL;   //  2^47 - 1
 static constexpr int64_t INT48_NEG_MAG = 140737488355328LL;   //  2^47  (magnitude of MIN_48)
@@ -239,6 +242,7 @@ public:
         check_impls();
         check_orphan();
         check_bodies();
+        drain_pending_generics();
         finalize_diagnostics();
         return CheckResult{ std::move(errors_), std::move(warnings_) };
     }
@@ -274,7 +278,7 @@ private:
     std::unordered_map<std::string, EnumInfo>   enums_;
     std::unordered_map<std::string, VariantInfo> variants_;   // variant name -> info
     std::unordered_map<std::string, FnSig>      fns_;
-    std::unordered_map<std::string, TyPtr>      consts_;        // module const (mangled name -> resolved type; S0 const feature)
+    std::unordered_map<std::string, TyPtr>      consts_;        // module const (mangled name -> resolved type)
     // The const's INITIALIZER, mangled name -> the `ConstItem::value` node (never owned, never
     // written through). Needed by range-pattern bounds, which must know a bound's VALUE at check
     // time to build an exact Maranget con id. Mirrors Codegen's `const_defs_` and RefEval's, and is
@@ -283,7 +287,7 @@ private:
     // with the value actually emitted in a program that has other errors.
     std::unordered_map<std::string, const Expr*> const_values_;
     std::unordered_map<std::string, FnSig>      builtin_fns_;   // container-constructing builtins (P7b)
-    // Native-gating (stdlib split S3): the opt-in module each gated native belongs to. A native
+    // Native-gating: the opt-in module each gated native belongs to. A native
     // NOT in this map is AMBIENT (always available -- the ring natives parseInt/parseDouble/GC
     // introspection). A gated native (readFile in std::io, rawRun in std::process, ...) is callable
     // only from its own module, or where `use m::*` or `use m::name` brings it in (native_available).
@@ -299,7 +303,7 @@ private:
     std::unordered_map<std::string, std::optional<std::string>> object_safety_; // trait -> why it is NOT dyn-able
     std::unordered_map<std::string, bool> eq_memo_;   // structural-Eq cache, keyed by describe(ty) (see is_eq)
 
-    // Inherent (traitless) impls: `impl[T: bounds] Head[T] { fn m(self, …) … }` (S2). One record per
+    // Inherent (traitless) impls: `impl[T: bounds] Head[T] { fn m(self, …) … }`. One record per
     // target head; the method sigs are resolved against the impl's generics (shared ids with `target`).
     struct InherentInfo {
         std::vector<GenericInfo> generics;                        // impl[T: bounds]
@@ -317,8 +321,8 @@ private:
     std::unordered_map<std::string, TyPtr> cur_generic_env_;   // in-scope type params
     TyPtr cur_return_;
     // True while checking a module's TOP-LEVEL statements (not a fn / method / lambda body): a `return`
-    // there has no function to return from. It used to compile and emit a RET from the top-level frame,
-    // which crashed the VM with a wild read.
+    // there has no function to return from; lowered, it would emit a RET from the top-level frame,
+    // which the VM cannot survive.
     bool at_top_level_ = false;
     // One frame per enclosing loop (innermost last). `is_loop` marks a `loop` -- the only form
     // that may `break` with a VALUE (a `while`/`for` has a fall-through exit yielding unit, so a
@@ -351,13 +355,13 @@ private:
     const LambdaExpr* let_bound_lambda_ = nullptr;
     bool lambda_is_let_bound_ = false;
 
-    // ----- module scoping (Slice 2b) ----------------------------------------
+    // ----- module scoping ---------------------------------------------------------
     // `cur_module_` is the mangle prefix of the item currently being resolved / checked
-    // ("" for the root program + prelude, "util" / "net::http" for an imported module). A
-    // module's declared struct/enum/variant/fn names are registered under `prefix::name`,
-    // and references are resolved against the module's import environment (own decls +
-    // explicit `use` names + a bare/ambient fallback). Empty prefix = identity, so a
-    // single-module program is byte-identical (traits/impls stay bare in 2b -- deferred).
+    // (`$entry` for the entry program, "util" / "std::math" for a module, "" / `$prelude` for a
+    // bare scope). A module's declared struct/enum/variant/fn/const/trait names are registered
+    // under `prefix::name`, and references are resolved against the module's import environment
+    // (own decls + explicit `use` names + `use m::*` globs + a bare/ambient fallback). A bare
+    // scope mangles to identity (see `mangle_name`). Impls carry no name of their own.
     std::string cur_module_;
     std::unordered_map<std::string, std::unordered_set<std::string>> module_declared_;   // prefix -> its bare decl names
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> use_map_;   // prefix -> (bare -> mangled): explicit `use` (STRONG)
@@ -369,28 +373,26 @@ private:
     // module prefix -> the short variant names that collide within it (they are enum-qualified instead of
     // entering module_declared_), so check_explicit_uses can tell them apart from a name that is absent.
     std::unordered_map<std::string, std::unordered_set<std::string>> colliding_variants_;
-    // Visibility (S4): the MANGLED names of every `pub` (exported) item -- a pub struct/enum/fn/trait,
+    // Visibility: the MANGLED names of every `pub` (exported) item -- a pub struct/enum/fn/trait,
     // plus every VARIANT of a pub enum (variants inherit). A cross-module reference to a name NOT in
     // this set is rejected (default private). Empty-prefix / same-module names are always visible, so
     // this is consulted only when the referrer's module differs from the referent's (visible_across).
     std::unordered_set<std::string> pub_items_;
-    // Home module of each trait / user type (Slice 4, for the orphan rule). Traits stay bare
-    // (project-unique), so trait_module_ is keyed by the bare trait name; types are mangled, so
-    // type_module_ is keyed by the mangled `mod::Type`. A builtin type is in NEITHER map (foreign).
-    std::unordered_map<std::string, std::string> trait_module_;   // bare trait name -> its module
+    // Home module of each trait / user type (for the orphan rule), keyed by the MANGLED name
+    // (`mod::Trait`, `mod::Type`). A builtin type is in NEITHER map (foreign).
+    std::unordered_map<std::string, std::string> trait_module_;   // mangled trait name -> its module
     std::unordered_map<std::string, std::string> type_module_;    // mangled type name -> its module
 
-    // `prefix::name`, or bare `name` for the root (empty prefix) AND the prelude (its own scoping
-    // prefix mangles to bare, so prelude names stay ambient -- see PRELUDE_MODULE_PREFIX in Ast.h).
+    // `prefix::name`, or bare `name` for an empty prefix AND the prelude (its own scoping
+    // prefix mangles to bare, so prelude names stay ambient -- see PRELUDE_MODULE_PREFIX in Naming.h).
     static std::string mangle(const std::string& prefix, const std::string& name) {
         return mangle_name(prefix, name);   // single source of truth in Ast.h
     }
 
     // Resolve a bare struct/enum/variant/fn reference in the CURRENT module to its canonical
     // (mangled) name: an own declaration -> `cur_module::name`; a `use`-imported name -> its
-    // source module's mangled name; otherwise the bare name (a prelude / ambient / root name --
-    // Slice 2c tightens this to reject a genuinely-unimported user name). Identity when
-    // cur_module_ is empty, which keeps single-module programs unchanged.
+    // source module's mangled name; a `use m::*` glob name -> likewise; otherwise the bare name
+    // (a prelude / ambient name). Identity in a bare scope.
     std::string mangle_ref(const std::string& name) const {
         // Priority (Rust's weak-glob rule): own declaration > explicit `use` (both STRONG) >
         // `use m::*` glob (WEAK) > a bare ambient/prelude/root name.
@@ -408,15 +410,14 @@ private:
 
     // ----- shadowing an ambient name is MODULE-SCOPED -------------------------------------
     //
-    // Builtins, natives and trait-method names belong to no module, so they are never mangled. The
-    // ENTRY program used to carry the empty prefix and so mangled bare into that same namespace, and a
-    // whole-program `fns_` lookup let a single user definition disable the ambient name EVERYWHERE,
-    // including inside the sealed standard library: `fn toInt(x: Double) -> Int { 999 }` silently made
-    // `std::math::toIntChecked(3.9)` return `Ok(999)`. The entry now mangles to `$entry::name`
-    // (ENTRY_MODULE_PREFIX, Naming.h), so the only BARE declarations left are the monolithic dev
-    // prelude's (`--prelude <path>`, see bare_scope).
+    // Builtins, natives and trait-method names belong to no module, so they are never mangled. A
+    // BARE user declaration shares their namespace, and a whole-program `fns_` lookup would let one
+    // such definition disable the ambient name EVERYWHERE, including inside the sealed standard
+    // library (`fn toInt(x: Double) -> Int { 999 }` making `std::math::toIntChecked(3.9)` return
+    // `Ok(999)`). The entry program mangles to `$entry::name` (ENTRY_MODULE_PREFIX, Naming.h), so the
+    // only BARE declarations are the monolithic dev prelude's (`--prelude <path>`, see bare_scope).
     //
-    // The rule, still needed for that scope: a user fn shadows an ambient name only where that fn is
+    // The rule for that scope: a user fn shadows an ambient name only where that fn is
     // actually VISIBLE. A module-mangled key was resolved through an own declaration / `use`, so it is
     // in scope by construction; a BARE key is in scope only from a bare-mangling scope.
     bool is_ambient_name(const std::string& n) const {
@@ -528,7 +529,7 @@ private:
         return it != imported_prefixes_.end() && it->second.count(mod);
     }
 
-    // Visibility (S4): is the foreign (already-mangled) name `key` reachable from the current
+    // Visibility: is the foreign (already-mangled) name `key` reachable from the current
     // module? An ambient/prelude name (empty prefix or `$prelude`, both bare) and a same-module name
     // are always visible; any other module's name must be `pub`. Consulted only at CROSS-module
     // resolution (a `mod::name` qualifier or an imported name) -- a bare same-module ref never hits it.
@@ -543,7 +544,7 @@ private:
 
     // Resolve a possibly module-qualified type/ctor/struct reference to its canonical (mangled)
     // name. An EMPTY qualifier takes the ordinary `mangle_ref` path (own-decl > use > glob >
-    // ambient) -- so a bare reference (and thus a single-module program) is byte-identical. A
+    // ambient). A
     // MODULE qualifier (`mod::Name`, always a lident head from the parser) resolves to the
     // `mod::name` key (bare for the virtual `std`), with an import check. Clears `qualifier`
     // (it is consumed here; codegen reads only the written-back `name`). Mirrors the qualified
@@ -551,7 +552,7 @@ private:
     std::string resolve_qualified_ref(std::string& qualifier, const std::string& name,
                                       uint32_t line, uint32_t col) {
         if (qualifier.empty()) return mangle_ref(name);
-        if (!is_module_qualifier(qualifier)) {           // `Enum::Variant` (S1): uppercase enum head
+        if (!is_module_qualifier(qualifier)) {           // `Enum::Variant`: uppercase enum head
             std::string vk = resolve_qualified_variant(qualifier, name, line, col);
             qualifier.clear();
             return vk.empty() ? name : vk;               // on error the helper already reported; the
@@ -562,17 +563,17 @@ private:
             error(line, col, "module '" + mod + "' is not imported");
         qualifier.clear();
         const std::string key = is_std ? resolve_std(name) : (mod + "::" + name);
-        if (!is_std && !visible_across(key))                          // default private (S4)
+        if (!is_std && !visible_across(key))                          // default private
             error(line, col, "item '" + name + "' is private in module '" + mod + "'");
         return key;
     }
 
-    // Resolve a qualified enum-variant reference `Enum::Variant` (S1) to the variant's canonical
+    // Resolve a qualified enum-variant reference `Enum::Variant` to the variant's canonical
     // (mangled) key, verifying the variant actually belongs to the named enum. The `enum_qual` head
     // is an uppercase type name resolved in the current scope (own module / `use`-imported / ring),
     // so a variant of an imported enum reads as `Enum::Variant` once the enum type is in scope
     // (the parser carries a single qualifier segment -- `mod::Enum::Variant` is NOT a value path;
-    // cross-module variants come bare via `use mod::Enum::*`, added in S3). On any failure (head is
+    // cross-module variants come bare via `use mod::Enum::*`). On any failure (head is
     // not an enum / private / has no such variant) it reports a precise diagnostic and returns "".
     std::string resolve_qualified_variant(const std::string& enum_qual, const std::string& variant,
                                           uint32_t line, uint32_t col) {
@@ -599,7 +600,7 @@ private:
         return {};
     }
 
-    // S2: a BARE uppercase name that failed to resolve MAY be a collision-disambiguated variant
+    // A BARE uppercase name that failed to resolve MAY be a collision-disambiguated variant
     // (short name shared by >1 enum in the current module -> only enum-qualified keys exist). If so,
     // report an ambiguity with a `Enum::V` hint and return true; otherwise return false (let the
     // caller emit its ordinary "unknown" error). Detected purely from `variants_`, so no extra state.
@@ -627,6 +628,25 @@ private:
         explicit QuietGuard(int& depth) : d(depth) { ++d; }
         ~QuietGuard() { --d; }
     };
+
+    // A generic argument a call site could not yet decide, re-examined once every body has been
+    // checked (`drain_pending_generics`). A type argument is often fixed only AFTER the call that
+    // introduced it -- by a later argument (`fold(xs, Set::new(), fn(acc: Set[Int], x: Int) ...)`) or a
+    // later statement (`let mut s = Set::new()` then `s.insert(3)`). Discharging the bound at the call
+    // would test the still-flexible var against its OWN bounds, which passes vacuously, so the type
+    // fixed later (a non-Hashable `P` reaching `Map[P, Int]` through an unannotated binding) would never
+    // be checked; rejecting the call would refuse programs whose type IS fixed. Deferring avoids both.
+    // `bound.trait` empty = a bare "must be solved" record (an associated function's unbounded
+    // generic). Still unsolved at the drain = "cannot infer".
+    struct PendingGeneric {
+        TyPtr var;
+        Bound bound;
+        std::string generic;   // the type parameter's name, for the diagnostic
+        std::string what;      // the callee / constructed type, for the diagnostic
+        uint32_t line = 0, col = 0;
+        std::string module;
+    };
+    std::vector<PendingGeneric> pending_generics_;
 
     // `display_name` (Naming.h) is applied HERE -- the one choke point every checker diagnostic
     // passes through -- rather than at each of the ~40 sites that interpolate a possibly-mangled
@@ -693,21 +713,21 @@ private:
                structs_.count(n) || enums_.count(n);
     }
 
-    // ----- pass 0 (Slice 2b): module name mangling --------------------------
-    // Rewrite every module's declared struct/enum/variant/fn NAME to `prefix::name` in place
-    // on the AST -- so register_names, resolve_signatures, the body passes AND codegen all see
+    // ----- pass 0: module name mangling -------------------------------------
+    // Rewrite every module's declared struct/enum/variant/fn/const/trait NAME to `prefix::name` in
+    // place on the AST -- so register_names, resolve_signatures, the body passes AND codegen all see
     // the canonical (globally-unique) name. Records the per-module BARE declared-name sets and
     // builds the import environment (explicit `use` targets + imported module prefixes) that
-    // mangle_ref resolves references against. Empty-prefix (root/prelude) names are unchanged,
-    // so a single-module program is byte-identical. Traits/impls are NOT mangled in 2b.
+    // mangle_ref resolves references against. A bare scope (empty / `$prelude`) mangles to
+    // identity. Impls declare no name; they carry their module via ImplInfo.
     void mangle_declarations() {
         auto join = [](const std::vector<std::string>& p) {
             std::string s; for (size_t i = 0; i < p.size(); ++i) { if (i) s += "::"; s += p[i]; } return s;
         };
-        // S2 pre-scan: count each variant SHORT name per module across all enums. A short name
+        // Count each variant SHORT name per module across all enums. A short name
         // used by >1 enum in one module COLLIDES -> those variants get an enum-qualified key
         // (`mod::Enum::V`) instead of the plain `mod::V`, so they coexist (Rust model). A
-        // non-colliding variant keeps its plain key, so existing code stays byte-identical.
+        // non-colliding variant keeps its plain key.
         std::unordered_map<std::string, std::unordered_map<std::string, int>> vcount;
         for (auto& item : prog_.items)
             if (item->kind == ItemKind::Enum)
@@ -718,7 +738,7 @@ private:
             return vit != vcount.end() && vit->second.count(n) && vit->second.at(n) > 1;
         };
         auto is_upper = [](const std::string& s) { return !s.empty() && s[0] >= 'A' && s[0] <= 'Z'; };
-        std::unordered_map<std::string, std::vector<std::string>> enum_variant_keys;   // enumKey -> variant keys (S3)
+        std::unordered_map<std::string, std::vector<std::string>> enum_variant_keys;   // enumKey -> variant keys
         for (auto& item : prog_.items) {
             const std::string& P = item->module_prefix;
             switch (item->kind) {
@@ -737,7 +757,7 @@ private:
                     type_module_[e.name] = P;                 // home module (orphan rule)
                     if (item->is_pub) pub_items_.insert(e.name);
                     for (auto& v : e.variants) {
-                        if (variant_collides(P, v.name)) {              // S2: colliding short -> enum-qualified key
+                        if (variant_collides(P, v.name)) {              // colliding short -> enum-qualified key
                             colliding_variants_[P].insert(v.name);
                             v.name = e.name + "::" + v.name;           // e.name is already mangled here
                             // NOT added to module_declared_: the bare short is ambiguous (must qualify)
@@ -746,7 +766,7 @@ private:
                             v.name = mangle(P, v.name);
                         }
                         if (item->is_pub) pub_items_.insert(v.name);   // variants inherit the enum's visibility
-                        enum_variant_keys[e.name].push_back(v.name);   // S3: for `use mod::Enum::*`
+                        enum_variant_keys[e.name].push_back(v.name);   // for `use mod::Enum::*`
                     }
                     break;
                 }
@@ -769,7 +789,7 @@ private:
                     break;
                 case ItemKind::Use: {
                     auto& u = static_cast<UseItem&>(*item);
-                    if (!u.path.empty() && is_upper(u.path.back())) {   // S3: `use mod::Enum::(*|V|{...})`
+                    if (!u.path.empty() && is_upper(u.path.back())) {   // `use mod::Enum::(*|V|{...})`
                         std::vector<std::string> modsegs(u.path.begin(), u.path.end() - 1);
                         imported_prefixes_[P].insert(join(modsegs));    // the MODULE (enum-use expanded in pass 3)
                         break;
@@ -798,13 +818,13 @@ private:
             }
         }
 
-        // Second pass (Slice 2c): expand `use m::*` globs (WEAK) + the strong-vs-strong collision
+        // Second pass: expand `use m::*` globs (WEAK) + the strong-vs-strong collision
         // check -- now that every module's declared-name set and every explicit `use` are known.
         for (auto& item : prog_.items) {
             if (item->kind != ItemKind::Use) continue;
             auto& u = static_cast<UseItem&>(*item);
             const std::string& P = item->module_prefix;
-            if (!u.path.empty() && is_upper(u.path.back())) continue;   // S3 enum-use: expanded below
+            if (!u.path.empty() && is_upper(u.path.back())) continue;   // enum-use: expanded below
             if (u.glob) {                                            // `use m::*`: all of m's PUB names, weakly
                 const std::string src = join(u.path);
                 glob_modules_[P].insert(src);                        // + m's gated natives (native_available)
@@ -824,7 +844,7 @@ private:
             }
         }
 
-        // S3 pass: expand enum-variant uses `use mod::Enum::(* | V | {X, Y})` -- bring another
+        // Expand enum-variant uses `use mod::Enum::(* | V | {X, Y})` -- bring another
         // module's enum variants into scope by their SHORT name (glob = WEAK like a module glob;
         // explicit = STRONG). The enum's variant keys were gathered above (enum_variant_keys), so
         // this resolves the short name to the canonical (possibly collision-disambiguated) key.
@@ -978,9 +998,9 @@ private:
                 }
                 case ItemKind::Impl:
                 case ItemKind::Stmt:
-                case ItemKind::Import:   // module items: resolved by the loader/resolver (Slice 2)
+                case ItemKind::Import:   // module items: resolved by the loader and mangle_declarations
                 case ItemKind::Use:
-                    break;   // impls handled in check_impls; top-level stmts in Stage 2
+                    break;   // impls handled in check_impls; top-level stmts in check_bodies
             }
         }
     }
@@ -1154,7 +1174,7 @@ private:
             if (item->kind != ItemKind::Use) continue;
             const auto& u = static_cast<const UseItem&>(*item);
             if (u.glob || u.path.empty()) continue;
-            if (const char c = u.path.back()[0]; c >= 'A' && c <= 'Z') continue;   // `use m::Enum::{V}`: the S3 pass
+            if (const char c = u.path.back()[0]; c >= 'A' && c <= 'Z') continue;   // `use m::Enum::{V}`: the enum-variant use pass
             const std::string& P = item->module_prefix;
             const std::string src = join(u.path);
             if (src == P) continue;
@@ -1396,7 +1416,7 @@ private:
             for (Expr* a : args) infer(*a);
             return ty_error();
         }
-        require_mut_arg(args[0], "push (it mutates its receiver)");   // Route B: receiver must be `mut`
+        require_mut_arg(args[0], "push (it mutates its receiver)");   // receiver must be `mut`
         TyPtr t0 = apply(infer(*args[0]));
         if (t0->kind == TyKind::Named && t0->name == "Bytes") {
             check_expr(*args[1], ty_int());                 // a byte value (0..255, masked at run time)
@@ -1416,7 +1436,7 @@ private:
             for (Expr* a : args) infer(*a);
             return make_named(std_Option(), { ty_error() });
         }
-        require_mut_arg(args[0], "pop (it mutates its receiver)");   // Route B: receiver must be `mut`
+        require_mut_arg(args[0], "pop (it mutates its receiver)");   // receiver must be `mut`
         TyPtr t0 = apply(infer(*args[0]));
         if (t0->kind == TyKind::Named && t0->name == "Bytes")
             return make_named(std_Option(), { ty_int() });
@@ -1435,7 +1455,7 @@ private:
             for (Expr* a : args) infer(*a);
             return make_named("Bytes", {});
         }
-        require_mut_arg(args[0], "appendBytes (it mutates its destination)");   // Route B: dst must be `mut`
+        require_mut_arg(args[0], "appendBytes (it mutates its destination)");   // dst must be `mut`
         check_expr(*args[0], make_named("Bytes", {}));    // dst must be a Bytes buffer
         TyPtr t1 = apply(infer(*args[1]));
         const bool src_ok = t1->kind == TyKind::String ||
@@ -1454,7 +1474,7 @@ private:
             for (Expr* a : args) infer(*a);
             return make_named("Bytes", {});
         }
-        require_mut_arg(args[0], "_appendBytesRange (it mutates its destination)");   // Route B: dst must be `mut`
+        require_mut_arg(args[0], "_appendBytesRange (it mutates its destination)");   // dst must be `mut`
         check_expr(*args[0], make_named("Bytes", {}));
         check_expr(*args[1], make_named("Bytes", {}));
         check_expr(*args[2], ty_int());
@@ -1562,7 +1582,7 @@ private:
                     if (!is_std && !imported_by_current(dt.qualifier))
                         error(t.line, t.col, "module '" + dt.qualifier + "' is not imported");
                     key = is_std ? resolve_std(dt.trait) : (dt.qualifier + "::" + dt.trait);
-                    if (!is_std && !visible_across(key))              // default private (S4)
+                    if (!is_std && !visible_across(key))              // default private
                         error(t.line, t.col, "trait '" + dt.trait + "' is private in module '" + dt.qualifier + "'");
                 } else {
                     key = mangle_ref(dt.trait);
@@ -1682,7 +1702,7 @@ private:
                 case ItemKind::Const:  resolve_const(static_cast<const ConstItem&>(*item));   break;
                 case ItemKind::Stmt:   break;
                 case ItemKind::Import:                                                        // module items:
-                case ItemKind::Use:    break;                                                 // resolved in Slice 2
+                case ItemKind::Use:    break;                                                 // resolved in mangle_declarations
             }
         }
     }
@@ -1934,7 +1954,7 @@ private:
         std::vector<GenericInfo> gens = make_generics(im.generics, env, im.line, im.col);
         ImplInfo info;
         info.ast = &im;
-        info.module = im.module_prefix;   // for the orphan rule (Slice 4)
+        info.module = im.module_prefix;   // for the orphan rule
         const_cast<ImplDecl&>(im).trait_name = mangle_ref(im.trait_name);   // module-qualify (+ writeback)
         info.trait_name = im.trait_name;
         info.line = im.line; info.col = im.col;
@@ -2105,12 +2125,11 @@ private:
 
     // ----- impl coherence ---------------------------------------------------
 
-    // The ORPHAN RULE (Slice 4): an `impl Trait for Type` is allowed only if the TRAIT or the
+    // The ORPHAN RULE: an `impl Trait for Type` is allowed only if the TRAIT or the
     // target TYPE is local to the impl's own module -- so no module may add an impl of a foreign
-    // trait for a foreign type (which is where two modules could define conflicting impls). Single
-    // -module programs are unaffected: every prefix is "", so a root/prelude trait (module "") is
-    // always local and the check never fires. Builtins (Int/Vec/...) are foreign (in neither home
-    // map); a blanket impl's target is a type param, so it must satisfy trait-locality.
+    // trait for a foreign type (which is where two modules could define conflicting impls).
+    // Builtins (Int/Vec/...) are foreign (in neither home map); a blanket impl's target is a type
+    // param, so it must satisfy trait-locality.
     void check_orphan() {
         for (const auto& im : impls_) {
             cur_module_ = im.module;   // tag the orphan error with the impl's module
@@ -2139,7 +2158,7 @@ private:
         for (size_t i = 0; i < impls_.size(); ++i) {
             ImplInfo& im = impls_[i];
             cur_module_ = im.module;   // tag impl-coherence errors with the impl's module
-            if (im.ast && im.ast->is_inherent) {   // S2: traitless inherent impl -> its own registration
+            if (im.ast && im.ast->is_inherent) {   // traitless inherent impl -> its own registration
                 register_inherent(const_cast<ImplDecl&>(*im.ast));
                 continue;
             }
@@ -2177,7 +2196,7 @@ private:
                       std::to_string(im.trait_args.size()) + " type argument(s) but the trait declares " +
                       std::to_string(tit->second.generics.size()));
             if (im.is_blanket) {
-                // Blanket impls of a PARAMETRIC trait are deferred (decision 5): the trait args
+                // Blanket impls of a PARAMETRIC trait are not supported: the trait args
                 // would have to be solved per satisfying type, which the blanket path does not do.
                 if (!tit->second.generics.empty())
                     error(im.line, im.col, "a blanket impl of the parametric trait '" +
@@ -2275,7 +2294,7 @@ private:
         }
     }
 
-    // ===== body checking (Stage 2: bidirectional, core, monomorphic) ========
+    // ===== body checking ========
 
     // Thin wrappers over the solver.
     TyPtr apply(const TyPtr& t)                          { return tc_.apply(t); }
@@ -2392,7 +2411,7 @@ private:
 
     // Check every method body of an impl, with `self : <target>` and the impl's
     // generics (+ each method's own generics) in scope.
-    // S2: register a traitless inherent impl `impl[G] Head[..] { … }` -- resolve method sigs against
+    // Register a traitless inherent impl `impl[G] Head[..] { … }` -- resolve method sigs against
     // the impl's generics (shared ids with the target), enforce the orphan rule (Head local), forbid
     // erased targets, and detect a duplicate method / a second inherent block for the same head.
     void register_inherent(ImplDecl& im) {
@@ -2428,7 +2447,7 @@ private:
         ii.target = target;
         ii.line = im.line; ii.col = im.col;
         // `Self` names the impl target in a SIGNATURE too, not just in a body (`check_method_body`
-        // already binds it there). Without this an inherent `fn new(...) -> Self` was rejected with
+        // already binds it there). Without this an inherent `fn new(...) -> Self` would be rejected with
         // "'Self' is only valid inside a trait or impl" -- inside an impl. For a generic head `Self`
         // is `Box[T]` over the impl's own generic ids, which every call site substitutes anyway.
         env["Self"] = target;
@@ -2445,7 +2464,7 @@ private:
         inherent_[head] = std::move(ii);
     }
 
-    // S2: check the bodies of an inherent impl's methods (Self := target, `self` bound). No trait
+    // Check the bodies of an inherent impl's methods (Self := target, `self` bound). No trait
     // conformance -- there is no trait to promise a signature.
     void check_inherent_bodies(ImplDecl& im) {
         std::unordered_map<std::string, TyPtr> env;
@@ -2455,7 +2474,7 @@ private:
             if (mth.body) check_method_body(mth, self_ty, env);
     }
 
-    // S2: resolve an inherent-method call `recv.name(args)` -- instantiate the impl generics as fresh
+    // Resolve an inherent-method call `recv.name(args)` -- instantiate the impl generics as fresh
     // vars, solve them by unifying the impl target with the receiver, then check the non-self args.
     TyPtr call_inherent_method(const std::string& head, const std::string& name,
                                const TyPtr& recvTy, Expr* recvExpr,
@@ -2480,8 +2499,9 @@ private:
         check_args_two_pass(args, params, &ms.origin);
         for (size_t i = 0; i < args.size() && i < ms.params_mut.size(); ++i)
             if (ms.params_mut[i]) require_mut_arg(args[i], "a `mut` parameter");
-        discharge_bounds(ii.generics, m, node.line, node.col);
-        discharge_bounds(ms.generics, m, node.line, node.col);
+        const std::string what = name;
+        discharge_bounds(ii.generics, m, node.line, node.col, &what);
+        discharge_bounds(ms.generics, m, node.line, node.col, &what);
         return apply(ret);
     }
 
@@ -2503,10 +2523,10 @@ private:
     }
 
     // Verify an impl method's param/return types MATCH the trait's (after Self :=
-    // target). Closes the soundness hole where the impl could declare a different
-    // type than the trait promises -- a caller resolves via the trait signature, so
-    // a mismatch would let a wrongly-typed value through. (H4) Methods with their OWN
-    // generics are now checked too: the trait's and the impl's positional type params
+    // target). Otherwise the impl could declare a different type than the trait
+    // promises -- a caller resolves via the trait signature, so a mismatch would let
+    // a wrongly-typed value through. Methods with their OWN
+    // generics are checked too: the trait's and the impl's positional type params
     // are aligned to a shared set of rigid skolems, then the signatures are deep-
     // compared -- and the impl may only ASSUME bounds the trait guarantees to callers.
     void check_method_conformance(const ImplDecl& im, const Method& mth, const MethodSig& ms,
@@ -2514,7 +2534,7 @@ private:
                                   const std::vector<GenericInfo>& trait_generics,
                                   const std::vector<TyPtr>& trait_args,
                                   const std::unordered_map<std::string, TyPtr>& env) {
-        if (mth.params.size() != ms.params.size()) return;   // arity already reported in Stage 1
+        if (mth.params.size() != ms.params.size()) return;   // arity already reported while resolving signatures
         // An impl may DROP a `mut` the trait declares, but never ADD one. Every caller -- concrete, generic
         // or `dyn` -- enforces the call-site `mut` rule from the TRAIT signature (`require_mut_arg`), so an
         // impl-only `mut self` / `mut` parameter would mutate a caller's non-`mut` binding with no diagnostic.
@@ -2552,7 +2572,7 @@ private:
             TyPtr sk = tc_.rigid_var(ms.generics[i].name, {});
             sub[ms.generics[i].id]        = sk;
             e2[mth.generics[i].name]      = sk;
-            // Soundness: a caller discharges only the TRAIT method's bounds (H3), so
+            // Soundness: a caller discharges only the TRAIT method's bounds, so
             // the impl method may not ASSUME a bound the trait does not guarantee -- an
             // extra impl bound would let the body use an operation the caller never
             // proved. (Dropping a trait bound is safe; only ADDING one is unsound.)
@@ -2807,7 +2827,7 @@ private:
     // require `match`. All bindings inherit the `let`'s `mut`.
     //
     // `ctx` names the construct in every diagnostic ("let" or "for"): both callers share this binder,
-    // so a rejected `for` pattern used to advise the user about `'let'`.
+    // so a fixed word would advise a user with a rejected `for` pattern about `'let'`.
     //
     // The switch is EXHAUSTIVE (no `default:`) on purpose -- a new PatKind must be classified as
     // irrefutable or not, deliberately, rather than inheriting the refutable message by accident.
@@ -2926,9 +2946,9 @@ private:
         }
     }
 
-    // Route B (mut-in-signature): an argument bound to a `mut` parameter must, IF it is a named
+    // An argument bound to a `mut` parameter must, IF it is a named
     // lvalue (an ident / field / index path rooted in a local binding), have a `mut` root binding --
-    // exactly the M5 rule for `p.x = …` / `a[i] = …`. A temporary / rvalue arg is fine (a fresh
+    // exactly the rule for `p.x = …` / `a[i] = …`. A temporary / rvalue arg is fine (a fresh
     // value is trivially the caller's to mutate). Unifies push/field-assign/index-assign under one
     // mutation rule; runtime-neutral (checker-only). `what` names the callee for the diagnostic.
     void require_mut_arg(Expr* arg, const std::string& what) {
@@ -3004,8 +3024,8 @@ private:
                 }
                 // THE LAMBDA WRITE BARRIER. A capture is a by-value copy of the BINDING, so storing
                 // into the name inside a lambda could never be seen outside it -- there is no code to
-                // generate, which is why codegen used to die here with a message blaming a name that
-                // is in scope and `mut`. Reported BEFORE the mutability test on purpose: telling
+                // generate, and codegen would fail with a message blaming a name that is in scope and
+                // `mut`. Reported BEFORE the mutability test on purpose: telling
                 // someone to add `mut` to a captured binding is advice that cannot work.
                 //
                 // The discriminator is the TARGET FORM, not its root. `o.f = v` / `a[i] = v` through a
@@ -3042,7 +3062,7 @@ private:
                 return;
             }
         }
-        // A field / index lvalue: M5 requires the ROOT binding to be `mut` -- else a
+        // A field / index lvalue requires the ROOT binding to be `mut` -- else a
         // non-`mut` value could be mutated under the programmer via `p.x = …` / `a[i] = …`.
         if (a.target->kind == ExprKind::Field || a.target->kind == ExprKind::Index) {
             if (IdentExpr* root = assignment_root(a.target.get())) {
@@ -3129,7 +3149,7 @@ private:
         // A BOUNDED generic fn used as a value, checked against a concrete `fn(...)->R`:
         // monomorphize it here and discharge the bound against the (now concrete) expected
         // type -- the only sound way to give it away as a value (see check_bounded_fn_value).
-        // Outside a concrete-fn expected type the H2 rejection in infer_ident still stands.
+        // Outside a concrete-fn expected type the rejection in infer_ident still stands.
         if (e.kind == ExprKind::Ident) {
             auto& id = static_cast<IdentExpr&>(e);
             if (id.qualifier.empty() && !id.upper && !lookup(id.name)) {
@@ -3178,7 +3198,7 @@ private:
     // vars, like call_direct_fn), unify against the expected fn type, then discharge each bound
     // against the SOLVED type argument. Sound only because we require each bounded type param to
     // resolve to a concrete or rigid (bound-carrying) type -- an unsolved inference var is
-    // rejected, so a bound is never trivially passed (the H0 invariant). Sets `e.ty` to the
+    // rejected, so a bound is never trivially passed. Sets `e.ty` to the
     // now-monomorphic fn type.
     void check_bounded_fn_value(IdentExpr& id, const FnSig& sig, const TyPtr& expectedFn, Expr& e) {
         std::unordered_map<uint32_t, TyPtr> m;
@@ -3265,7 +3285,7 @@ private:
                     return ty_error();
                 }
                 const std::string key = is_std ? resolve_std(e.name) : (mod + "::" + e.name);
-                if (!is_std && !visible_across(key)) {       // default private (S4)
+                if (!is_std && !visible_across(key)) {       // default private
                     error(e.line, e.col, "item '" + e.name + "' is private in module '" + mod + "'");
                     return ty_error();
                 }
@@ -3292,7 +3312,7 @@ private:
                 error(e.line, e.col, "module '" + mod + "' has no value '" + e.name + "'");
                 return ty_error();
             }
-            if (e.upper) {                               // `Enum::Variant` used as a VALUE (S1)
+            if (e.upper) {                               // `Enum::Variant` used as a VALUE
                 std::string vkey = resolve_qualified_variant(e.qualifier, e.name, e.line, e.col);
                 if (vkey.empty()) return ty_error();
                 e.qualifier.clear(); e.name = vkey;
@@ -3307,7 +3327,7 @@ private:
             if (auto cit = consts_.find(ckey); cit != consts_.end() && cit->second) {
                 e.name = ckey; return const_ref_type(e, cit->second);
             }
-            if (report_if_ambiguous_variant(e.name, e.line, e.col)) return ty_error();   // S2: collision
+            if (report_if_ambiguous_variant(e.name, e.line, e.col)) return ty_error();   // collision
             TyPtr ct = infer_ctor_value(e);
             if (ct->kind != TyKind::Error) return ct;
             report_unknown_uppercase(e, ckey);
@@ -3321,7 +3341,7 @@ private:
         const std::string key = mangle_ref(e.name);   // a local shadows; else module-qualify
         if (const FnSig* usig = user_fn(key, &e)) {
             e.name = key;   // writeback: codegen resolves the fn value by this (mangled) name
-            // H2: a generic fn with trait bounds cannot become a first-class `Fn` value
+            // A generic fn with trait bounds cannot become a first-class `Fn` value
             // -- an `Fn` type has nowhere to record `T: Display`, so the bound would be
             // silently dropped and an unsatisfying type could slip through the eventual
             // indirect call. Reject (sound); direct calls still discharge via
@@ -3343,8 +3363,8 @@ private:
             return ty_error();
         }
         // A builtin or native is call-only: it lowers to an opcode / CALL_NATIVE, with no function object
-        // behind it. `map(toString)` used to report "unknown variable 'toString'" -- wrong on its face for
-        // a name the same program calls two lines later -- while `map(trim)`, a prelude fn, just works.
+        // behind it. Saying so beats "unknown variable 'toString'" for `map(toString)` -- wrong on its face
+        // for a name the same program calls two lines later -- while `map(trim)`, a prelude fn, just works.
         if (is_builtin_fn_name(e.name) || (native_id_of(e.name) >= 0 && native_available(e.name))) {
             error(e.line, e.col, "built-in function '" + e.name + "' can only be called, not used as a value "
                   "-- wrap it in a lambda, e.g. `fn(x: T) -> U { " + e.name + "(x) }`");
@@ -3366,14 +3386,12 @@ private:
     // Diagnose an uppercase name in VALUE position that resolved to no constructor. Kept out of
     // `infer_ctor_value` (a pure resolver with three callers, each wanting its own wording).
     //
-    // Reporting here at all is the fix for a real gap: the uppercase path used to return `ty_error()`
-    // SILENTLY, so `errors_` stayed empty, the program passed the checker, and codegen raised an
-    // unlocated `CodegenError: undefined variable 'X'` instead. In a multi-module program that
-    // carries no module id, so the caret landed on the WRONG FILE. Every other unknown name has been
-    // a located type error with a `use` hint for a long time; this one kind was not.
+    // It must REPORT: returning `ty_error()` silently would leave `errors_` empty, pass the program,
+    // and let codegen raise an unlocated `CodegenError: undefined variable 'X'` instead -- which in a
+    // multi-module program carries no module id, so the caret would land on the WRONG FILE.
     void report_unknown_uppercase(const IdentExpr& e, const std::string& key) {
         // A record struct is a real type -- it just needs its fields, so say that instead of
-        // "unknown" (codegen's own late message said as much; now it arrives located and on time).
+        // "unknown".
         if (auto sit = structs_.find(key); sit != structs_.end() && !sit->second.is_tuple) {
             error(e.line, e.col, "struct '" + e.name + "' needs field initializers -- write `" +
                   e.name + " { ... }`");
@@ -3471,7 +3489,7 @@ private:
         coerce_char_operand(*e.rhs, r, l);
         // An operand that is still an UNSOLVED flexible variable after an error was already reported is
         // almost always that error's shadow -- a lambda whose argument failed to check never gets its
-        // parameter type (`xs |> map(fn(x) { x * 2 })` with `xs` a Vec used to add "found T and Int").
+        // parameter type (`xs |> map(fn(x) { x * 2 })` with `xs` a Vec would add "found T and Int").
         // Only then is it treated like Error; with no earlier error the operator still reports it.
         const auto unsolved = [&](const TyPtr& t) { return t->kind == TyKind::Var && !t->rigid; };
         const bool anyErr = (l->kind == TyKind::Error || r->kind == TyKind::Error) ||
@@ -3527,7 +3545,7 @@ private:
                 } else if (!is_eq(j)) {
                     // Structural `==`: a value is comparable iff all its components are (see is_eq).
                     // A function/closure component, a trait object, or an unbounded type parameter
-                    // has no structural equality -- reject instead of the old silent reference compare.
+                    // has no structural equality -- reject rather than silently compare references.
                     error(e.line, e.col, "type " + tr(j) + " does not support '==' / '!=' "
                           "(it contains a function value, a trait object, or an unbounded type "
                           "parameter -- add a 'T: Eq' bound, compare fields directly, or use `match`)");
@@ -3570,7 +3588,7 @@ private:
                     return call_module_member(id, args, node);
                 }
                 callee.ty = ty_error();
-                if (id.upper) {                            // `Enum::Variant(...)` -- qualified ctor call (S1)
+                if (id.upper) {                            // `Enum::Variant(...)` -- qualified ctor call
                     std::string vkey = resolve_qualified_variant(id.qualifier, id.name, node.line, node.col);
                     if (vkey.empty()) { for (Expr* a : args) infer(*a); return ty_error(); }
                     id.qualifier.clear(); id.name = vkey;
@@ -3603,8 +3621,8 @@ private:
                         ? call_qualified_inherent(id, id.qualifier, args, node)
                         : call_associated_fn(id, id.qualifier, args, node, expected);
                 if (!traits_.count(id.qualifier)) {
-                    // Not a trait at all. Naming the head's actual kind beats the old blanket
-                    // "unknown trait 'Counter'", which sent the reader looking for a missing trait.
+                    // Not a trait at all. Naming the head's actual kind beats a blanket
+                    // "unknown trait 'Counter'", which sends the reader looking for a missing trait.
                     const std::string bare = short_name(id.qualifier);
                     if (structs_.count(id.qualifier) || enums_.count(id.qualifier))
                         error(node.line, node.col, "type '" + bare + "' has no method '" + id.name +
@@ -3625,11 +3643,11 @@ private:
                 if (auto sit = structs_.find(key); sit != structs_.end())
                     is_tuple_struct = sit->second.is_tuple;
                 if (is_variant || is_tuple_struct) {
-                    id.name = key;   // writeback for codegen; call_ctor now looks up the mangled name
+                    id.name = key;   // writeback for codegen; call_ctor looks up the mangled name
                     callee.ty = ty_error();
                     return call_ctor(id, args, node);
                 }
-                if (report_if_ambiguous_variant(id.name, node.line, node.col)) {   // S2: collision
+                if (report_if_ambiguous_variant(id.name, node.line, node.col)) {   // collision
                     for (Expr* a : args) infer(*a);
                     callee.ty = ty_error();
                     return ty_error();
@@ -3642,7 +3660,7 @@ private:
                 if (const FnSig* sig = user_fn(key, &id)) {
                     id.name = key;   // writeback for codegen
                     callee.ty = ty_error();
-                    return call_direct_fn(*sig, args, node, expected);
+                    return call_direct_fn(*sig, short_name(key), args, node, expected);
                 }
                 // push / pop are polymorphic over Vec AND Bytes (the VM's VEC_PUSH/VEC_POP are
                 // tri-kind), which one generic FnSig cannot express -- special-case before the
@@ -3655,7 +3673,7 @@ private:
                 if (id.name == "_appendBytesRange") { callee.ty = ty_error(); return check_append_bytes_range(args, node); }
                 // A container-constructing builtin (array / vec), an ambient native, or a GATED
                 // opt-in native. A gated native (readFile/rawRun/getEnv/...) requires its module to
-                // be in scope -- reject with a `use` hint otherwise (stdlib split S3).
+                // be in scope -- reject with a `use` hint otherwise.
                 if (auto bit = builtin_fns_.find(id.name); bit != builtin_fns_.end()) {
                     if (!native_available(id.name)) {
                         error(node.line, node.col, "native '" + id.name + "' requires `use " +
@@ -3665,7 +3683,7 @@ private:
                         return ty_error();
                     }
                     callee.ty = ty_error();
-                    return call_direct_fn(bit->second, args, node, expected);
+                    return call_direct_fn(bit->second, id.name, args, node, expected);
                 }
                 if (id.name == "len") { callee.ty = ty_error(); return check_len(args, node); }
                 if (id.name == "print")   { callee.ty = ty_error(); return check_print(args, node); }
@@ -3706,7 +3724,7 @@ private:
                 }
             }
         }
-        // Method-call syntax `recv.method(args)` (S1): a call whose callee is a (non-tuple) field
+        // Method-call syntax `recv.method(args)`: a call whose callee is a (non-tuple) field
         // access. FIELD-FIRST (a fn-valued field keeps working); otherwise resolve as a method.
         // The receiver is inferred exactly ONCE here and its type handed on -- see call_trait_method.
         TyPtr ct;
@@ -3747,11 +3765,11 @@ private:
         return false;
     }
 
-    // Resolve method-call syntax `recv.method(args)` (S1: trait methods). Builds [recv]+args and
+    // Resolve method-call syntax `recv.method(args)` to a trait method. Builds [recv]+args and
     // reuses `call_trait_method`, which infers the receiver (arg 0), checks the trait bound, and
     // solves the trait's type params from the receiver's impl.
     TyPtr method_call(const TyPtr& recvTy, FieldExpr& fld, const std::vector<Expr*>& args, Expr& node) {
-        // S2: an inherent method on the receiver's head takes precedence over a trait method (Rust
+        // An inherent method on the receiver's head takes precedence over a trait method (Rust
         // shadowing; the trait method stays reachable via `Trait::method(x)`). Only a method with
         // `self` is reachable this way -- an ASSOCIATED function has no receiver to dispatch on, so
         // it must NOT shadow a same-named trait method here (codegen's dot branch applies the same
@@ -3793,7 +3811,7 @@ private:
 
     // Instantiate a generic fn's scheme with fresh (bound-carrying) vars, check the
     // args, then discharge each generic's trait bounds against its solved type.
-    TyPtr call_direct_fn(const FnSig& sig, const std::vector<Expr*>& args, Expr& node,
+    TyPtr call_direct_fn(const FnSig& sig, const std::string& what, const std::vector<Expr*>& args, Expr& node,
                          TyPtr expected = nullptr) {
         std::unordered_map<uint32_t, TyPtr> m;
         for (const auto& g : sig.generics)
@@ -3812,14 +3830,13 @@ private:
         for (size_t i = 0; i < args.size() && i < sig.params_mut.size(); ++i)
             if (sig.params_mut[i]) require_mut_arg(args[i], "a `mut` parameter");
         // Pin a return-type-determined type parameter BEFORE discharging bounds. A nullary (or
-        // otherwise return-only) bounded generic -- e.g. `set[T: Hashable]()` assigned to a
-        // `Set[P]` -- fixes T solely through the expected type; without this pin, discharge would
-        // see the fresh var still carrying its own bound and satisfy it vacuously, so the real type
-        // argument (P) would escape the check. Best-effort: a genuine return-type mismatch is left
-        // for the caller's `subsumes` to report (we ignore the bool here). Only the check-mode Call
-        // path passes `expected`; every infer-mode caller passes null and behaves exactly as before.
+        // otherwise return-only) bounded generic -- e.g. `mkSet[T: Hashable]()` assigned to a
+        // `Set[P]` -- fixes T solely through the expected type; the pin solves it here, so the bound
+        // is discharged at once instead of being deferred to `drain_pending_generics`. Best-effort: a
+        // genuine return-type mismatch is left for the caller's `subsumes` to report (we ignore the
+        // bool here). Only the check-mode Call path passes `expected`; infer-mode callers pass null.
         if (expected) tc_.subsumes(apply(ret), apply(expected));
-        discharge_bounds(sig.generics, m, node.line, node.col);
+        discharge_bounds(sig.generics, m, node.line, node.col, &what);
         return apply(ret);
     }
 
@@ -3833,7 +3850,7 @@ private:
         // `std` is a VIRTUAL module = the ambient/prelude namespace (bare-named). `std::map`
         // resolves to the bare `map`, so a module that shadows a prelude name with a local one
         // can still reach the prelude version. It is always available (no import required) and its
-        // members are NOT mangled (prelude items stay bare). (Slice 3, pragmatic alias form.)
+        // members are NOT mangled (prelude items stay bare).
         const bool is_std = (mod == "std");
         if (!is_std && !imported_by_current(mod)) {
             error(node.line, node.col, "module '" + mod + "' is not imported");
@@ -3841,7 +3858,7 @@ private:
             return ty_error();
         }
         const std::string key = is_std ? resolve_std(id.name) : (mod + "::" + id.name);
-        if (!is_std && !visible_across(key)) {                        // default private (S4)
+        if (!is_std && !visible_across(key)) {                        // default private
             error(node.line, node.col, "item '" + id.name + "' is private in module '" + mod + "'");
             for (Expr* a : args) infer(*a);
             return ty_error();
@@ -3854,7 +3871,7 @@ private:
         }
         if (auto it = fns_.find(key); it != fns_.end()) {
             id.qualifier.clear(); id.name = key; id.upper = false;   // writeback for codegen
-            return call_direct_fn(it->second, args, node);
+            return call_direct_fn(it->second, short_name(key), args, node);
         }
         error(node.line, node.col, "module '" + mod + "' has no function or constructor '" + id.name + "'");
         for (Expr* a : args) infer(*a);
@@ -3899,7 +3916,8 @@ private:
             for (Expr* a : args) infer(*a);
         } else {
             check_args_two_pass(args, params);
-            discharge_bounds(G, m, node.line, node.col);
+            const std::string what = short_name(made_name);
+            discharge_bounds(G, m, node.line, node.col, &what);
         }
         std::vector<TyPtr> applied;
         for (const auto& t : targs) applied.push_back(apply(t));
@@ -3942,10 +3960,12 @@ private:
     // leniently accepted -- it is discharged against its OWN bounds, so a truly
     // unconstrained/unbounded type cannot be PROVEN to satisfy `b` and is rejected.
     // This is safe for completeness because every bounded generic is instantiated as
-    // a fresh var CARRYING its bounds (see `call_direct_fn` etc.), so a legitimately-
+    // a fresh var CARRYING its bounds (see `call_direct_fn` etc.), so an
     // unsolved-but-constrained var still discharges here; only a genuinely unbounded
     // unknown fails -- exactly the unsound case (the checker is the only guard once
-    // types erase).
+    // types erase). A var's own bounds say nothing about the type it is solved to LATER,
+    // which is why user-facing call sites never reach this with an unsolved argument:
+    // `discharge_bounds` defers those to `drain_pending_generics`.
     bool satisfies_bound(TyPtr ty, const std::string& b) {
         ty = apply(ty);
         if (ty->kind == TyKind::Error || ty->kind == TyKind::Never) return true;
@@ -4155,7 +4175,7 @@ private:
         if (selfTy->kind == TyKind::Var) {
             for (const auto& bd : selfTy->bounds)
                 if (bd.trait == trait) { out = bd.args; return true; }
-            return false;   // a parametric supertrait via a var bound is out of scope (decision 4)
+            return false;   // a parametric supertrait via a var bound is not supported
         }
         // A trait object carries its trait args written out (there is no impl to solve them
         // from) -- read them straight off, mirroring the Var branch above.
@@ -4178,7 +4198,7 @@ private:
     }
 
     // The IMPL ORACLE the solver asks to decide `sub <: dyn Trait[args]` (installed on `tc_` in
-    // run()). Reuses the H0-H6-hardened `satisfies_bound` for "does an impl exist", then -- for a
+    // run()). Reuses the hardened `satisfies_bound` for "does an impl exist", then -- for a
     // parametric trait -- solves the trait's args for `sub` from its impl and requires them to
     // MATCH what the trait object names: an `impl Iterable[Int] for Nums` coerces to
     // `dyn Iterable[Int]` but not to `dyn Iterable[String]`.
@@ -4230,9 +4250,14 @@ private:
     // bound's args are substituted through `m` so its OUTPUT vars are the fn's fresh vars,
     // solved here by impl-matching. The one reusable bound-checking site shared by every
     // call/constructor shape.
+    // `what` non-null = a USER-FACING call or construction site (named by `what` in a diagnostic): a
+    // bound whose type argument is still an unsolved flexible var is DEFERRED to
+    // `drain_pending_generics` instead of being discharged vacuously against the var's own bounds.
+    // Null = an internal discharge (the impl-bound step of `trait_args_for`, reached speculatively
+    // from the `dyn` oracle too), which keeps the immediate behaviour.
     void discharge_bounds(const std::vector<GenericInfo>& gens,
                           const std::unordered_map<uint32_t, TyPtr>& m,
-                          uint32_t line, uint32_t col) {
+                          uint32_t line, uint32_t col, const std::string* what = nullptr) {
         for (const auto& g : gens) {
             if (g.bounds.empty()) continue;
             auto it = m.find(g.id);
@@ -4242,11 +4267,79 @@ private:
                 Bound bi;
                 bi.trait = b.trait;
                 for (const auto& a : b.args) bi.args.push_back(tc_.substitute(a, m));
+                if (what && solved->kind == TyKind::Var && !solved->rigid) {
+                    defer_generic(it->second, std::move(bi), g.name, *what, line, col);
+                    continue;
+                }
                 if (!discharge_parametric_bound(solved, bi, line, col))
                     error(line, col, "type " + describe(solved) +
                           " does not satisfy the bound '" + describe_bound(bi) + "'");
             }
         }
+    }
+
+    // Record a generic argument to re-examine after all bodies are checked. Not inside a speculative
+    // region: its diagnostics are dropped there, so a record would outlive the probe that made it.
+    void defer_generic(const TyPtr& var, Bound bound, const std::string& generic, const std::string& what,
+                       uint32_t line, uint32_t col) {
+        if (quiet_depth_ > 0) return;
+        pending_generics_.push_back(PendingGeneric{ var, std::move(bound), generic, what, line, col, cur_module_ });
+    }
+
+    // Every type parameter of an associated-function call must end up solved -- by an argument, the
+    // expected type, or any later use of the result. A bounded one is already recorded by
+    // `discharge_bounds`; this adds the bare "must be solved" record for an unbounded one (with no
+    // receiver and no turbofish, an unsolved one would leak an unnamed var into the result type).
+    void require_solved_generics(const std::vector<GenericInfo>& gens,
+                                 const std::unordered_map<uint32_t, TyPtr>& m,
+                                 const std::string& what, uint32_t line, uint32_t col) {
+        for (const auto& g : gens) {
+            if (!g.bounds.empty()) continue;
+            auto it = m.find(g.id);
+            if (it == m.end()) continue;
+            TyPtr solved = apply(it->second);
+            if (solved->kind == TyKind::Var && !solved->rigid)
+                defer_generic(it->second, Bound{}, g.name, what, line, col);
+        }
+    }
+
+    // Re-examine the deferred generic arguments once every body is checked, i.e. once every use that
+    // could fix them has been seen. Solved: discharge the bound for real, reported at the ORIGINAL call
+    // site. Still unsolved: nothing in the program fixes the type, so it cannot be inferred -- unless
+    // other errors were reported, in which case an unsolved var is most likely their fallout (the same
+    // stance as the comparison check's `unsolved` guard).
+    // One root cause is reported ONCE, at its earliest site: the var a call introduced flows on into
+    // every later method call on the value (`let s = mkSet()` then `s.size()` re-instantiates the
+    // impl's `T` and unifies it with the same var), and each of those sites recorded it too.
+    void drain_pending_generics() {
+        const bool had_errors = !errors_.empty();
+        const std::string saved_module = cur_module_;
+        std::vector<PendingGeneric> pending = std::move(pending_generics_);
+        pending_generics_.clear();
+        std::stable_sort(pending.begin(), pending.end(), [](const PendingGeneric& a, const PendingGeneric& b) {
+            if (a.module != b.module) return a.module < b.module;
+            return a.line != b.line ? a.line < b.line : a.col < b.col;
+        });
+        std::unordered_set<uint32_t> unsolved_reported;   // by the var's representative
+        std::unordered_set<std::string> unsatisfied_reported;   // by (module, type, bound)
+        for (auto& p : pending) {
+            cur_module_ = p.module;
+            TyPtr solved = apply(p.var);
+            if (solved->kind == TyKind::Var && !solved->rigid) {
+                if (!had_errors && unsolved_reported.insert(solved->var_id).second)
+                    error(p.line, p.col, "cannot infer the type argument '" + p.generic + "' of '" +
+                          p.what + "'; add a type annotation");
+                continue;
+            }
+            if (p.bound.trait.empty()) continue;
+            if (!discharge_parametric_bound(solved, p.bound, p.line, p.col)) {
+                const std::string msg = "type " + describe(solved) +
+                                        " does not satisfy the bound '" + describe_bound(p.bound) + "'";
+                if (unsatisfied_reported.insert(p.module + '\x1f' + msg).second)
+                    error(p.line, p.col, msg);
+            }
+        }
+        cur_module_ = saved_module;
     }
 
     static std::string type_head(const TyPtr& t) {
@@ -4341,37 +4434,19 @@ private:
             if (ms.params_mut[i]) require_mut_arg(args[i], "a `mut` parameter");
         // Pin a return-type-determined type parameter BEFORE discharging bounds -- the same rule (and
         // the same one-liner) as `call_direct_fn`, and it matters MORE here: with no receiver, a head
-        // param like `Set[T]`'s T can be fixed by nothing else. See the rejection below for why the
-        // pin alone is not enough.
+        // param like `Set[T]`'s T has no other source at the call itself.
         if (expected) tc_.subsumes(apply(ret), apply(expected));
-        if (!reject_unsolved_generics(ii.generics, m, head, id.name, node) ||
-            !reject_unsolved_generics(ms.generics, m, head, id.name, node))
-            return ty_error();
-        discharge_bounds(ii.generics, m, node.line, node.col);
-        discharge_bounds(ms.generics, m, node.line, node.col);
+        // A type param nothing has fixed YET is not an error here: a later argument of an enclosing
+        // call or a later use of the result may still fix it (`fold(xs, Set::new(), fn(acc: Set[Int], ..)`).
+        // Its bound is deferred, and so is the requirement that it be solved at all (see
+        // `drain_pending_generics`), which keeps a bounded head param from satisfying its own bound
+        // vacuously. Scoped to this path: a METHOD's return-only generic is not required to be solved.
+        const std::string what = short_name(head) + "::" + id.name;
+        require_solved_generics(ii.generics, m, what, node.line, node.col);
+        require_solved_generics(ms.generics, m, what, node.line, node.col);
+        discharge_bounds(ii.generics, m, node.line, node.col, &what);
+        discharge_bounds(ms.generics, m, node.line, node.col, &what);
         return apply(ret);
-    }
-
-    // Every instantiated type param of an associated-function call must be SOLVED by the arguments
-    // or the expected type. Without this a still-flexible var slips through: `satisfies_bound`
-    // deliberately discharges an unsolved var against its OWN declared bounds, so a bounded head
-    // param (`Set[T: Hashable]`) would satisfy `Hashable` vacuously and the real type argument would
-    // never be checked -- the exact leak the `set[T: Hashable]()` fix closed for free functions. An
-    // unbounded one would simply leak an unnamed var into the result type. Scoped to this path: a
-    // METHOD's return-only generic is solved (or not) exactly as it is today.
-    bool reject_unsolved_generics(const std::vector<GenericInfo>& gens,
-                                  const std::unordered_map<uint32_t, TyPtr>& m,
-                                  const std::string& head, const std::string& name, Expr& node) {
-        for (const auto& g : gens) {
-            auto it = m.find(g.id);
-            if (it == m.end()) continue;
-            TyPtr solved = apply(it->second);
-            if (solved->kind != TyKind::Var || solved->rigid) continue;
-            error(node.line, node.col, "cannot infer the type argument '" + g.name + "' of '" +
-                  short_name(head) + "::" + name + "'; add a type annotation");
-            return false;
-        }
-        return true;
     }
 
     // A trait-method call `m(self, ...)` / `Trait::m(...)` / `x |> m`: instantiate the
@@ -4404,7 +4479,7 @@ private:
         TyPtr fresh_self = tc_.fresh_var();
         m[ti.self_id] = fresh_self;
         for (const auto& g : ti.generics) m[g.id] = tc_.fresh_var(g.name, g.bounds);   // trait type params (`Iterable[T]`)
-        for (const auto& g : ms->generics) m[g.id] = tc_.fresh_var(g.name, g.bounds);  // H3: carry bounds
+        for (const auto& g : ms->generics) m[g.id] = tc_.fresh_var(g.name, g.bounds);  // carry bounds
         std::vector<TyPtr> params;
         for (const auto& p : ms->params) params.push_back(tc_.substitute(p, m));
         TyPtr ret = tc_.substitute(ms->ret, m);
@@ -4442,7 +4517,7 @@ private:
         check_args_two_pass(rest, params, &ms->origin);
         for (size_t i = 0; i < rest.size() && i < ms->params_mut.size(); ++i)
             if (ms->params_mut[i]) require_mut_arg(rest[i], "a `mut` parameter");
-        discharge_bounds(ms->generics, m, node.line, node.col);   // H3: the method's OWN generic bounds
+        discharge_bounds(ms->generics, m, node.line, node.col, &methodName);   // the method's OWN generic bounds
         return apply(ret);
     }
 
@@ -4536,17 +4611,14 @@ private:
     //
     // The `reported` latch is the reason this is one helper instead of four copies. A failed join
     // deliberately does NOT advance `acc`, so every LATER element of the offending type collides with
-    // it again, and the NUMBER of diagnostics then depends on element ORDER: `[1, 2.0, 3]` reported
-    // once while `[2.0, 1, 3]` reported the identical message TWICE, and a match whose Double arm
-    // comes first reported it once per remaining Int arm.
+    // it again; without the latch the NUMBER of diagnostics would depend on element ORDER
+    // (`[2.0, 1, 3]` reporting the identical message twice where `[1, 2.0, 3]` reports it once).
     //
     // Reporting is also what keeps the fold SOUND, which is why `infer_map` must come through here
     // too. `join` yields `Error` on a mismatch and `Error` subsumes everything (`Solver.cpp:181`), so
-    // an Error type reaching an ACCEPTED program silences every later check on that value. `infer_map`
-    // used to fold keys and values with a bare `join` and NO report, so `#{1 => 7, 2 => 8.0}` inferred
-    // `Map[Int, Error]` and `let s: String = m[1]` was accepted -- an Int then flowed into a `String`
-    // binding on the erased runtime. That was a checker-accepts/unsound-bytecode hole, not a cosmetic
-    // one; the fix is simply that the mismatch is now REPORTED, after which nothing is lowered.
+    // an unreported Error type silences every later check on that value: with a bare `join`,
+    // `#{1 => 7, 2 => 8.0}` would infer `Map[Int, Error]` and accept `let s: String = m[1]`, putting
+    // an Int into a `String` binding on the erased runtime. A REPORTED mismatch means nothing is lowered.
     bool join_element(TyPtr& acc, const TyPtr& t, bool& reported, const std::string& what,
                       const std::string& first_note, const Expr* first_site, const Expr& here) {
         TyPtr j = tc_.join(acc, t);
@@ -4701,14 +4773,14 @@ private:
             join_element(v, infer(*e.entries[i].second), vReported, "map values", "this value has type ",
                          e.entries[0].second.get(), *e.entries[i].second);
         }
-        // `k` is now the FIRST key's type even on a mismatch, never `Error` -- so the key gate below
+        // `k` is the FIRST key's type even on a mismatch, never `Error` -- so the key gate below
         // asks about a real type instead of being silently satisfied by `Error`.
         require_hashable_key(k, e.line, e.col);
         warn_duplicate_map_keys(e);
         return make_named("Map", { apply(k), apply(v) });
     }
 
-    // ----- lambdas + check-position container literals (Stage 4) ------------
+    // ----- lambdas + check-position container literals ------------
 
     // A lambda with no expected type: every parameter must be annotated.
     TyPtr infer_lambda(LambdaExpr& l) {
@@ -4949,7 +5021,10 @@ private:
                 if (!seen.count(fn))
                     error(e.line, e.col, "missing field '" + fn + "' in literal for variant '" + e.name + "'");
 
-        if (eit != enums_.end()) discharge_bounds(eit->second.generics, m, e.line, e.col);
+        if (eit != enums_.end()) {
+            const std::string what = short_name(vi.enum_name);
+            discharge_bounds(eit->second.generics, m, e.line, e.col, &what);
+        }
         std::vector<TyPtr> applied;
         for (auto& a : targs) applied.push_back(apply(a));
         return make_named(vi.enum_name, std::move(applied));
@@ -5019,7 +5094,8 @@ private:
                     error(e.line, e.col, "missing field '" + fn + "' in literal for struct '" + e.name + "'");
         }
 
-        discharge_bounds(si.generics, m, e.line, e.col);   // enforce `struct S[T: Display]` at the literal
+        const std::string what = short_name(e.name);
+        discharge_bounds(si.generics, m, e.line, e.col, &what);   // enforce `struct S[T: Display]` at the literal
         std::vector<TyPtr> applied;
         for (auto& a : targs) applied.push_back(apply(a));
         return make_named(e.name, std::move(applied));
@@ -5079,8 +5155,8 @@ private:
         }
         // The frame is addressed by INDEX, never by a reference held across the value's check: a value
         // that contains a loop (`break loop { break 2 }`) pushes onto `loop_frames_`, and a reallocation
-        // left a reference dangling -- the outer join went to freed memory, the outer loop stayed `Never`,
-        // and `Never` subsumes every type (`let y: Int = <a String loop>` was accepted).
+        // would leave a reference dangling -- the outer join would go to freed memory, the outer loop would
+        // stay `Never`, and `Never` subsumes every type (`let y: Int = <a String loop>` would be accepted).
         const size_t fi = loop_frames_.size() - 1;
         const LoopFrame& fr = loop_frames_[fi];
         if (e.value) {
@@ -5236,7 +5312,7 @@ private:
         return ty_error();
     }
 
-    // ===== match + patterns (Stage 3) =======================================
+    // ===== match + patterns =======================================
 
     TyPtr infer_match(MatchExpr& e) {
         TyPtr scrut = apply(infer(*e.scrut));
@@ -5647,7 +5723,7 @@ private:
         }
         auto sit = structs_.find(s.name);
         if (sit == structs_.end()) {
-            if (!report_if_ambiguous_variant(short_name(s.name), s.line, s.col))   // S2: collision hint
+            if (!report_if_ambiguous_variant(short_name(s.name), s.line, s.col))   // collision hint
                 error(s.line, s.col, "unknown struct '" + s.name + "' in pattern");
             for (auto& fp : s.fields) if (fp.pat) check_pattern(*fp.pat, ty_error());
             return;
@@ -5976,10 +6052,9 @@ private:
                 return static_cast<BindPat&>(p).sub ? lower_pat(*static_cast<BindPat&>(p).sub, colTy)
                                                     : UPat{};
             case PatKind::Or: {
-                // A NESTED or-pattern (`Some(A | B)`, `(true | false, n)`) -- reachable since the
-                // parenthesized form shipped. It cannot be one row, so it lowers to a MARKER that
-                // expand_ors turns into one row per combination. Lowering just the first
-                // alternative, as this used to, silently under-approximates the row set.
+                // A NESTED or-pattern (`Some(A | B)`, `(true | false, n)`). It cannot be one row, so
+                // it lowers to a MARKER that expand_ors turns into one row per combination. Lowering
+                // just the first alternative would silently under-approximate the row set.
                 auto& op = static_cast<OrPat&>(p);
                 if (op.alts.empty()) return UPat{};
                 UPat u; u.wild = false; u.con = OR_MARKER;
@@ -6088,8 +6163,8 @@ private:
             if (is_or) for (auto& a : static_cast<OrPat&>(*head).alts) alts.push_back(a.get());
             else       alts.push_back(arm.pat.get());
 
-            // One SOURCE alternative can now contribute several rows (nested alternation), so the
-            // row -> alternative mapping is no longer the identity and has to be recorded: the
+            // One SOURCE alternative can contribute several rows (nested alternation), so the
+            // row -> alternative mapping is not the identity and has to be recorded: the
             // per-alternative warning below asks whether ALL of that alternative's rows are dead.
             std::vector<UPat> rows;
             std::vector<size_t> row_alt;

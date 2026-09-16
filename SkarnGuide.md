@@ -2672,10 +2672,14 @@ Rules and boundaries:
   turn shadows an inherent method — and since a field is not callable, that method is then reachable *only*
   as `Type::name(x)`. An **associated function** takes no part in this: it has no receiver, so it never
   shadows anything for `.` and is reached only as `Type::name(...)`.
-- **An associated function on a generic type needs its type argument fixed** by an argument, by an annotation,
-  or by the enclosing return type — there is no receiver to solve it from and no syntax to name it
-  explicitly. `Bag::of(1)` and `let b: Bag[Int] = Bag::empty()` are fine; a bare `let b = Bag::empty()` is
-  rejected as *cannot infer the type argument*.
+- **An associated function on a generic type needs its type argument fixed somewhere** — there is no receiver
+  to solve it from and no syntax to name it explicitly. An argument, an annotation or the enclosing return type
+  does it (`Bag::of(1)`, `let b: Bag[Int] = Bag::empty()`), and so does a later use in the same function body or script: another
+  argument of the enclosing call, as in `fold(xs, Bag::empty(), fn(acc: Bag[Int], x: Int) -> Bag[Int] { … })`,
+  or a later statement such as `b.add(3)`. Only when nothing fixes it is the call rejected as
+  *cannot infer the type argument*. A generic function with a bounded type parameter
+  (`fn mkSet[T: Hashable]() -> Set[T]`) follows the same rule, and its bound is checked against the type that is
+  fixed later.
 - **`.` and `|>` are complements, not rivals.** `.method()` reaches a type's methods; the pipe threads a value
   into *any* free function or builtin, which is what the lazy-iterator pipelines use:
   `xs |> intoIter |> map(f) |> filter(p) |> sum`. There is no `xs.map(f)` — `map`/`filter`/… are free
@@ -4169,7 +4173,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 
 | Function | Purpose |
 |----------|---------|
-| `Set::new()` / `Set::fromVec(v)` | an empty `Set[T]` — needs an annotation (`let s: Set[Int] = Set::new()`), since nothing else fixes `T` / a set of the distinct elements of a `Vec` |
+| `Set::new()` / `Set::fromVec(v)` | an empty `Set[T]` — `T` comes from how the set is used (`let mut s = Set::new()` then `s.insert(3)`), or from an annotation (`let s: Set[Int] = Set::new()`) when nothing uses it / a set of the distinct elements of a `Vec` |
 | `s.insert(x)` / `s.remove(x)` | add / delete `x` → `Bool` (was-new / was-present); `s` must be `mut` |
 | `s.isMember(x)` / `s.size()` | membership → `Bool` / cardinality → `Int` (both O(1)) |
 | `a.union(b)` / `a.intersect(b)` / `a.difference(b)` | the combined / common / left-only set |

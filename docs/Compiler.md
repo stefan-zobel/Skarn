@@ -139,6 +139,11 @@ branch types (in `if`, `match`, or the `break` values of a `loop`) is exact.
 ### Generics, traits and `dyn`
 
 - **Generics** are first-order and rank-1 with trait bounds. One body serves every instantiation.
+  - A type argument a call cannot yet decide is settled after the whole body has been checked, so it may be
+    fixed by a later argument of an enclosing call or by a later statement (`fold(xs, Set::new(), fn(acc:
+    Set[Int], x: Int) …)`). Its bounds are checked against that later type and reported at the call. A type
+    argument nothing fixes is an error for an associated function (`Type::f()`) and for a bounded type
+    parameter; an unbounded one of a free function may stay open.
 - **Traits** may be generic (`trait Iterable[T]`). A trait's type parameter can be solved as an output from the
   matching impl, which gives associated-type-like inference. Blanket impls (`impl[T: Show] Tr for T`) are
   allowed; a concrete impl wins over a blanket one.

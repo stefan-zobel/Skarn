@@ -1,0 +1,21 @@
+// CLAIM: the type argument of an associated function on a GENERIC head may be fixed by a LATER use,
+//        not only by the call's own arguments or an annotation: by another argument of the enclosing
+//        call (the lambda of `fold`), or by a later statement (the `add` call).
+// GUIDE: SkarnGuide.md 16 (method-call syntax and inherent methods)
+// EXPECT: ok 3 1
+struct Bag[T] { items: Vec[T] }
+
+impl[T] Bag[T] {
+    fn empty() -> Bag[T] { Bag { items: vec() } }
+    fn add(self, x: T) -> Bag[T] {
+        let mut v = clone(self.items)
+        push(v, x)
+        Bag { items: v }
+    }
+    fn size(self) -> Int { len(self.items) }
+}
+
+let numbers = fold([1, 2, 3] |> intoIter, Bag::empty(), fn(acc: Bag[Int], x: Int) -> Bag[Int] { acc.add(x) })
+let empty = Bag::empty()
+let words = empty.add("x")
+println("${numbers.size()} ${words.size()}")

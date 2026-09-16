@@ -1,0 +1,13 @@
+// CLAIM: a bound on a type parameter is checked against the type fixed LATER, not waved through at
+//        the call: a non-Hashable struct cannot reach a Map through an unannotated intermediate
+//        binding. A COMPILE error, caret on the call that introduced the type parameter.
+// GUIDE: SkarnGuide.md 16 (method-call syntax and inherent methods); Maps / hash identity
+// EXPECT: fail does not satisfy the bound 'std::core::Hashable'
+struct P { name: String }
+
+fn mkMap[K: Hashable, V]() -> Map[K, V] { #{} }
+
+let m0 = mkMap()
+let mut m: Map[P, Int] = m0
+m[P { name: "a" }] = 1
+println(len(m))

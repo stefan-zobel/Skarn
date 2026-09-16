@@ -1,6 +1,7 @@
 // CLAIM: an associated function on a GENERIC head has no receiver to solve the type parameter, so
-//        it must be fixed by an argument, an annotation, or the enclosing return type. When nothing
-//        fixes it, the call is rejected — Skarn has no turbofish to name it explicitly.
+//        something must fix it: an argument, an annotation, the enclosing return type, or a later use.
+//        When nothing does (`size` below does not), the call is rejected — Skarn has no turbofish to
+//        name it explicitly.
 // GUIDE: SkarnGuide.md 16 (method-call syntax and inherent methods)
 // EXPECT: fail cannot infer the type argument 'T' of 'Bag::empty'
 struct Bag[T] { items: Vec[T] }
