@@ -57,3 +57,23 @@ static inline int closesocket(int s) { return ::close(s); }
 #  define SKARN_FORCEINLINE
 #  define SKARN_NOINLINE
 #endif
+
+// ---- Allocation-helper exception specification -------------------------------
+// The allocation helpers in opcodes/op_{string,vec,map,bytes}.h signal heap exhaustion
+// through RaiseException, and what that IS differs per platform:
+//
+//   Windows -- a genuine SEH raise. It unwinds to run_switch's __except WITHOUT ever
+//              throwing a C++ exception, so the helpers really do not throw, and saying
+//              so keeps unwind edges out of the enormous dispatch function. That is the
+//              only reason the `noexcept` was ever there; it is not decoration.
+//   POSIX   -- the stub at the top of this header THROWS std::runtime_error, so the same
+//              helpers must NOT be noexcept or the throw would hit std::terminate.
+//
+// One specifier cannot be right for both, hence the macro. Apply it ONLY to helpers that
+// can reach a RaiseException site: the non-allocating ones (vec_pop, map_get, str_eq, ...)
+// keep their plain `noexcept` on every platform.
+#ifdef _WIN32
+#  define SKARN_ALLOC_NOEXCEPT noexcept
+#else
+#  define SKARN_ALLOC_NOEXCEPT
+#endif

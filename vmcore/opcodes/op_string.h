@@ -111,7 +111,7 @@ inline constexpr unsigned long VM_EXC_HEAP_EXHAUSTED = 0xE0564D00u; // 'VM'\0, c
 // now a plain code-quality choice -- keeping a std::string and its cleanup out of the one
 // enormous dispatch function. That benefit is UNMEASURED; treat it as a sane default
 // rather than a fact, and measure before removing it.
-[[nodiscard]] SKARN_NOINLINE inline Value string_concat(Value a, Value b, Context* ctx) {
+[[nodiscard]] SKARN_NOINLINE inline Value string_concat(Value a, Value b, Context* ctx) SKARN_ALLOC_NOEXCEPT {
     const GcObject* oa = GcObject::from_slots(a.asPtr());
     const GcObject* ob = GcObject::from_slots(b.asPtr());
     assert(oa->kind == GcObject::KIND_STRING && ob->kind == GcObject::KIND_STRING);
@@ -219,7 +219,7 @@ inline void tag_integral_double(std::string& s) {
 // (Debug assert only -- the compiler is expected to emit well-typed ADDs, matching
 // the other type-check-free fast paths). `noexcept` / SKARN_NOINLINE mirror
 // string_concat (raises the heap-exhausted SEH code rather than throwing).
-[[nodiscard]] SKARN_NOINLINE inline Value string_add(Value a, Value b, Context* ctx) {
+[[nodiscard]] SKARN_NOINLINE inline Value string_add(Value a, Value b, Context* ctx) SKARN_ALLOC_NOEXCEPT {
     const auto to_host = [](Value v) -> std::string {
         if (is_string(v)) {
             const GcObject* o = GcObject::from_slots(v.asPtr());
@@ -536,7 +536,7 @@ inline void append_map_dump(Value v, Context* ctx, std::string& out, int depth) 
 // append_* never allocate, so the struct graph cannot be moved mid-render; the single
 // alloc happens after the buffer is complete. undefined / other -> Debug-assert.
 // `noexcept` / SKARN_NOINLINE mirror string_add (raises on heap exhaustion).
-[[nodiscard]] SKARN_NOINLINE inline Value to_string_value(Value v, Context* ctx) {
+[[nodiscard]] SKARN_NOINLINE inline Value to_string_value(Value v, Context* ctx) SKARN_ALLOC_NOEXCEPT {
     if (is_string(v)) return v;                                      // identity, no alloc
     if (v.isAtom()) {
         const uint32_t id = v.asAtomId();
@@ -578,3 +578,9 @@ inline void append_map_dump(Value v, Context* ctx, std::string& out, int depth) 
     }
     return Value::fromPtr(obj->bytes());
 }
+
+// See the matching assert in op_vec.h for why this is checked rather than assumed.
+#ifdef _WIN32
+static_assert(noexcept(to_string_value(Value{}, nullptr)),
+              "string allocation helpers must stay noexcept on Windows (SEH, not a throw)");
+#endif

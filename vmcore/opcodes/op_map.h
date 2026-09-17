@@ -169,7 +169,7 @@ map_delete(GcObject* map_obj, Value key) noexcept {
 // HEADER first and root it via *dst (its backing slot stays Undefined -- scanned
 // as a non-pointer), THEN allocate the backing; a collection triggered by the
 // backing alloc keeps the header alive through *dst. Re-fetch the header after.
-inline void map_new(Context* ctx, Value* dst) {
+inline void map_new(Context* ctx, Value* dst) SKARN_ALLOC_NOEXCEPT {
     GcObject* hdr = ctx->vm->heap->alloc_slots_gc(GcObject::KIND_MAP, MAP_HDR_SLOTS, ctx);
     if (!hdr) RaiseException(VM_EXC_HEAP_EXHAUSTED, EXCEPTION_NONCONTINUABLE, 0, nullptr);
     hdr->slots()[MAP_SLOT_COUNT] = Value::fromSigned48(0);
@@ -186,7 +186,7 @@ inline void map_new(Context* ctx, Value* dst) {
 // Grow the backing to 2x capacity and rehash the live entries (tombstones dropped).
 // Allocates -> may collect; `map_slot` (a register) roots the header, re-fetched
 // after. RAISES on heap exhaustion.
-SKARN_NOINLINE inline void map_grow(Context* ctx, Value* map_slot) {
+SKARN_NOINLINE inline void map_grow(Context* ctx, Value* map_slot) SKARN_ALLOC_NOEXCEPT {
     GcObject*      hdr     = GcObject::from_slots(map_slot->asPtr());
     GcObject*      old_b   = GcObject::from_slots(hdr->slots()[MAP_SLOT_BACKING].asPtr());
     const uint32_t old_cap = old_b->slot_count() / 2;
@@ -256,3 +256,9 @@ inline void map_set(Context* ctx, Value* map_slot, Value* key_slot, Value* val_s
         hdr->slots()[MAP_SLOT_USED] = Value::fromSigned48(
             hdr->slots()[MAP_SLOT_USED].asSigned48() + 1);
 }
+
+// See the matching assert in op_vec.h for why this is checked rather than assumed.
+#ifdef _WIN32
+static_assert(noexcept(map_new(nullptr, nullptr)),
+              "map allocation helpers must stay noexcept on Windows (SEH, not a throw)");
+#endif
