@@ -18,6 +18,7 @@
 #include <bit>
 #include <cassert>
 #include <vector>
+#include "Inline.h"   // SKARN_FORCEINLINE
 #include "HashingPolicy.h"
 
 struct Entry {
@@ -102,7 +103,7 @@ public:
         }
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     Entry* findEntry(Value key) {
         return findEntryWithHash(
             key,

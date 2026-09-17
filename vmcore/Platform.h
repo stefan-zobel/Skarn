@@ -47,16 +47,10 @@ static inline int closesocket(int s) { return ::close(s); }
 #endif // _WIN32
 
 // ---- Cross-platform compiler-hint macros ------------------------------------
-#ifdef _MSC_VER
-#  define SKARN_FORCEINLINE [[msvc::forceinline]]
-#  define SKARN_NOINLINE    [[msvc::noinline]]
-#elif defined(__GNUC__) || defined(__clang__)
-#  define SKARN_FORCEINLINE [[gnu::always_inline]]
-#  define SKARN_NOINLINE    [[gnu::noinline]]
-#else
-#  define SKARN_FORCEINLINE
-#  define SKARN_NOINLINE
-#endif
+// They live in their own leaf header so the hot leaf headers (Value.h, Instruction.h,
+// HashingPolicy.h) can take the hints without taking <windows.h> with them. Included
+// here as well, so everything that has Platform.h keeps having them.
+#include "Inline.h"
 
 // ---- Allocation-helper exception specification -------------------------------
 // The allocation helpers in opcodes/op_{string,vec,map,bytes}.h signal heap exhaustion

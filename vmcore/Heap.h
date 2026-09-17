@@ -645,7 +645,7 @@ public:
     // Public because external strong-root providers (e.g. StringInterner)
     // must forward the pointer slots they own through the same path.
     // -------------------------------------------------------------------
-    [[msvc::forceinline]] void forward(Value* slot) noexcept {
+    SKARN_FORCEINLINE void forward(Value* slot) noexcept {
         if (!slot->isPtr())
             return; // immediates, Bool/Nil, native-fn TAG_INT: not heap pointers
 

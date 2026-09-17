@@ -14,10 +14,16 @@ if(APPLE)
     add_compile_definitions(_LIBCPP_DISABLE_AVAILABILITY)
 endif()
 
-# Silence any residual unknown-attribute warnings from the MSVC attribute shims
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    add_compile_options(-Wno-unknown-attributes)
-endif()
+# NOTE: there is deliberately no -Wno-unknown-attributes here.
+#
+# It was needed while MSVC-only attributes were still written out raw, and it hid what it
+# suppressed: [[msvc::forceinline]] on the NaN-boxing predicates in Value.h and on the
+# bytecode decoders in Instruction.h is IGNORED by Clang and GCC, so the hottest inlining
+# hints in the project were silently dropped on every non-MSVC build while the warning
+# that said so was turned off. Every hint now goes through SKARN_FORCEINLINE /
+# SKARN_NOINLINE (Inline.h), which expands to the spelling each toolchain acts on, so
+# there is nothing left to suppress -- and if someone reintroduces a raw attribute, the
+# warning is there to say so.
 
 # ---- Prelude embed generation ------------------------------------------------
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
