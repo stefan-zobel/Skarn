@@ -472,6 +472,23 @@ public:
     // on top of the current live set. Last-resort allocation growth, used by
     // the caller only after a collection failed to free enough room. Returns
     // false if even MAX_SEMI cannot hold it.
+    //
+    // It can fail for two DIFFERENT reasons, and they do not behave alike across
+    // platforms:
+    //
+    //   1. "the request exceeds our own reservation" -- `needed > new_cap` below, a
+    //      plain comparison against MAX_SEMI with no operating system involved. Identical
+    //      everywhere, and the branch a program realistically reaches.
+    //   2. "the system is out of memory" -- commit_both() fails. On Windows
+    //      VirtualAlloc(MEM_COMMIT) genuinely fails when there is nothing to commit, so
+    //      this returns false and the caller degrades cleanly. On POSIX it effectively
+    //      cannot: mprotect() on an already-reserved mapping charges nothing, so it
+    //      succeeds and real exhaustion surfaces later as SIGBUS or an OOM kill on first
+    //      touch instead of as a "Heap exhausted" fault.
+    //
+    // Reason 2 has no clean fix -- touching pages to force the charge does not help,
+    // because the failure arrives as a signal rather than an error code. Treat it as a
+    // known platform limitation, not as something the ladder can paper over.
     // -------------------------------------------------------------------
     [[nodiscard]] bool grow_to_fit(size_t total) noexcept {
         size_t needed = used() + total;

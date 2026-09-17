@@ -7,6 +7,9 @@
 #include <vector>
 #include <iostream>
 #include "Platform.h"
+#ifndef _WIN32
+#  include "FaultSignals.h"   // the POSIX stand-in for run_switch's SEH frame
+#endif
 
 #include "Fault.h"          // VmFault -- the structured serious-fault exception raise_located throws
 
@@ -2076,11 +2079,69 @@ static void run_switch(Context* ctx) {
     }
 }
 #else
-// On POSIX all faults are C++ exceptions (thrown by our RaiseException stub and
-// by raise_located). The SEH __try/__except frame is unnecessary here; the loop
-// just propagates exceptions normally to execute()'s caller.
+// The POSIX counterpart -- and it is NOT equivalent to the Windows frame above.
+//
+// Three of the four conditions the SEH filter catches do arrive as C++ exceptions here:
+// heap exhaustion and the illegal opcode are thrown by Platform.h's RaiseException stub,
+// and every located fault is thrown by raise_located. Those propagate out to execute()'s
+// caller by themselves and need no frame at all.
+//
+// The FOURTH does not, and it is the one the frame exists for: EXCEPTION_ACCESS_VIOLATION.
+// A hardware fault is a SIGNAL here, not an exception, so a guard-page hit or a wild
+// pointer ends the process on the spot -- no classification by fault address, no
+// "VM Stack Overflow" vs "dangling pointer" verdict, none of the next-step guidance
+// raise_access_violation prints.
+//
+// What still works unchanged is the ORDINARY stack overflow: GROW_CHECK ->
+// grow_stacks_or_overflow -> raise_located is a plain C++ throw on every platform, so a
+// runaway recursion still ends in a located fault with a source caret. What is restored
+// below is the backstop underneath it, and the wild-pointer diagnosis.
+//
+// The mechanism lives in FaultSignals.h; the shape of it here mirrors the __try above.
+// Four things about THIS function are easy to get wrong:
+//
+//  1. SKARN_NOINLINE is LOAD-BEARING, for a different reason than on Windows. sigsetjmp
+//     is a returns-twice call: every non-volatile automatic in its frame that is modified
+//     between the sigsetjmp and the siglongjmp has an indeterminate value afterwards. If
+//     this were inlined into execute(), that would cover str_pool, atom_pool, carr_pool,
+//     net_registry, res and ctx -- and their destructors would then run against garbage.
+//     Keeping the sigsetjmp in a frame that holds nothing but `ctx` and `land` is what
+//     makes this safe. (It costs nothing: run_switch_loop is separately SKARN_NOINLINE
+//     and holds every hot cursor, so no register residency is lost either.)
+//  2. The Arm destructor does NOT run on the landing path -- siglongjmp restores SP
+//     without unwinding. The explicit retract() below is mandatory: without it a second
+//     fault (std::format walking a corrupt ctx, say) would jump back into a jmp_buf whose
+//     frame is being reused.
+//  3. sigsetjmp's savemask MUST be 1. sigaction is installed without SA_NODEFER, so the
+//     signal is blocked inside the handler; leaving by longjmp without restoring the mask
+//     would leave SIGSEGV blocked forever and make the SECOND fault fatal.
+//  4. Nothing here may allocate before raise_access_violation -- see rearm_altstack's
+//     comment for why the first thing after landing is bookkeeping, not diagnosis.
+//
+// AFTER A HARDWARE FAULT THE HEAP IS POISONED. A longjmp past a native leaves any
+// Heap::add_root(&local) pairing in vmcore.cpp unbalanced, so the root list can point at
+// a dead frame. Today's drivers propagate the fault straight out and drop the Heap, so it
+// does not bite -- but a REPL, or anything that reuses a Heap across runs, must not.
+SKARN_NOINLINE
 static void run_switch(Context* ctx) {
-    run_switch_loop(ctx);
+    if (!vm_signals::ensure_installed()) {   // opt-out / sanitizer build: no frame at all
+        run_switch_loop(ctx);
+        return;
+    }
+    vm_signals::Landing land;
+
+    if (sigsetjmp(land.jb, /*savemask=*/1) == 0) {
+        vm_signals::Arm arm(land);
+        run_switch_loop(ctx);
+        return;                              // normal HALT path; arm's destructor retracts
+    }
+
+    // --- landed from the handler: normal context, original stack, mask restored --------
+    vm_signals::retract(land);               // the destructor did NOT run (see 2 above)
+    vm_signals::rearm_altstack();            // Darwin's sticky SA_ONSTACK (see 4 above)
+    raise_access_violation(ctx,
+                           reinterpret_cast<uintptr_t>(land.addr),
+                           land.is_write != 0);   // [[noreturn]] -- throws
 }
 #endif
 

@@ -2384,6 +2384,84 @@ inline void test_av_classification() {
 }
 
 // =============================================================================
+// test_fault_probe -- the END-TO-END counterpart of test_av_classification, and the only
+// thing that can show the fault frame around run_switch_loop actually works.
+//
+// WHY IT IS SEPARATE, AND OPT-IN. test_av_classification above deliberately does not
+// fault: it pins the decision function with synthetic addresses. That is the right shape
+// for a predicate, but it leaves the whole chain untested -- the handler (or SEH filter),
+// the capture of the fault address, the escape back to normal context, and the throw.
+// This test provokes a REAL hardware fault, so a regression here is a process kill rather
+// than a failed assertion. Hence `vm_tests --fault-probe`: off by default, and its own
+// ctest entry, so a crash cannot take the other hundred-odd tests with it.
+//
+// HOW IT REACHES A FAULT AT ALL. Not by recursing: with vm.resources set, GROW_CHECK
+// grows on demand and, at the reserved cap, raises a clean LOCATED fault -- the hardware
+// guard page is by design unreachable from a well-formed program. So the test installs a
+// native that hands back a deliberately bad pointer and lets LEN dereference it. The
+// object-header read inside GcObject::from_slots IS the fault: a known address, on the VM
+// thread, with no lock held and no allocation in flight.
+//
+// Platform-NEUTRAL in intent: on POSIX the sigaction frame catches it, on Windows the SEH
+// filter does -- which incidentally gives the Windows path its first end-to-end coverage.
+// =============================================================================
+
+// kind 0 -> deep inside the reserved-but-uncommitted register stack: mapped with no
+//           access on both platforms and inside a VM stack region, so it must classify
+//           as a stack overflow.
+// kind 1 -> an address in no mapping at all: must classify as NOT a stack overflow. If
+//           it ever became mapped the test fails cleanly ("no fault"), never silently.
+inline Value native_fault_ptr(Value* args, uint8_t nargs, Context* ctx) {
+    const int64_t kind = (nargs >= 1 && args[0].isInt()) ? args[0].asSigned48() : 0;
+    if (kind == 0) {
+        // Well past the committed end, so the header subtraction inside from_slots stays
+        // in the reserved range instead of landing back on a committed page.
+        return Value::fromPtr(ctx->vm->resources->reg_committed_end() + 4096);
+    }
+    return Value::fromPtr(reinterpret_cast<Value*>(uintptr_t{0x00007A00DEAD0000}));
+}
+
+inline bool fault_probe_once(int64_t kind, const char* want) {
+    Assembler as;
+    as.C2(OpCode::LOAD_CONST, 2, static_cast<int16_t>(kind));      // r2 = kind
+    as.call_native_id(/*rd*/3, /*id_reg*/1, /*first_arg*/2, /*nargs*/1, /*id*/0);
+    as.R6(OpCode::LEN, 4, 3, 0);              // r4 = len(r3) -- THE FAULTING ACCESS
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+
+    std::vector<NativeFunc> ntab = { native_fault_ptr };
+    try {
+        auto res = execute(bytecode, nullptr, nullptr, nullptr, 0, nullptr, nullptr,
+                           nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                           nullptr, nullptr, nullptr, &ntab);
+        (void)res;
+        std::cout << std::format("  kind {}: NO fault raised -- the frame never fired\n", kind);
+        return false;
+    } catch (const std::exception& e) {
+        const bool ok = std::string(e.what()).find(want) != std::string::npos;
+        std::cout << std::format("  kind {}: {}\n    caught: {}\n",
+                                 kind, ok ? "PASS" : "FAIL", e.what());
+        return ok;
+    }
+}
+
+inline void test_fault_probe() {
+    std::cout << "=== fault_probe (a real hardware fault, classified) ===\n";
+    // A recovered hardware fault can leave the Heap's root list pointing at a dead frame,
+    // so each probe must run on a Heap that is dropped straight afterwards and never
+    // reused. execute() building and dropping its own is exactly that.
+    const bool stack_ok = fault_probe_once(0, "Stack Overflow");
+    const bool wild_ok  = fault_probe_once(1, "NOT a stack overflow");
+    // Third case: fault, recover, fault again. On Darwin the kernel's SA_ONSTACK flag is
+    // sticky across a siglongjmp, so without the re-arm every fault after the first is
+    // delivered on the normal stack. Only a SECOND fault can catch that.
+    const bool again_ok = fault_probe_once(0, "Stack Overflow");
+    std::cout << std::format("  recovered twice in a row:            {}\n",
+                             again_ok ? "PASS" : "FAIL");
+    check(stack_ok && wild_ok && again_ok);
+}
+
+// =============================================================================
 // test_mov_take -- MOV_TAKE copies like MOV but EMPTIES the source. Used for the
 // return-value fetch after a call, where a leftover copy would be a heap pointer
 // in a slot no collection forwards again (see the opcode table).

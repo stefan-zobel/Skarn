@@ -75,6 +75,12 @@ target_include_directories(vm_tests PRIVATE vm_tests)
 target_link_libraries(vm_tests PRIVATE vmcore)
 add_test(NAME vm_tests COMMAND vm_tests)
 
+# The real-hardware-fault probe, as its OWN ctest entry. It deliberately dereferences a
+# bad pointer to prove that run_switch's fault frame classifies and recovers, so its
+# failure mode is a process kill rather than a failed assertion -- keeping it out of the
+# main invocation means a regression costs one test result instead of all of them.
+add_test(NAME vm_fault_probe COMMAND vm_tests --fault-probe)
+
 file(GLOB COMPILER_TEST_SOURCES "static_compiler_tests/*.cpp")
 add_executable(static_compiler_tests ${COMPILER_TEST_SOURCES})
 target_include_directories(static_compiler_tests PRIVATE static_compiler_tests)
