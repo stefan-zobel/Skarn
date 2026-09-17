@@ -5,8 +5,14 @@
 // internally so each call site keeps a single, readable form.
 
 #ifdef _WIN32
-#  define WIN32_LEAN_AND_MEAN
-#  define NOMINMAX
+// Guarded: a consumer that already defines either of these would otherwise get a
+// macro-redefinition warning, which /W4 surfaces on every translation unit.
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
 #  include <windows.h>
 #else
 #  include <stdexcept>

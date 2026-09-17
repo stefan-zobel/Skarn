@@ -834,8 +834,16 @@ static Value native_parse_int(Value* args, uint8_t nargs, Context* ctx) {
 }
 
 // parseDouble(s) -> Double (success) | String (error message). Strict full-string
-// parse via std::from_chars (chars_format::general: decimal + optional exponent, '-'
-// sign; no leading '+' or whitespace, no trailing junk); otherwise the error String.
+// parse in chars_format::general: an optional '-', decimal digits with an optional '.'
+// and an optional exponent, or one of the inf / infinity / nan spellings (any case).
+// Rejected: a leading '+' or whitespace, a hexadecimal 0x form, a ',' decimal
+// separator, and any trailing junk.
+//
+// std::from_chars is exactly that grammar, and it is locale-independent. libc++ has no
+// floating-point from_chars, so the #else falls back to strtod -- which is a LOOSER
+// grammar (it takes '+', leading whitespace and hex floats) and is locale-SENSITIVE via
+// LC_NUMERIC. The pre-scan below removes the difference: it rejects everything strtod
+// would accept and from_chars would not, so both paths accept the same strings.
 static Value native_parse_double(Value* args, uint8_t nargs, Context* ctx) {
     if (nargs < 1 || !is_string(args[0]))
         return native_make_error(ctx, "parseDouble: invalid number");
@@ -846,14 +854,33 @@ static Value native_parse_double(Value* args, uint8_t nargs, Context* ctx) {
     }
     const char* first = s.data();
     const char* last  = first + s.size();
-    // strtod skips leading whitespace; from_chars doesn't — reject it explicitly.
-    if (first == last || *first == ' ' || *first == '\t' || *first == '\n' || *first == '\r')
-        return native_make_error(ctx, "parseDouble: invalid number");
-    char* endptr = nullptr;
-    double v = std::strtod(first, &endptr);
-    if (endptr != last)
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+    double v = 0.0;
+    auto r = std::from_chars(first, last, v);           // chars_format::general
+    if (r.ec != std::errc{} || r.ptr != last)
         return native_make_error(ctx, "parseDouble: invalid number");
     return Value::fromDouble(v);
+#else
+    const auto reject = [&] { return native_make_error(ctx, "parseDouble: invalid number"); };
+    if (first == last) return reject();
+    // strtod SKIPS leading whitespace and then reports a clean end, so the trailing-junk
+    // check below cannot see it -- it has to be rejected up front.
+    if (*first == ' ' || *first == '\t' || *first == '\n' || *first == '\r'
+        || *first == '\f' || *first == '\v')
+        return reject();
+    const char* p = first;
+    if (*p == '-') ++p;                                 // '+' is NOT part of the grammar
+    if (p == last) return reject();
+    if (*p == '+' || *p == ' ' || *p == '\t') return reject();
+    if (*p == '0' && p + 1 < last && (p[1] == 'x' || p[1] == 'X'))
+        return reject();                                // no hex floats
+    if (s.find(',') != std::string::npos)
+        return reject();                                // no locale decimal comma
+    char*  endptr = nullptr;
+    double v      = std::strtod(first, &endptr);
+    if (endptr != last) return reject();                // trailing junk / nothing parsed
+    return Value::fromDouble(v);
+#endif
 }
 
 // Drain a readable pipe to EOF into `out`. Runs on its own std::thread so

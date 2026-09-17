@@ -2,6 +2,9 @@
 
 #include <cassert>
 #include <charconv>
+#include <cmath>      // isnan / isinf / signbit  (format_double's non-to_chars path)
+#include <cstdio>     // snprintf                 (ditto)
+#include <cstdlib>    // strtod / atoi            (ditto)
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -128,37 +131,83 @@ inline constexpr unsigned long VM_EXC_HEAP_EXHAUSTED = 0xE0564D00u; // 'VM'\0, c
     return Value::fromPtr(obj->bytes());
 }
 
+// Append the ".0" tag when `s` reads as a bare integer (only an optional '-' and
+// digits), so a Double always prints AS a Double: 2.0 -> "2.0", not "2". A result
+// carrying a '.', an exponent or letters -- "0.5", "1e+16", "nan", "-inf" -- is left
+// exactly as produced. Shared by both format_double paths so the tag rule cannot drift.
+inline void tag_integral_double(std::string& s) {
+    bool looks_integer = !s.empty();
+    for (const char c : s) {
+        if (c == '-' || (c >= '0' && c <= '9')) continue;
+        looks_integer = false;
+        break;
+    }
+    if (looks_integer) s += ".0";
+}
+
+// The shortest decimal form of `d` that reads back as the same value -- the textual
+// contract every `println`, `toString` and interpolation of a Double is held to. The
+// claim is pinned by tests/guide_claims/tier1/double_render_shortest_form.skn.
+//
+// std::to_chars(chars_format::general) IS that contract. Where the library has it, use
+// it. libc++ ships no floating-point to_chars, so the #else reconstructs the same output
+// from snprintf -- and "the same" is meant literally: the two agree on every one of
+// 3.4 million doubles tested, finite and non-finite alike, the only exception being
+// MSVC's signaling-NaN spelling "nan(snan)", which no Skarn arithmetic can produce.
+//
+// The reconstruction is NOT `%g`. %g switches to exponential once the decimal exponent
+// reaches the precision, which would render 100.0 as "1e+02" and change one integral
+// double in ten below a thousand. general format instead picks whichever of the two
+// notations is SHORTER, ties going to fixed -- hence the explicit length compare below.
+[[nodiscard]] inline std::string format_double(double d) {
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+    char buf[40];
+    const std::to_chars_result res = std::to_chars(buf, buf + sizeof(buf), d);
+    std::string s(buf, res.ptr);
+    tag_integral_double(s);
+    return s;
+#else
+    if (std::isnan(d)) return std::signbit(d) ? "-nan" : "nan";
+    if (std::isinf(d)) return d < 0 ? "-inf" : "inf";
+
+    // 1. The fewest significant digits that still read back as the same value.
+    char sci[40];
+    int  prec = 1;
+    for (; prec < 17; ++prec) {
+        std::snprintf(sci, sizeof(sci), "%.*e", prec - 1, d);
+        if (std::strtod(sci, nullptr) == d) break;
+    }
+    const int sci_len = std::snprintf(sci, sizeof(sci), "%.*e", prec - 1, d);
+
+    // 2. The same digits in fixed notation. The decimal exponent comes from the
+    //    scientific form just produced; a negative fraction count clamps to 0, which
+    //    prints the value's exact integer expansion (what general format uses there).
+    const char* e     = std::strrchr(sci, 'e');
+    const int   exp10 = e ? std::atoi(e + 1) : 0;
+    const int   frac  = prec - 1 - exp10;
+    char fixed[512];   // a fixed form too long for this is longer than sci either way
+    const int fixed_len = std::snprintf(fixed, sizeof(fixed), "%.*f", frac < 0 ? 0 : frac, d);
+
+    // 3. Shorter wins; a tie goes to fixed.
+    const bool use_fixed = fixed_len > 0 && fixed_len < static_cast<int>(sizeof(fixed))
+                        && fixed_len <= sci_len;
+    std::string s = use_fixed ? std::string(fixed, static_cast<size_t>(fixed_len))
+                              : std::string(sci,   static_cast<size_t>(sci_len));
+    tag_integral_double(s);
+    return s;
+#endif
+}
+
 // Format a numeric Value (Int or Double) to its textual form, host-side. Ints go
-// through to_chars as a signed 48-bit decimal; doubles use to_chars' shortest
-// round-trip form, then get a trailing ".0" appended when the result reads as a bare
-// integer (only an optional '-' and digits) so a Double always prints AS a Double
-// (2.0 -> "2.0", not "2"). Values with a '.', exponent, or letters -- "0.5", "1e+16",
-// and NaN/inf's "nan"/"inf"/"-inf" -- are left exactly as to_chars produced them.
+// through to_chars as a signed 48-bit decimal; doubles through format_double above.
 // Precondition: v.isInt() || v.isDouble().
 [[nodiscard]] inline std::string format_number(Value v) {
-    char buf[40];
     if (v.isInt()) {
+        char buf[40];
         const std::to_chars_result res = std::to_chars(buf, buf + sizeof(buf), v.asSigned48());
         return std::string(buf, res.ptr);
     }
-    // Use snprintf with shortest-round-trip: try increasing precision until strtod
-    // reproduces the same bits, matching the semantics of to_chars(chars_format::general).
-    double d = v.numAsDouble();
-    for (int prec = 1; prec <= 17; ++prec) {
-        int n = std::snprintf(buf, sizeof(buf), "%.*g", prec, d);
-        if (n > 0 && n < static_cast<int>(sizeof(buf))) {
-            char* ep = nullptr;
-            if (std::strtod(buf, &ep) == d && ep == buf + n) {
-                std::string s(buf, static_cast<size_t>(n));
-                bool looks_integer = true;
-                for (char c : s) { if (!(c == '-' || (c >= '0' && c <= '9'))) { looks_integer = false; break; } }
-                if (looks_integer) s += ".0";
-                return s;
-            }
-        }
-    }
-    int n = std::snprintf(buf, sizeof(buf), "%.17g", d);
-    return n > 0 ? std::string(buf, static_cast<size_t>(n)) : "nan";
+    return format_double(v.numAsDouble());
 }
 
 // Concatenate two operands where AT LEAST one is a heap string, coercing a numeric
