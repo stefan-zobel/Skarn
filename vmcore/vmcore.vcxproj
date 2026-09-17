@@ -96,6 +96,7 @@
     <ClInclude Include="HashingPolicy.h" />
     <ClInclude Include="HashTable.h" />
     <ClInclude Include="Heap.h" />
+    <ClInclude Include="Inline.h" />
     <ClInclude Include="Instruction.h" />
     <ClInclude Include="Interpreter.h" />
     <ClInclude Include="NumericOps.h" />
