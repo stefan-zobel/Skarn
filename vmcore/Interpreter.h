@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 #include <iostream>
-#include "Windows.h"
+#include "Platform.h"
 
 #include "Fault.h"          // VmFault -- the structured serious-fault exception raise_located throws
 
@@ -20,14 +20,14 @@
 #include "StructType.h"
 #include "FunctionTable.h"
 #include "NumericOps.h"
-#include "opcodes\op_string.h"   // is_string, str_eq, str_cmp, string_concat, VM_EXC_HEAP_EXHAUSTED
-#include "opcodes\op_map.h"      // map_new/map_get/map_set, map_key_valid, VM_EXC_INVALID_MAP_KEY
-#include "opcodes\op_vec.h"      // vec_new/vec_push/vec_pop, VEC_SLOT_*
-#include "opcodes\op_bytes.h"    // bytes_new_cap/bytes_push/bytes_pop/bytes_from_str/bytes_to_string, BYTES_SLOT_*
+#include "opcodes/op_string.h"   // is_string, str_eq, str_cmp, string_concat, VM_EXC_HEAP_EXHAUSTED
+#include "opcodes/op_map.h"      // map_new/map_get/map_set, map_key_valid, VM_EXC_INVALID_MAP_KEY
+#include "opcodes/op_vec.h"      // vec_new/vec_push/vec_pop, VEC_SLOT_*
+#include "opcodes/op_bytes.h"    // bytes_new_cap/bytes_push/bytes_pop/bytes_from_str/bytes_to_string, BYTES_SLOT_*
 #include "TypeUniverse.h"        // BuiltinTid, BUILTIN_COUNT, TRAIT_METHOD_NONE (trait dispatch)
 
 // C4714: "function marked as __forceinline not inlined". MSVC will not inline a
-// [[msvc::forceinline]] helper into a function that contains a `__try`, so every
+// SKARN_FORCEINLINE helper into a function that contains a `__try`, so every
 // forceinline helper called from such a function trips C4714 in optimized builds.
 //
 // HISTORY, and why the code no longer looks like that earlier: the __try used
@@ -44,8 +44,10 @@
 // it) and is scoped with a matching pop at end-of-file so it does not leak into the
 // natives compiled after this header is included by vmcore.cpp, which inline their
 // forceinline helpers fine and must stay covered by 4714.
+#ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable : 4714)
+#endif
 
 #ifdef VM_COUNT_OPS
 // -----------------------------------------------------------------------------
@@ -146,7 +148,7 @@ inline constexpr unsigned long VM_EXC_NO_TRAIT_IMPL = 0xE0564D02u; // 'VM'\2, cu
 // __try at all. Note these throw for the SAME condition that op_string.h / op_vec.h /
 // op_map.h / op_bytes.h raise as VM_EXC_HEAP_EXHAUSTED -- see that code's definition
 // for why one condition still has two mechanisms.
-[[msvc::noinline]] static Value switch_alloc_array(Context* ctx, int32_t nslots) {
+SKARN_NOINLINE static Value switch_alloc_array(Context* ctx, int32_t nslots) {
     // 0 is a valid (empty) array -- only a negative count is a bug. A 0-slot
     // KIND_ARRAY is just the 8-byte header; len is 0 and every index traps.
     if (nslots < 0) {
@@ -163,7 +165,7 @@ inline constexpr unsigned long VM_EXC_NO_TRAIT_IMPL = 0xE0564D02u; // 'VM'\2, cu
 // ANEW's out-of-line allocator: element count comes from a register (unlike ALLOC's
 // immediate), so it is a runtime int. Mirrors switch_alloc_array (0 allowed, negative
 // is a fault) and shares the same collect/grow ladder via alloc_slots_gc.
-[[msvc::noinline]] static Value switch_anew(Context* ctx, int64_t count) {
+SKARN_NOINLINE static Value switch_anew(Context* ctx, int64_t count) {
     if (count < 0) {
         throw std::runtime_error("array() requires a non-negative element count");
     }
@@ -175,7 +177,7 @@ inline constexpr unsigned long VM_EXC_NO_TRAIT_IMPL = 0xE0564D02u; // 'VM'\2, cu
     return Value::fromPtr(obj->slots());
 }
 
-[[msvc::noinline]] static Value switch_new_struct(Context* ctx, uint16_t type_id) {
+SKARN_NOINLINE static Value switch_new_struct(Context* ctx, uint16_t type_id) {
     assert(type_id < ctx->vm->struct_type_count && "NEW_STRUCT type id out of range");
     const uint32_t n_fields = ctx->vm->struct_types[type_id].field_count;
     GcObject* obj = ctx->vm->heap->alloc_object_gc(type_id, n_fields, ctx);
@@ -194,7 +196,7 @@ inline constexpr unsigned long VM_EXC_NO_TRAIT_IMPL = 0xE0564D02u; // 'VM'\2, cu
 // address (the register frame is a GC root, forwarded in place). If the function has a
 // self-capture slot (direct self-recursive lambda, Milestone A6), it is back-patched
 // with the closure itself -- a self-reference the copying collector handles as a cycle.
-[[msvc::noinline]] static Value switch_make_closure(Context* ctx, uint16_t fn_id, uint8_t capture_base) {
+SKARN_NOINLINE static Value switch_make_closure(Context* ctx, uint16_t fn_id, uint8_t capture_base) {
     assert(fn_id < ctx->vm->fn_table_size && "MAKE_CLOSURE fn id out of range");
     const FnInfo&  fn = ctx->vm->fn_table[fn_id];
     const uint32_t n  = fn.ncaptures;
@@ -221,7 +223,7 @@ inline constexpr unsigned long VM_EXC_NO_TRAIT_IMPL = 0xE0564D02u; // 'VM'\2, cu
 // rewritten in place), so we re-fetch header + backing AFTER the alloc. The fill loop
 // then allocates nothing, so backing and result stay put. rd may alias ra: the case
 // writes window[rd] only after this returns, and *map_slot is fully read here first.
-[[msvc::noinline]] static Value switch_map_collect(Context* ctx, Value* map_slot, bool want_values) {
+SKARN_NOINLINE static Value switch_map_collect(Context* ctx, Value* map_slot, bool want_values) {
     GcObject*     hdr   = GcObject::from_slots(map_slot->asPtr());
     assert(hdr->kind == GcObject::KIND_MAP && "MAP_KEYS/VALUES on a non-map");
     const int64_t count = hdr->slots()[MAP_SLOT_COUNT].asSigned48();   // live entries
@@ -252,7 +254,7 @@ inline constexpr unsigned long VM_EXC_NO_TRAIT_IMPL = 0xE0564D02u; // 'VM'\2, cu
 // maps a live Value to the index PROTO_RESOLVE uses. Returns a value >= any table
 // width (0xFFFFFFFF) for types that can never be a trait receiver (Undefined /
 // Tombstone / native FuncPtr) so the caller's `dense < width` guard forces a miss.
-[[msvc::forceinline]] static uint32_t trait_dense_id(Value v) {
+SKARN_FORCEINLINE static uint32_t trait_dense_id(Value v) {
     if (v.isPtr()) {
         GcObject* obj = GcObject::from_slots(v.asPtr());
         switch (obj->kind) {
@@ -284,7 +286,7 @@ inline constexpr unsigned long VM_EXC_NO_TRAIT_IMPL = 0xE0564D02u; // 'VM'\2, cu
 // (the caller then SYNC+raise_located's). The KIND_ARRAY branch is first so the fixed
 // -array hot path stays a single predicted compare. `out_elems`/`out_len` are written
 // only on a true return.
-[[msvc::forceinline]] static bool
+SKARN_FORCEINLINE static bool
 indexable_view(Value coll, Value*& out_elems, uint64_t& out_len) noexcept {
     if (!coll.isPtr()) return false;
     GcObject* o = GcObject::from_slots(coll.asPtr());
@@ -414,7 +416,7 @@ static std::string frame_where(const VmFault::Frame& fr) {
 // exception propagates out through the SEH frame (whose filter returns CONTINUE_SEARCH
 // for the C++ EH code). The caller must SYNC_TO_CTX() first so ctx->ip and
 // ctx->ret_stack_ptr are current (the faulting ops are not safepoints).
-[[msvc::noinline]] [[noreturn]]
+SKARN_NOINLINE [[noreturn]]
 static void raise_located(Context* ctx, const char* what) {
     const VM* vm = ctx->vm;
     // Cap the collected/printed stacktrace. A deep-recursion "stack overflow" can have
@@ -462,11 +464,11 @@ inline constexpr int64_t EQ_DEEP_MAX_WORK = 200'000'000;
 // native C++ recursion, so a deep-but-finite value (a long cons list, a deep tree) compares
 // correctly and can never overflow the native stack -- which the SEH filter cannot cleanly
 // catch anyway (it handles only the VM's own guard-page AV, not EXCEPTION_STACK_OVERFLOW).
-// [[msvc::noinline]] keeps run_switch's __try frame free of the std::vector's unwind state
+// SKARN_NOINLINE keeps run_switch's __try frame free of the std::vector's unwind state
 // (mirrors raise_located). Read-only: does NO allocation, so the value graph cannot move
 // mid-compare and the queued Values need no rooting. May THROW via raise_located (cycle
 // budget / closure operand), so the caller must SYNC_TO_CTX() first.
-[[nodiscard]] [[msvc::noinline]]
+[[nodiscard]] SKARN_NOINLINE
 static bool value_deep_eq(Value a0, Value b0, Context* ctx) {
     std::vector<std::pair<Value, Value>> work;
     work.emplace_back(a0, b0);
@@ -573,9 +575,9 @@ static constexpr int VM_REG_MARGIN = 512;
 // adds >= the INITIAL commit (>= 131072 reg slots / 16384 ret frames), far more than the
 // <= 256+margin a single frame needs, so a single grow suffices. On the reserved cap or a
 // VirtualAlloc commit failure it raises the same located VmFault as any other serious
-// fault. [[msvc::noinline]] keeps run_switch's __try free of the cold commit/throw path;
+// fault. SKARN_NOINLINE keeps run_switch's __try free of the cold commit/throw path;
 // the caller SYNC's the pre-advance cursors first so an overflow trace points at the CALL.
-[[msvc::noinline]]
+SKARN_NOINLINE
 static void grow_stacks_or_overflow(Context* ctx, bool need_reg, bool need_ret) {
     VM_Resources* res = ctx->vm->resources;
     if (need_reg && !res->grow_reg()) raise_located(ctx, "stack overflow");
@@ -599,7 +601,7 @@ static void grow_stacks_or_overflow(Context* ctx, bool need_reg, bool need_ret) 
 // Out-of-line and [[noreturn]]: building the message needs a std::string, which must not
 // live in run_switch's __try/__except function (C2712) -- the same discipline as
 // raise_located and the alloc helpers.
-[[msvc::noinline]] [[noreturn]]
+SKARN_NOINLINE [[noreturn]]
 static void raise_access_violation(const Context* ctx, uintptr_t fault_addr, bool is_write) {
     const VM_Resources* res = (ctx && ctx->vm) ? ctx->vm->resources : nullptr;
     const void* addr = reinterpret_cast<const void*>(fault_addr);
@@ -627,7 +629,7 @@ static void raise_access_violation(const Context* ctx, uintptr_t fault_addr, boo
 // The dispatch loop proper. Deliberately SEH-FREE and deliberately __declspec(noinline):
 // the noinline is LOAD-BEARING, because with LTCG the compiler would otherwise inline this
 // back into run_switch's __try scope and reinstate exactly the cost the split removes.
-__declspec(noinline) static void run_switch_loop(Context* ctx) {
+SKARN_NOINLINE static void run_switch_loop(Context* ctx) {
     const uint8_t* ip     = ctx->ip;
     // The bytecode base (entry = instruction 0). CALL_INDIRECT jumps to an ABSOLUTE
     // code position (code_base + 4 * code_offset) recovered from the function table,
@@ -2026,7 +2028,7 @@ __declspec(noinline) static void run_switch_loop(Context* ctx) {
 // The SEH frame, and nothing else. It exists as a SEPARATE function from the dispatch
 // loop because a `__try` forces every value that lives across the region to be
 // memory-resident instead of register-allocated, and it blocks inlining of the
-// [[msvc::forceinline]] helpers. Wrapping the loop directly makes the interpreter
+// SKARN_FORCEINLINE helpers. Wrapping the loop directly makes the interpreter
 // several times slower, and it silently undermines the register-residency that is the
 // whole reason vmcore dispatches with a while{switch} in the first place. SEH is dynamic
 // and stack-based, so a hardware exception raised inside run_switch_loop still unwinds to
@@ -2042,6 +2044,7 @@ __declspec(noinline) static void run_switch_loop(Context* ctx) {
 // HERE: GetExceptionInformation() is only valid inside the filter expression.
 // ExceptionInformation[0] is the access type (0 = read, 1 = write), [1] the faulting
 // address -- what tells a stack overflow apart from a wild pointer (raise_access_violation).
+#ifdef _WIN32
 static void run_switch(Context* ctx) {
     DWORD     seh_code       = 0;
     uintptr_t seh_fault_addr = 0;   // ACCESS_VIOLATION only: ExceptionInformation[1]
@@ -2067,16 +2070,20 @@ static void run_switch(Context* ctx) {
         else if (seh_code == EXCEPTION_INT_DIVIDE_BY_ZERO)
             throw std::runtime_error("Division by zero");
         else if (seh_code == VM_EXC_HEAP_EXHAUSTED)
-            // All 15 raise sites (string / vec / map / bytes) share the one SEH code, so
-            // the message cannot name what failed to allocate. It used to say "string
-            // allocation", which was simply wrong for the 11 non-string sites -- a Vec or
-            // Map growth failure reported a string OOM. Naming the site again would mean
-            // carrying it in RaiseException's argument array; not worth it for a fault
-            // that ends the program either way.
             throw std::runtime_error("Heap exhausted");
         else
             throw std::runtime_error("Illegal Opcode executed");
     }
 }
+#else
+// On POSIX all faults are C++ exceptions (thrown by our RaiseException stub and
+// by raise_located). The SEH __try/__except frame is unnecessary here; the loop
+// just propagates exceptions normally to execute()'s caller.
+static void run_switch(Context* ctx) {
+    run_switch_loop(ctx);
+}
+#endif
 
+#ifdef _MSC_VER
 #pragma warning(pop)   // restore C4714 for the rest of the TU (see the disable above)
+#endif

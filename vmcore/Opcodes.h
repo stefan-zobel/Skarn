@@ -28,7 +28,6 @@
 // removed earlier -- so none of that scaffolding exists here any more.
 // =============================================================================
 
-#include <immintrin.h>
 #include <array>
 #include "Context.h"
 

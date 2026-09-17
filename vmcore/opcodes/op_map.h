@@ -3,9 +3,9 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
-#include "..\Value.h"
-#include "..\Heap.h"
-#include "..\Context.h"
+#include "../Value.h"
+#include "../Heap.h"
+#include "../Context.h"
 
 // =============================================================================
 // op_map.h -- runtime helpers for the dynamic map type (KIND_MAP).
@@ -55,7 +55,7 @@ inline constexpr uint32_t MAP_INITIAL_CAP  = 8;   // power of two
 // A key is valid iff it is an Int / Double / Bool / Atom / Nil immediate, or a
 // heap KIND_STRING. Everything else -- Undefined, Tombstone, Func / FuncPtr, and
 // non-string heap objects (Array / Struct / Closure / Map) -- is rejected.
-[[nodiscard]] [[msvc::forceinline]] inline bool map_key_valid(Value k) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline bool map_key_valid(Value k) noexcept {
     if (k.isInt() || k.isDouble() || k.isBool() || k.isAtom() || k.isNil())
         return true;
     if (k.isPtr())
@@ -64,14 +64,14 @@ inline constexpr uint32_t MAP_INITIAL_CAP  = 8;   // power of two
 }
 
 // FNV-1a 32-bit over raw bytes (matches StringPoolPolicy / the interner hash).
-[[nodiscard]] [[msvc::forceinline]] inline uint32_t map_fnv1a(const char* d, uint32_t n) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline uint32_t map_fnv1a(const char* d, uint32_t n) noexcept {
     uint32_t h = 2166136261u;
     for (uint32_t i = 0; i < n; ++i) { h ^= static_cast<uint8_t>(d[i]); h *= 16777619u; }
     return h;
 }
 
 // Key hash: string keys hash by CONTENT; every other permitted key by its bits.
-[[nodiscard]] [[msvc::forceinline]] inline uint32_t map_key_hash(Value k) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline uint32_t map_key_hash(Value k) noexcept {
     if (k.isPtr()) {
         const GcObject* s = GcObject::from_slots(k.asPtr());
         return map_fnv1a(s->bytes(), s->string_length());
@@ -81,7 +81,7 @@ inline constexpr uint32_t MAP_INITIAL_CAP  = 8;   // power of two
 
 // Key equality: two string keys compare by CONTENT (so a non-interned concat
 // result equals an equal literal); otherwise bit-identity (SameValueZero).
-[[nodiscard]] [[msvc::forceinline]] inline bool map_key_eq(Value a, Value b) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline bool map_key_eq(Value a, Value b) noexcept {
     if (a.isPtr() && b.isPtr()) {
         const GcObject* oa = GcObject::from_slots(a.asPtr());
         const GcObject* ob = GcObject::from_slots(b.asPtr());
@@ -96,7 +96,7 @@ inline constexpr uint32_t MAP_INITIAL_CAP  = 8;   // power of two
 // Probe the backing (2*cap interleaved key/value slots) for `key`. Returns the
 // pair index in [0, cap): the slot holding an equal key if present, otherwise the
 // insertion slot (first tombstone if any, else the terminating empty slot).
-[[nodiscard]] [[msvc::forceinline]] inline uint32_t
+[[nodiscard]] SKARN_FORCEINLINE inline uint32_t
 map_probe(const Value* s, uint32_t cap, Value key, uint32_t h) noexcept {
     const uint32_t mask = cap - 1;
     uint32_t idx        = h & mask;
@@ -115,7 +115,7 @@ map_probe(const Value* s, uint32_t cap, Value key, uint32_t h) noexcept {
 }
 
 // rd = map[key] or Nil on miss. Non-allocating. Caller has validated the key.
-[[nodiscard]] [[msvc::forceinline]] inline Value map_get(GcObject* map_obj, Value key) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline Value map_get(GcObject* map_obj, Value key) noexcept {
     GcObject*      backing = GcObject::from_slots(map_obj->slots()[MAP_SLOT_BACKING].asPtr());
     const uint32_t cap     = backing->slot_count() / 2;
     const Value*   s       = backing->slots();
@@ -130,7 +130,7 @@ map_probe(const Value* s, uint32_t cap, Value key, uint32_t h) noexcept {
 // caller has validated the key. This is map_get's probe returning presence instead of
 // the value -- it distinguishes an absent key from one mapped to Nil (which map_get
 // cannot: a miss and `m[k] = nil` both read Nil).
-[[nodiscard]] [[msvc::forceinline]] inline bool map_has(GcObject* map_obj, Value key) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline bool map_has(GcObject* map_obj, Value key) noexcept {
     GcObject*      backing = GcObject::from_slots(map_obj->slots()[MAP_SLOT_BACKING].asPtr());
     const uint32_t cap     = backing->slot_count() / 2;
     const Value*   s       = backing->slots();
@@ -148,7 +148,7 @@ map_probe(const Value* s, uint32_t cap, Value key, uint32_t h) noexcept {
 //   * `count` (live) drops by one; `used` (live + tombstones, the load-factor driver)
 //     is left unchanged -- the tombstone still occupies a probe slot until a future
 //     map_grow rehashes and drops it.
-[[nodiscard]] [[msvc::forceinline]] inline bool
+[[nodiscard]] SKARN_FORCEINLINE inline bool
 map_delete(GcObject* map_obj, Value key) noexcept {
     GcObject*      backing = GcObject::from_slots(map_obj->slots()[MAP_SLOT_BACKING].asPtr());
     const uint32_t cap     = backing->slot_count() / 2;
@@ -169,7 +169,7 @@ map_delete(GcObject* map_obj, Value key) noexcept {
 // HEADER first and root it via *dst (its backing slot stays Undefined -- scanned
 // as a non-pointer), THEN allocate the backing; a collection triggered by the
 // backing alloc keeps the header alive through *dst. Re-fetch the header after.
-inline void map_new(Context* ctx, Value* dst) noexcept {
+inline void map_new(Context* ctx, Value* dst) {
     GcObject* hdr = ctx->vm->heap->alloc_slots_gc(GcObject::KIND_MAP, MAP_HDR_SLOTS, ctx);
     if (!hdr) RaiseException(VM_EXC_HEAP_EXHAUSTED, EXCEPTION_NONCONTINUABLE, 0, nullptr);
     hdr->slots()[MAP_SLOT_COUNT] = Value::fromSigned48(0);
@@ -186,7 +186,7 @@ inline void map_new(Context* ctx, Value* dst) noexcept {
 // Grow the backing to 2x capacity and rehash the live entries (tombstones dropped).
 // Allocates -> may collect; `map_slot` (a register) roots the header, re-fetched
 // after. RAISES on heap exhaustion.
-[[msvc::noinline]] inline void map_grow(Context* ctx, Value* map_slot) noexcept {
+SKARN_NOINLINE inline void map_grow(Context* ctx, Value* map_slot) {
     GcObject*      hdr     = GcObject::from_slots(map_slot->asPtr());
     GcObject*      old_b   = GcObject::from_slots(hdr->slots()[MAP_SLOT_BACKING].asPtr());
     const uint32_t old_cap = old_b->slot_count() / 2;

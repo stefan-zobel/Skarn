@@ -14,3 +14,4 @@ static_compiler/prelude_embed.inc
 *.log
 !examples/log_analysis/access.log
 
+/build

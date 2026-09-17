@@ -41,4 +41,6 @@ struct alignas(64) Context {
 };
 static_assert(sizeof(Context) == 64);
 
-typedef void(__fastcall* Handler)(Context* ctx);
+// Handler typedef (retired with the threaded tail-call dispatcher; kept as a
+// forward-compat alias in case external tooling references it).
+typedef void(*Handler)(Context* ctx);

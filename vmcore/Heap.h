@@ -9,7 +9,7 @@
 #include <vector>
 #include <chrono>       // steady_clock -- measurement-only GC timing (--bench)
 #include <ostream>      // debug_dump(std::ostream&)  (<format> comes via Value.h)
-#include <Windows.h>
+#include "Platform.h"
 #include "Value.h"
 #include "Context.h"
 #include "VM.h"
@@ -857,18 +857,26 @@ private:
         return GcObject::align_up_8(sizeof(GcObject) + static_cast<size_t>(n_bytes));
     }
 
-    // ---- VirtualAlloc management --------------------------------------------
+    // ---- Memory management (VirtualAlloc on Windows, mmap on POSIX) ---------
 
     static std::byte* reserve_semi() {
+#ifdef _WIN32
         void* p = VirtualAlloc(nullptr, MAX_SEMI, MEM_RESERVE, PAGE_READWRITE);
-        if (!p)
-            throw std::runtime_error("Heap: VirtualAlloc reserve failed");
+        if (!p) throw std::runtime_error("Heap: VirtualAlloc reserve failed");
+#else
+        void* p = mmap(nullptr, MAX_SEMI, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p == MAP_FAILED) throw std::runtime_error("Heap: mmap reserve failed");
+#endif
         return static_cast<std::byte*>(p);
     }
 
     static void release_semi(std::byte* base) noexcept {
-        if (base)
-            VirtualFree(base, 0, MEM_RELEASE);
+        if (!base) return;
+#ifdef _WIN32
+        VirtualFree(base, 0, MEM_RELEASE);
+#else
+        munmap(base, MAX_SEMI);
+#endif
     }
 
     // Commit [0, new_cap) in BOTH semispaces (idempotent on already-committed
@@ -877,8 +885,13 @@ private:
     [[nodiscard]] bool commit_both(size_t new_cap) noexcept {
         assert(new_cap <= MAX_SEMI);
         for (int i = 0; i < 2; ++i) {
+#ifdef _WIN32
             if (!VirtualAlloc(space_[i], new_cap, MEM_COMMIT, PAGE_READWRITE))
                 return false;
+#else
+            if (mprotect(space_[i], new_cap, PROT_READ | PROT_WRITE) != 0)
+                return false;
+#endif
         }
         semi_capacity_ = new_cap;
         return true;

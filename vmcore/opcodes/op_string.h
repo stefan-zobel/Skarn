@@ -5,10 +5,10 @@
 #include <cstring>
 #include <string>
 #include <string_view>
-#include "..\Heap.h"
-#include "..\Value.h"
-#include "..\Context.h"
-#include "..\StructType.h"   // TO_STRING's struct dump reads name / field_names
+#include "../Heap.h"
+#include "../Value.h"
+#include "../Context.h"
+#include "../StructType.h"   // TO_STRING's struct dump reads name / field_names
 
 // =============================================================================
 // op_string.h -- runtime helpers for string values (KIND_STRING heap objects).
@@ -22,7 +22,7 @@
 // NOT interned, so pointer identity would be wrong.
 // =============================================================================
 
-// These three are [[msvc::forceinline]] and use manual byte loops rather than a memcmp
+// These three are SKARN_FORCEINLINE and use manual byte loops rather than a memcmp
 // CALL. The reason that MADE that mandatory is retired: under the old threaded tail-call
 // dispatcher the op_eq/op_ne/op_lt/op_le handlers had to stay CALL-FREE leaves so their
 // DISPATCH remained a tail-jmp, or a deep TCO loop grew the native stack. Those handlers,
@@ -32,7 +32,7 @@
 // not a correctness requirement.
 
 // True iff `v` is a heap string (KIND_STRING). Only derefs on the pointer path.
-[[nodiscard]] [[msvc::forceinline]] inline bool is_string(Value v) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline bool is_string(Value v) noexcept {
     return v.isPtr() && GcObject::from_slots(v.asPtr())->kind == GcObject::KIND_STRING;
 }
 
@@ -40,7 +40,7 @@
 // order, ties broken by length (a prefix is < the longer string). The internal
 // "STR_CMP" -- a shared helper, deliberately not exposed as an opcode (no surface
 // operator needs a three-way result yet). Both args must be KIND_STRING.
-[[nodiscard]] [[msvc::forceinline]] inline int str_cmp(Value a, Value b) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline int str_cmp(Value a, Value b) noexcept {
     const GcObject* oa = GcObject::from_slots(a.asPtr());
     const GcObject* ob = GcObject::from_slots(b.asPtr());
     assert(oa->kind == GcObject::KIND_STRING && ob->kind == GcObject::KIND_STRING);
@@ -56,7 +56,7 @@
 }
 
 // Content equality of two heap strings (length short-circuit then byte compare).
-[[nodiscard]] [[msvc::forceinline]] inline bool str_eq(Value a, Value b) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline bool str_eq(Value a, Value b) noexcept {
     const GcObject* oa = GcObject::from_slots(a.asPtr());
     const GcObject* ob = GcObject::from_slots(b.asPtr());
     assert(oa->kind == GcObject::KIND_STRING && ob->kind == GcObject::KIND_STRING);
@@ -101,14 +101,14 @@ inline constexpr unsigned long VM_EXC_HEAP_EXHAUSTED = 0xE0564D00u; // 'VM'\0, c
 // KIND_STRING. `noexcept` (see VM_EXC_HEAP_EXHAUSTED): on the near-impossible 1 GiB
 // OOM it raises an SEH fault instead of throwing.
 //
-// [[msvc::noinline]] WAS load-bearing for a reason that no longer exists: inlining this
+// SKARN_NOINLINE WAS load-bearing for a reason that no longer exists: inlining this
 // (with its std::string local + cleanup) into the old tail-call dispatcher's op_add_num
 // gave that handler unwind code, which defeated the DISPATCH tail-jmp and grew the native
 // stack on every ADD. There is no tail-jmp under the while{switch}, so the attribute is
 // now a plain code-quality choice -- keeping a std::string and its cleanup out of the one
 // enormous dispatch function. That benefit is UNMEASURED; treat it as a sane default
 // rather than a fact, and measure before removing it.
-[[nodiscard]] [[msvc::noinline]] inline Value string_concat(Value a, Value b, Context* ctx) noexcept {
+[[nodiscard]] SKARN_NOINLINE inline Value string_concat(Value a, Value b, Context* ctx) {
     const GcObject* oa = GcObject::from_slots(a.asPtr());
     const GcObject* ob = GcObject::from_slots(b.asPtr());
     assert(oa->kind == GcObject::KIND_STRING && ob->kind == GcObject::KIND_STRING);
@@ -141,16 +141,24 @@ inline constexpr unsigned long VM_EXC_HEAP_EXHAUSTED = 0xE0564D00u; // 'VM'\0, c
         const std::to_chars_result res = std::to_chars(buf, buf + sizeof(buf), v.asSigned48());
         return std::string(buf, res.ptr);
     }
-    const std::to_chars_result res = std::to_chars(buf, buf + sizeof(buf), v.numAsDouble());
-    std::string s(buf, res.ptr);
-    bool looks_integer = !s.empty();
-    for (const char c : s) {
-        if (c == '-' || (c >= '0' && c <= '9')) continue;
-        looks_integer = false;
-        break;
+    // Use snprintf with shortest-round-trip: try increasing precision until strtod
+    // reproduces the same bits, matching the semantics of to_chars(chars_format::general).
+    double d = v.numAsDouble();
+    for (int prec = 1; prec <= 17; ++prec) {
+        int n = std::snprintf(buf, sizeof(buf), "%.*g", prec, d);
+        if (n > 0 && n < static_cast<int>(sizeof(buf))) {
+            char* ep = nullptr;
+            if (std::strtod(buf, &ep) == d && ep == buf + n) {
+                std::string s(buf, static_cast<size_t>(n));
+                bool looks_integer = true;
+                for (char c : s) { if (!(c == '-' || (c >= '0' && c <= '9'))) { looks_integer = false; break; } }
+                if (looks_integer) s += ".0";
+                return s;
+            }
+        }
     }
-    if (looks_integer) s += ".0";
-    return s;
+    int n = std::snprintf(buf, sizeof(buf), "%.17g", d);
+    return n > 0 ? std::string(buf, static_cast<size_t>(n)) : "nan";
 }
 
 // Concatenate two operands where AT LEAST one is a heap string, coercing a numeric
@@ -160,9 +168,9 @@ inline constexpr unsigned long VM_EXC_HEAP_EXHAUSTED = 0xE0564D00u; // 'VM'\0, c
 // alloc_string_gc, so a collection that relocates a/b during the allocation cannot
 // dangle. A non-string, non-number operand (struct/bool/nil/atom) is a type error
 // (Debug assert only -- the compiler is expected to emit well-typed ADDs, matching
-// the other type-check-free fast paths). `noexcept` / [[msvc::noinline]] mirror
+// the other type-check-free fast paths). `noexcept` / SKARN_NOINLINE mirror
 // string_concat (raises the heap-exhausted SEH code rather than throwing).
-[[nodiscard]] [[msvc::noinline]] inline Value string_add(Value a, Value b, Context* ctx) noexcept {
+[[nodiscard]] SKARN_NOINLINE inline Value string_add(Value a, Value b, Context* ctx) {
     const auto to_host = [](Value v) -> std::string {
         if (is_string(v)) {
             const GcObject* o = GcObject::from_slots(v.asPtr());
@@ -478,8 +486,8 @@ inline void append_map_dump(Value v, Context* ctx, std::string& out, int depth) 
 //                 <fn> placeholder (their own slice can improve on this later).
 // append_* never allocate, so the struct graph cannot be moved mid-render; the single
 // alloc happens after the buffer is complete. undefined / other -> Debug-assert.
-// `noexcept` / [[msvc::noinline]] mirror string_add (raises on heap exhaustion).
-[[nodiscard]] [[msvc::noinline]] inline Value to_string_value(Value v, Context* ctx) noexcept {
+// `noexcept` / SKARN_NOINLINE mirror string_add (raises on heap exhaustion).
+[[nodiscard]] SKARN_NOINLINE inline Value to_string_value(Value v, Context* ctx) {
     if (is_string(v)) return v;                                      // identity, no alloc
     if (v.isAtom()) {
         const uint32_t id = v.asAtomId();
