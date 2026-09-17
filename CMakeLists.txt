@@ -62,3 +62,28 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/static_vmrun/main.cpp")
     target_include_directories(skarnvm PRIVATE static_vmrun)
     target_link_libraries(skarnvm PRIVATE skarnclib vmcore)
 endif()
+
+# ---- test executables --------------------------------------------------------
+# Both are their own runner: main() IS the suite, it prints an "N passed, M failed"
+# summary and exits non-zero on any failure, so ctest needs nothing but the exit code.
+# They are the only thing that can show a port of this VM is correct, so they build by
+# default rather than behind an option.
+enable_testing()
+
+add_executable(vm_tests vm_tests/main.cpp)
+target_include_directories(vm_tests PRIVATE vm_tests)
+target_link_libraries(vm_tests PRIVATE vmcore)
+add_test(NAME vm_tests COMMAND vm_tests)
+
+file(GLOB COMPILER_TEST_SOURCES "static_compiler_tests/*.cpp")
+add_executable(static_compiler_tests ${COMPILER_TEST_SOURCES})
+target_include_directories(static_compiler_tests PRIVATE static_compiler_tests)
+target_link_libraries(static_compiler_tests PRIVATE skarnclib vmcore)
+add_test(NAME static_compiler_tests COMMAND static_compiler_tests)
+
+# The switch rot-guards in static_compiler/Codegen.cpp are `#pragma warning(error: 4062)`,
+# which only MSVC honours. Keep the guard alive on the Clang/GCC side with its equivalent,
+# so an enumerator added to an AST node still fails the build instead of falling through.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(skarnclib PRIVATE -Werror=switch)
+endif()
