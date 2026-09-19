@@ -5056,14 +5056,14 @@ void test_codegen_process() {
         == "hi\n");
 #endif
 
-    // sh: on Windows wraps cmd.exe; on POSIX use runText with sh -c to exercise the same path.
+    // sh() hard-wires cmd.exe and is Windows-only; on POSIX it must return Err (cmd not found).
     check_true("process_sh", cg_run_native(
 #ifdef _WIN32
         "match sh(\"echo ok\") { Ok(o) => print(fromBytes(o.stdout)), Err(_) => print(\"err\") }")
         == "ok\r\n");
 #else
-        "match runText([\"sh\", \"-c\", \"echo ok\"]) { Ok(t) => print(t.stdout), Err(_) => print(\"err\") }")
-        == "ok\n");
+        "match sh(\"echo ok\") { Ok(_) => print(\"ran\"), Err(_) => print(\"err\") }")
+        == "err");
 #endif
 
     // runWith feeds stdin (Bytes) to the child; `sort` reads it and exits 0.

@@ -1075,7 +1075,9 @@ static Value native_run_process(Value* args, uint8_t nargs, Context* ctx) {
     // (EOF via O_CLOEXEC) if exec succeeded.
     ::close(exec_err_pipe[1]); exec_err_pipe[1] = -1;
     int child_exec_errno = 0;
-    ssize_t exec_err_n = ::read(exec_err_pipe[0], &child_exec_errno, sizeof(child_exec_errno));
+    ssize_t exec_err_n;
+    do { exec_err_n = ::read(exec_err_pipe[0], &child_exec_errno, sizeof(child_exec_errno)); }
+    while (exec_err_n < 0 && errno == EINTR);
     ::close(exec_err_pipe[0]); exec_err_pipe[0] = -1;
     if (exec_err_n == static_cast<ssize_t>(sizeof(child_exec_errno))) {
         waitpid(pid, nullptr, 0);
