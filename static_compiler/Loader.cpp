@@ -31,6 +31,12 @@ Program parse_module_source(const std::string& src) {
     return parser.parse_program();     // propagates LexError / ParseError
 }
 
+// The message without the " at line L:C" suffix LexError / ParseError append (the position travels apart).
+std::string bare_message(const std::string& what) {
+    const std::size_t at = what.rfind(" at line ");
+    return at == std::string::npos ? what : what.substr(0, at);
+}
+
 // The module paths this program depends on -- one per `import`/`use` declaration (a
 // `use a::b::{..}` depends on module `a::b`, exactly like `import a::b`).
 std::vector<std::vector<std::string>> module_deps(const Program& prog) {
@@ -61,6 +67,7 @@ std::vector<std::vector<std::string>> module_deps(const Program& prog) {
 // Recursive DFS state. `out` accumulates modules in post-order (= topological).
 struct Loader {
     const ModuleResolver&           resolve;
+    std::vector<SyntaxError>*       syntax = nullptr;   // non-null = tool mode (recover, collect)
     std::vector<LoadedModule>       out;
     std::unordered_set<std::string> done;      // keys fully emitted into `out`
     std::unordered_set<std::string> visiting;  // keys on the current DFS stack (cycle guard)
@@ -75,7 +82,17 @@ struct Loader {
         // the caret against that module's source). The entry module has the empty key.
         const std::string where = key.empty() ? std::string("<entry>") : key;
         Program prog;
-        try {
+        if (syntax) {
+            std::vector<LexError> lex_errors;
+            std::vector<ParseError> parse_errors;
+            Lexer lex(src);
+            std::vector<Token> toks = lex.tokenize_tolerant(lex_errors);
+            prog = Parser(std::move(toks)).parse_program_tolerant(parse_errors, lex_errors);
+            for (const LexError& e : lex_errors)
+                syntax->push_back(SyntaxError{ key, e.line(), e.col(), "lex error: " + bare_message(e.what()) });
+            for (const ParseError& e : parse_errors)
+                syntax->push_back(SyntaxError{ key, e.line(), e.col(), "parse error: " + bare_message(e.what()) });
+        } else try {
             prog = parse_module_source(src);
         } catch (const ParseError& e) {
             throw LoadError("parse error in module '" + where + "': " + e.what(), key, e.line(), e.col());
@@ -112,6 +129,15 @@ ModuleSet load_modules(const char* entry_source, const ModuleResolver& resolve) 
     ModuleSet set;
     set.modules = std::move(ld.out);
     return set;
+}
+
+ToolLoad load_modules_for_tools(const char* entry_source, const ModuleResolver& resolve) {
+    ToolLoad result;
+    Loader ld(resolve);
+    ld.syntax = &result.syntax_errors;
+    ld.visit({}, entry_source ? entry_source : "");
+    result.modules.modules = std::move(ld.out);
+    return result;
 }
 
 } // namespace svc

@@ -220,7 +220,7 @@ struct ScopeVar {
 
 class Checker {
 public:
-    explicit Checker(Program& p) : prog_(p) {}
+    Checker(Program& p, const CheckOptions& options) : prog_(p), options_(options) {}
 
     CheckResult run() {
         // Teach the solver the `Concrete <: dyn Trait` edge: it is AST-free and cannot know the
@@ -243,8 +243,73 @@ public:
         check_orphan();
         check_bodies();
         drain_pending_generics();
+        if (options_.resolve_types) resolve_expr_types();
         finalize_diagnostics();
-        return CheckResult{ std::move(errors_), std::move(warnings_) };
+        CheckResult result{ std::move(errors_), std::move(warnings_), {} };
+        if (options_.list_ambient) result.ambient = ambient_fns();
+        return result;
+    }
+
+    // What the builtins that infer_call special-cases accept, written by hand: no FnSig can state
+    // them (polymorphic over container kinds, variadic, or a FnSig row that goes unused, as push /
+    // pop). One line per accepted shape; keep in step with the check_* function named in infer_call.
+    static constexpr std::pair<std::string_view, std::string_view> SPECIAL_BUILTIN_SIGNATURES[] = {
+        { "len",             "fn len(String | List[T] | Array[T] | Vec[T] | Bytes | Map[K, V]) -> Int" },
+        { "print",           "fn print(T, ...)" },
+        { "println",         "fn println(T, ...)" },
+        { "panic",           "fn panic(String) -> Never" },
+        { "has",             "fn has(Map[K, V], K) -> Bool" },
+        { "delete",          "fn delete(Map[K, V], K) -> Bool" },
+        { "get",             "fn get(Map[K, V], K) -> Option[V]\nfn get(Array[T], Int) -> Option[T]\n"
+                             "fn get(Vec[T], Int) -> Option[T]\nfn get(Bytes, Int) -> Option[Int]" },
+        { "keys",            "fn keys(Map[K, V]) -> Array[K]" },
+        { "values",          "fn values(Map[K, V]) -> Array[V]" },
+        { "push",            "fn push(mut Vec[T], T) -> Vec[T]\nfn push(mut Bytes, Int) -> Bytes" },
+        { "pop",             "fn pop(mut Vec[T]) -> Option[T]\nfn pop(mut Bytes) -> Option[Int]" },
+        { "toBytes",         "fn toBytes(String) -> Bytes" },
+        { "fromBytes",       "fn fromBytes(Bytes) -> String" },
+        { "bytes",           "fn bytes() -> Bytes\nfn bytes(Int) -> Bytes" },
+        { "appendBytes",     "fn appendBytes(mut Bytes, String) -> Bytes\nfn appendBytes(mut Bytes, Bytes) -> Bytes" },
+        { "toInt",           "fn toInt(Double) -> Int" },
+        { "toDouble",        "fn toDouble(Int) -> Double" },
+        { "floor",           "fn floor(Double) -> Double" },
+        { "ceil",            "fn ceil(Double) -> Double" },
+        { "trunc",           "fn trunc(Double) -> Double" },
+        { "round",           "fn round(Double) -> Double" },
+        { "roundHalfToEven", "fn roundHalfToEven(Double) -> Double" },
+        { "ordinal",         "fn ordinal(E) -> Int" },   // E: an int-backed enum
+    };
+
+    // CheckOptions::list_ambient: the builtins and natives a user may call, sorted by name. The
+    // cursor primitives behind the prelude's MapCursor and `_appendBytesRange` are internal.
+    std::vector<AmbientFn> ambient_fns() const {
+        std::vector<AmbientFn> out;
+        auto internal = [](std::string_view n) {
+            return n == "mapIterNext" || n == "mapKeyAt" || n == "mapValAt" || n.starts_with('_');
+        };
+        auto special = [](std::string_view n) -> std::string {
+            for (const auto& [name, sig] : SPECIAL_BUILTIN_SIGNATURES)
+                if (name == n) return std::string(sig);
+            return {};
+        };
+        for (const auto& [name, sig] : builtin_fns_) {
+            if (internal(name)) continue;
+            std::string s = special(name);
+            if (s.empty()) {
+                s = "fn " + name + "(";
+                for (size_t i = 0; i < sig.params.size(); ++i) s += (i ? ", " : "") + describe(sig.params[i]);
+                s += ")";
+                if (sig.ret) s += " -> " + describe(sig.ret);
+                s = display_name(s);
+            }
+            const auto m = native_module_.find(name);
+            out.push_back(AmbientFn{ name, m != native_module_.end() ? m->second : std::string(), s });
+        }
+        for (std::string_view n : BUILTIN_FN_NAMES)
+            if (!internal(n) && !builtin_fns_.count(std::string(n)))
+                out.push_back(AmbientFn{ std::string(n), {}, special(n) });
+        std::sort(out.begin(), out.end(), [](const AmbientFn& a, const AmbientFn& b) { return a.name < b.name; });
+        return out;
     }
 
     // Collect-all polish: drop exact-duplicate diagnostics (a body-checking pass may
@@ -268,8 +333,16 @@ public:
     }
     void finalize_diagnostics() { finalize_list(errors_); finalize_list(warnings_); }
 
+    // CheckOptions::resolve_types: inference is over, so the solution is final -- write it into every
+    // slot of the user items (the prelude is never shown to a user, so it is skipped).
+    void resolve_expr_types() {
+        for (size_t i = prog_.prelude_item_count; i < prog_.items.size(); ++i)
+            for_each_expr(*prog_.items[i], [this](Expr& e) { if (e.ty) e.ty = apply(e.ty); });
+    }
+
 private:
     Program& prog_;
+    const CheckOptions options_;
     TypeContext tc_;
     std::vector<TypeError> errors_;
     std::vector<TypeError> warnings_;   // advisory tier (must-use / unused); never affects ok()
@@ -6441,8 +6514,8 @@ private:
 
 } // namespace
 
-CheckResult check(Program& program) {
-    return Checker(program).run();
+CheckResult check(Program& program, const CheckOptions& options) {
+    return Checker(program, options).run();
 }
 
 } // namespace svc

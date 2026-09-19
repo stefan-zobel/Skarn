@@ -18,14 +18,18 @@
 //
 // Input is the Lexer's token vector (already carrying ASI `StmtEnd` markers and
 // ending in Eof). The parser treats `StmtEnd`, `}`, and Eof as statement
-// terminators. Throws ParseError on malformed input (fail-fast).
+// terminators. Throws ParseError on malformed input (fail-fast); the editor-tooling
+// entry parse_program_tolerant records and recovers instead.
 // =============================================================================
 
 #include "Ast.h"
+#include "Lexer.h"
 #include "Token.h"
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace svc {
@@ -42,15 +46,44 @@ private:
     uint32_t col_;
 };
 
+// Editor tooling (the formatter): how the parser read the token stream, by token index into the
+// vector the Parser was given. `starts` holds the first token of every top-level item or statement,
+// block statement, match arm and impl/trait member -- the grammar separates statements, which may
+// share a line with nothing between them, so only the parser knows where one begins. `braces` says
+// what each `{` it recorded opens; a `{` not recorded there opens a comma list (a struct literal or
+// pattern, a map literal, a `use` list, a record variant's fields).
+struct ParseLayout {
+    enum class Brace : uint8_t {
+        Block,     // statements: a fn / lambda / if / loop body or a block expression
+        Match,     // match arms
+        Members,   // impl / trait methods
+        Fields,    // a struct declaration's fields, an enum's variants
+    };
+    std::vector<size_t> starts;
+    std::vector<std::pair<size_t, Brace>> braces;
+};
+
 class Parser {
 public:
     explicit Parser(std::vector<Token> tokens);
+
+    // Editor tooling: record the layout of what parse_program() reads into `layout` (null = off).
+    void set_layout(ParseLayout* layout) { layout_ = layout; }
 
     // Parse a whole compilation unit (zero or more top-level items) up to Eof.
     Program parse_program();
 
     // Parse exactly one expression, then require Eof. Convenience for tests.
     ExprPtr parse_expression();
+
+    // Editor tooling: never throws a ParseError. Each syntax error is appended to `errors` and parsing
+    // resumes at the next statement, match arm, impl/trait member, field, variant or item; the
+    // construct that failed is dropped whole, so the tree holds complete nodes only. A token that can
+    // only start an item (`fn name`, `struct`, `impl`, `pub`, ...) closes every open body -- the
+    // missing-`}` case -- and the innermost open `{` is reported. An item that lost part of itself, or
+    // whose text holds one of the `lex_errors`, gets `Item::has_syntax_error`. On valid input the tree
+    // equals parse_program()'s.
+    Program parse_program_tolerant(std::vector<ParseError>& errors, const std::vector<LexError>& lex_errors);
 
 private:
     // ----- cursor -----
@@ -64,6 +97,25 @@ private:
     [[noreturn]] void error(const std::string& msg) const; // throw at cur()
 
     void skip_terminators();  // consume any run of StmtEnd tokens
+
+    // ----- error recovery (parse_program_tolerant only; recover_ false = every catch rethrows) -----
+    enum class Sync { Item, Stmt, Arm, Member, Field };
+    bool at_item_start() const noexcept;           // a token only an item can start with
+    void note(const ParseError& e);                // record once per position, at most MAX_ERRORS
+    // Record `e`, then skip to the sync point of `where` (counting `( [ {` depth); `start` is the
+    // token index the failed construct began at, to guarantee progress; `open` is the `{` of the
+    // body the construct sits in (none at item level).
+    void recover(const ParseError& e, Sync where, size_t start, const Token* open = nullptr);
+    uint32_t line_indent(const Token& t) const;    // column of the first token on t's line
+    // In recover mode: does the body opened at `open` end here without its closer (Eof, or an item
+    // start; for an impl/trait body a token indented past `owner_col` is a member, not an item)? If
+    // so the innermost such body reports it once.
+    bool body_unclosed(const Token& open, uint32_t owner_col = 0, bool members_are_fns = false);
+    // Consume the `}` of the body opened at `open`. In recover mode it also remembers the first
+    // `}` of the item that does not line up with the indentation of its opener's line: when a
+    // body later turns out unclosed, that opener is where the `}` is most likely missing (the
+    // braces paired up wrongly after it), not the outermost `{` left over.
+    void close_body(const Token& open);
 
     // ----- items -----
     ItemPtr parse_item();
@@ -98,10 +150,12 @@ private:
     ExprPtr parse_loop();                   // `loop { … }` -- the condition-less infinite loop
     ExprPtr parse_lambda();
     ExprPtr parse_block();
+    ExprPtr parse_braceless_block();   // recover mode: a block whose `{` is missing (see Parser.cpp)
     ExprPtr parse_paren();     // grouping / tuple / unit `()`
     ExprPtr parse_list();      // `[...]` sequence (list) literal
     ExprPtr parse_map_lit();   // `#{k => v, ...}` map literal
-    ExprPtr parse_struct_lit(std::string qualifier, std::string name, uint32_t line, uint32_t col);
+    ExprPtr parse_struct_lit(std::string qualifier, std::string name, uint32_t line, uint32_t col,
+                             uint32_t name_line, uint32_t name_col);
     std::vector<ExprPtr> parse_arg_list();
 
     // ----- patterns -----
@@ -144,7 +198,7 @@ private:
     // Ctor / struct pattern body past the (optional-qualified) head name: `Name { ... }`,
     // `Name(p, ...)`, or a bare nullary `Name`. `qualifier` is a module path (empty = bare).
     PatPtr parse_ctor_or_struct_pattern(std::string name, std::string qualifier,
-                                        uint32_t line, uint32_t col);
+                                        uint32_t line, uint32_t col, uint32_t qual_line, uint32_t qual_col);
 
     // ----- types -----
     TypePtr parse_type();
@@ -159,10 +213,20 @@ private:
 
     std::vector<Token> toks_;
     size_t pos_ = 0;
+    ParseLayout* layout_ = nullptr;   // set_layout: where statements start and what each `{` opens
+    void layout_start() { if (layout_) layout_->starts.push_back(pos_); }
+    void layout_brace(ParseLayout::Brace b) { if (layout_) layout_->braces.emplace_back(pos_, b); }
     // When true, a bare `Name { ... }` is NOT parsed as a struct literal -- set
     // while parsing the header expression of if/match/while/for, exactly like Rust,
     // to keep the `{` for the following block.
     bool no_struct_lit_ = false;
+
+    bool recover_ = false;
+    std::vector<ParseError>* errors_ = nullptr;
+    size_t unclosed_at_ = SIZE_MAX;   // token index where an unclosed body was last reported
+    size_t syntax_events_ = 0;        // errors noted so far, including those past the cap
+    uint32_t item_col_ = 0;           // column of the current item's first token (`pub` included)
+    const Token* first_mismatch_ = nullptr;   // see close_body; reset per item
 };
 
 } // namespace svc

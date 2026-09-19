@@ -1,4 +1,5 @@
 .vs/
+.project
 **/.vs
 **/bin
 **/obj
@@ -15,3 +16,4 @@ static_compiler/prelude_embed.inc
 !examples/log_analysis/access.log
 
 /build
+/upload

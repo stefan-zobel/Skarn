@@ -62,6 +62,25 @@ native functions attached:
 Exit code 0 means success. 1 means a compile error or a runtime fault, reported with a caret into the right
 source file. 2 means a driver error.
 
+## The language server: `skarn_lsp`
+
+`skarn_lsp` gives an editor live diagnostics, an outline, hover, go to definition, find references, rename,
+completion and signature help; it is described in [LanguageServer.md](LanguageServer.md). It runs the front
+half of the compiler only, through entry points the compiler provides for tools and never uses itself:
+
+- `svc::load_modules_for_tools` lexes and parses in an **error-tolerant** mode: every syntax error is
+  collected, and parsing resumes at the next statement, match arm, member, field, variant or item, leaving
+  the failed construct out whole, so the tree has no error nodes and the checker runs on it unchanged.
+- `svc::check_modules_for_tools` returns the checked program with every error and warning instead of
+  throwing, writes the final inferred type into every expression, and lists the builtins and natives a
+  program may call, each with the module whose `use` reaches it and its signature (hand-written for a
+  builtin the checker types per call, one line per accepted shape).
+- The parser records the position of every name token (declared names, the member after `.`, the tail of a
+  qualified path, the names in a `use` list); the compiler itself does not read them.
+- For the formatter, every token carries its source bytes, `Lexer::tokenize_with_comments` also returns the
+  comments, and `Parser::set_layout` reports where each statement, match arm and member starts and what each
+  `{` opens.
+
 ## Modules and the standard library
 
 One `.skn` file is one module. Modules are a **name-resolution layer**: every top-level name is mangled to

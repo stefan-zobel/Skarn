@@ -93,6 +93,14 @@ target_include_directories(static_compiler_tests PRIVATE static_compiler_tests)
 target_link_libraries(static_compiler_tests PRIVATE skarnclib vmcore)
 add_test(NAME static_compiler_tests COMMAND static_compiler_tests)
 
+# ---- skarn_lsp -- the language server (LSP over stdio) ----------------------
+# Uses the front end only, so it is as portable as skarnclib. `--selftest` is its suite.
+file(GLOB LSP_SOURCES "skarn_lsp/*.cpp")
+add_executable(skarn_lsp ${LSP_SOURCES})
+target_include_directories(skarn_lsp PRIVATE skarn_lsp)
+target_link_libraries(skarn_lsp PRIVATE skarnclib vmcore)
+add_test(NAME skarn_lsp_selftest COMMAND skarn_lsp --selftest)
+
 # The switch rot-guards in static_compiler/Codegen.cpp are `#pragma warning(error: 4062)`,
 # which only MSVC honours. Keep the guard alive on the Clang/GCC side with its equivalent,
 # so an enumerator added to an AST node still fails the build instead of falling through.

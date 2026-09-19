@@ -542,6 +542,516 @@ bool parse_throws(const std::string& src) {
       catch (const svc::LexError&)   { return true; }
 }
 
+// The positions of the TAILS and HEADS of qualified paths, `use` names, supertraits and a trait impl's
+// trait -- what a rename must edit. Expected columns are computed from the source line itself.
+void test_name_positions_qualified() {
+    const std::vector<std::string> lines = {
+        "use util::{f, Pair}",                                          // 1
+        "use m::g",                                                     // 2
+        "trait A: B, C { }",                                            // 3
+        "impl Tr for Int { }",                                          // 4
+        "let x = util::f(Shape::Square(1), Tr::m, self)",               // 5
+        "let y: m::T = P { a: 1 }",                                     // 6
+        "let z = m::Q { a: 1 }",                                        // 7
+        "match x { Shape::Sq(w) => 1, m::R { a } => 2, Shape::LO..9 => 3, None => 4 }",  // 8
+        "let d: dyn m::Show = Shape::Rec { a: 1 }",                     // 9
+    };
+    std::string src;
+    for (const auto& l : lines) src += l + "\n";
+    // "line:col" of the `nth` occurrence of `needle` on 1-based line `line`
+    auto at = [&](size_t line, const std::string& needle, int nth = 1) {
+        size_t i = std::string::npos;
+        for (int k = 0; k < nth; ++k) i = lines[line - 1].find(needle, i == std::string::npos ? 0 : i + 1);
+        return std::to_string(line) + ":" + std::to_string(i + 1);
+    };
+    auto pos = [](uint32_t l, uint32_t c) { return std::to_string(l) + ":" + std::to_string(c); };
+    svc::Lexer lex(src);
+    svc::Parser parser(lex.tokenize());
+    const svc::Program prog = parser.parse_program();
+    auto stmt_init = [&](size_t item) -> const svc::Expr& {
+        return *static_cast<const svc::LetStmt&>(*static_cast<const svc::StmtItem&>(*prog.items[item]).stmt).init;
+    };
+
+    const auto& u1 = static_cast<const svc::UseItem&>(*prog.items[0]);
+    check_true("npos_use_list", u1.name_pos.size() == 2 && pos(u1.name_pos[0].first, u1.name_pos[0].second) == at(1, "f") &&
+                                pos(u1.name_pos[1].first, u1.name_pos[1].second) == at(1, "Pair"));
+    const auto& u2 = static_cast<const svc::UseItem&>(*prog.items[1]);
+    check_true("npos_use_single", u2.name_pos.size() == 1 && pos(u2.name_pos[0].first, u2.name_pos[0].second) == at(2, "g"));
+    const auto& tr = static_cast<const svc::TraitDecl&>(*prog.items[2]);
+    check_true("npos_supertraits", tr.supertrait_pos.size() == 2 &&
+               pos(tr.supertrait_pos[1].first, tr.supertrait_pos[1].second) == at(3, "C"));
+    const auto& im = static_cast<const svc::ImplDecl&>(*prog.items[3]);
+    check_str("npos_impl_trait", pos(im.trait_line, im.trait_col), at(4, "Tr"));
+
+    const auto& call = static_cast<const svc::CallExpr&>(stmt_init(4));
+    const auto& callee = static_cast<const svc::IdentExpr&>(*call.callee);
+    check_str("npos_mod_path_head", pos(callee.line, callee.col), at(5, "util"));
+    check_str("npos_mod_path_tail", pos(callee.name_line, callee.name_col), at(5, "f"));
+    const auto& variant = static_cast<const svc::IdentExpr&>(*static_cast<const svc::CallExpr&>(*call.args[0]).callee);
+    check_str("npos_enum_path_tail", pos(variant.name_line, variant.name_col), at(5, "Square"));
+    const auto& tm = static_cast<const svc::IdentExpr&>(*call.args[1]);
+    check_str("npos_trait_path_tail", pos(tm.name_line, tm.name_col), at(5, "m"));
+    const auto& self_id = static_cast<const svc::IdentExpr&>(*call.args[2]);
+    check_str("npos_self", pos(self_id.name_line, self_id.name_col), at(5, "self"));
+
+    const auto& let_y = static_cast<const svc::LetStmt&>(*static_cast<const svc::StmtItem&>(*prog.items[5]).stmt);
+    const auto& ty = static_cast<const svc::NamedType&>(*let_y.type);
+    check_str("npos_type_head", pos(ty.line, ty.col), at(6, "m"));
+    check_str("npos_type_tail", pos(ty.name_line, ty.name_col), at(6, "T"));
+    const auto& lit = static_cast<const svc::StructLit&>(*let_y.init);
+    check_str("npos_struct_lit_bare", pos(lit.name_line, lit.name_col), at(6, "P"));
+    const auto& qlit = static_cast<const svc::StructLit&>(stmt_init(6));
+    check_str("npos_struct_lit_qualified", pos(qlit.name_line, qlit.name_col), at(7, "Q"));
+
+    const auto& m = static_cast<const svc::MatchExpr&>(*static_cast<const svc::ExprStmt&>(
+        *static_cast<const svc::StmtItem&>(*prog.items[7]).stmt).expr);
+    const auto& cp = static_cast<const svc::CtorPat&>(*m.arms[0].pat);
+    check_str("npos_ctor_pat_tail", pos(cp.line, cp.col), at(8, "Sq"));
+    check_str("npos_ctor_pat_head", pos(cp.qual_line, cp.qual_col), at(8, "Shape"));
+    const auto& sp = static_cast<const svc::StructPat&>(*m.arms[1].pat);
+    check_str("npos_struct_pat_head", pos(sp.qual_line, sp.qual_col), at(8, "m::R"));
+    const auto& rp = static_cast<const svc::RangePat&>(*m.arms[2].pat);
+    const auto& lo = static_cast<const svc::IdentExpr&>(*rp.lo);
+    check_str("npos_range_bound_tail", pos(lo.name_line, lo.name_col), at(8, "LO"));
+    const auto& none = static_cast<const svc::CtorPat&>(*m.arms[3].pat);
+    check_str("npos_ctor_pat_bare_has_no_head", pos(none.qual_line, none.qual_col), "0:0");
+
+    const auto& let_d = static_cast<const svc::LetStmt&>(*static_cast<const svc::StmtItem&>(*prog.items[8]).stmt);
+    const auto& dt = static_cast<const svc::DynType&>(*let_d.type);
+    check_str("npos_dyn_trait", pos(dt.name_line, dt.name_col), at(9, "Show"));
+    const auto& rec = static_cast<const svc::StructLit&>(*let_d.init);
+    check_str("npos_record_variant_tail", pos(rec.name_line, rec.name_col), at(9, "Rec"));
+}
+
+// The NAME positions the parser records for editor tooling (a declaration's `line`/`col` is its
+// keyword; these point at the name). Each is "line:col", 1-based.
+void test_name_positions() {
+    std::cout << "[parser: name positions]\n";
+    auto pos = [](uint32_t l, uint32_t c) { return std::to_string(l) + ":" + std::to_string(c); };
+    const std::string src =
+        "pub fn add(a: Int,\n"                           // 1
+        "           mut b: Vec[Int]) -> Int { a }\n"      // 2
+        "pub transparent struct Id(Int)\n"               // 3
+        "enum E { A, B }\n"                              // 4
+        "trait T { fn m(self) -> Int\n"                  // 5
+        "  fn make() -> Int }\n"                         // 6
+        "impl T for Int { fn m(self) -> Int { 1 }\n"     // 7
+        "  fn make() -> Int { 2 } }\n"                   // 8
+        "const  LIMIT: Int = 3\n"                        // 9
+        "let f = fn(x, y: Int) { x + y }\n"              // 10
+        "let p = (1, 2)\n"                               // 11
+        "let q = p.\n"                                   // 12
+        "  0 + len(p.  0.toString())\n";                 // 13 (field names only matter by position)
+    svc::Lexer lex(src);
+    svc::Parser parser(lex.tokenize());
+    const svc::Program prog = parser.parse_program();
+    const auto& fn = static_cast<const svc::FnItem&>(*prog.items[0]);
+    check_str("npos_fn_keyword", pos(fn.line, fn.col), "1:5");
+    check_str("npos_fn_name", pos(fn.name_line, fn.name_col), "1:8");
+    check_str("npos_param_plain", pos(fn.params[0].name_line, fn.params[0].name_col), "1:12");
+    check_str("npos_param_plain_no_mut_pos", pos(fn.params[0].line, fn.params[0].col), "0:0");
+    check_str("npos_param_mut_name", pos(fn.params[1].name_line, fn.params[1].name_col), "2:16");
+    check_str("npos_param_mut_keyword", pos(fn.params[1].line, fn.params[1].col), "2:12");
+    const auto& st = *prog.items[1];
+    check_str("npos_struct_keyword", pos(st.line, st.col), "3:17");
+    check_str("npos_struct_name", pos(st.name_line, st.name_col), "3:24");
+    check_str("npos_enum_name", pos(prog.items[2]->name_line, prog.items[2]->name_col), "4:6");
+    const auto& tr = static_cast<const svc::TraitDecl&>(*prog.items[3]);
+    check_str("npos_trait_name", pos(tr.name_line, tr.name_col), "5:7");
+    check_str("npos_trait_method", pos(tr.methods[0].line, tr.methods[0].col), "5:14");
+    check_str("npos_trait_method_no_self", pos(tr.methods[1].line, tr.methods[1].col), "6:6");
+    const auto& im = static_cast<const svc::ImplDecl&>(*prog.items[4]);
+    check_str("npos_impl_has_no_name", pos(im.name_line, im.name_col), "0:0");
+    check_str("npos_impl_method", pos(im.methods[1].line, im.methods[1].col), "8:6");
+    check_str("npos_const_name", pos(prog.items[5]->name_line, prog.items[5]->name_col), "9:8");
+    const auto& let_f = static_cast<const svc::LetStmt&>(*static_cast<const svc::StmtItem&>(*prog.items[6]).stmt);
+    const auto& lam = static_cast<const svc::LambdaExpr&>(*let_f.init);
+    check_str("npos_lambda_param_untyped", pos(lam.params[0].name_line, lam.params[0].name_col), "10:12");
+    check_str("npos_lambda_param_typed", pos(lam.params[1].name_line, lam.params[1].name_col), "10:15");
+    const auto& let_q = static_cast<const svc::LetStmt&>(*static_cast<const svc::StmtItem&>(*prog.items[8]).stmt);
+    const auto& sum = static_cast<const svc::BinaryExpr&>(*let_q.init);
+    const auto& idx = static_cast<const svc::FieldExpr&>(*sum.lhs);
+    check_str("npos_field_dot", pos(idx.line, idx.col), "12:10");
+    check_str("npos_field_member_next_line", pos(idx.name_line, idx.name_col), "13:3");
+    // `p.  0.toString()` -> Call(Field(Field(p, 0), toString)); the method name sits after the 2nd dot
+    const auto& len_call = static_cast<const svc::CallExpr&>(*sum.rhs);
+    const auto& ts_call = static_cast<const svc::CallExpr&>(*len_call.args[0]);
+    const auto& ts = static_cast<const svc::FieldExpr&>(*ts_call.callee);
+    check_str("npos_method_member", pos(ts.name_line, ts.name_col), "13:17");
+    check_str("npos_tuple_member_after_spaces",
+              pos(static_cast<const svc::FieldExpr&>(*ts.obj).name_line,
+                  static_cast<const svc::FieldExpr&>(*ts.obj).name_col), "13:15");
+}
+
+// svc::check_modules_for_tools -- the editor-tooling entry: never throws on a type error, returns the
+// program with every error and warning, and writes the FINAL types into the expression slots.
+void test_tool_check() {
+    std::cout << "[check for tools]\n";
+    auto run = [](const std::string& src) {
+        const svc::ModuleResolver none = [](const std::vector<std::string>&) { return std::optional<std::string>(); };
+        return svc::check_modules_for_tools(svc::load_modules(src.c_str(), none), &svc::builtin_prelude());
+    };
+    // The initializer of the `n`-th user statement item (a `let`).
+    auto let_init = [](const svc::ToolCheck& tc, size_t n) -> const svc::Expr& {
+        const auto& it = static_cast<const svc::StmtItem&>(*tc.program.items[tc.program.prelude_item_count + n]);
+        return *static_cast<const svc::LetStmt&>(*it.stmt).init;
+    };
+
+    {   // `vec()` is checked before `push(v, 3)` fixes its element type
+        const svc::ToolCheck tc = run("let mut v = vec()\npush(v, 3)\nprintln(v)\n");
+        check_true("tool_clean_no_errors", tc.errors.empty());
+        check_str("tool_resolves_later_solution", svc::describe(let_init(tc, 0).ty), "Vec[Int]");
+    }
+    {
+        const svc::ToolCheck tc = run("let e: Option[Int] = None\nprintln(e)\n");
+        check_str("tool_resolves_expected_type", svc::describe(let_init(tc, 0).ty), "std::core::Option[Int]");
+    }
+    {   // an error does not throw, and the must-use warning comes back with it
+        const svc::ToolCheck tc = run("fn f() -> Result[Int, String] { Ok(1) }\nf()\nlet s: String = 5\nprintln(s)\n");
+        check_true("tool_error_returned", tc.errors.size() == 1 && tc.errors[0].line == 3);
+        check_true("tool_warning_kept_with_error", !tc.warnings.empty() && tc.warnings[0].line == 2);
+        check_true("tool_program_kept_with_error", tc.program.items.size() == tc.program.prelude_item_count + 4);
+    }
+    {   // the ambient functions, with the module that gates a native
+        const svc::ToolCheck tc = run("println(1)\n");
+        auto find = [&](const std::string& n) -> const svc::AmbientFn* {
+            for (const svc::AmbientFn& f : tc.ambient) if (f.name == n) return &f;
+            return nullptr;
+        };
+        const svc::AmbientFn* len = find("len");
+        const svc::AmbientFn* parse_int = find("parseInt");
+        const svc::AmbientFn* sqrt = find("sqrt");
+        const svc::AmbientFn* read_file = find("readFile");
+        check_true("tool_ambient_builtin", len && len->module.empty());
+        check_str("tool_ambient_builtin_signature", len ? len->signature : "",
+                  "fn len(String | List[T] | Array[T] | Vec[T] | Bytes | Map[K, V]) -> Int");
+        const svc::AmbientFn* push = find("push");
+        check_true("tool_ambient_push_overloads", push && push->signature.find('\n') != std::string::npos);
+        bool all_signed = true;   // every builtin a user may call has a signature
+        for (std::string_view n : svc::BUILTIN_FN_NAMES) {
+            const svc::AmbientFn* f = find(std::string(n));
+            if (f && f->signature.empty()) { all_signed = false; std::cout << "  unsigned builtin: " << n << "\n"; }
+        }
+        check_true("tool_ambient_builtin_signatures", all_signed);
+        check_true("tool_ambient_native", parse_int && parse_int->module.empty());
+        check_str("tool_ambient_native_signature", parse_int ? parse_int->signature : "",
+                  "fn parseInt(String) -> std::core::Result[Int, String]");
+        check_true("tool_ambient_gated_math", sqrt && sqrt->module == "std::math");
+        check_true("tool_ambient_gated_io", read_file && read_file->module == "std::io");
+        check_true("tool_ambient_internal_hidden", !find("mapIterNext") && !find("_appendBytesRange"));
+        const svc::ToolCheck plain = [] {
+            svc::Program p = svc::Parser(svc::Lexer("println(1)\n").tokenize()).parse_program();
+            svc::ToolCheck t;
+            t.ambient = svc::check(p).ambient;
+            return t;
+        }();
+        check_true("tool_ambient_off_by_default", plain.ambient.empty());
+    }
+}
+
+// Editor-tooling recovery: Lexer::tokenize_tolerant + Parser::parse_program_tolerant +
+// svc::load_modules_for_tools. A recovered tree is compared with the dump of the source that has the
+// dropped construct removed by hand.
+struct TolerantParse {
+    svc::Program prog;
+    std::vector<svc::LexError> lex;
+    std::vector<svc::ParseError> parse;
+};
+TolerantParse parse_tolerant(const std::string& src) {
+    TolerantParse t;
+    svc::Lexer lex(src);
+    std::vector<svc::Token> toks = lex.tokenize_tolerant(t.lex);
+    t.prog = svc::Parser(std::move(toks)).parse_program_tolerant(t.parse, t.lex);
+    return t;
+}
+
+void test_lex_spans() {
+    std::cout << "[lexer: token spans and comments for tools]\n";
+    const std::string src =
+        "let s = \"a\\tb\"  // tail\n"
+        "let r = r#\"x\"y\"#\n"
+        "let i = \"v=${x:>3} end\"\n"
+        "let c = 'A'\n"
+        "let h = 0xFF_FF\n"
+        "let u = \"http://x\"\n"
+        "/* a /* nested */ b */ let z = 1\n";
+    std::vector<svc::Comment> comments;
+    const std::vector<svc::Token> toks = svc::Lexer(src).tokenize_with_comments(comments);
+    const std::vector<svc::Token> plain = svc::Lexer(src).tokenize();
+    auto spelling = [&](const svc::Token& t) { return src.substr(t.begin, t.end - t.begin); };
+    auto first = [&](svc::TokKind k, std::size_t from = 0) -> std::size_t {
+        for (std::size_t i = from; i < toks.size(); ++i) if (toks[i].kind == k) return i;
+        return toks.size();
+    };
+    bool same = toks.size() == plain.size();
+    for (std::size_t i = 0; same && i < toks.size(); ++i)
+        same = toks[i].kind == plain[i].kind && toks[i].text == plain[i].text &&
+               toks[i].begin == plain[i].begin && toks[i].end == plain[i].end;
+    check_true("lex_span_same_tokens", same);
+    const std::size_t s = first(svc::TokKind::Str);
+    check_str("lex_span_decoded_string", s < toks.size() ? spelling(toks[s]) : "", "\"a\\tb\"");
+    const std::size_t r = first(svc::TokKind::Str, s + 1);
+    check_str("lex_span_raw_string", r < toks.size() ? spelling(toks[r]) : "", "r#\"x\"y\"#");
+    const std::size_t ib = first(svc::TokKind::InterpStrBegin), ie = first(svc::TokKind::InterpStrEnd);
+    check_str("lex_span_interpolation", ib < ie && ie < toks.size() ? src.substr(toks[ib].begin, toks[ie].end - toks[ib].begin) : "",
+              "\"v=${x:>3} end\"");
+    std::size_t c = toks.size(), h = toks.size();
+    for (std::size_t i = 0; i < toks.size(); ++i) {
+        if (toks[i].kind == svc::TokKind::Int && spelling(toks[i]) == "'A'") c = i;
+        if (toks[i].kind == svc::TokKind::Int && spelling(toks[i]) == "0xFF_FF") h = i;
+    }
+    check_true("lex_span_char", c < toks.size() && toks[c].int_val == 65);
+    check_true("lex_span_hex_with_separator", h < toks.size() && toks[h].int_val == 0xFFFF);
+    const std::size_t ident = first(svc::TokKind::LIdent);
+    check_true("lex_span_ident", ident < toks.size() && spelling(toks[ident]) == "s" && toks[ident].line == 1 && toks[ident].col == 5);
+    check_true("lex_comments_count", comments.size() == 2);
+    if (comments.size() == 2) {
+        check_str("lex_comments_line", src.substr(comments[0].begin, comments[0].end - comments[0].begin), "// tail");
+        check_str("lex_comments_nested_block", src.substr(comments[1].begin, comments[1].end - comments[1].begin),
+                  "/* a /* nested */ b */");
+        check_true("lex_comments_position", comments[0].line == 1 && comments[0].col == 17 && comments[1].line == 7 && comments[1].col == 1);
+    }
+    std::vector<svc::Comment> none;
+    (void)svc::Lexer("let x = 1 // c\n").tokenize();
+    check_true("lex_comments_off_by_default", none.empty());
+
+    // The parser's layout (the formatter's structure): two statements sharing a line are two starts.
+    const std::string prog =
+        "struct P { x: Int }\n"
+        "impl P { fn f(self) -> Int { let a = 1  a } }\n"
+        "let q = match 1 { 1 => 2, _ => P { x: 3 }.x }\n";
+    const std::vector<svc::Token> pt = svc::Lexer(prog).tokenize();
+    svc::ParseLayout layout;
+    svc::Parser parser(pt);
+    parser.set_layout(&layout);
+    (void)parser.parse_program();
+    std::string starts, braces;
+    for (std::size_t st : layout.starts) starts += pt[st].text + " ";
+    for (const auto& [i, b] : layout.braces)
+        braces += std::to_string(pt[i].line) + ":" + std::to_string(pt[i].col) + "=" + std::to_string(static_cast<int>(b)) + " ";
+    check_str("parse_layout_starts", starts, "struct impl fn let a let 1 _ ");
+    check_str("parse_layout_braces", braces, "1:10=3 2:8=2 2:28=0 3:17=1 ");
+}
+
+void test_parse_recovery() {
+    std::cout << "[parser: error recovery for tools]\n";
+    auto flags = [](const TolerantParse& t) {
+        std::string s;
+        for (const auto& it : t.prog.items) s += it->has_syntax_error ? '1' : '0';
+        return s;
+    };
+    auto at = [](const auto& e) { return std::to_string(e.line()) + ":" + std::to_string(e.col()); };
+
+    {   // an unknown character: the rest of its line is dropped, the next line lexes
+        const TolerantParse t = parse_tolerant("let a = 1 $ 2\nlet b = 3\n");
+        check_true("lexrec_unknown_char_one_error", t.lex.size() == 1 && at(t.lex[0]) == "1:11" && t.parse.empty());
+        check_str("lexrec_unknown_char_tree", svc::dump(t.prog), prog_dump("let a = 1\nlet b = 3\n"));
+        check_str("lexrec_unknown_char_flags", flags(t), "10");
+    }
+    {   // an unterminated raw string no longer swallows the file; the unfinished `let s =` is
+        // reported at the next line, which is still parsed
+        const TolerantParse t = parse_tolerant("let s = r\"abc\nlet b = 3\n");
+        check_true("lexrec_raw_string_one_error", t.lex.size() == 1 && at(t.lex[0]) == "1:9");
+        check_true("lexrec_raw_string_parse_error", t.parse.size() == 1 && at(t.parse[0]) == "2:1");
+        check_str("lexrec_raw_string_tree", svc::dump(t.prog), prog_dump("let b = 3\n"));
+    }
+    {   // an unterminated string after an interpolation hole leaves the interpolation
+        const TolerantParse t = parse_tolerant("let s = \"a ${x} b\nlet b = 3\n");
+        check_true("lexrec_interp_error", t.lex.size() == 1 && at(t.lex[0]) == "1:15");
+        check_true("lexrec_interp_next_line_kept", !t.prog.items.empty() &&
+                   svc::dump(t.prog).find("(let b 3)") != std::string::npos);
+    }
+    {   // an unfinished line: the next line is parsed, not skipped
+        const TolerantParse t = parse_tolerant("fn f() -> Int {\n    let a = 1 +\n    let c = 3\n    c\n}\n");
+        check_true("precov_line_start_one_error", t.parse.size() == 1 && at(t.parse[0]) == "3:5");
+        check_str("precov_line_start_tree", svc::dump(t.prog), prog_dump("fn f() -> Int {\n    let c = 3\n    c\n}\n"));
+    }
+    {   // `pub trait`: the members are indented past `pub`, not past `trait`
+        const TolerantParse t = parse_tolerant("pub trait T {\n  fn a(self) -> Int\n  fn b(self -> Int\n  fn c(self) -> Int\n}\n");
+        check_true("precov_pub_trait_one_error", t.parse.size() == 1);
+        check_str("precov_pub_trait_tree", svc::dump(t.prog), prog_dump("pub trait T {\n  fn a(self) -> Int\n  fn c(self) -> Int\n}\n"));
+    }
+    {   // an unterminated block comment ends the input
+        const TolerantParse t = parse_tolerant("let a = 1\n/* never closed\nlet b = 2\n");
+        check_true("lexrec_block_comment", t.lex.size() == 1 && at(t.lex[0]) == "2:1");
+        check_str("lexrec_block_comment_tree", svc::dump(t.prog), prog_dump("let a = 1\n"));
+    }
+    {   // two broken statements: both reported, the others kept, only `f` flagged
+        const TolerantParse t = parse_tolerant(
+            "fn f() -> Int {\n    let a = 1\n    let b = foo(1 2)\n    let c = 3\n    let d = * 4\n    a + c\n}\n"
+            "fn g() -> Int { 5 }\n");
+        check_true("precov_two_stmts_errors", t.parse.size() == 2 && at(t.parse[0]) == "3:19" && at(t.parse[1]) == "5:13");
+        check_str("precov_two_stmts_tree", svc::dump(t.prog),
+                  prog_dump("fn f() -> Int {\n    let a = 1\n    let c = 3\n    a + c\n}\nfn g() -> Int { 5 }\n"));
+        check_str("precov_two_stmts_flags", flags(t), "10");
+    }
+    {   // a missing `}`: the next item closes every open body; the innermost `{` is reported once
+        const TolerantParse t = parse_tolerant(
+            "fn f() -> Int {\n    let a = 1\n    if a > 0 {\n        a\nfn g() -> Int { 5 }\n");
+        check_true("precov_missing_brace_one_error", t.parse.size() == 1 && at(t.parse[0]) == "3:14" &&
+                   std::string(t.parse[0].what()).find("never closed") != std::string::npos);
+        check_str("precov_missing_brace_tree", svc::dump(t.prog),
+                  prog_dump("fn f() -> Int {\n    let a = 1\n    if a > 0 {\n        a\n    }\n}\nfn g() -> Int { 5 }\n"));
+        check_str("precov_missing_brace_flags", flags(t), "10");
+    }
+    {   // the `}` of the fn closed the `if` instead: indentation points at the `if` as the unclosed one
+        const TolerantParse t = parse_tolerant(
+            "fn f() -> Int {\n    let a = 1\n    if a > 0 {\n        a\n    a\n}\nfn g() -> Int { 5 }\n");
+        check_true("precov_missing_brace_by_indent", t.parse.size() == 1 && at(t.parse[0]) == "3:14");
+        const TolerantParse n = parse_tolerant(
+            "fn f() -> Int {\n    if a {\n        if b {\n            x\n    }\n    y\n}\nfn g() -> Int { 5 }\n");
+        check_true("precov_missing_brace_by_indent_nested", n.parse.size() == 1 && at(n.parse[0]) == "3:14");
+        const TolerantParse k = parse_tolerant(   // one-line bodies and `} else {` line up fine
+            "fn f() -> Int {\n    if a { 1 } else {\n        2\n    }\n    match a {\n        1 => { 3 }\n    }\n"
+            "fn g() -> Int { 5 }\n");
+        check_true("precov_missing_brace_aligned_bodies", k.parse.size() == 1 && at(k.parse[0]) == "1:15");
+    }
+    {   // `else` where a statement should start: the `}` before it is missing (one line, so
+        // indentation cannot tell)
+        const TolerantParse t = parse_tolerant(
+            "fn f(a: Int) -> Int { if a == 1 { 2  else { 3 } }\nfn g() -> Int { 5 }\n");
+        check_true("precov_brace_before_else", t.parse.size() == 1 && at(t.parse[0]) == "1:38" &&
+                   std::string(t.parse[0].what()).find("expected '}' before 'else'") != std::string::npos);
+        check_str("precov_brace_before_else_tree", svc::dump(t.prog),
+                  prog_dump("fn f(a: Int) -> Int { if a == 1 { 2 } else { 3 } }\nfn g() -> Int { 5 }\n"));
+    }
+    {   // the end of the input closes too
+        const TolerantParse t = parse_tolerant("fn f() -> Int {\n    1\n");
+        check_true("precov_eof_one_error", t.parse.size() == 1 && at(t.parse[0]) == "1:15");
+        check_str("precov_eof_tree", svc::dump(t.prog), prog_dump("fn f() -> Int {\n    1\n}\n"));
+    }
+    {   // a broken field / variant drops only itself
+        const TolerantParse s = parse_tolerant("struct P { x: Int, y: , z: Int }\n");
+        check_str("precov_field_tree", svc::dump(s.prog), prog_dump("struct P { x: Int, z: Int }\n"));
+        check_true("precov_field_one_error", s.parse.size() == 1);
+        const TolerantParse e = parse_tolerant("enum E { A, B(, C }\n");
+        check_str("precov_variant_tree", svc::dump(e.prog), prog_dump("enum E { A, C }\n"));
+    }
+    {   // a broken method signature drops that method
+        const TolerantParse t = parse_tolerant(
+            "struct P { x: Int }\nimpl P {\n    fn a(self) -> Int { self.x }\n    fn b(self -> Int { 1 }\n"
+            "    fn c(self) -> Int { 2 }\n}\n");
+        check_str("precov_member_tree", svc::dump(t.prog),
+                  prog_dump("struct P { x: Int }\nimpl P {\n    fn a(self) -> Int { self.x }\n    fn c(self) -> Int { 2 }\n}\n"));
+        check_str("precov_member_flags", flags(t), "01");
+    }
+    {   // a method whose body lost its `{`: read as a brace-less body, the impl stays open
+        const TolerantParse t = parse_tolerant(
+            "struct P { x: Int }\nimpl P {\n    fn a(self) -> Int { self.x }\n    fn b(self) -> Int  self.x }\n"
+            "    fn c(self) -> Int { 2 }\n}\nfn g() -> Int { 5 }\n");
+        check_true("precov_member_lost_open_brace_one_error", t.parse.size() == 1 && at(t.parse[0]) == "4:24");
+        check_str("precov_member_lost_open_brace_tree", svc::dump(t.prog),
+                  prog_dump("struct P { x: Int }\nimpl P {\n    fn a(self) -> Int { self.x }\n    fn b(self) -> Int { self.x }\n"
+                            "    fn c(self) -> Int { 2 }\n}\nfn g() -> Int { 5 }\n"));
+    }
+    {   // a match arm that lost its `{`: its `}` goes with it, the match and the impl stay whole
+        const TolerantParse t = parse_tolerant(
+            "impl[T] Tree[T] {\n    fn c(t: Tree[T]) -> Int {\n        match t {\n            Leaf => },\n"
+            "            Node(l, v, r) => {\n                1\n            },\n        }\n    }\n"
+            "    fn size(t: Tree[T]) -> Int { 0 }\n}\n");
+        check_true("precov_arm_lost_open_brace_one_error", t.parse.size() == 1 && at(t.parse[0]) == "4:21");
+        check_str("precov_arm_lost_open_brace_tree", svc::dump(t.prog),
+                  prog_dump("impl[T] Tree[T] {\n    fn c(t: Tree[T]) -> Int {\n        match t {\n"
+                            "            Node(l, v, r) => {\n                1\n            },\n        }\n    }\n"
+                            "    fn size(t: Tree[T]) -> Int { 0 }\n}\n"));
+        const TolerantParse o = parse_tolerant("fn f() -> Int { let x = + 1 }\nfn g() -> Int { 5 }\n");
+        check_true("precov_one_line_body_closer_kept", o.parse.size() == 1 && o.prog.items.size() == 2);
+    }
+    {   // a forgotten `{`: the statements up to the matching `}` become the block
+        const TolerantParse t = parse_tolerant(
+            "fn f(a: Int) -> String { if a == 1  \"one\" } else { \"other\" } }\nfn g() -> Int { 5 }\n");
+        check_true("precov_braceless_if_one_error", t.parse.size() == 1 && at(t.parse[0]) == "1:37");
+        check_str("precov_braceless_if_tree", svc::dump(t.prog),
+                  prog_dump("fn f(a: Int) -> String { if a == 1 { \"one\" } else { \"other\" } }\nfn g() -> Int { 5 }\n"));
+        const TolerantParse m = parse_tolerant(
+            "struct P { x: Int }\nimpl P {\n    fn a(self) -> Int  self.x }\n    fn b(self) -> Int { 2 }\n}\n");
+        check_str("precov_braceless_method_tree", svc::dump(m.prog),
+                  prog_dump("struct P { x: Int }\nimpl P {\n    fn a(self) -> Int { self.x }\n    fn b(self) -> Int { 2 }\n}\n"));
+        const TolerantParse w = parse_tolerant(   // multi-line: the `}` on the `while` line's indentation
+            "fn f() -> Int {\n    let mut i = 0\n    while i < 3\n        i += 1\n    }\n    i\n}\n");
+        check_true("precov_braceless_while_one_error", w.parse.size() == 1 && at(w.parse[0]) == "4:9");
+        check_str("precov_braceless_while_tree", svc::dump(w.prog),
+                  prog_dump("fn f() -> Int {\n    let mut i = 0\n    while i < 3 {\n        i += 1\n    }\n    i\n}\n"));
+        const TolerantParse u = parse_tolerant(   // no `}` of its own (the fn's is less indented): not a block
+            "fn f() -> Int {\n    if a\n    1\n}\n");
+        check_true("precov_braceless_not_taken", u.parse.size() == 1 && u.prog.items.size() == 1);
+    }
+    {   // a missing impl `}`: an unindented `fn` is the next item, not a method
+        const TolerantParse t = parse_tolerant(
+            "struct P { x: Int }\nimpl P {\n    fn a(self) -> Int { self.x }\nfn g() -> Int { 5 }\n");
+        check_true("precov_impl_unclosed_error", t.parse.size() == 1 && at(t.parse[0]) == "2:8");
+        check_str("precov_impl_unclosed_tree", svc::dump(t.prog),
+                  prog_dump("struct P { x: Int }\nimpl P {\n    fn a(self) -> Int { self.x }\n}\nfn g() -> Int { 5 }\n"));
+        check_str("precov_impl_unclosed_flags", flags(t), "010");
+    }
+    {   // a broken match arm drops that arm
+        const TolerantParse t = parse_tolerant(
+            "fn f(o: Option[Int]) -> Int {\n    match o {\n        Some(x) => x +,\n        None => 0\n    }\n}\n");
+        check_str("precov_arm_tree", svc::dump(t.prog),
+                  prog_dump("fn f(o: Option[Int]) -> Int {\n    match o {\n        None => 0\n    }\n}\n"));
+        check_true("precov_arm_one_error", t.parse.size() == 1 && at(t.parse[0]) == "3:23");
+    }
+    {   // a broken item header drops the item, including its body
+        const TolerantParse t = parse_tolerant("fn f( -> Int { 1 }\nfn g() -> Int { 2 }\n");
+        check_str("precov_header_tree", svc::dump(t.prog), prog_dump("fn g() -> Int { 2 }\n"));
+        check_str("precov_header_flags", flags(t), "0");
+    }
+    {   // a lex error inside an item flags it without a parse error
+        const TolerantParse t = parse_tolerant("fn f() -> Int {\n    let a = 1 $\n    a\n}\nfn g() -> Int { 2 }\n");
+        check_true("precov_lex_flag_no_parse_error", t.lex.size() == 1 && t.parse.empty());
+        check_str("precov_lex_flags", flags(t), "10");
+    }
+    {   // on valid input the tolerant path equals the strict one: every std module
+        bool same = true, clean = true;
+        for (const svc::PreludeModule& m : svc::builtin_prelude()) {
+            const TolerantParse t = parse_tolerant(m.source);
+            if (!t.lex.empty() || !t.parse.empty() || flags(t).find('1') != std::string::npos) clean = false;
+            if (svc::dump(t.prog) != prog_dump(m.source)) same = false;
+        }
+        check_true("precov_std_no_errors", clean);
+        check_true("precov_std_same_tree", same);
+    }
+    {   // the strict path is untouched: the first error is thrown, with the old message
+        std::string msg;
+        try { prog_dump("fn f() -> Int {\n    1\n"); } catch (const svc::ParseError& e) { msg = e.what(); }
+        check_str("precov_strict_unchanged", msg, "unterminated block at line 3:1");
+    }
+    {   // garbage terminates, and the error count is capped
+        bool all = true;
+        for (const char* src : { ")))}}}]]]", "fn", "impl", "pub", "{{{{", "match {", "struct S {", "enum E { A(",
+                                 "fn f() -> Int { match x { , , , } }", "impl P { fn", "trait T { x y z }",
+                                 "let x = [1, 2", "#{ 1 => }", "fn f() -> Int { let }" }) {
+            const TolerantParse t = parse_tolerant(src);
+            if (t.parse.empty() && t.lex.empty()) all = false;
+        }
+        check_true("precov_garbage_terminates_with_errors", all);
+        std::string many;
+        for (int i = 0; i < 500; ++i) many += "let x = )\n";
+        check_true("precov_error_cap", parse_tolerant(many).parse.size() == 100);
+    }
+    {   // the tool-mode loader collects per module and still follows the recovered imports
+        const std::unordered_map<std::string, std::string> files = {
+            { "util", "pub fn f() -> Int { 1 }\npub fn g( -> Int { 2 }\n" },
+        };
+        const svc::ModuleResolver res = [&](const std::vector<std::string>& p) -> std::optional<std::string> {
+            const auto it = files.find(svc::join_module_path(p));
+            if (it == files.end()) return std::nullopt;
+            return it->second;
+        };
+        svc::ToolLoad tl = svc::load_modules_for_tools("import util\nprintln(util::f())\nlet x = )\n", res);
+        check_true("tool_load_two_errors", tl.syntax_errors.size() == 2);
+        check_true("tool_load_entry_error", tl.syntax_errors.size() == 2 && tl.syntax_errors[0].module.empty() &&
+                   tl.syntax_errors[0].line == 3);
+        check_true("tool_load_util_error", tl.syntax_errors.size() == 2 && tl.syntax_errors[1].module == "util" &&
+                   tl.syntax_errors[1].line == 2 && tl.syntax_errors[1].col == 11 &&
+                   tl.syntax_errors[1].message == "parse error: expected parameter name");
+        check_true("tool_load_modules", tl.modules.modules.size() == 2 &&
+                   tl.modules.modules[0].program.items.size() == 1);
+        const svc::ToolCheck tc = svc::check_modules_for_tools(std::move(tl.modules), &svc::builtin_prelude());
+        check_true("tool_load_checks_clean", tc.errors.empty());
+    }
+}
+
 void test_parser_expr() {
     std::cout << "[parser: expressions]\n";
     // precedence + associativity
@@ -10357,6 +10867,11 @@ int main(int argc, char** argv) {
     test_parser_items();
     test_parser_patterns();
     test_parser_errors();
+    test_name_positions();
+    test_name_positions_qualified();
+    test_tool_check();
+    test_lex_spans();
+    test_parse_recovery();
     test_loader();
     test_modules();
     test_import_matrix();

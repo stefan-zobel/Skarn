@@ -164,9 +164,14 @@ bool Lexer::skip_trivia() {
             saw_newline = true;
             advance();
         } else if (c == '/' && peek(1) == '/') {
+            const size_t b = pos_; const uint32_t sl = line_, sc = col_;
             advance(); advance();
             while (!at_end() && cur() != '\n') advance();
+            size_t e = pos_;
+            if (e > b && src_[e - 1] == '\r') --e;
+            if (comments_) comments_->push_back(Comment{ uint32_t(b), uint32_t(e), sl, sc });
         } else if (c == '/' && peek(1) == '*') {
+            const size_t b = pos_;
             uint32_t sl = line_, sc = col_;
             advance(); advance();
             int depth = 1;
@@ -176,6 +181,7 @@ bool Lexer::skip_trivia() {
                 else if (cur() == '*' && peek(1) == '/') { advance(); advance(); --depth; }
                 else { if (cur() == '\n') saw_newline = true; advance(); }
             }
+            if (comments_) comments_->push_back(Comment{ uint32_t(b), uint32_t(pos_), sl, sc });
         } else {
             break;
         }
@@ -523,12 +529,18 @@ Token Lexer::scan_colon(uint32_t line, uint32_t col) {
 // emitting an RBrace token; otherwise track `{`/`}` depth of the enclosing hole so struct-literal /
 // block braces inside it are not mistaken for the closer. Outside any hole this is a thin pass-through.
 Token Lexer::scan_token() {
+    const size_t begin = pos_;
+    auto spanned = [&](Token t) {
+        t.begin = static_cast<uint32_t>(begin);
+        t.end   = static_cast<uint32_t>(pos_);
+        return t;
+    };
     if (!interp_stack_.empty() && cur() == '}' && interp_stack_.back().brace_depth == 0) {
         uint32_t line = line_, col = col_;
         advance();                                 // consume the hole-closing '}'
-        return scan_interp_text(line, col, /*continuation=*/true);
+        return spanned(scan_interp_text(line, col, /*continuation=*/true));
     }
-    Token t = scan_token_raw();
+    Token t = spanned(scan_token_raw());
     if (!interp_stack_.empty()) {                  // a `"…"` in the raw scan may have pushed a nested
         InterpFrame& f = interp_stack_.back();     // frame; adjust the top (current) hole's delimiter depths
         if      (t.kind == TokKind::LBrace)   f.brace_depth++;
@@ -680,10 +692,27 @@ std::vector<Token> Lexer::apply_asi(const std::vector<Token>& raw) {
     return out;
 }
 
-std::vector<Token> Lexer::tokenize() {
+std::vector<Token> Lexer::tokenize() { return tokenize_impl(nullptr); }
+
+std::vector<Token> Lexer::tokenize_tolerant(std::vector<LexError>& errors) { return tokenize_impl(&errors); }
+
+std::vector<Token> Lexer::tokenize_with_comments(std::vector<Comment>& comments) {
+    comments_ = &comments;
+    struct Reset { std::vector<Comment>*& p; ~Reset() { p = nullptr; } } reset{ comments_ };
+    return tokenize_impl(nullptr);
+}
+
+std::vector<Token> Lexer::tokenize_impl(std::vector<LexError>* errors) {
     std::vector<Token> raw;
     for (;;) {
-        bool nl = skip_trivia();
+        bool nl = false;
+        try {
+            nl = skip_trivia();
+        } catch (const LexError& e) {              // only an unterminated block comment: it ran to the end
+            if (!errors) throw;
+            errors->push_back(e);
+            nl = true;
+        }
         if (at_end()) {
             if (nl) {
                 Token n; n.kind = TokKind::Newline; n.line = line_; n.col = col_;
@@ -694,6 +723,23 @@ std::vector<Token> Lexer::tokenize() {
         if (nl) {
             Token n; n.kind = TokKind::Newline; n.line = line_; n.col = col_;
             raw.push_back(std::move(n));
+        }
+        if (errors) {
+            // Recovery: back to where the token started, drop the rest of that line, and leave any
+            // string interpolation (a string never continues past its line, so the hole is lost).
+            const size_t p = pos_; const uint32_t l = line_, c = col_;
+            try {
+                Token tk = scan_token();
+                prev_was_dot_ = (tk.kind == TokKind::Dot);
+                raw.push_back(std::move(tk));
+            } catch (const LexError& e) {
+                errors->push_back(e);
+                pos_ = p; line_ = l; col_ = c;
+                while (!at_end() && cur() != '\n') advance();
+                interp_stack_.clear();
+                prev_was_dot_ = false;
+            }
+            continue;
         }
         Token tk = scan_token();
         // Track member dots so scan_number can distinguish a tuple index from a Double.

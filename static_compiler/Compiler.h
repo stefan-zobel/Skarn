@@ -193,6 +193,20 @@ inline Program parse_check_modules(ModuleSet modules, const std::vector<PreludeM
     return parse_check_modules(std::move(modules), &prelude, out_warnings);
 }
 
+// For editor tooling: parse_check_modules without the throw and with final types. Assembles the
+// same combined Program, checks it with CheckOptions::resolve_types, and RETURNS the program with
+// every error and warning instead of throwing CheckFailure -- a tool must answer "what is the type
+// here" while the program still has errors, and it wants the warnings then too. The returned tree
+// may hold `Error` types where the checker rejected something; never lower it. A LexError /
+// ParseError in the prelude still propagates (there is no tree to return).
+struct ToolCheck {
+    Program program;
+    std::vector<TypeError> errors;
+    std::vector<TypeError> warnings;
+    std::vector<AmbientFn> ambient;   // the builtins and natives a user may call (CheckOptions::list_ambient)
+};
+ToolCheck check_modules_for_tools(ModuleSet modules, const std::vector<PreludeModule>* prelude = nullptr);
+
 // The built-in static prelude, as an ordered list of prelude modules (embedded from the
 // std/*.skn sources by the pre-build). Pre-split this is a single { "$prelude", <source> }
 // entry (mangles to bare = the old monolithic prelude); the stdlib split turns it into
