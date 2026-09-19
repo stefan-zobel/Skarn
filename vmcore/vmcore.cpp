@@ -1030,14 +1030,20 @@ static Value native_run_process(Value* args, uint8_t nargs, Context* ctx) {
     int in_pipe[2]  = {-1, -1};   // [read-end, write-end]: child reads, parent writes
     int out_pipe[2] = {-1, -1};   // [read-end, write-end]: parent reads, child writes
     int err_pipe[2] = {-1, -1};
+    // exec_err_pipe: O_CLOEXEC write-end is closed by exec on success; child writes errno on
+    // exec failure so the parent can distinguish "exec failed" from "process exited non-zero".
+    int exec_err_pipe[2] = {-1, -1};
     auto close_fds = [&]() {
-        for (int fd : {in_pipe[0], in_pipe[1], out_pipe[0], out_pipe[1], err_pipe[0], err_pipe[1]})
+        for (int fd : {in_pipe[0], in_pipe[1], out_pipe[0], out_pipe[1],
+                       err_pipe[0], err_pipe[1], exec_err_pipe[0], exec_err_pipe[1]})
             if (fd >= 0) ::close(fd);
     };
-    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0 || pipe(err_pipe) != 0) {
+    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0 || pipe(err_pipe) != 0 ||
+        pipe(exec_err_pipe) != 0) {
         close_fds();
         return native_make_error(ctx, "run: could not create pipes for " + argv[0]);
     }
+    fcntl(exec_err_pipe[1], F_SETFD, FD_CLOEXEC);
     pid_t pid = fork();
     if (pid < 0) {
         close_fds();
@@ -1045,6 +1051,7 @@ static Value native_run_process(Value* args, uint8_t nargs, Context* ctx) {
     }
     if (pid == 0) {
         // Child: wire up stdio then exec
+        ::close(exec_err_pipe[0]);
         dup2(in_pipe[0],  STDIN_FILENO);
         dup2(out_pipe[1], STDOUT_FILENO);
         dup2(err_pipe[1], STDERR_FILENO);
@@ -1055,12 +1062,30 @@ static Value native_run_process(Value* args, uint8_t nargs, Context* ctx) {
         for (auto& s : argv) exec_argv.push_back(const_cast<char*>(s.c_str()));
         exec_argv.push_back(nullptr);
         execvp(exec_argv[0], exec_argv.data());
-        _exit(127);  // execvp failed
+        // exec failed: send errno back to parent then exit
+        int child_errno = errno;
+        ::write(exec_err_pipe[1], &child_errno, sizeof(child_errno));
+        _exit(127);
     }
     // Parent: close child-side ends so EOF propagates
     ::close(in_pipe[0]);  in_pipe[0]  = -1;
     ::close(out_pipe[1]); out_pipe[1] = -1;
     ::close(err_pipe[1]); err_pipe[1] = -1;
+    // Read from exec_err_pipe: returns sizeof(int) bytes if exec failed (errno), 0 bytes
+    // (EOF via O_CLOEXEC) if exec succeeded.
+    ::close(exec_err_pipe[1]); exec_err_pipe[1] = -1;
+    int child_exec_errno = 0;
+    ssize_t exec_err_n = ::read(exec_err_pipe[0], &child_exec_errno, sizeof(child_exec_errno));
+    ::close(exec_err_pipe[0]); exec_err_pipe[0] = -1;
+    if (exec_err_n == static_cast<ssize_t>(sizeof(child_exec_errno))) {
+        waitpid(pid, nullptr, 0);
+        ::close(in_pipe[1]); in_pipe[1] = -1;
+        // drain threads haven't started yet so drain fds manually
+        ::close(out_pipe[0]); out_pipe[0] = -1;
+        ::close(err_pipe[0]); err_pipe[0] = -1;
+        return native_make_error(ctx, "run: could not start process: " + argv[0] +
+                                      ": " + std::strerror(child_exec_errno));
+    }
     std::thread t_out(drain_pipe, out_pipe[0], &out_buf);  // drain_pipe closes fd on return
     std::thread t_err(drain_pipe, err_pipe[0], &err_buf);
     out_pipe[0] = err_pipe[0] = -1;  // drain_pipe owns/closes these

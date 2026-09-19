@@ -659,26 +659,38 @@ inline void test_native_process() {
         };
 
         // 1) echo -> stdout carries "hello", exit 0 (a plain successful spawn).
+#ifdef _WIN32
         RawResult echo = run_raw({ "cmd", "/c", "echo", "hello" }, nullptr);
+#else
+        RawResult echo = run_raw({ "echo", "hello" }, nullptr);
+#endif
         const bool echo_ok = !echo.is_err && echo.exit == 0 &&
                              echo.out.rfind("hello", 0) == 0;
         std::cout << std::format("echo -> exit {}, stdout starts \"hello\": {}\n",
             echo.exit, echo.out.rfind("hello", 0) == 0 ? "yes" : "no");
 
         // 2) exit 3 -> a NON-zero exit is still a success (Ok), exitCode == 3.
+#ifdef _WIN32
         RawResult ex = run_raw({ "cmd", "/c", "exit", "3" }, nullptr);
+#else
+        RawResult ex = run_raw({ "sh", "-c", "exit 3" }, nullptr);
+#endif
         const bool exit_ok = !ex.is_err && ex.exit == 3;
         std::cout << std::format("exit 3 -> is_err {}, exitCode {} (expect 3)\n",
             ex.is_err ? "yes" : "no", ex.exit);
 
-        // 3) findstr with fed stdin -> the child sees the input (exit 0 == "needle" found)
-        //    and echoes the matching line back, proving the WriteFile + concurrent drain
+        // 3) grep/findstr with fed stdin -> the child sees the input (exit 0 == "needle" found)
+        //    and echoes the matching line back, proving the pipe + concurrent drain
         //    path delivers stdin AND captures stdout together.
         const std::string feed = "has needle here\n";
+#ifdef _WIN32
         RawResult fs = run_raw({ "cmd", "/c", "findstr", "needle" }, &feed);
+#else
+        RawResult fs = run_raw({ "grep", "needle" }, &feed);
+#endif
         const bool sort_ok = !fs.is_err && fs.exit == 0 &&
                              fs.out.find("needle") != std::string::npos;
-        std::cout << std::format("findstr <stdin -> exit {} (expect 0), stdout has \"needle\": {}\n",
+        std::cout << std::format("grep/findstr <stdin -> exit {} (expect 0), stdout has \"needle\": {}\n",
             fs.exit, fs.out.find("needle") != std::string::npos ? "yes" : "no");
 
         // 4) a non-existent program -> a spawn error (the error String, not an Array).

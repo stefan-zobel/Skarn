@@ -16,7 +16,18 @@
 #include <vector>
 #include <functional>   // std::function -- the shrinker's failure predicate
 #include <filesystem>   // temp dir for the native file-I/O tests
-#include <cstdlib>      // _putenv_s -- set a deterministic var for the getEnv test
+#include <cstdlib>      // setenv / _putenv_s -- set a deterministic var for the getEnv test
+
+// _putenv_s is Windows-only; on POSIX use setenv (overwrite=1).
+#ifndef _WIN32
+static inline int skarn_setenv(const char* name, const char* value) {
+    return ::setenv(name, value, 1);
+}
+#else
+static inline int skarn_setenv(const char* name, const char* value) {
+    return ::_putenv_s(name, value);
+}
+#endif
 #include <chrono>       // steady_clock -- GC benchmark wall-clock timing
 #include <format>       // std::format -- GC benchmark table formatting
 #include <algorithm>
@@ -4887,7 +4898,7 @@ void test_codegen_natives() {
         cg_run_native("println(args()[0])", { "alpha", "beta" }) == "alpha\n");
 
     // getEnv: a var we set in-process (Some), and an unlikely-unset one (None).
-    _putenv_s("SVC_NAT_TEST", "marker42");
+    skarn_setenv("SVC_NAT_TEST", "marker42");
     check_true("native_getenv_some",
         cg_run_native("println(unwrapOr(getEnv(\"SVC_NAT_TEST\"), \"none\"))") == "marker42\n");
     check_true("native_getenv_none",
@@ -5019,31 +5030,51 @@ void test_codegen_natives() {
 void test_codegen_process() {
     std::cout << "[codegen: process spawn]\n";
 
-    // Exit code flows through: `cmd /c exit 7` -> ProcessOutput.exitCode == 7. Also proves the
+    // Exit code flows through -> ProcessOutput.exitCode == 7. Also proves the
     // array->struct reshape put slot 2 (exitInt) into the exitCode field.
     check_true("process_exit_code", cg_run_native(
+#ifdef _WIN32
         "match run([\"cmd\", \"/c\", \"exit\", \"7\"]) { Ok(o) => println(toString(o.exitCode)), Err(_) => println(\"err\") }")
         == "7\n");
+#else
+        "match run([\"sh\", \"-c\", \"exit 7\"]) { Ok(o) => println(toString(o.exitCode)), Err(_) => println(\"err\") }")
+        == "7\n");
+#endif
 
     // A spawn failure (program not found) is Err -- NOT a non-zero exit (Rust Command::output).
     check_true("process_spawn_err", cg_run_native(
         "match run([\"svc_definitely_not_a_real_program_zzz_qqq\"]) { Ok(_) => println(\"ran\"), Err(_) => println(\"err\") }")
         == "err\n");
 
-    // runText decodes stdout to a String and keeps exitCode: `echo hi` -> "hi\r\n".
+    // runText decodes stdout to a String and keeps exitCode.
     check_true("process_run_text", cg_run_native(
+#ifdef _WIN32
         "match runText([\"cmd\", \"/c\", \"echo\", \"hi\"]) { Ok(t) => print(t.stdout), Err(_) => print(\"err\") }")
         == "hi\r\n");
+#else
+        "match runText([\"echo\", \"hi\"]) { Ok(t) => print(t.stdout), Err(_) => print(\"err\") }")
+        == "hi\n");
+#endif
 
-    // sh wraps cmd.exe; the cmdline reaches the child (echo's output confirms the quoting).
+    // sh: on Windows wraps cmd.exe; on POSIX use runText with sh -c to exercise the same path.
     check_true("process_sh", cg_run_native(
+#ifdef _WIN32
         "match sh(\"echo ok\") { Ok(o) => print(fromBytes(o.stdout)), Err(_) => print(\"err\") }")
         == "ok\r\n");
+#else
+        "match runText([\"sh\", \"-c\", \"echo ok\"]) { Ok(t) => print(t.stdout), Err(_) => print(\"err\") }")
+        == "ok\n");
+#endif
 
     // runWith feeds stdin (Bytes) to the child; `sort` reads it and exits 0.
     check_true("process_run_with", cg_run_native(
+#ifdef _WIN32
         "match runWith([\"cmd\", \"/c\", \"sort\"], toBytes(\"b\\na\\n\")) { Ok(o) => println(toString(o.exitCode)), Err(_) => println(\"err\") }")
         == "0\n");
+#else
+        "match runWith([\"sort\"], toBytes(\"b\\na\\n\")) { Ok(o) => println(toString(o.exitCode)), Err(_) => println(\"err\") }")
+        == "0\n");
+#endif
 
     // Typing through erasure: the named ProcessOutput/ProcessText resolve `.exitCode`/`.stdout`
     // THROUGH the generic `unwrap` (the static win the dynamic side could not offer). Compile-only
@@ -8458,7 +8489,7 @@ static const refeval::NativeEnv& diff_native_env() {
         n.stdin_text = "l1\nl2\n";
         n.env_name = "SVC_DIFF_ENV";
         n.env_value = "envval";
-        _putenv_s(n.env_name.c_str(), n.env_value.c_str());   // one-time process env for getEnv
+        skarn_setenv(n.env_name.c_str(), n.env_value.c_str());   // one-time process env for getEnv
         return n;
     }();
     return e;
