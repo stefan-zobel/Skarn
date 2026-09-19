@@ -21,16 +21,30 @@
 #include <iterator>   // std::istreambuf_iterator (readFile)
 #include <chrono>     // millisTime native (wall-clock ms since epoch)
 #include <cmath>      // std::math natives (sqrt/pow/sin/... + isnan/isinf)
-#include <cstdlib>    // _dupenv_s (getEnv native)
+#include <cstdlib>    // std::getenv / std::free
 #include <filesystem> // fileExists / deleteFile natives
 #include <thread>     // reader threads that drain a child process's stdout/stderr (rawRun)
-// Winsock (std::net TCP natives) MUST be included BEFORE <Windows.h> -- windows.h pulls in the old
-// winsock.h, which then clashes with winsock2.h ("redefinition" errors). ws2_32.lib is linked via the
-// pragma below so no consumer .vcxproj needs editing.
-#include <winsock2.h> // socket / connect / send / recv / select / closesocket / WSAStartup
-#include <ws2tcpip.h> // getaddrinfo / freeaddrinfo (AF_UNSPEC -> IPv4 + IPv6)
-#pragma comment(lib, "ws2_32.lib")
-#include "Windows.h"  // VirtualAlloc / SEH / QueryPerformanceCounter (nanoTime) / CreateProcess (rawRun)
+#ifdef _WIN32
+// Winsock MUST precede <windows.h> to avoid winsock.h/winsock2.h redefinition errors.
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  pragma comment(lib, "ws2_32.lib")
+#  include <windows.h>
+#else
+#  include <sys/socket.h>
+#  include <sys/types.h>
+#  include <sys/wait.h>
+#  include <netdb.h>
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
+#  include <netinet/tcp.h>
+#  include <fcntl.h>
+#  include <unistd.h>
+#  include <cerrno>
+#  include <cstring>    // std::strerror
+#  include <time.h>     // clock_gettime
+#endif
+#include "Platform.h"   // cross-platform macros + POSIX socket/SEH stubs
 
 #include "Instruction.h"
 #include "Context.h"
@@ -44,29 +58,40 @@
 #include "Natives.h"        // build_native_table() declaration
 #include "Interpreter.h"   // run_switch: the register-resident while{switch} dispatcher
 
+// ---- Portable socket type aliases -------------------------------------------
+#ifdef _WIN32
+using socket_t = SOCKET;
+static constexpr socket_t INVALID_SOCK = INVALID_SOCKET;
+static void sock_close(socket_t s) { closesocket(s); }
+#else
+using socket_t = int;
+static constexpr socket_t INVALID_SOCK = -1;
+static void sock_close(socket_t s) { ::close(s); }
+#endif
+
 // TCP socket registry for the std::net natives -- defined here (before execute()) so execute() can
 // hold a stack-local instance whose destructor closes any socket still open at teardown. A socket is
 // exposed to Skarn as a small Int DESCRIPTOR (an index into `socks`), never a raw OS SOCKET (a 64-bit
 // kernel handle that need not fit a 48-bit Int). NOT a GC root (integer handles, no Values). The
 // tcp* native implementations live further down, next to build_native_table().
 struct NetRegistry {
-    std::vector<SOCKET> socks;              // descriptor (index) -> SOCKET; INVALID_SOCKET = a freed slot
+    std::vector<socket_t> socks;
     ~NetRegistry() {
-        for (SOCKET s : socks)
-            if (s != INVALID_SOCKET) closesocket(s);
+        for (socket_t s : socks)
+            if (s != INVALID_SOCK) sock_close(s);
     }
-    int add(SOCKET s) {                     // reuse a freed slot if one exists, else append
+    int add(socket_t s) {
         for (size_t i = 0; i < socks.size(); ++i)
-            if (socks[i] == INVALID_SOCKET) { socks[i] = s; return static_cast<int>(i); }
+            if (socks[i] == INVALID_SOCK) { socks[i] = s; return static_cast<int>(i); }
         socks.push_back(s);
         return static_cast<int>(socks.size()) - 1;
     }
-    SOCKET get(int fd) const {
-        if (fd < 0 || static_cast<size_t>(fd) >= socks.size()) return INVALID_SOCKET;
+    socket_t get(int fd) const {
+        if (fd < 0 || static_cast<size_t>(fd) >= socks.size()) return INVALID_SOCK;
         return socks[fd];
     }
     void drop(int fd) {
-        if (fd >= 0 && static_cast<size_t>(fd) < socks.size()) socks[fd] = INVALID_SOCKET;
+        if (fd >= 0 && static_cast<size_t>(fd) < socks.size()) socks[fd] = INVALID_SOCK;
     }
 };
 
@@ -396,15 +421,20 @@ static Value native_write_file(Value* args, uint8_t nargs, Context* ctx) {
     return Value::fromNil();
 }
 
-// A monotonic high-resolution clock reading in nanoseconds (QueryPerformanceCounter).
-// Split the counter*1e9/freq so the intermediate never overflows int64.
+// A monotonic high-resolution clock reading in nanoseconds.
 static int64_t qpc_now_ns() noexcept {
+#ifdef _WIN32
     static const LARGE_INTEGER freq = [] {
-        LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f;   // fixed after boot
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f;
     }();
     LARGE_INTEGER c; QueryPerformanceCounter(&c);
     return (c.QuadPart / freq.QuadPart) * 1000000000LL
          + ((c.QuadPart % freq.QuadPart) * 1000000000LL) / freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+#endif
 }
 
 // nanoTime() -> Int. A MONOTONIC counter, offset from the first call (Java
@@ -451,25 +481,31 @@ static Value native_args(Value*, uint8_t, Context* ctx) {
 }
 
 // getEnv(name) -> String (present) | nil (absent). The compiler wraps this Some/None
-// (NativeReturn::Option). Reads the CRT process environment via _dupenv_s (a var set to
-// "" is present -> Some("") , distinct from unset -> None). Option has no error channel,
-// so a non-string argument also reads as None. Single heap alloc on the present path.
+// (NativeReturn::Option). Option has no error channel, so a non-string argument reads as None.
+// Single heap alloc on the present path.
 static Value native_get_env(Value* args, uint8_t nargs, Context* ctx) {
     if (nargs < 1 || !is_string(args[0]))
-        return Value::fromNil();                  // no error channel -> treat as absent
-    std::string name, val;
+        return Value::fromNil();
+    std::string name;
     {
         GcObject* o = GcObject::from_slots(args[0].asPtr());
-        name.assign(o->bytes(), o->string_length());   // host copy before any alloc
+        name.assign(o->bytes(), o->string_length());
     }
+    std::string val;
+#ifdef _WIN32
     char*  buf = nullptr;
     size_t sz  = 0;
     if (_dupenv_s(&buf, &sz, name.c_str()) != 0 || !buf) {
-        std::free(buf);                           // buf is null on "not found"; free is a no-op
-        return Value::fromNil();                  // unset -> None
+        std::free(buf);
+        return Value::fromNil();
     }
-    val.assign(buf, sz > 0 ? sz - 1 : 0);         // sz counts the trailing NUL; copy before alloc
+    val.assign(buf, sz > 0 ? sz - 1 : 0);  // sz includes trailing NUL
     std::free(buf);
+#else
+    const char* raw = std::getenv(name.c_str());
+    if (!raw) return Value::fromNil();
+    val = raw;
+#endif
     GcObject* s = ctx->vm->heap->alloc_string_gc(val, ctx);
     return Value::fromPtr(s->payload());
 }
@@ -798,8 +834,16 @@ static Value native_parse_int(Value* args, uint8_t nargs, Context* ctx) {
 }
 
 // parseDouble(s) -> Double (success) | String (error message). Strict full-string
-// parse via std::from_chars (chars_format::general: decimal + optional exponent, '-'
-// sign; no leading '+' or whitespace, no trailing junk); otherwise the error String.
+// parse in chars_format::general: an optional '-', decimal digits with an optional '.'
+// and an optional exponent, or one of the inf / infinity / nan spellings (any case).
+// Rejected: a leading '+' or whitespace, a hexadecimal 0x form, a ',' decimal
+// separator, and any trailing junk.
+//
+// std::from_chars is exactly that grammar, and it is locale-independent. libc++ has no
+// floating-point from_chars, so the #else falls back to strtod -- which is a LOOSER
+// grammar (it takes '+', leading whitespace and hex floats) and is locale-SENSITIVE via
+// LC_NUMERIC. The pre-scan below removes the difference: it rejects everything strtod
+// would accept and from_chars would not, so both paths accept the same strings.
 static Value native_parse_double(Value* args, uint8_t nargs, Context* ctx) {
     if (nargs < 1 || !is_string(args[0]))
         return native_make_error(ctx, "parseDouble: invalid number");
@@ -810,62 +854,74 @@ static Value native_parse_double(Value* args, uint8_t nargs, Context* ctx) {
     }
     const char* first = s.data();
     const char* last  = first + s.size();
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
     double v = 0.0;
     auto r = std::from_chars(first, last, v);           // chars_format::general
     if (r.ec != std::errc{} || r.ptr != last)
         return native_make_error(ctx, "parseDouble: invalid number");
     return Value::fromDouble(v);
+#else
+    const auto reject = [&] { return native_make_error(ctx, "parseDouble: invalid number"); };
+    if (first == last) return reject();
+    // strtod SKIPS leading whitespace and then reports a clean end, so the trailing-junk
+    // check below cannot see it -- it has to be rejected up front.
+    if (*first == ' ' || *first == '\t' || *first == '\n' || *first == '\r'
+        || *first == '\f' || *first == '\v')
+        return reject();
+    const char* p = first;
+    if (*p == '-') ++p;                                 // '+' is NOT part of the grammar
+    if (p == last) return reject();
+    if (*p == '+' || *p == ' ' || *p == '\t') return reject();
+    if (*p == '0' && p + 1 < last && (p[1] == 'x' || p[1] == 'X'))
+        return reject();                                // no hex floats
+    if (s.find(',') != std::string::npos)
+        return reject();                                // no locale decimal comma
+    char*  endptr = nullptr;
+    double v      = std::strtod(first, &endptr);
+    if (endptr != last) return reject();                // trailing junk / nothing parsed
+    return Value::fromDouble(v);
+#endif
 }
 
-// Quote one argument for a Win32 command line, following the CommandLineToArgvW
-// inverse rules (the "Everyone quotes command line arguments the wrong way"
-// algorithm): a run of N backslashes is doubled to 2N when it precedes a quote or
-// the closing quote, and the whole argument is wrapped in "..." when it is empty or
-// contains a space, tab or quote. CreateProcess takes ONE command line string, so
-// build_command_line reconstructs it from an argv the caller passed as an array.
+// Drain a readable pipe to EOF into `out`. Runs on its own std::thread so
+// stdout and stderr are read concurrently (a child that fills one pipe while we are
+// blocked on the other would otherwise deadlock). Never throws across the thread
+// boundary; a broken pipe / closed handle just ends the loop.
+#ifdef _WIN32
+// Quote one argument for a Win32 command line (CommandLineToArgvW inverse rules).
+// CreateProcess takes ONE command line string, so build_command_line reconstructs it.
 static std::string quote_win32_arg(const std::string& arg) {
-    if (!arg.empty() &&
-        arg.find_first_of(" \t\"") == std::string::npos)
-        return arg;                                 // no metacharacters -> pass through
+    if (!arg.empty() && arg.find_first_of(" \t\"") == std::string::npos)
+        return arg;
     std::string out = "\"";
     for (size_t i = 0; ; ++i) {
         size_t backslashes = 0;
         while (i < arg.size() && arg[i] == '\\') { ++backslashes; ++i; }
-        if (i == arg.size()) {
-            out.append(backslashes * 2, '\\');      // escape trailing run before closing "
-            break;
-        }
-        if (arg[i] == '"') {
-            out.append(backslashes * 2 + 1, '\\');  // escape run + the embedded quote
-            out.push_back('"');
-        } else {
-            out.append(backslashes, '\\');
-            out.push_back(arg[i]);
-        }
+        if (i == arg.size()) { out.append(backslashes * 2, '\\'); break; }
+        if (arg[i] == '"') { out.append(backslashes * 2 + 1, '\\'); out.push_back('"'); }
+        else { out.append(backslashes, '\\'); out.push_back(arg[i]); }
     }
     out.push_back('"');
     return out;
 }
-
 static std::string build_command_line(const std::vector<std::string>& argv) {
     std::string cmd;
-    for (size_t i = 0; i < argv.size(); ++i) {
-        if (i) cmd.push_back(' ');
-        cmd += quote_win32_arg(argv[i]);
-    }
+    for (size_t i = 0; i < argv.size(); ++i) { if (i) cmd.push_back(' '); cmd += quote_win32_arg(argv[i]); }
     return cmd;
 }
-
-// Drain a readable pipe handle to EOF into `out`. Runs on its own std::thread so
-// stdout and stderr are read concurrently (a child that fills one pipe while we are
-// blocked on the other would otherwise deadlock). Never throws across the thread
-// boundary; a broken pipe / closed handle just ends the loop.
 static void drain_pipe(HANDLE h, std::string* out) noexcept {
-    char buf[4096];
-    DWORD got = 0;
+    char buf[4096]; DWORD got = 0;
     while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got > 0)
         out->append(buf, got);
 }
+#else
+static void drain_pipe(int fd, std::string* out) noexcept {
+    char buf[4096]; ssize_t got = 0;
+    while ((got = ::read(fd, buf, sizeof(buf))) > 0)
+        out->append(buf, static_cast<size_t>(got));
+    ::close(fd);
+}
+#endif
 
 // rawRun(argv, input) -> [stdoutBytes, stderrBytes, exitInt] (success) | String (spawn error).
 // The low-level process primitive; the prelude's run/runWith reshape the Array[3] into a
@@ -918,13 +974,16 @@ static Value native_run_process(Value* args, uint8_t nargs, Context* ctx) {
         stdin_data.assign(backing->bytes(), count);
     }
 
-    // --- Pipes: child-inheritable ends, parent ends made non-inheritable ---------------
+    // --- Spawn child process with three pipes (stdin/stdout/stderr) ----------------
+    std::string out_buf, err_buf;
+    int64_t exit_code = 0;
+
+#ifdef _WIN32
     SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-    HANDLE in_rd = nullptr, in_wr = nullptr;        // child stdin  (we write in_wr)
-    HANDLE out_rd = nullptr, out_wr = nullptr;      // child stdout (we read out_rd)
-    HANDLE err_rd = nullptr, err_wr = nullptr;      // child stderr (we read err_rd)
+    sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE;
+    HANDLE in_rd = nullptr, in_wr = nullptr;
+    HANDLE out_rd = nullptr, out_wr = nullptr;
+    HANDLE err_rd = nullptr, err_wr = nullptr;
     auto close_all = [&]() {
         for (HANDLE* h : { &in_rd, &in_wr, &out_rd, &out_wr, &err_rd, &err_wr })
             if (*h) { CloseHandle(*h); *h = nullptr; }
@@ -935,60 +994,116 @@ static Value native_run_process(Value* args, uint8_t nargs, Context* ctx) {
         close_all();
         return native_make_error(ctx, "run: could not create pipes for " + argv[0]);
     }
-    // The parent-side ends must NOT be inherited by the child (else the child holds a
-    // write end open and we never see EOF on read).
     SetHandleInformation(in_wr,  HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(out_rd, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(err_rd, HANDLE_FLAG_INHERIT, 0);
-
-    // --- Spawn -------------------------------------------------------------------------
-    STARTUPINFOA si{};
-    si.cb = sizeof(si);
-    si.dwFlags    = STARTF_USESTDHANDLES;
-    si.hStdInput  = in_rd;
-    si.hStdOutput = out_wr;
-    si.hStdError  = err_wr;
+    STARTUPINFOA si{}; si.cb = sizeof(si); si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = in_rd; si.hStdOutput = out_wr; si.hStdError = err_wr;
     PROCESS_INFORMATION pi{};
     std::string cmdline = build_command_line(argv);
-    std::vector<char> cmd_mut(cmdline.begin(), cmdline.end());  // CreateProcessA needs a mutable buffer
-    cmd_mut.push_back('\0');
-    const BOOL ok = CreateProcessA(nullptr, cmd_mut.data(), nullptr, nullptr,
-                                   TRUE, 0, nullptr, nullptr, &si, &pi);
-    if (!ok) {
-        const DWORD gle = GetLastError();
-        close_all();
+    std::vector<char> cmd_mut(cmdline.begin(), cmdline.end()); cmd_mut.push_back('\0');
+    if (!CreateProcessA(nullptr, cmd_mut.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+        DWORD gle = GetLastError(); close_all();
         return native_make_error(ctx, "run: could not start process: " + argv[0] +
                                       " (error " + std::to_string(gle) + ")");
     }
-    // Close the child-side ends in the parent so EOF propagates once the child exits.
-    CloseHandle(in_rd);  in_rd  = nullptr;
-    CloseHandle(out_wr); out_wr = nullptr;
-    CloseHandle(err_wr); err_wr = nullptr;
-
-    // --- Deadlock-safe I/O: drain stdout+stderr on threads, write stdin on this one ----
-    std::string out_buf, err_buf;
+    CloseHandle(in_rd); CloseHandle(out_wr); CloseHandle(err_wr);
+    in_rd = out_wr = err_wr = nullptr;
     std::thread t_out(drain_pipe, out_rd, &out_buf);
     std::thread t_err(drain_pipe, err_rd, &err_buf);
     if (!stdin_data.empty()) {
-        const char* p = stdin_data.data();
-        size_t      left = stdin_data.size();
+        const char* p = stdin_data.data(); size_t left = stdin_data.size();
         while (left > 0) {
-            DWORD wrote = 0;
-            const DWORD chunk = static_cast<DWORD>(left > (1u << 20) ? (1u << 20) : left);
-            if (!WriteFile(in_wr, p, chunk, &wrote, nullptr) || wrote == 0) break;  // child closed stdin
+            DWORD wrote = 0; DWORD chunk = static_cast<DWORD>(left > (1u<<20) ? (1u<<20) : left);
+            if (!WriteFile(in_wr, p, chunk, &wrote, nullptr) || wrote == 0) break;
             p += wrote; left -= wrote;
         }
     }
-    CloseHandle(in_wr); in_wr = nullptr;            // EOF to the child's stdin
-    t_out.join();
-    t_err.join();
+    CloseHandle(in_wr); in_wr = nullptr;
+    t_out.join(); t_err.join();
     WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exit_code = 0;
-    GetExitCodeProcess(pi.hProcess, &exit_code);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    CloseHandle(out_rd); out_rd = nullptr;
-    CloseHandle(err_rd); err_rd = nullptr;
+    DWORD wec = 0; GetExitCodeProcess(pi.hProcess, &wec);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    CloseHandle(out_rd); CloseHandle(err_rd);
+    exit_code = static_cast<int64_t>(static_cast<int32_t>(wec));
+#else
+    int in_pipe[2]  = {-1, -1};   // [read-end, write-end]: child reads, parent writes
+    int out_pipe[2] = {-1, -1};   // [read-end, write-end]: parent reads, child writes
+    int err_pipe[2] = {-1, -1};
+    // exec_err_pipe: O_CLOEXEC write-end is closed by exec on success; child writes errno on
+    // exec failure so the parent can distinguish "exec failed" from "process exited non-zero".
+    int exec_err_pipe[2] = {-1, -1};
+    auto close_fds = [&]() {
+        for (int fd : {in_pipe[0], in_pipe[1], out_pipe[0], out_pipe[1],
+                       err_pipe[0], err_pipe[1], exec_err_pipe[0], exec_err_pipe[1]})
+            if (fd >= 0) ::close(fd);
+    };
+    if (pipe(in_pipe) != 0 || pipe(out_pipe) != 0 || pipe(err_pipe) != 0 ||
+        pipe(exec_err_pipe) != 0) {
+        close_fds();
+        return native_make_error(ctx, "run: could not create pipes for " + argv[0]);
+    }
+    fcntl(exec_err_pipe[1], F_SETFD, FD_CLOEXEC);
+    pid_t pid = fork();
+    if (pid < 0) {
+        close_fds();
+        return native_make_error(ctx, "run: fork failed for " + argv[0] + ": " + std::strerror(errno));
+    }
+    if (pid == 0) {
+        // Child: wire up stdio then exec
+        ::close(exec_err_pipe[0]);
+        dup2(in_pipe[0],  STDIN_FILENO);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        dup2(err_pipe[1], STDERR_FILENO);
+        for (int fd : {in_pipe[0], in_pipe[1], out_pipe[0], out_pipe[1], err_pipe[0], err_pipe[1]})
+            ::close(fd);
+        std::vector<char*> exec_argv;
+        exec_argv.reserve(argv.size() + 1);
+        for (auto& s : argv) exec_argv.push_back(const_cast<char*>(s.c_str()));
+        exec_argv.push_back(nullptr);
+        execvp(exec_argv[0], exec_argv.data());
+        // exec failed: send errno back to parent then exit
+        int child_errno = errno;
+        ::write(exec_err_pipe[1], &child_errno, sizeof(child_errno));
+        _exit(127);
+    }
+    // Parent: close child-side ends so EOF propagates
+    ::close(in_pipe[0]);  in_pipe[0]  = -1;
+    ::close(out_pipe[1]); out_pipe[1] = -1;
+    ::close(err_pipe[1]); err_pipe[1] = -1;
+    // Read from exec_err_pipe: returns sizeof(int) bytes if exec failed (errno), 0 bytes
+    // (EOF via O_CLOEXEC) if exec succeeded.
+    ::close(exec_err_pipe[1]); exec_err_pipe[1] = -1;
+    int child_exec_errno = 0;
+    ssize_t exec_err_n;
+    do { exec_err_n = ::read(exec_err_pipe[0], &child_exec_errno, sizeof(child_exec_errno)); }
+    while (exec_err_n < 0 && errno == EINTR);
+    ::close(exec_err_pipe[0]); exec_err_pipe[0] = -1;
+    if (exec_err_n == static_cast<ssize_t>(sizeof(child_exec_errno))) {
+        waitpid(pid, nullptr, 0);
+        ::close(in_pipe[1]); in_pipe[1] = -1;
+        // drain threads haven't started yet so drain fds manually
+        ::close(out_pipe[0]); out_pipe[0] = -1;
+        ::close(err_pipe[0]); err_pipe[0] = -1;
+        return native_make_error(ctx, "run: could not start process: " + argv[0] +
+                                      ": " + std::strerror(child_exec_errno));
+    }
+    std::thread t_out(drain_pipe, out_pipe[0], &out_buf);  // drain_pipe closes fd on return
+    std::thread t_err(drain_pipe, err_pipe[0], &err_buf);
+    out_pipe[0] = err_pipe[0] = -1;  // drain_pipe owns/closes these
+    if (!stdin_data.empty()) {
+        const char* p = stdin_data.data(); size_t left = stdin_data.size();
+        while (left > 0) {
+            ssize_t wrote = ::write(in_pipe[1], p, left);
+            if (wrote <= 0) break;
+            p += wrote; left -= static_cast<size_t>(wrote);
+        }
+    }
+    ::close(in_pipe[1]); in_pipe[1] = -1;   // EOF to child's stdin
+    t_out.join(); t_err.join();
+    int wstatus = 0; waitpid(pid, &wstatus, 0);
+    exit_code = static_cast<int64_t>(WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : 1);
+#endif
 
     // --- Build the Array[3] result (root-then-fill; see native_args) --------------------
     Heap* heap = ctx->vm->heap;
@@ -1001,8 +1116,7 @@ static Value native_run_process(Value* args, uint8_t nargs, Context* ctx) {
     Value err_bytes;
     bytes_from_str(ctx, &err_bytes, err_buf);       // may collect -> arr rewritten in place
     GcObject::from_slots(arr.asPtr())->slots()[1] = err_bytes;
-    GcObject::from_slots(arr.asPtr())->slots()[2] =
-        Value::fromSigned48(static_cast<int64_t>(static_cast<int32_t>(exit_code)));
+    GcObject::from_slots(arr.asPtr())->slots()[2] = Value::fromSigned48(exit_code);
     heap->remove_root(&arr);
     return arr;
 }
@@ -1052,13 +1166,30 @@ static Value native_gc_reset_stats(Value*, uint8_t, Context* ctx) {
 // Lazy, once-only WSAStartup (single-threaded VM -> no synchronization). No WSACleanup:
 // process exit reclaims the Winsock state, and a paired cleanup would race a still-open socket.
 static bool ensure_wsa() {
+#ifdef _WIN32
     static bool inited = false, ok = false;
     if (!inited) { WSADATA d; ok = (WSAStartup(MAKEWORD(2, 2), &d) == 0); inited = true; }
     return ok;
+#else
+    return true;  // POSIX sockets need no initialization
+#endif
 }
-static std::string wsa_msg(const char* op) {
+
+static std::string net_error_msg(const char* op) {
+#ifdef _WIN32
     return std::string(op) + " failed (WSA error " + std::to_string(WSAGetLastError()) + ")";
+#else
+    return std::string(op) + " failed: " + std::strerror(errno);
+#endif
 }
+
+#ifndef _WIN32
+static int set_nonblocking(int s, bool nb) {
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(s, F_SETFL, nb ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK));
+}
+#endif
 static const long NET_CONNECT_TIMEOUT_SEC = 10;   // connect() select() timeout
 static const long NET_RECV_CHUNK_MAX      = 1 << 20; // cap a single tcpRecv at 1 MiB
 
@@ -1082,27 +1213,43 @@ static Value native_tcp_connect(Value* args, uint8_t nargs, Context* ctx) {
     if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res) != 0 || !res)
         return native_make_error(ctx, "tcpConnect: cannot resolve host: " + host);
 
-    SOCKET sock = INVALID_SOCKET;
-    for (addrinfo* ai = res; ai && sock == INVALID_SOCKET; ai = ai->ai_next) {
-        SOCKET s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (s == INVALID_SOCKET) continue;
-        u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);                 // non-blocking for the timed connect
+    socket_t sock = INVALID_SOCK;
+    for (addrinfo* ai = res; ai && sock == INVALID_SOCK; ai = ai->ai_next) {
+        socket_t s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s == INVALID_SOCK) continue;
+#ifdef _WIN32
+        u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
+#else
+        set_nonblocking(s, true);
+#endif
         int rc = connect(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
         bool ok = (rc == 0);
+#ifdef _WIN32
         if (rc == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
+#else
+        if (rc == -1 && (errno == EINPROGRESS || errno == EWOULDBLOCK)) {
+#endif
             fd_set wf; FD_ZERO(&wf); FD_SET(s, &wf);
             timeval tv{}; tv.tv_sec = NET_CONNECT_TIMEOUT_SEC; tv.tv_usec = 0;
+#ifdef _WIN32
             if (select(0, nullptr, &wf, nullptr, &tv) > 0) {
-                int soErr = 0; int len = sizeof(soErr);
+#else
+            if (select(s + 1, nullptr, &wf, nullptr, &tv) > 0) {
+#endif
+                int soErr = 0; socklen_t len = sizeof(soErr);
                 getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &len);
                 ok = (soErr == 0);
             }
         }
-        u_long bl = 0; ioctlsocket(s, FIONBIO, &bl);                 // restore blocking mode
-        if (ok) sock = s; else closesocket(s);
+#ifdef _WIN32
+        u_long bl = 0; ioctlsocket(s, FIONBIO, &bl);
+#else
+        set_nonblocking(s, false);
+#endif
+        if (ok) sock = s; else sock_close(s);
     }
     freeaddrinfo(res);
-    if (sock == INVALID_SOCKET) return native_make_error(ctx, "tcpConnect: could not connect to " + host);
+    if (sock == INVALID_SOCK) return native_make_error(ctx, "tcpConnect: could not connect to " + host);
     return Value::fromSigned48(ctx->vm->net->add(sock));
 }
 
@@ -1114,8 +1261,8 @@ static Value native_tcp_send(Value* args, uint8_t nargs, Context* ctx) {
         return native_make_error(ctx, "tcpSend: expected (sock: Int, data: Bytes)");
     if (!args[1].isPtr() || GcObject::from_slots(args[1].asPtr())->kind != GcObject::KIND_BYTES)
         return native_make_error(ctx, "tcpSend: data must be a byte buffer");
-    SOCKET s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
-    if (s == INVALID_SOCKET) return native_make_error(ctx, "tcpSend: invalid socket");
+    socket_t s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
+    if (s == INVALID_SOCK) return native_make_error(ctx, "tcpSend: invalid socket");
     std::string data;
     {
         GcObject*      hdr     = GcObject::from_slots(args[1].asPtr());
@@ -1126,7 +1273,7 @@ static Value native_tcp_send(Value* args, uint8_t nargs, Context* ctx) {
     size_t sent = 0;
     while (sent < data.size()) {
         int n = ::send(s, data.data() + sent, static_cast<int>(data.size() - sent), 0);
-        if (n == SOCKET_ERROR) return native_make_error(ctx, "tcpSend: " + wsa_msg("send"));
+        if (n < 0) return native_make_error(ctx, "tcpSend: " + net_error_msg("send"));
         sent += static_cast<size_t>(n);
     }
     return Value::fromNil();
@@ -1138,17 +1285,21 @@ static Value native_tcp_recv(Value* args, uint8_t nargs, Context* ctx) {
     if (!ctx->vm->net) return native_make_error(ctx, "tcpRecv: networking unavailable");
     if (nargs < 2 || !args[0].isInt() || !args[1].isInt())
         return native_make_error(ctx, "tcpRecv: expected (sock: Int, maxBytes: Int)");
-    SOCKET s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
-    if (s == INVALID_SOCKET) return native_make_error(ctx, "tcpRecv: invalid socket");
+    socket_t s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
+    if (s == INVALID_SOCK) return native_make_error(ctx, "tcpRecv: invalid socket");
     long maxB = static_cast<long>(args[1].asSigned48());
     if (maxB < 0) return native_make_error(ctx, "tcpRecv: maxBytes must be non-negative");
     if (maxB > NET_RECV_CHUNK_MAX) maxB = NET_RECV_CHUNK_MAX;
     std::string buf;
     buf.resize(static_cast<size_t>(maxB));
     int n = (maxB == 0) ? 0 : ::recv(s, buf.data(), static_cast<int>(maxB), 0);
-    if (n == SOCKET_ERROR) {
+    if (n < 0) {
+#ifdef _WIN32
         if (WSAGetLastError() == WSAETIMEDOUT) return native_make_error(ctx, "tcpRecv: timeout");
-        return native_make_error(ctx, "tcpRecv: " + wsa_msg("recv"));
+#else
+        if (errno == EAGAIN || errno == ETIMEDOUT) return native_make_error(ctx, "tcpRecv: timeout");
+#endif
+        return native_make_error(ctx, "tcpRecv: " + net_error_msg("recv"));
     }
     const std::string got(buf.data(), static_cast<size_t>(n));  // host copy before the allocating build
     Value result;
@@ -1162,9 +1313,9 @@ static Value native_tcp_close(Value* args, uint8_t nargs, Context* ctx) {
     if (!ctx->vm->net) return native_make_error(ctx, "tcpClose: networking unavailable");
     if (nargs < 1 || !args[0].isInt()) return native_make_error(ctx, "tcpClose: expected (sock: Int)");
     int fd = static_cast<int>(args[0].asSigned48());
-    SOCKET s = ctx->vm->net->get(fd);
-    if (s == INVALID_SOCKET) return native_make_error(ctx, "tcpClose: invalid socket");
-    closesocket(s);
+    socket_t s = ctx->vm->net->get(fd);
+    if (s == INVALID_SOCK) return native_make_error(ctx, "tcpClose: invalid socket");
+    sock_close(s);
     ctx->vm->net->drop(fd);
     return Value::fromNil();
 }
@@ -1177,17 +1328,22 @@ static Value native_tcp_listen(Value* args, uint8_t nargs, Context* ctx) {
     long port = static_cast<long>(args[0].asSigned48());
     if (port < 0 || port > 65535) return native_make_error(ctx, "tcpListen: port out of range (0..65535)");
     if (!ensure_wsa()) return native_make_error(ctx, "tcpListen: WSAStartup failed");
-    SOCKET s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return native_make_error(ctx, "tcpListen: " + wsa_msg("socket"));
+    socket_t s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCK) return native_make_error(ctx, "tcpListen: " + net_error_msg("socket"));
+#ifdef _WIN32
     DWORD v6only = 0; setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<char*>(&v6only), sizeof(v6only));
-    BOOL reuse = TRUE; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char*>(&reuse), sizeof(reuse));
+    BOOL  reuse  = TRUE; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char*>(&reuse), sizeof(reuse));
+#else
+    int v6only = 0; setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+    int reuse  = 1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#endif
     sockaddr_in6 addr{};
-    addr.sin6_family = AF_INET6; addr.sin6_addr = in6addr_any; addr.sin6_port = htons(static_cast<u_short>(port));
-    if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
-        std::string m = "tcpListen: " + wsa_msg("bind"); closesocket(s); return native_make_error(ctx, m);
+    addr.sin6_family = AF_INET6; addr.sin6_addr = in6addr_any; addr.sin6_port = htons(static_cast<uint16_t>(port));
+    if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        std::string m = "tcpListen: " + net_error_msg("bind"); sock_close(s); return native_make_error(ctx, m);
     }
-    if (listen(s, SOMAXCONN) == SOCKET_ERROR) {
-        std::string m = "tcpListen: " + wsa_msg("listen"); closesocket(s); return native_make_error(ctx, m);
+    if (listen(s, SOMAXCONN) < 0) {
+        std::string m = "tcpListen: " + net_error_msg("listen"); sock_close(s); return native_make_error(ctx, m);
     }
     return Value::fromSigned48(ctx->vm->net->add(s));
 }
@@ -1197,10 +1353,10 @@ static Value native_tcp_listen(Value* args, uint8_t nargs, Context* ctx) {
 static Value native_tcp_accept(Value* args, uint8_t nargs, Context* ctx) {
     if (!ctx->vm->net) return native_make_error(ctx, "tcpAccept: networking unavailable");
     if (nargs < 1 || !args[0].isInt()) return native_make_error(ctx, "tcpAccept: expected (sock: Int)");
-    SOCKET s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
-    if (s == INVALID_SOCKET) return native_make_error(ctx, "tcpAccept: invalid socket");
-    SOCKET c = accept(s, nullptr, nullptr);
-    if (c == INVALID_SOCKET) return native_make_error(ctx, "tcpAccept: " + wsa_msg("accept"));
+    socket_t s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
+    if (s == INVALID_SOCK) return native_make_error(ctx, "tcpAccept: invalid socket");
+    socket_t c = accept(s, nullptr, nullptr);
+    if (c == INVALID_SOCK) return native_make_error(ctx, "tcpAccept: " + net_error_msg("accept"));
     return Value::fromSigned48(ctx->vm->net->add(c));
 }
 
@@ -1213,13 +1369,13 @@ static Value native_tcp_accept(Value* args, uint8_t nargs, Context* ctx) {
 static Value native_tcp_local_port(Value* args, uint8_t nargs, Context* ctx) {
     if (!ctx->vm->net) return native_make_error(ctx, "tcpLocalPort: networking unavailable");
     if (nargs < 1 || !args[0].isInt()) return native_make_error(ctx, "tcpLocalPort: expected (sock: Int)");
-    SOCKET s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
-    if (s == INVALID_SOCKET) return native_make_error(ctx, "tcpLocalPort: invalid socket");
+    socket_t s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
+    if (s == INVALID_SOCK) return native_make_error(ctx, "tcpLocalPort: invalid socket");
     sockaddr_storage ss{};
-    int len = static_cast<int>(sizeof(ss));
-    if (getsockname(s, reinterpret_cast<sockaddr*>(&ss), &len) == SOCKET_ERROR)
-        return native_make_error(ctx, "tcpLocalPort: " + wsa_msg("getsockname"));
-    u_short net_port = 0;
+    socklen_t len = static_cast<socklen_t>(sizeof(ss));
+    if (getsockname(s, reinterpret_cast<sockaddr*>(&ss), &len) < 0)
+        return native_make_error(ctx, "tcpLocalPort: " + net_error_msg("getsockname"));
+    uint16_t net_port = 0;
     if (ss.ss_family == AF_INET6)      net_port = reinterpret_cast<sockaddr_in6*>(&ss)->sin6_port;
     else if (ss.ss_family == AF_INET)  net_port = reinterpret_cast<sockaddr_in*>(&ss)->sin_port;
     else return native_make_error(ctx, "tcpLocalPort: unsupported address family");
@@ -1232,12 +1388,19 @@ static Value native_tcp_set_timeout(Value* args, uint8_t nargs, Context* ctx) {
     if (!ctx->vm->net) return native_make_error(ctx, "tcpSetTimeout: networking unavailable");
     if (nargs < 2 || !args[0].isInt() || !args[1].isInt())
         return native_make_error(ctx, "tcpSetTimeout: expected (sock: Int, ms: Int)");
-    SOCKET s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
-    if (s == INVALID_SOCKET) return native_make_error(ctx, "tcpSetTimeout: invalid socket");
+    socket_t s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
+    if (s == INVALID_SOCK) return native_make_error(ctx, "tcpSetTimeout: invalid socket");
     long ms = static_cast<long>(args[1].asSigned48());
-    DWORD tv = static_cast<DWORD>(ms < 0 ? 0 : ms);   // Windows SO_*TIMEO take a DWORD of milliseconds
+#ifdef _WIN32
+    DWORD tv = static_cast<DWORD>(ms < 0 ? 0 : ms);   // Windows SO_*TIMEO: DWORD of milliseconds
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&tv), sizeof(tv));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&tv), sizeof(tv));
+#else
+    struct timeval tv{};
+    if (ms > 0) { tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000; }
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
     return Value::fromNil();
 }
 

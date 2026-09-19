@@ -2,13 +2,16 @@
 
 #include <cassert>
 #include <charconv>
+#include <cmath>      // isnan / isinf / signbit  (format_double's non-to_chars path)
+#include <cstdio>     // snprintf                 (ditto)
+#include <cstdlib>    // strtod / atoi            (ditto)
 #include <cstring>
 #include <string>
 #include <string_view>
-#include "..\Heap.h"
-#include "..\Value.h"
-#include "..\Context.h"
-#include "..\StructType.h"   // TO_STRING's struct dump reads name / field_names
+#include "../Heap.h"
+#include "../Value.h"
+#include "../Context.h"
+#include "../StructType.h"   // TO_STRING's struct dump reads name / field_names
 
 // =============================================================================
 // op_string.h -- runtime helpers for string values (KIND_STRING heap objects).
@@ -22,7 +25,7 @@
 // NOT interned, so pointer identity would be wrong.
 // =============================================================================
 
-// These three are [[msvc::forceinline]] and use manual byte loops rather than a memcmp
+// These three are SKARN_FORCEINLINE and use manual byte loops rather than a memcmp
 // CALL. The reason that MADE that mandatory is retired: under the old threaded tail-call
 // dispatcher the op_eq/op_ne/op_lt/op_le handlers had to stay CALL-FREE leaves so their
 // DISPATCH remained a tail-jmp, or a deep TCO loop grew the native stack. Those handlers,
@@ -32,7 +35,7 @@
 // not a correctness requirement.
 
 // True iff `v` is a heap string (KIND_STRING). Only derefs on the pointer path.
-[[nodiscard]] [[msvc::forceinline]] inline bool is_string(Value v) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline bool is_string(Value v) noexcept {
     return v.isPtr() && GcObject::from_slots(v.asPtr())->kind == GcObject::KIND_STRING;
 }
 
@@ -40,7 +43,7 @@
 // order, ties broken by length (a prefix is < the longer string). The internal
 // "STR_CMP" -- a shared helper, deliberately not exposed as an opcode (no surface
 // operator needs a three-way result yet). Both args must be KIND_STRING.
-[[nodiscard]] [[msvc::forceinline]] inline int str_cmp(Value a, Value b) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline int str_cmp(Value a, Value b) noexcept {
     const GcObject* oa = GcObject::from_slots(a.asPtr());
     const GcObject* ob = GcObject::from_slots(b.asPtr());
     assert(oa->kind == GcObject::KIND_STRING && ob->kind == GcObject::KIND_STRING);
@@ -56,7 +59,7 @@
 }
 
 // Content equality of two heap strings (length short-circuit then byte compare).
-[[nodiscard]] [[msvc::forceinline]] inline bool str_eq(Value a, Value b) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline bool str_eq(Value a, Value b) noexcept {
     const GcObject* oa = GcObject::from_slots(a.asPtr());
     const GcObject* ob = GcObject::from_slots(b.asPtr());
     assert(oa->kind == GcObject::KIND_STRING && ob->kind == GcObject::KIND_STRING);
@@ -101,14 +104,14 @@ inline constexpr unsigned long VM_EXC_HEAP_EXHAUSTED = 0xE0564D00u; // 'VM'\0, c
 // KIND_STRING. `noexcept` (see VM_EXC_HEAP_EXHAUSTED): on the near-impossible 1 GiB
 // OOM it raises an SEH fault instead of throwing.
 //
-// [[msvc::noinline]] WAS load-bearing for a reason that no longer exists: inlining this
+// SKARN_NOINLINE WAS load-bearing for a reason that no longer exists: inlining this
 // (with its std::string local + cleanup) into the old tail-call dispatcher's op_add_num
 // gave that handler unwind code, which defeated the DISPATCH tail-jmp and grew the native
 // stack on every ADD. There is no tail-jmp under the while{switch}, so the attribute is
 // now a plain code-quality choice -- keeping a std::string and its cleanup out of the one
 // enormous dispatch function. That benefit is UNMEASURED; treat it as a sane default
 // rather than a fact, and measure before removing it.
-[[nodiscard]] [[msvc::noinline]] inline Value string_concat(Value a, Value b, Context* ctx) noexcept {
+[[nodiscard]] SKARN_NOINLINE inline Value string_concat(Value a, Value b, Context* ctx) SKARN_ALLOC_NOEXCEPT {
     const GcObject* oa = GcObject::from_slots(a.asPtr());
     const GcObject* ob = GcObject::from_slots(b.asPtr());
     assert(oa->kind == GcObject::KIND_STRING && ob->kind == GcObject::KIND_STRING);
@@ -128,21 +131,11 @@ inline constexpr unsigned long VM_EXC_HEAP_EXHAUSTED = 0xE0564D00u; // 'VM'\0, c
     return Value::fromPtr(obj->bytes());
 }
 
-// Format a numeric Value (Int or Double) to its textual form, host-side. Ints go
-// through to_chars as a signed 48-bit decimal; doubles use to_chars' shortest
-// round-trip form, then get a trailing ".0" appended when the result reads as a bare
-// integer (only an optional '-' and digits) so a Double always prints AS a Double
-// (2.0 -> "2.0", not "2"). Values with a '.', exponent, or letters -- "0.5", "1e+16",
-// and NaN/inf's "nan"/"inf"/"-inf" -- are left exactly as to_chars produced them.
-// Precondition: v.isInt() || v.isDouble().
-[[nodiscard]] inline std::string format_number(Value v) {
-    char buf[40];
-    if (v.isInt()) {
-        const std::to_chars_result res = std::to_chars(buf, buf + sizeof(buf), v.asSigned48());
-        return std::string(buf, res.ptr);
-    }
-    const std::to_chars_result res = std::to_chars(buf, buf + sizeof(buf), v.numAsDouble());
-    std::string s(buf, res.ptr);
+// Append the ".0" tag when `s` reads as a bare integer (only an optional '-' and
+// digits), so a Double always prints AS a Double: 2.0 -> "2.0", not "2". A result
+// carrying a '.', an exponent or letters -- "0.5", "1e+16", "nan", "-inf" -- is left
+// exactly as produced. Shared by both format_double paths so the tag rule cannot drift.
+inline void tag_integral_double(std::string& s) {
     bool looks_integer = !s.empty();
     for (const char c : s) {
         if (c == '-' || (c >= '0' && c <= '9')) continue;
@@ -150,7 +143,71 @@ inline constexpr unsigned long VM_EXC_HEAP_EXHAUSTED = 0xE0564D00u; // 'VM'\0, c
         break;
     }
     if (looks_integer) s += ".0";
+}
+
+// The shortest decimal form of `d` that reads back as the same value -- the textual
+// contract every `println`, `toString` and interpolation of a Double is held to. The
+// claim is pinned by tests/guide_claims/tier1/double_render_shortest_form.skn.
+//
+// std::to_chars(chars_format::general) IS that contract. Where the library has it, use
+// it. libc++ ships no floating-point to_chars, so the #else reconstructs the same output
+// from snprintf -- and "the same" is meant literally: the two agree on every one of
+// 3.4 million doubles tested, finite and non-finite alike, the only exception being
+// MSVC's signaling-NaN spelling "nan(snan)", which no Skarn arithmetic can produce.
+//
+// The reconstruction is NOT `%g`. %g switches to exponential once the decimal exponent
+// reaches the precision, which would render 100.0 as "1e+02" and change one integral
+// double in ten below a thousand. general format instead picks whichever of the two
+// notations is SHORTER, ties going to fixed -- hence the explicit length compare below.
+[[nodiscard]] inline std::string format_double(double d) {
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+    char buf[40];
+    const std::to_chars_result res = std::to_chars(buf, buf + sizeof(buf), d);
+    std::string s(buf, res.ptr);
+    tag_integral_double(s);
     return s;
+#else
+    if (std::isnan(d)) return std::signbit(d) ? "-nan" : "nan";
+    if (std::isinf(d)) return d < 0 ? "-inf" : "inf";
+
+    // 1. The fewest significant digits that still read back as the same value.
+    char sci[40];
+    int  prec = 1;
+    for (; prec < 17; ++prec) {
+        std::snprintf(sci, sizeof(sci), "%.*e", prec - 1, d);
+        if (std::strtod(sci, nullptr) == d) break;
+    }
+    const int sci_len = std::snprintf(sci, sizeof(sci), "%.*e", prec - 1, d);
+
+    // 2. The same digits in fixed notation. The decimal exponent comes from the
+    //    scientific form just produced; a negative fraction count clamps to 0, which
+    //    prints the value's exact integer expansion (what general format uses there).
+    const char* e     = std::strrchr(sci, 'e');
+    const int   exp10 = e ? std::atoi(e + 1) : 0;
+    const int   frac  = prec - 1 - exp10;
+    char fixed[512];   // a fixed form too long for this is longer than sci either way
+    const int fixed_len = std::snprintf(fixed, sizeof(fixed), "%.*f", frac < 0 ? 0 : frac, d);
+
+    // 3. Shorter wins; a tie goes to fixed.
+    const bool use_fixed = fixed_len > 0 && fixed_len < static_cast<int>(sizeof(fixed))
+                        && fixed_len <= sci_len;
+    std::string s = use_fixed ? std::string(fixed, static_cast<size_t>(fixed_len))
+                              : std::string(sci,   static_cast<size_t>(sci_len));
+    tag_integral_double(s);
+    return s;
+#endif
+}
+
+// Format a numeric Value (Int or Double) to its textual form, host-side. Ints go
+// through to_chars as a signed 48-bit decimal; doubles through format_double above.
+// Precondition: v.isInt() || v.isDouble().
+[[nodiscard]] inline std::string format_number(Value v) {
+    if (v.isInt()) {
+        char buf[40];
+        const std::to_chars_result res = std::to_chars(buf, buf + sizeof(buf), v.asSigned48());
+        return std::string(buf, res.ptr);
+    }
+    return format_double(v.numAsDouble());
 }
 
 // Concatenate two operands where AT LEAST one is a heap string, coercing a numeric
@@ -160,9 +217,9 @@ inline constexpr unsigned long VM_EXC_HEAP_EXHAUSTED = 0xE0564D00u; // 'VM'\0, c
 // alloc_string_gc, so a collection that relocates a/b during the allocation cannot
 // dangle. A non-string, non-number operand (struct/bool/nil/atom) is a type error
 // (Debug assert only -- the compiler is expected to emit well-typed ADDs, matching
-// the other type-check-free fast paths). `noexcept` / [[msvc::noinline]] mirror
+// the other type-check-free fast paths). `noexcept` / SKARN_NOINLINE mirror
 // string_concat (raises the heap-exhausted SEH code rather than throwing).
-[[nodiscard]] [[msvc::noinline]] inline Value string_add(Value a, Value b, Context* ctx) noexcept {
+[[nodiscard]] SKARN_NOINLINE inline Value string_add(Value a, Value b, Context* ctx) SKARN_ALLOC_NOEXCEPT {
     const auto to_host = [](Value v) -> std::string {
         if (is_string(v)) {
             const GcObject* o = GcObject::from_slots(v.asPtr());
@@ -478,8 +535,8 @@ inline void append_map_dump(Value v, Context* ctx, std::string& out, int depth) 
 //                 <fn> placeholder (their own slice can improve on this later).
 // append_* never allocate, so the struct graph cannot be moved mid-render; the single
 // alloc happens after the buffer is complete. undefined / other -> Debug-assert.
-// `noexcept` / [[msvc::noinline]] mirror string_add (raises on heap exhaustion).
-[[nodiscard]] [[msvc::noinline]] inline Value to_string_value(Value v, Context* ctx) noexcept {
+// `noexcept` / SKARN_NOINLINE mirror string_add (raises on heap exhaustion).
+[[nodiscard]] SKARN_NOINLINE inline Value to_string_value(Value v, Context* ctx) SKARN_ALLOC_NOEXCEPT {
     if (is_string(v)) return v;                                      // identity, no alloc
     if (v.isAtom()) {
         const uint32_t id = v.asAtomId();
@@ -521,3 +578,9 @@ inline void append_map_dump(Value v, Context* ctx, std::string& out, int depth) 
     }
     return Value::fromPtr(obj->bytes());
 }
+
+// See the matching assert in op_vec.h for why this is checked rather than assumed.
+#ifdef _WIN32
+static_assert(noexcept(to_string_value(Value{}, nullptr)),
+              "string allocation helpers must stay noexcept on Windows (SEH, not a throw)");
+#endif

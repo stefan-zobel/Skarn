@@ -1,0 +1,30 @@
+// CLAIM: a `Double` renders as the SHORTEST decimal form that reads back as the same value, and an
+//        integral one carries a `.0` tag. Tier 1 because a drift here is a user-facing lie in the most
+//        visible place the language has: the value a reader printed. The failure mode is silent and
+//        total -- nothing traps, the number is still numerically right, it is simply written in a
+//        notation no one asked for, on every `println`, every `toString` and every interpolation.
+//        What this pins is that "shortest" means shortest, and NOT the `%g` rule "exponential once the
+//        exponent reaches the precision": under that rule `100.0` prints as `1e+02` and one integral
+//        double in ten below a thousand changes notation. The pair `1000.0` vs `1000000.0` is the
+//        assertion -- fixed where fixed is shorter, exponential where exponential is, and the crossing
+//        is decided by LENGTH. `0.001` vs `0.0001` pins the same crossing on the small side.
+//        The `.0` on every integral value is the second half of the claim: it is what keeps a `Double`
+//        distinguishable from an `Int` on sight, and it survives the exponential forms' absence of it.
+// GUIDE: SkarnGuide.md 5 (Arithmetic -- `println(10.0 / 4.0)  // => 2.5   (Double)`)
+//        SkarnIn30Minutes.md 2 (The primitive types -- you write the `.0` on a double literal)
+// EXPECT: ok 10.0 | 20.0 | 100.0 | 110.0 | 1000.0 | -70.0 | 1e+06 | 0.001 | 1e-04 | 2.5 | 10.0 100.0
+let ten      = 10.0
+let twenty   = 20.0
+let hundred  = 100.0
+let oneten   = 110.0
+let thousand = 1000.0
+let neg      = -70.0
+let million  = 1000000.0      // fixed "1000000" is 7 chars, "1e+06" is 5 -> exponential wins
+let milli    = 0.001          // "0.001" is 5 chars, "1e-03" is 5 -> a tie goes to fixed
+let tenth_k  = 0.0001         // "0.0001" is 6 chars, "1e-04" is 5 -> exponential wins
+let half     = 2.5
+
+// toString and interpolation must agree: one renderer, not two.
+println("${toString(ten)} | ${toString(twenty)} | ${toString(hundred)} | ${toString(oneten)}"
+      + " | ${toString(thousand)} | ${toString(neg)} | ${toString(million)} | ${toString(milli)}"
+      + " | ${toString(tenth_k)} | ${toString(half)} | ${ten} ${hundred}")

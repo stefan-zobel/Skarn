@@ -2,9 +2,9 @@
 
 #include <cassert>
 #include <cstdint>
-#include "..\Value.h"
-#include "..\Heap.h"
-#include "..\Context.h"
+#include "../Value.h"
+#include "../Heap.h"
+#include "../Context.h"
 
 // =============================================================================
 // op_vec.h -- runtime helpers for the growable vector type (KIND_VEC).
@@ -44,7 +44,7 @@ inline constexpr uint32_t VEC_INITIAL_CAP  = 8;
 // header alive through *dst. Re-fetch the header after. `cap` may be 0 -- the first
 // push then grows via vec_grow's `old_cap ? .. : VEC_INITIAL_CAP` floor, so there is
 // no grow-from-zero trap.
-inline void vec_new_cap(Context* ctx, Value* dst, uint32_t cap) noexcept {
+inline void vec_new_cap(Context* ctx, Value* dst, uint32_t cap) SKARN_ALLOC_NOEXCEPT {
     GcObject* hdr = ctx->vm->heap->alloc_slots_gc(GcObject::KIND_VEC, VEC_HDR_SLOTS, ctx);
     if (!hdr) RaiseException(VM_EXC_HEAP_EXHAUSTED, EXCEPTION_NONCONTINUABLE, 0, nullptr);
     hdr->slots()[VEC_SLOT_COUNT] = Value::fromSigned48(0);
@@ -57,14 +57,14 @@ inline void vec_new_cap(Context* ctx, Value* dst, uint32_t cap) noexcept {
 }
 
 // Allocate a new empty vector with the default initial capacity (the `vec()` builtin).
-inline void vec_new(Context* ctx, Value* dst) noexcept {
+inline void vec_new(Context* ctx, Value* dst) SKARN_ALLOC_NOEXCEPT {
     vec_new_cap(ctx, dst, VEC_INITIAL_CAP);
 }
 
 // Grow the backing to 2x capacity and copy the live prefix [0, count) across.
 // Allocates -> may collect; `vec_slot` (a register) roots the header, re-fetched
 // after. Simpler than map_grow: no rehash, just a linear copy. RAISES on exhaustion.
-[[msvc::noinline]] inline void vec_grow(Context* ctx, Value* vec_slot) noexcept {
+SKARN_NOINLINE inline void vec_grow(Context* ctx, Value* vec_slot) SKARN_ALLOC_NOEXCEPT {
     GcObject*      hdr     = GcObject::from_slots(vec_slot->asPtr());
     GcObject*      old_b   = GcObject::from_slots(hdr->slots()[VEC_SLOT_BACKING].asPtr());
     const uint32_t old_cap = old_b->slot_count();
@@ -86,7 +86,7 @@ inline void vec_new(Context* ctx, Value* dst) noexcept {
 // Append *val_slot to the vector. `vec_slot` / `val_slot` are register slots so the
 // vector and the value both survive a collection triggered by a grow. Allocates only
 // on the grow path.
-inline void vec_push(Context* ctx, Value* vec_slot, Value* val_slot) noexcept {
+inline void vec_push(Context* ctx, Value* vec_slot, Value* val_slot) SKARN_ALLOC_NOEXCEPT {
     GcObject* hdr     = GcObject::from_slots(vec_slot->asPtr());
     GcObject* backing = GcObject::from_slots(hdr->slots()[VEC_SLOT_BACKING].asPtr());
     uint32_t  count   = static_cast<uint32_t>(hdr->slots()[VEC_SLOT_COUNT].asSigned48());
@@ -105,7 +105,7 @@ inline void vec_push(Context* ctx, Value* vec_slot, Value* val_slot) noexcept {
 // Remove and return the last element, or Nil if the vector is empty (a no-op then).
 // Non-allocating. The vacated slot is reset to Nil so a popped heap value is no longer
 // pinned as a GC root.
-[[nodiscard]] [[msvc::forceinline]] inline Value vec_pop(GcObject* vec_obj) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline Value vec_pop(GcObject* vec_obj) noexcept {
     const int64_t count = vec_obj->slots()[VEC_SLOT_COUNT].asSigned48();
     if (count <= 0) return Value::fromNil();      // empty -> Nil, count unchanged
     GcObject* backing = GcObject::from_slots(vec_obj->slots()[VEC_SLOT_BACKING].asPtr());
@@ -115,3 +115,12 @@ inline void vec_push(Context* ctx, Value* vec_slot, Value* val_slot) noexcept {
     vec_obj->slots()[VEC_SLOT_COUNT]    = Value::fromSigned48(count - 1);
     return x;
 }
+
+// SKARN_ALLOC_NOEXCEPT is only worth having if it actually resolves to `noexcept` on the
+// platform whose dispatch function it protects. Prove it here rather than trusting the
+// macro: an unevaluated call, so nothing runs and the null arguments are never read.
+// A POSIX build must NOT assert the opposite -- the stub throws there by design.
+#ifdef _WIN32
+static_assert(noexcept(vec_new(nullptr, nullptr)),
+              "vec allocation helpers must stay noexcept on Windows (SEH, not a throw)");
+#endif

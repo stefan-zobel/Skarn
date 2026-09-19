@@ -8,6 +8,7 @@
 
 #include <iostream>
 #include <stdexcept>
+#include <string>     // argv comparison for --fault-probe
 
 #include "Execute.h"
 #include "Tests.h"
@@ -39,7 +40,32 @@ static void run(const char* name, void (*fn)()) {
     std::cout << "\n";
 }
 
-int main() {
+int main(int argc, char** argv) {
+    // --fault-probe runs ONLY the real-hardware-fault test, and nothing else.
+    //
+    // It is separated because it is the one test whose failure mode is a process kill
+    // rather than a failed assertion: it deliberately dereferences a bad pointer to prove
+    // that the fault frame around run_switch_loop classifies and recovers. Mixing it into
+    // the ordinary run would mean a regression there destroys every other result in the
+    // same invocation. See test_fault_probe in Tests.h.
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) != "--fault-probe") continue;
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+        // The VM declines to install its handler under a sanitizer (doing so would
+        // destroy the sanitizer's own reporting), so the probe cannot pass there. Skip it
+        // rather than report a failure that says nothing about the code.
+        std::cout << "fault_probe: SKIPPED (sanitizer build keeps its own handler)\n";
+        return 0;
+#  endif
+#endif
+        run("fault_probe", test_fault_probe);
+        const TestStats& fs = g_test_stats;
+        std::cout << "==== fault probe: " << fs.tests_passed << " passed, "
+                  << fs.tests_failed << " failed ====\n";
+        return fs.tests_failed == 0 ? 0 : 1;
+    }
+
     run("far_call_relaxation",      test_far_call_relaxation);
     run("factorial",                test_factorial);
     run("sum_tco",                  test_sum_tco);

@@ -168,6 +168,8 @@ bool TypeContext::unify(const TyPtr& a0, const TyPtr& b0) {
             return true;
         case TyKind::Var:   // unreachable (handled above)
             return false;
+        case TyKind::Error: // unreachable (guarded at the top of this function)
+            return true;
     }
     return false;
 }

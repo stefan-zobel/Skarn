@@ -83,8 +83,26 @@ must print exactly the output shown.
 
 ## Building
 
-The project targets **Windows x64 with Visual Studio 2022** (MSVC toolset v143, C++20). It is a Visual Studio
-solution without CMake. From a developer command prompt:
+### macOS (Apple Silicon)
+
+Requires Xcode Command Line Tools (Clang) and CMake 3.21+. **arm64 only** — no Intel support.
+
+```bash
+# Install CMake if needed
+brew install cmake
+
+# Configure (once)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+# Build
+cmake --build build -- -j$(sysctl -n hw.logicalcpu)
+```
+
+The driver binary is `build/skarnvm`.
+
+### Windows (x64, Visual Studio 2022)
+
+The project also ships a Visual Studio solution for Windows. From a developer command prompt:
 
 ```bash
 msbuild vMachine.sln /p:Configuration=Release /p:Platform=x64
@@ -94,6 +112,12 @@ Everything is built into `x64\Release\`. The Debug configuration works the same 
 
 ## Running a program
 
+**macOS:**
+```bash
+./build/skarnvm hello.skn
+```
+
+**Windows:**
 ```bash
 x64\Release\static_vmrun.exe hello.skn
 ```
@@ -104,10 +128,12 @@ Arguments after the script are passed to the program. Useful flags:
 - `--dump-ast` type-checks the program and prints the typed syntax tree without running it.
 - `--emit-bytecode <file>` / `--run-bytecode <file>` compile to a `.skbc` image and run it later.
 
-Run `static_vmrun` without arguments for the full list. A multi-file program is a directory of `.skn` files:
+Run the driver without arguments for the full list. A multi-file program is a directory of `.skn` files:
 `import net::http` loads `net/http.skn` relative to the entry file.
 
 ## Tests
+
+**Windows:**
 
 | command | what it checks |
 |---|---|

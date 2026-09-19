@@ -5,9 +5,9 @@
 #include <cstring>
 #include <string>
 #include <string_view>
-#include "..\Value.h"
-#include "..\Heap.h"
-#include "..\Context.h"
+#include "../Value.h"
+#include "../Heap.h"
+#include "../Context.h"
 
 // =============================================================================
 // op_bytes.h -- runtime helpers for the growable byte buffer type (KIND_BYTES).
@@ -54,7 +54,7 @@ inline constexpr uint32_t BYTES_INITIAL_CAP  = 8;
 // backing slot stays Undefined -- scanned as a non-pointer), THEN allocate the
 // backing; re-fetch the header after. `cap` may be 0 -- the first push then grows
 // via bytes_grow's `old_cap ? .. : BYTES_INITIAL_CAP` floor.
-inline void bytes_new_cap(Context* ctx, Value* dst, uint32_t cap) noexcept {
+inline void bytes_new_cap(Context* ctx, Value* dst, uint32_t cap) SKARN_ALLOC_NOEXCEPT {
     GcObject* hdr = ctx->vm->heap->alloc_slots_gc(GcObject::KIND_BYTES, BYTES_HDR_SLOTS, ctx);
     if (!hdr) RaiseException(VM_EXC_HEAP_EXHAUSTED, EXCEPTION_NONCONTINUABLE, 0, nullptr);
     hdr->slots()[BYTES_SLOT_COUNT] = Value::fromSigned48(0);
@@ -69,7 +69,7 @@ inline void bytes_new_cap(Context* ctx, Value* dst, uint32_t cap) noexcept {
 // Grow the backing to 2x capacity and copy the live prefix [0, count) across.
 // Allocates -> may collect; `buf_slot` (a register) roots the header, re-fetched
 // after. The straight-memcpy analogue of vec_grow. RAISES on exhaustion.
-[[msvc::noinline]] inline void bytes_grow(Context* ctx, Value* buf_slot) noexcept {
+SKARN_NOINLINE inline void bytes_grow(Context* ctx, Value* buf_slot) SKARN_ALLOC_NOEXCEPT {
     GcObject*      hdr     = GcObject::from_slots(buf_slot->asPtr());
     GcObject*      old_b   = GcObject::from_slots(hdr->slots()[BYTES_SLOT_BACKING].asPtr());
     const uint32_t old_cap = bytes_backing_cap(old_b);
@@ -107,7 +107,7 @@ inline void bytes_push(Context* ctx, Value* buf_slot, int64_t byte_val) noexcept
 
 // Remove and return the last byte as an Int (0..255), or Nil if the buffer is empty
 // (a no-op then). Non-allocating. No GC unpin needed -- a byte is not a pointer.
-[[nodiscard]] [[msvc::forceinline]] inline Value bytes_pop(GcObject* buf_obj) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline Value bytes_pop(GcObject* buf_obj) noexcept {
     const int64_t count = buf_obj->slots()[BYTES_SLOT_COUNT].asSigned48();
     if (count <= 0) return Value::fromNil();
     GcObject* backing = GcObject::from_slots(buf_obj->slots()[BYTES_SLOT_BACKING].asPtr());
@@ -119,7 +119,7 @@ inline void bytes_push(Context* ctx, Value* buf_slot, int64_t byte_val) noexcept
 // Build a byte buffer holding a copy of `src` (the `toBytes(str)` builtin). `src`
 // MUST be host-stable (materialized into a std::string by the caller): the two
 // allocations here can collect and would move a source that lived on the GC heap.
-inline void bytes_from_str(Context* ctx, Value* dst, std::string_view src) noexcept {
+inline void bytes_from_str(Context* ctx, Value* dst, std::string_view src) SKARN_ALLOC_NOEXCEPT {
     const uint32_t n = static_cast<uint32_t>(src.size());
     bytes_new_cap(ctx, dst, n);                    // header + backing, *dst rooted throughout
     GcObject* hdr     = GcObject::from_slots(dst->asPtr());
@@ -130,13 +130,13 @@ inline void bytes_from_str(Context* ctx, Value* dst, std::string_view src) noexc
 
 // Out-of-line wrapper for BYTES_FROM_STR: materialize the source KIND_STRING's bytes
 // into a host std::string (stable across the allocs), then build the buffer. Kept
-// [[msvc::noinline]] so the std::string (which needs unwinding) stays out of the dispatch
+// SKARN_NOINLINE so the std::string (which needs unwinding) stays out of the dispatch
 // function -- the same discipline as to_string_value. NOTE: this no longer avoids C2712.
 // The caller is run_switch_LOOP, which holds no __try (the SEH frame lives in the
 // separate run_switch), so nothing forbids an unwindable local there.
 // C2712 does still bind raise_access_violation, which run_switch's __except calls.
-[[msvc::noinline]] inline void bytes_from_string_obj(Context* ctx, Value* dst,
-                                                     const GcObject* src_obj) noexcept {
+SKARN_NOINLINE inline void bytes_from_string_obj(Context* ctx, Value* dst,
+                                                     const GcObject* src_obj) SKARN_ALLOC_NOEXCEPT {
     std::string host(src_obj->bytes(), src_obj->string_length());
     bytes_from_str(ctx, dst, host);
 }
@@ -146,7 +146,7 @@ inline void bytes_from_str(Context* ctx, Value* dst, std::string_view src) noexc
 // TARGET rather than bytes_grow's fixed doubling (still doubles when that suffices, so
 // repeated appends stay amortized O(1)). `buf_slot` (a register) roots the header across
 // the possible collection; re-fetched after. RAISES on exhaustion.
-[[msvc::noinline]] inline void bytes_ensure_cap(Context* ctx, Value* buf_slot, uint32_t needed) noexcept {
+SKARN_NOINLINE inline void bytes_ensure_cap(Context* ctx, Value* buf_slot, uint32_t needed) SKARN_ALLOC_NOEXCEPT {
     GcObject* hdr     = GcObject::from_slots(buf_slot->asPtr());
     GcObject* backing = GcObject::from_slots(hdr->slots()[BYTES_SLOT_BACKING].asPtr());
     const uint32_t cap = bytes_backing_cap(backing);
@@ -171,8 +171,8 @@ inline void bytes_from_str(Context* ctx, Value* dst, std::string_view src) noexc
 // KIND_STRING (off/len over its byte payload) or a KIND_BYTES (over its backing). Handles
 // src == dst: the destination region [count, count+n) is disjoint from the source
 // [src_off, src_off+n) which lies within [0, count). Caller validates the source range.
-[[msvc::noinline]] inline void bytes_append_span(Context* ctx, Value* dst_slot, Value* src_slot,
-                                                 uint32_t src_off, uint32_t n) noexcept {
+SKARN_NOINLINE inline void bytes_append_span(Context* ctx, Value* dst_slot, Value* src_slot,
+                                                 uint32_t src_off, uint32_t n) SKARN_ALLOC_NOEXCEPT {
     if (n == 0) return;
     GcObject*      dhdr  = GcObject::from_slots(dst_slot->asPtr());
     const uint32_t count = static_cast<uint32_t>(dhdr->slots()[BYTES_SLOT_COUNT].asSigned48());
@@ -189,7 +189,7 @@ inline void bytes_from_str(Context* ctx, Value* dst, std::string_view src) noexc
 
 // Live byte length of a source that is a KIND_STRING (its payload) or a KIND_BYTES (its
 // count slot) -- the length BYTES_APPEND appends and the bound BYTES_APPEND_RANGE checks.
-[[nodiscard]] [[msvc::forceinline]] inline uint32_t bytes_src_len(const GcObject* src) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline uint32_t bytes_src_len(const GcObject* src) noexcept {
     return src->kind == GcObject::KIND_STRING
         ? src->string_length()
         : static_cast<uint32_t>(src->slots()[BYTES_SLOT_COUNT].asSigned48());
@@ -197,10 +197,10 @@ inline void bytes_from_str(Context* ctx, Value* dst, std::string_view src) noexc
 
 // Decode a buffer's live bytes [0, count) into a fresh KIND_STRING (the `fromBytes(b)`
 // builtin). Bytes are materialized host-side FIRST, so the following alloc_string_gc
-// collection cannot move the source out from under the copy. [[msvc::noinline]] so the
+// collection cannot move the source out from under the copy. SKARN_NOINLINE so the
 // std::string stays out of the dispatch function -- no longer a C2712 requirement, see
 // bytes_from_string_obj above.
-[[nodiscard]] [[msvc::noinline]] inline Value bytes_to_string(Context* ctx, Value* buf_slot) noexcept {
+[[nodiscard]] SKARN_NOINLINE inline Value bytes_to_string(Context* ctx, Value* buf_slot) SKARN_ALLOC_NOEXCEPT {
     GcObject*      hdr     = GcObject::from_slots(buf_slot->asPtr());
     GcObject*      backing = GcObject::from_slots(hdr->slots()[BYTES_SLOT_BACKING].asPtr());
     const uint32_t count   = static_cast<uint32_t>(hdr->slots()[BYTES_SLOT_COUNT].asSigned48());
@@ -209,3 +209,9 @@ inline void bytes_from_str(Context* ctx, Value* dst, std::string_view src) noexc
     if (!s) RaiseException(VM_EXC_HEAP_EXHAUSTED, EXCEPTION_NONCONTINUABLE, 0, nullptr);
     return Value::fromPtr(s->payload());
 }
+
+// See the matching assert in op_vec.h for why this is checked rather than assumed.
+#ifdef _WIN32
+static_assert(noexcept(bytes_to_string(nullptr, nullptr)),
+              "bytes allocation helpers must stay noexcept on Windows (SEH, not a throw)");
+#endif
