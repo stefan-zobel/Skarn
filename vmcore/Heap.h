@@ -9,7 +9,7 @@
 #include <vector>
 #include <chrono>       // steady_clock -- measurement-only GC timing (--bench)
 #include <ostream>      // debug_dump(std::ostream&)  (<format> comes via Value.h)
-#include <Windows.h>
+#include "Platform.h"
 #include "Value.h"
 #include "Context.h"
 #include "VM.h"
@@ -472,6 +472,23 @@ public:
     // on top of the current live set. Last-resort allocation growth, used by
     // the caller only after a collection failed to free enough room. Returns
     // false if even MAX_SEMI cannot hold it.
+    //
+    // It can fail for two DIFFERENT reasons, and they do not behave alike across
+    // platforms:
+    //
+    //   1. "the request exceeds our own reservation" -- `needed > new_cap` below, a
+    //      plain comparison against MAX_SEMI with no operating system involved. Identical
+    //      everywhere, and the branch a program realistically reaches.
+    //   2. "the system is out of memory" -- commit_both() fails. On Windows
+    //      VirtualAlloc(MEM_COMMIT) genuinely fails when there is nothing to commit, so
+    //      this returns false and the caller degrades cleanly. On POSIX it effectively
+    //      cannot: mprotect() on an already-reserved mapping charges nothing, so it
+    //      succeeds and real exhaustion surfaces later as SIGBUS or an OOM kill on first
+    //      touch instead of as a "Heap exhausted" fault.
+    //
+    // Reason 2 has no clean fix -- touching pages to force the charge does not help,
+    // because the failure arrives as a signal rather than an error code. Treat it as a
+    // known platform limitation, not as something the ladder can paper over.
     // -------------------------------------------------------------------
     [[nodiscard]] bool grow_to_fit(size_t total) noexcept {
         size_t needed = used() + total;
@@ -628,7 +645,7 @@ public:
     // Public because external strong-root providers (e.g. StringInterner)
     // must forward the pointer slots they own through the same path.
     // -------------------------------------------------------------------
-    [[msvc::forceinline]] void forward(Value* slot) noexcept {
+    SKARN_FORCEINLINE void forward(Value* slot) noexcept {
         if (!slot->isPtr())
             return; // immediates, Bool/Nil, native-fn TAG_INT: not heap pointers
 
@@ -857,18 +874,26 @@ private:
         return GcObject::align_up_8(sizeof(GcObject) + static_cast<size_t>(n_bytes));
     }
 
-    // ---- VirtualAlloc management --------------------------------------------
+    // ---- Memory management (VirtualAlloc on Windows, mmap on POSIX) ---------
 
     static std::byte* reserve_semi() {
+#ifdef _WIN32
         void* p = VirtualAlloc(nullptr, MAX_SEMI, MEM_RESERVE, PAGE_READWRITE);
-        if (!p)
-            throw std::runtime_error("Heap: VirtualAlloc reserve failed");
+        if (!p) throw std::runtime_error("Heap: VirtualAlloc reserve failed");
+#else
+        void* p = mmap(nullptr, MAX_SEMI, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p == MAP_FAILED) throw std::runtime_error("Heap: mmap reserve failed");
+#endif
         return static_cast<std::byte*>(p);
     }
 
     static void release_semi(std::byte* base) noexcept {
-        if (base)
-            VirtualFree(base, 0, MEM_RELEASE);
+        if (!base) return;
+#ifdef _WIN32
+        VirtualFree(base, 0, MEM_RELEASE);
+#else
+        munmap(base, MAX_SEMI);
+#endif
     }
 
     // Commit [0, new_cap) in BOTH semispaces (idempotent on already-committed
@@ -877,8 +902,13 @@ private:
     [[nodiscard]] bool commit_both(size_t new_cap) noexcept {
         assert(new_cap <= MAX_SEMI);
         for (int i = 0; i < 2; ++i) {
+#ifdef _WIN32
             if (!VirtualAlloc(space_[i], new_cap, MEM_COMMIT, PAGE_READWRITE))
                 return false;
+#else
+            if (mprotect(space_[i], new_cap, PROT_READ | PROT_WRITE) != 0)
+                return false;
+#endif
         }
         semi_capacity_ = new_cap;
         return true;

@@ -1,7 +1,10 @@
 #pragma once
 
 #include <stdexcept>
-#include "Windows.h"
+#ifndef _WIN32
+#  include <sys/mman.h>
+#endif
+#include "Platform.h"
 #include "Context.h"
 
 // Owns all memory blocks the VM needs:
@@ -55,7 +58,12 @@ public:
     // A single trailing PAGE_NOACCESS page past the RESERVED end is defense-in-depth:
     // an overflow past the cap is caught proactively by run_switch's soft-check (a clean
     // located fault), but a stray write beyond the reserved range still faults here.
-    static constexpr size_t GUARD_SIZE = 4096;   // x64/Windows page size
+    // Apple Silicon (arm64) uses 16 KiB pages; x86-64 / Windows use 4 KiB.
+#ifdef __APPLE__
+    static constexpr size_t GUARD_SIZE = 16384;
+#else
+    static constexpr size_t GUARD_SIZE = 4096;
+#endif
     static_assert(REG_INIT_SIZE % GUARD_SIZE == 0, "register stack initial must be page-aligned");
     static_assert(RET_INIT_SIZE % GUARD_SIZE == 0, "return stack initial must be page-aligned");
     static_assert(REG_MAX_SIZE  % GUARD_SIZE == 0, "register stack max must be page-aligned");
@@ -158,30 +166,48 @@ private:
     // the base. `commit_size` <= `reserve_size`, both page-aligned. The guard page sits
     // just past the reserved end.
     static void* reserve_with_guard(size_t reserve_size, size_t commit_size) {
+#ifdef _WIN32
         void* ptr = VirtualAlloc(nullptr, reserve_size + GUARD_SIZE, MEM_RESERVE, PAGE_NOACCESS);
         if (!ptr) throw std::runtime_error("VirtualAlloc(MEM_RESERVE) failed");
-        if (commit_size &&
-            !VirtualAlloc(ptr, commit_size, MEM_COMMIT, PAGE_READWRITE)) {
+        if (commit_size && !VirtualAlloc(ptr, commit_size, MEM_COMMIT, PAGE_READWRITE)) {
             VirtualFree(ptr, 0, MEM_RELEASE);
             throw std::runtime_error("VirtualAlloc(MEM_COMMIT) failed");
         }
-        // The trailing guard page stays reserved-only (PAGE_NOACCESS) -- a stray write
-        // there faults just like the reserved-but-uncommitted tail.
         return ptr;
+#else
+        void* ptr = mmap(nullptr, reserve_size + GUARD_SIZE,
+                         PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (ptr == MAP_FAILED) throw std::runtime_error("mmap(PROT_NONE) failed");
+        if (commit_size && mprotect(ptr, commit_size, PROT_READ | PROT_WRITE) != 0) {
+            munmap(ptr, reserve_size + GUARD_SIZE);
+            throw std::runtime_error("mprotect(PROT_READ|PROT_WRITE) failed");
+        }
+        return ptr;
+#endif
     }
 
-    // Commit the reserved region up to `total_bytes` from the base. MEM_COMMIT is
-    // idempotent over already-committed pages, so committing the whole [base, total)
-    // prefix each time is safe and simple. Returns false on failure.
+    // Commit the reserved region up to `total_bytes` from the base. Returns false on failure.
+    // On Windows MEM_COMMIT is idempotent; on POSIX mprotect(PROT_READ|PROT_WRITE) is too.
     static bool commit_to(void* base, size_t total_bytes) {
+#ifdef _WIN32
         return VirtualAlloc(base, total_bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+#else
+        return mprotect(base, total_bytes, PROT_READ | PROT_WRITE) == 0;
+#endif
     }
 
     void release_all() {
+#ifdef _WIN32
         if (reg_base_)           VirtualFree(reg_base_, 0, MEM_RELEASE);
         if (ret_base_)           VirtualFree(ret_base_, 0, MEM_RELEASE);
         if (frame_size_base_)    VirtualFree(frame_size_base_, 0, MEM_RELEASE);
         if (closure_stack_base_) VirtualFree(closure_stack_base_, 0, MEM_RELEASE);
+#else
+        if (reg_base_)           munmap(reg_base_,           REG_MAX_SIZE + GUARD_SIZE);
+        if (ret_base_)           munmap(ret_base_,           RET_MAX_SIZE + GUARD_SIZE);
+        if (frame_size_base_)    munmap(frame_size_base_,    FSZ_MAX_SIZE + GUARD_SIZE);
+        if (closure_stack_base_) munmap(closure_stack_base_, CLO_MAX_SIZE + GUARD_SIZE);
+#endif
     }
 
     void steal_from(VM_Resources& other) noexcept {

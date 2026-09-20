@@ -1,15 +1,31 @@
 {
   "name": "skarn-language",
   "displayName": "Skarn",
-  "description": "Syntax highlighting for the Skarn language (.skn files).",
-  "version": "0.1.0",
+  "description": "Syntax highlighting, live type checking, outline, hover, go to definition, references, rename, completion, signature help and formatting for the Skarn language (.skn files).",
+  "version": "0.2.0",
   "publisher": "vmachine",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/stefan-zobel/Skarn"
+  },
+  "homepage": "https://github.com/stefan-zobel/Skarn",
+  "bugs": {
+    "url": "https://github.com/stefan-zobel/Skarn/issues"
+  },
   "engines": {
-    "vscode": "^1.75.0"
+    "vscode": "^1.91.0"
   },
   "categories": [
     "Programming Languages"
   ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:skarn"
+  ],
+  "dependencies": {
+    "vscode-languageclient": "^10.1.1"
+  },
   "contributes": {
     "languages": [
       {
@@ -30,6 +46,21 @@
         "scopeName": "source.skarn",
         "path": "./syntaxes/skarn.tmLanguage.json"
       }
-    ]
+    ],
+    "configurationDefaults": {
+      "[skarn]": {
+        "editor.wordBasedSuggestions": "off"
+      }
+    },
+    "configuration": {
+      "title": "Skarn",
+      "properties": {
+        "skarn.server.path": {
+          "type": "string",
+          "default": "skarn_lsp",
+          "description": "Path to the skarn_lsp language server executable (or just its name when it is on the PATH). Takes effect after reloading the window."
+        }
+      }
+    }
   }
 }

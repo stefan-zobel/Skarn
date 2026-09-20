@@ -531,4 +531,85 @@ std::string dump_pat(const Pattern& p) { std::string s; render_pat(p, s); return
 std::string dump_type(const Type& t) { std::string s; render_type(t, s); return s; }
 std::string dump_item(const Item& i) { std::string s; render_item(i, s); return s; }
 
+namespace {
+
+using ExprFn = std::function<void(Expr&)>;
+void each_expr(Expr& e, const ExprFn& fn);
+void each_stmt(Stmt& s, const ExprFn& fn);
+
+void each_pat(Pattern& p, const ExprFn& fn) {
+    switch (p.kind) {
+    case PatKind::Wildcard: case PatKind::Ident: break;
+    case PatKind::Bind:    { auto& bp = static_cast<BindPat&>(p); if (bp.sub) each_pat(*bp.sub, fn); break; }
+    case PatKind::Literal: { auto& lp = static_cast<LiteralPat&>(p); if (lp.lit) each_expr(*lp.lit, fn); break; }
+    case PatKind::Range:   { auto& rp = static_cast<RangePat&>(p); if (rp.lo) each_expr(*rp.lo, fn); if (rp.hi) each_expr(*rp.hi, fn); break; }
+    case PatKind::Ctor:    { auto& cp = static_cast<CtorPat&>(p); for (auto& e : cp.elems) each_pat(*e, fn); break; }
+    case PatKind::Tuple:   { auto& tp = static_cast<TuplePat&>(p); for (auto& e : tp.elems) each_pat(*e, fn); break; }
+    case PatKind::List:    { auto& lp = static_cast<ListPat&>(p); for (auto& e : lp.elems) each_pat(*e, fn); if (lp.rest) each_pat(*lp.rest, fn); break; }
+    case PatKind::Struct:  { auto& sp = static_cast<StructPat&>(p); for (auto& f : sp.fields) if (f.pat) each_pat(*f.pat, fn); break; }
+    case PatKind::Map:     { auto& mp = static_cast<MapPat&>(p); for (auto& kv : mp.entries) { if (kv.first) each_expr(*kv.first, fn); if (kv.second) each_pat(*kv.second, fn); } break; }
+    case PatKind::Or:      { auto& op = static_cast<OrPat&>(p); for (auto& a : op.alts) each_pat(*a, fn); break; }
+    }
+}
+
+void each_expr(Expr& e, const ExprFn& fn) {
+    fn(e);
+    switch (e.kind) {
+    case ExprKind::IntLit: case ExprKind::DoubleLit: case ExprKind::StrLit: case ExprKind::BoolLit:
+    case ExprKind::Ident: case ExprKind::Continue:
+        break;
+    case ExprKind::Break:  { auto& b = static_cast<BreakExpr&>(e); if (b.value) each_expr(*b.value, fn); break; }
+    case ExprKind::Return: { auto& r = static_cast<ReturnExpr&>(e); if (r.value) each_expr(*r.value, fn); break; }
+    case ExprKind::Unary:  { auto& u = static_cast<UnaryExpr&>(e); if (u.operand) each_expr(*u.operand, fn); break; }
+    case ExprKind::Binary: { auto& b = static_cast<BinaryExpr&>(e); if (b.lhs) each_expr(*b.lhs, fn); if (b.rhs) each_expr(*b.rhs, fn); break; }
+    case ExprKind::Pipe:   { auto& p = static_cast<PipeExpr&>(e); if (p.lhs) each_expr(*p.lhs, fn); if (p.rhs) each_expr(*p.rhs, fn); break; }
+    case ExprKind::Call:   { auto& c = static_cast<CallExpr&>(e); if (c.callee) each_expr(*c.callee, fn); for (auto& a : c.args) each_expr(*a, fn); break; }
+    case ExprKind::Field:  { auto& f = static_cast<FieldExpr&>(e); if (f.obj) each_expr(*f.obj, fn); break; }
+    case ExprKind::Index:  { auto& ix = static_cast<IndexExpr&>(e); if (ix.obj) each_expr(*ix.obj, fn); if (ix.index) each_expr(*ix.index, fn); break; }
+    case ExprKind::Try:    { auto& t = static_cast<TryExpr&>(e); if (t.operand) each_expr(*t.operand, fn); break; }
+    case ExprKind::If:     { auto& i = static_cast<IfExpr&>(e); if (i.cond) each_expr(*i.cond, fn); if (i.then_blk) each_expr(*i.then_blk, fn); if (i.else_blk) each_expr(*i.else_blk, fn); break; }
+    case ExprKind::Match:  {
+        auto& m = static_cast<MatchExpr&>(e);
+        if (m.scrut) each_expr(*m.scrut, fn);
+        for (auto& arm : m.arms) { if (arm.pat) each_pat(*arm.pat, fn); if (arm.guard) each_expr(*arm.guard, fn); if (arm.body) each_expr(*arm.body, fn); }
+        break;
+    }
+    case ExprKind::While:  { auto& w = static_cast<WhileExpr&>(e); if (w.cond) each_expr(*w.cond, fn); if (w.body) each_expr(*w.body, fn); break; }
+    case ExprKind::For:    { auto& f = static_cast<ForExpr&>(e); if (f.pat) each_pat(*f.pat, fn); if (f.iter) each_expr(*f.iter, fn); if (f.body) each_expr(*f.body, fn); break; }
+    case ExprKind::Loop:   { auto& l = static_cast<LoopExpr&>(e); if (l.body) each_expr(*l.body, fn); break; }
+    case ExprKind::Block:  { auto& b = static_cast<BlockExpr&>(e); for (auto& s : b.stmts) each_stmt(*s, fn); break; }
+    case ExprKind::Lambda: { auto& l = static_cast<LambdaExpr&>(e); if (l.body) each_expr(*l.body, fn); break; }
+    case ExprKind::StructLit: { auto& sl = static_cast<StructLit&>(e); for (auto& fi : sl.fields) if (fi.value) each_expr(*fi.value, fn); if (sl.base) each_expr(*sl.base, fn); break; }
+    case ExprKind::Tuple:   { auto& t = static_cast<TupleExpr&>(e); for (auto& x : t.elems) each_expr(*x, fn); break; }
+    case ExprKind::ListLit: { auto& l = static_cast<ListLit&>(e); for (auto& x : l.elems) each_expr(*x, fn); break; }
+    case ExprKind::MapLit:  { auto& m = static_cast<MapLit&>(e); for (auto& kv : m.entries) { if (kv.first) each_expr(*kv.first, fn); if (kv.second) each_expr(*kv.second, fn); } break; }
+    }
+}
+
+void each_stmt(Stmt& s, const ExprFn& fn) {
+    switch (s.kind) {
+    case StmtKind::Let:    { auto& l = static_cast<LetStmt&>(s); if (l.pat) each_pat(*l.pat, fn); if (l.init) each_expr(*l.init, fn); break; }
+    case StmtKind::Assign: { auto& a = static_cast<AssignStmt&>(s); if (a.target) each_expr(*a.target, fn); if (a.value) each_expr(*a.value, fn); break; }
+    case StmtKind::Expr:   { auto& es = static_cast<ExprStmt&>(s); if (es.expr) each_expr(*es.expr, fn); break; }
+    }
+}
+
+void each_method(std::vector<Method>& ms, const ExprFn& fn) {
+    for (auto& m : ms) if (m.body) each_expr(*m.body, fn);
+}
+
+} // namespace
+
+void for_each_expr(Item& item, const std::function<void(Expr&)>& fn) {
+    switch (item.kind) {
+    case ItemKind::Fn:    { auto& f = static_cast<FnItem&>(item); if (f.body) each_expr(*f.body, fn); break; }
+    case ItemKind::Stmt:  { auto& si = static_cast<StmtItem&>(item); if (si.stmt) each_stmt(*si.stmt, fn); break; }
+    case ItemKind::Const: { auto& c = static_cast<ConstItem&>(item); if (c.value) each_expr(*c.value, fn); break; }
+    case ItemKind::Trait: each_method(static_cast<TraitDecl&>(item).methods, fn); break;
+    case ItemKind::Impl:  each_method(static_cast<ImplDecl&>(item).methods, fn); break;
+    case ItemKind::Struct: case ItemKind::Enum: case ItemKind::Import: case ItemKind::Use:
+        break;
+    }
+}
+
 } // namespace svc

@@ -78,6 +78,10 @@ struct Token {
     std::string text;             // lexeme (ident/keyword/operator) or decoded string
     uint32_t    line = 0;         // 1-based
     uint32_t    col  = 0;         // 1-based, column of the first character
+    // The token's source bytes [begin, end): its spelling, which `text` is not for a decoded string
+    // (editor tooling -- the formatter copies literals verbatim). A StmtEnd from a line break and Eof
+    // are empty.
+    uint32_t    begin = 0, end = 0;
     int64_t     int_val    = 0;   // valid iff kind == Int
     double      double_val = 0.0; // valid iff kind == Double
     // Format specifier of the hole that a `InterpStrMid`/`InterpStrEnd` token CLOSES: for `${e:spec}`,

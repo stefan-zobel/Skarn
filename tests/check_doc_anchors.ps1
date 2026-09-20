@@ -23,7 +23,8 @@
 #   powershell -File tests/check_doc_anchors.ps1
 #   powershell -File tests/check_doc_anchors.ps1 -Docs docs\Compiler.md -Trigger 'Compiler\.md'
 #
-# Parameters (all optional; the defaults check docs/VirtualMachine.md and docs/Compiler.md):
+# Parameters (all optional; the defaults check docs/VirtualMachine.md, docs/Compiler.md and
+# docs/LanguageServer.md):
 #   -Docs               repo-relative paths of the document family (missing files are skipped)
 #   -Trigger            regex a line must match to be scanned; also the primary citation trigger
 #   -ExtraDir           an additional directory of *.md files to scan for citations
@@ -33,8 +34,8 @@
 # Exit code: 0 = every citation resolves; 1 = at least one does not (or no document was found).
 
 param(
-    [string[]]$Docs = @('docs\VirtualMachine.md', 'docs\Compiler.md'),
-    [string]  $Trigger = '(VirtualMachine|Compiler)\.md',
+    [string[]]$Docs = @('docs\VirtualMachine.md', 'docs\Compiler.md', 'docs\LanguageServer.md'),
+    [string]  $Trigger = '(VirtualMachine|Compiler|LanguageServer)\.md',
     [string]  $ExtraDir = '',
     [switch]  $RejectPartNumbers,
     [string]  $Label = 'doc anchors'

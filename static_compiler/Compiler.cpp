@@ -482,8 +482,9 @@ Program parse_check(const char* source, const std::vector<PreludeModule>* prelud
     return prog;
 }
 
-Program parse_check_modules(ModuleSet modules, const std::vector<PreludeModule>* prelude,
-                            std::vector<TypeError>* out_warnings) {
+namespace {
+// The combined Program behind parse_check_modules and check_modules_for_tools.
+Program assemble_modules(ModuleSet& modules, const std::vector<PreludeModule>* prelude) {
     // Assemble ONE program: the prelude modules' items first (each tagged with its own module
     // prefix), then every user module's items in the loader's topological order (dependencies
     // before dependents; the entry/root module last). The prelude/user boundary is recorded for
@@ -499,12 +500,31 @@ Program parse_check_modules(ModuleSet modules, const std::vector<PreludeModule>*
             combined.items.push_back(std::move(it));
         }
     combined.prelude_item_count = npre;
+    return combined;
+}
+} // namespace
 
+Program parse_check_modules(ModuleSet modules, const std::vector<PreludeModule>* prelude,
+                            std::vector<TypeError>* out_warnings) {
+    Program combined = assemble_modules(modules, prelude);
     CheckResult cr = check(combined);
     if (!cr.ok())
         throw CheckFailure(std::move(cr.errors));
     if (out_warnings) *out_warnings = std::move(cr.warnings);
     return combined;
+}
+
+ToolCheck check_modules_for_tools(ModuleSet modules, const std::vector<PreludeModule>* prelude) {
+    ToolCheck out;
+    out.program = assemble_modules(modules, prelude);
+    CheckOptions options;
+    options.resolve_types = true;
+    options.list_ambient  = true;
+    CheckResult cr = check(out.program, options);
+    out.errors   = std::move(cr.errors);
+    out.warnings = std::move(cr.warnings);
+    out.ambient  = std::move(cr.ambient);
+    return out;
 }
 
 // The inlining knob (declared in Compiler.h). File-scope, read only when a Codegen is built.

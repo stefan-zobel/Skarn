@@ -57,12 +57,145 @@ void Parser::skip_terminators() {
     while (check(TokKind::StmtEnd)) advance();
 }
 
+// ---- error recovery (editor tooling) ----------------------------------------
+
+namespace {
+constexpr size_t MAX_ERRORS = 100;
+}
+
+bool Parser::at_item_start() const noexcept {
+    switch (cur().kind) {
+    case TokKind::KwStruct: case TokKind::KwEnum:   case TokKind::KwTrait: case TokKind::KwImpl:
+    case TokKind::KwImport: case TokKind::KwUse:    case TokKind::KwPub:   case TokKind::KwConst:
+    case TokKind::KwTransparent:
+        return true;
+    case TokKind::KwFn:
+        return peek(1).kind == TokKind::LIdent;   // `fn (` is a lambda
+    default:
+        return false;
+    }
+}
+
+void Parser::note(const ParseError& e) {
+    ++syntax_events_;
+    if (errors_->size() >= MAX_ERRORS) return;
+    for (const ParseError& x : *errors_)
+        if (x.line() == e.line() && x.col() == e.col()) return;
+    errors_->push_back(e);
+}
+
+uint32_t Parser::line_indent(const Token& t) const {
+    size_t i = static_cast<size_t>(&t - toks_.data());   // back to the first token of its line
+    while (i > 0 && toks_[i - 1].line == t.line && toks_[i - 1].kind != TokKind::StmtEnd) --i;
+    return toks_[i].col;
+}
+
+void Parser::recover(const ParseError& e, Sync where, size_t start, const Token* open) {
+    note(e);
+    // An error at the first token of a line, in a construct that began on an earlier line, is
+    // usually an unfinished line above (`let x = ` then the next statement): resume right there.
+    if (pos_ > start && cur().line > toks_[start].line) {
+        size_t p = pos_;
+        while (p > start && toks_[p - 1].kind == TokKind::StmtEnd) --p;
+        if (p > start && toks_[p - 1].line < cur().line && !check(TokKind::RBrace)) return;
+    }
+    int depth = 0;
+    while (!at_end()) {
+        const TokKind k = cur().kind;
+        // An item keyword closes everything open. At item level only at depth 0 or in column 1, so a
+        // broken impl header does not re-enter its own body at the first `fn`.
+        if (at_item_start() && (where != Sync::Item || depth == 0 || cur().col == 1)) break;
+        if (k == TokKind::LBrace || k == TokKind::LParen || k == TokKind::LBracket) {
+            ++depth; advance(); continue;
+        }
+        if (k == TokKind::RParen || k == TokKind::RBracket) {
+            if (depth > 0) --depth;
+            advance(); continue;
+        }
+        if (k == TokKind::RBrace) {
+            if (depth > 0) { --depth; advance(); continue; }
+            // A construct that lost its `{` (`Leaf => },`, `fn m(self) -> Int  x }`) leaves its `}`
+            // behind, on a later line and indented past the body's own closer: skip it with the
+            // construct instead of ending the enclosing body there.
+            if (open && cur().line != open->line && cur().col > line_indent(*open)) { advance(); break; }
+            if (where != Sync::Item) break;        // ends the enclosing body; left for its loop
+            advance(); continue;                   // a stray `}` at item level
+        }
+        if (depth == 0) {
+            if (k == TokKind::StmtEnd && where != Sync::Member) { advance(); break; }
+            if (k == TokKind::Comma && (where == Sync::Arm || where == Sync::Field)) { advance(); break; }
+            if (k == TokKind::KwFn && where == Sync::Member) break;
+        }
+        advance();
+    }
+    const bool loop_exits = where != Sync::Item && (check(TokKind::RBrace) || at_item_start());
+    if (pos_ == start && !at_end() && !loop_exits) advance();
+}
+
+bool Parser::body_unclosed(const Token& open, uint32_t owner_col, bool members_are_fns) {
+    if (!recover_) return false;
+    if (!at_end()) {
+        if (!at_item_start()) return false;
+        if (members_are_fns && cur().col > owner_col) return false;   // an indented member
+    }
+    if (unclosed_at_ != pos_) {                    // only the innermost body reports
+        const Token& at = first_mismatch_ ? *first_mismatch_ : open;
+        note(ParseError("this '{' is never closed", at.line, at.col));
+        unclosed_at_ = pos_;
+        first_mismatch_ = nullptr;
+    }
+    return true;
+}
+
+void Parser::close_body(const Token& open) {
+    if (recover_ && !first_mismatch_ && check(TokKind::RBrace) && cur().line != open.line &&
+        cur().col != line_indent(open))
+        first_mismatch_ = &open;
+    expect(TokKind::RBrace, "'}'");
+}
+
+Program Parser::parse_program_tolerant(std::vector<ParseError>& errors, const std::vector<LexError>& lex_errors) {
+    recover_ = true;
+    errors_ = &errors;
+    auto before = [](uint32_t l1, uint32_t c1, uint32_t l2, uint32_t c2) {
+        return l1 < l2 || (l1 == l2 && c1 < c2);
+    };
+    Program prog;
+    skip_terminators();
+    while (!at_end()) {
+        const size_t start = pos_;
+        const uint32_t sl = cur().line, sc = cur().col;
+        const size_t events = syntax_events_;
+        first_mismatch_ = nullptr;
+        ItemPtr it;
+        try {
+            it = parse_item();
+        } catch (const ParseError& e) {
+            no_struct_lit_ = false;
+            recover(e, Sync::Item, start);
+        }
+        skip_terminators();
+        if (!it) continue;
+        bool broken = syntax_events_ != events;
+        for (const LexError& le : lex_errors)
+            if (!before(le.line(), le.col(), sl, sc) &&
+                (at_end() || before(le.line(), le.col(), cur().line, cur().col)))
+                broken = true;
+        it->has_syntax_error = broken;
+        prog.items.push_back(std::move(it));
+    }
+    recover_ = false;
+    errors_ = nullptr;
+    return prog;
+}
+
 // ---- program / items --------------------------------------------------------
 
 Program Parser::parse_program() {
     Program prog;
     skip_terminators();
     while (!at_end()) {
+        layout_start();
         prog.items.push_back(parse_item());
         skip_terminators();
     }
@@ -73,6 +206,7 @@ ItemPtr Parser::parse_item() {
     // Optional `pub` visibility prefix (S4). Only a fn / struct / enum / trait can be exported;
     // `pub impl` / `pub use` / `pub let` are meaningless (an impl is reached by dispatch; a `use`
     // is not an export in v1 -- no `pub use`; a top-level stmt is module-private state).
+    item_col_ = cur().col;
     bool is_pub = false;
     if (check(TokKind::KwPub)) { advance(); is_pub = true; }
 
@@ -118,7 +252,8 @@ ItemPtr Parser::parse_fn_item() {
     const Token& kw = expect(TokKind::KwFn, "'fn'");
     auto fn = std::make_unique<FnItem>();
     fn->line = kw.line; fn->col = kw.col;
-    fn->name = expect(TokKind::LIdent, "function name").text;
+    const Token& nm = expect(TokKind::LIdent, "function name");
+    fn->name = nm.text; fn->name_line = nm.line; fn->name_col = nm.col;
     fn->generics = parse_generic_params();
     fn->params = parse_param_list();
     expect(TokKind::Arrow, "'->' (return type is mandatory)");
@@ -134,7 +269,9 @@ ItemPtr Parser::parse_const_item() {
     const Token& kw = expect(TokKind::KwConst, "'const'");
     auto c = std::make_unique<ConstItem>();
     c->line = kw.line; c->col = kw.col;
-    if (check(TokKind::LIdent) || check(TokKind::UIdent)) { c->name = cur().text; advance(); }
+    if (check(TokKind::LIdent) || check(TokKind::UIdent)) {
+        c->name = cur().text; c->name_line = cur().line; c->name_col = cur().col; advance();
+    }
     else error("constant name");
     expect(TokKind::Colon, "':' (a const requires a type annotation)");
     c->type = parse_type();
@@ -170,23 +307,33 @@ ItemPtr Parser::parse_struct_item() {
     const Token& kw = expect(TokKind::KwStruct, "'struct'");
     auto s = std::make_unique<StructItem>();
     s->line = kw.line; s->col = kw.col;
-    s->name = expect(TokKind::UIdent, "struct name").text;
+    const Token& nm = expect(TokKind::UIdent, "struct name");
+    s->name = nm.text; s->name_line = nm.line; s->name_col = nm.col;
     s->generics = parse_generic_params();
 
-    if (accept(TokKind::LBrace)) {                 // record form: { f: T, ... }
+    if (check(TokKind::LBrace)) {                  // record form: { f: T, ... }
+        layout_brace(ParseLayout::Brace::Fields);
+        const Token& open = advance();
         s->is_tuple = false;
         skip_terminators();
         while (!check(TokKind::RBrace)) {
+            if (body_unclosed(open)) return s;
             if (at_end()) error("unterminated struct body");
-            Field f;
-            f.name = expect(TokKind::LIdent, "field name").text;
-            expect(TokKind::Colon, "':'");
-            f.type = parse_type();
-            s->fields.push_back(std::move(f));
+            const size_t start = pos_;
+            try {
+                Field f;
+                f.name = expect(TokKind::LIdent, "field name").text;
+                expect(TokKind::Colon, "':'");
+                f.type = parse_type();
+                s->fields.push_back(std::move(f));
+            } catch (const ParseError& e) {
+                if (!recover_) throw;
+                recover(e, Sync::Field, start, &open);
+            }
             accept(TokKind::Comma);
             skip_terminators();
         }
-        expect(TokKind::RBrace, "'}'");
+        close_body(open);
     } else if (accept(TokKind::LParen)) {          // positional tuple form: ( T0, T1 )
         s->is_tuple = true;
         s->fields = parse_positional_fields();
@@ -200,50 +347,59 @@ ItemPtr Parser::parse_enum_item() {
     const Token& kw = expect(TokKind::KwEnum, "'enum'");
     auto en = std::make_unique<EnumItem>();
     en->line = kw.line; en->col = kw.col;
-    en->name = expect(TokKind::UIdent, "enum name").text;
+    const Token& nm = expect(TokKind::UIdent, "enum name");
+    en->name = nm.text; en->name_line = nm.line; en->name_col = nm.col;
     en->generics = parse_generic_params();
     if (accept(TokKind::Colon)) {              // `enum Name : Int` -- int-backed repr annotation (opt-in)
         en->is_int_backed = true;
         en->repr = expect(TokKind::UIdent, "an enum repr type (Int)").text;
     }
-    expect(TokKind::LBrace, "'{'");
+    layout_brace(ParseLayout::Brace::Fields);
+    const Token& open = expect(TokKind::LBrace, "'{'");
     skip_terminators();
     while (!check(TokKind::RBrace)) {
+        if (body_unclosed(open)) return en;
         if (at_end()) error("unterminated enum body");
-        EnumVariant v;
-        const Token& vt = expect(TokKind::UIdent, "variant name");
-        v.name = vt.text; v.line = vt.line; v.col = vt.col;
-        if (accept(TokKind::LParen)) {             // V(T0, T1) -- positional
-            v.is_tuple = true;
-            v.fields = parse_positional_fields();
-        } else if (accept(TokKind::LBrace)) {      // V { f: T } -- record
-            v.is_tuple = false;
-            skip_terminators();
-            while (!check(TokKind::RBrace)) {
-                if (at_end()) error("unterminated variant body");
-                Field f;
-                f.name = expect(TokKind::LIdent, "field name").text;
-                expect(TokKind::Colon, "':'");
-                f.type = parse_type();
-                v.fields.push_back(std::move(f));
-                accept(TokKind::Comma);
+        const size_t start = pos_;
+        try {
+            EnumVariant v;
+            const Token& vt = expect(TokKind::UIdent, "variant name");
+            v.name = vt.text; v.line = vt.line; v.col = vt.col;
+            if (accept(TokKind::LParen)) {             // V(T0, T1) -- positional
+                v.is_tuple = true;
+                v.fields = parse_positional_fields();
+            } else if (accept(TokKind::LBrace)) {      // V { f: T } -- record
+                v.is_tuple = false;
                 skip_terminators();
+                while (!check(TokKind::RBrace)) {
+                    if (at_end()) error("unterminated variant body");
+                    Field f;
+                    f.name = expect(TokKind::LIdent, "field name").text;
+                    expect(TokKind::Colon, "':'");
+                    f.type = parse_type();
+                    v.fields.push_back(std::move(f));
+                    accept(TokKind::Comma);
+                    skip_terminators();
+                }
+                expect(TokKind::RBrace, "'}'");
+            } else {
+                v.is_tuple = true;                     // V -- nullary
+                if (accept(TokKind::Assign)) {         // `V = <intlit>` -- explicit discriminant (int-backed enums)
+                    const bool neg = accept(TokKind::Minus);
+                    const Token& d = expect(TokKind::Int, "an integer discriminant");
+                    v.has_disc = true;
+                    v.disc = neg ? -d.int_val : d.int_val;
+                }
             }
-            expect(TokKind::RBrace, "'}'");
-        } else {
-            v.is_tuple = true;                     // V -- nullary
-            if (accept(TokKind::Assign)) {         // `V = <intlit>` -- explicit discriminant (int-backed enums)
-                const bool neg = accept(TokKind::Minus);
-                const Token& d = expect(TokKind::Int, "an integer discriminant");
-                v.has_disc = true;
-                v.disc = neg ? -d.int_val : d.int_val;
-            }
+            en->variants.push_back(std::move(v));
+        } catch (const ParseError& e) {
+            if (!recover_) throw;
+            recover(e, Sync::Field, start, &open);
         }
-        en->variants.push_back(std::move(v));
         accept(TokKind::Comma);
         skip_terminators();
     }
-    expect(TokKind::RBrace, "'}'");
+    close_body(open);
     return en;
 }
 
@@ -251,23 +407,39 @@ ItemPtr Parser::parse_trait_item() {
     const Token& kw = expect(TokKind::KwTrait, "'trait'");
     auto tr = std::make_unique<TraitDecl>();
     tr->line = kw.line; tr->col = kw.col;
-    tr->name = expect(TokKind::UIdent, "trait name").text;
+    const Token& nm = expect(TokKind::UIdent, "trait name");
+    tr->name = nm.text; tr->name_line = nm.line; tr->name_col = nm.col;
     tr->generics = parse_generic_params();         // trait Iterable[T] ...
     if (accept(TokKind::Colon)) {                  // supertraits: `: A, B`
-        tr->supertraits.push_back(expect(TokKind::UIdent, "supertrait name").text);
+        auto add_super = [&] {
+            const Token& st = expect(TokKind::UIdent, "supertrait name");
+            tr->supertraits.push_back(st.text);
+            tr->supertrait_pos.emplace_back(st.line, st.col);
+        };
+        add_super();
         while (accept(TokKind::Comma)) {
             if (check(TokKind::LBrace)) break;
-            tr->supertraits.push_back(expect(TokKind::UIdent, "supertrait name").text);
+            add_super();
         }
     }
-    expect(TokKind::LBrace, "'{'");
+    layout_brace(ParseLayout::Brace::Members);
+    const Token& open = expect(TokKind::LBrace, "'{'");
     skip_terminators();
     while (!check(TokKind::RBrace)) {
+        if (body_unclosed(open, item_col_, /*members_are_fns=*/true)) return tr;
         if (at_end()) error("unterminated trait body");
-        tr->methods.push_back(parse_method(/*require_body=*/false));
+        const size_t start = pos_;
+        layout_start();
+        try {
+            tr->methods.push_back(parse_method(/*require_body=*/false));
+        } catch (const ParseError& e) {
+            if (!recover_) throw;
+            no_struct_lit_ = false;
+            recover(e, Sync::Member, start, &open);
+        }
         skip_terminators();
     }
-    expect(TokKind::RBrace, "'}'");
+    close_body(open);
     return tr;
 }
 
@@ -295,22 +467,34 @@ ItemPtr Parser::parse_impl_item() {
     }
     if (accept(TokKind::KwFor)) {                   // `impl[G] Trait[args] for Target { … }`
         im->trait_name = std::move(head);
+        im->trait_line = hl; im->trait_col = hc;
         im->trait_args = std::move(head_args);
         im->target = parse_type();                 // e.g. List[T]
     } else {                                        // `impl[G] Target[args] { … }` -- inherent (traitless)
         im->is_inherent = true;                     // trait_name stays empty
         auto nt = std::make_unique<NamedType>();
-        nt->line = hl; nt->col = hc; nt->name = std::move(head); nt->args = std::move(head_args);
+        nt->line = hl; nt->col = hc; nt->name_line = hl; nt->name_col = hc;
+        nt->name = std::move(head); nt->args = std::move(head_args);
         im->target = std::move(nt);
     }
-    expect(TokKind::LBrace, "'{'");
+    layout_brace(ParseLayout::Brace::Members);
+    const Token& open = expect(TokKind::LBrace, "'{'");
     skip_terminators();
     while (!check(TokKind::RBrace)) {
+        if (body_unclosed(open, item_col_, /*members_are_fns=*/true)) return im;
         if (at_end()) error("unterminated impl body");
-        im->methods.push_back(parse_method(/*require_body=*/true));
+        const size_t start = pos_;
+        layout_start();
+        try {
+            im->methods.push_back(parse_method(/*require_body=*/true));
+        } catch (const ParseError& e) {
+            if (!recover_) throw;
+            no_struct_lit_ = false;
+            recover(e, Sync::Member, start, &open);
+        }
         skip_terminators();
     }
-    expect(TokKind::RBrace, "'}'");
+    close_body(open);
     return im;
 }
 
@@ -334,6 +518,7 @@ ItemPtr Parser::parse_use_item() {
     auto u = std::make_unique<UseItem>();
     u->line = kw.line; u->col = kw.col;
     std::vector<std::string> segs;
+    uint32_t last_line = 0, last_col = 0;   // the last segment: the imported name of `use a::name`
     segs.push_back(expect(TokKind::LIdent, "module name").text);
     bool tail_done = false;
     while (accept(TokKind::ColonColon)) {
@@ -341,8 +526,10 @@ ItemPtr Parser::parse_use_item() {
             advance();
             if (!check(TokKind::RBrace)) {
                 for (;;) {
-                    if (check(TokKind::LIdent) || check(TokKind::UIdent))
+                    if (check(TokKind::LIdent) || check(TokKind::UIdent)) {
+                        u->name_pos.emplace_back(cur().line, cur().col);
                         u->names.push_back(advance().text);
+                    }
                     else error("expected an imported name inside '{ }'");
                     if (!accept(TokKind::Comma)) break;
                     if (check(TokKind::RBrace)) break;       // trailing comma
@@ -360,8 +547,10 @@ ItemPtr Parser::parse_use_item() {
             tail_done = true;
             break;
         }
-        if (check(TokKind::LIdent) || check(TokKind::UIdent)) // an ordinary path segment / final name
+        if (check(TokKind::LIdent) || check(TokKind::UIdent)) { // an ordinary path segment / final name
+            last_line = cur().line; last_col = cur().col;
             segs.push_back(advance().text);
+        }
         else
             error("expected a module path segment or name after '::'");
     }
@@ -369,6 +558,7 @@ ItemPtr Parser::parse_use_item() {
         if (segs.size() < 2)
             error("'use' needs a module path and a name (e.g. `use util::helper`)");
         u->names.push_back(segs.back());
+        u->name_pos.emplace_back(last_line, last_col);
         segs.pop_back();
         u->path = std::move(segs);
     }
@@ -383,7 +573,8 @@ Method Parser::parse_method(bool require_body) {
         error("'pub' is not allowed on a method -- a method is visible wherever its type or trait is; "
               "mark the type or trait `pub` instead");
     expect(TokKind::KwFn, "'fn'");
-    m.name = expect(TokKind::LIdent, "method name").text;
+    const Token& nm = expect(TokKind::LIdent, "method name");
+    m.name = nm.text; m.line = nm.line; m.col = nm.col;
     m.generics = parse_generic_params();
     expect(TokKind::LParen, "'('");
     // method_params = [ "mut" ] "self" { "," param } | param_list
@@ -415,7 +606,7 @@ Method Parser::parse_method(bool require_body) {
     expect(TokKind::RParen, "')'");
     expect(TokKind::Arrow, "'->' (return type is mandatory)");
     m.ret = parse_type();
-    if (check(TokKind::LBrace)) m.body = parse_block();
+    if (check(TokKind::LBrace) || (recover_ && require_body)) m.body = parse_block();
     else if (require_body)      error("impl method requires a body");
     return m;
 }
@@ -425,7 +616,8 @@ Method Parser::parse_method(bool require_body) {
 Param Parser::parse_param() {
     Param p;
     if (check(TokKind::KwMut)) { p.is_mut = true; p.line = cur().line; p.col = cur().col; advance(); }
-    p.name = expect(TokKind::LIdent, "parameter name").text;
+    const Token& nm = expect(TokKind::LIdent, "parameter name");
+    p.name = nm.text; p.name_line = nm.line; p.name_col = nm.col;
     expect(TokKind::Colon, "':' (parameter type is mandatory)");
     p.type = parse_type();
     return p;
@@ -618,6 +810,7 @@ ExprPtr Parser::parse_expr(int min_bp) {
                 fld->obj = std::move(lhs);
                 fld->tuple_index = true;
                 fld->index = static_cast<uint32_t>(it.int_val);
+                fld->name_line = it.line; fld->name_col = it.col;
                 fld->name  = "_" + std::to_string(it.int_val);
                 advance();
                 lhs = std::move(fld);
@@ -626,7 +819,8 @@ ExprPtr Parser::parse_expr(int min_bp) {
             auto fld = std::make_unique<FieldExpr>();   // `.name` -- field access
             fld->line = dl; fld->col = dc;
             fld->obj = std::move(lhs);
-            fld->name = expect(TokKind::LIdent, "field name").text;
+            const Token& nm = expect(TokKind::LIdent, "field name");
+            fld->name = nm.text; fld->name_line = nm.line; fld->name_col = nm.col;
             lhs = std::move(fld);
             continue;
         }
@@ -671,20 +865,24 @@ ExprPtr Parser::parse_prefix() {
     case TokKind::InterpStrBegin: return parse_interp_string();
     case TokKind::KwTrue: { auto n = std::make_unique<BoolLit>();   n->line=t.line; n->col=t.col; n->value=true;         advance(); return n; }
     case TokKind::KwFalse:{ auto n = std::make_unique<BoolLit>();   n->line=t.line; n->col=t.col; n->value=false;        advance(); return n; }
-    case TokKind::KwSelf: { auto n = std::make_unique<IdentExpr>(); n->line=t.line; n->col=t.col; n->name="self";        advance(); return n; }
+    case TokKind::KwSelf: { auto n = std::make_unique<IdentExpr>(); n->line=t.line; n->col=t.col; n->name="self";
+                            n->name_line=t.line; n->name_col=t.col; advance(); return n; }
 
     case TokKind::LIdent: {
         auto id = std::make_unique<IdentExpr>();
         id->line = t.line; id->col = t.col; id->name = t.text; id->upper = false;
+        id->name_line = t.line; id->name_col = t.col;
         advance();
         if (accept(TokKind::ColonColon)) {             // module-qualified path `mod::name`
             id->qualifier = std::move(id->name);        // the module (lowercase head)
             const Token& tail = cur();
+            id->name_line = tail.line; id->name_col = tail.col;
             if (tail.kind == TokKind::LIdent)      { id->name = tail.text; id->upper = false; advance(); }
             else if (tail.kind == TokKind::UIdent) {
                 id->name = tail.text; id->upper = true; advance();
                 if (!no_struct_lit_ && check(TokKind::LBrace))   // `mod::Name { ... }` struct literal
-                    return parse_struct_lit(std::move(id->qualifier), std::move(id->name), id->line, id->col);
+                    return parse_struct_lit(std::move(id->qualifier), std::move(id->name), id->line, id->col,
+                                            id->name_line, id->name_col);
             }
             else error("expected a function or constructor name after 'module::'");
         }
@@ -693,13 +891,16 @@ ExprPtr Parser::parse_prefix() {
     case TokKind::UIdent: {
         auto id = std::make_unique<IdentExpr>();
         id->line = t.line; id->col = t.col; id->name = t.text; id->upper = true;
+        id->name_line = t.line; id->name_col = t.col;
         advance();
         if (accept(TokKind::ColonColon)) {             // qualified path: `Trait::method` or `Enum::Variant`
             id->qualifier = std::move(id->name);
+            id->name_line = cur().line; id->name_col = cur().col;
             if (cur().kind == TokKind::UIdent) {       // `Enum::Variant` (S1) -- an enum-variant path
                 id->name = cur().text; id->upper = true; advance();
                 if (!no_struct_lit_ && check(TokKind::LBrace))   // `Enum::Variant { ... }` record variant
-                    return parse_struct_lit(std::move(id->qualifier), std::move(id->name), id->line, id->col);
+                    return parse_struct_lit(std::move(id->qualifier), std::move(id->name), id->line, id->col,
+                                            id->name_line, id->name_col);
                 return id;
             }
             id->name = expect(TokKind::LIdent, "method or variant name after '::'").text;
@@ -707,7 +908,7 @@ ExprPtr Parser::parse_prefix() {
             return id;
         }
         if (!no_struct_lit_ && check(TokKind::LBrace))  // struct literal Name { ... }
-            return parse_struct_lit("", std::move(id->name), id->line, id->col);
+            return parse_struct_lit("", std::move(id->name), id->line, id->col, id->line, id->col);
         return id;                                     // bare constructor / type value (None)
     }
 
@@ -843,10 +1044,12 @@ ExprPtr Parser::parse_map_lit() {
     return m;
 }
 
-ExprPtr Parser::parse_struct_lit(std::string qualifier, std::string name, uint32_t line, uint32_t col) {
+ExprPtr Parser::parse_struct_lit(std::string qualifier, std::string name, uint32_t line, uint32_t col,
+                                 uint32_t name_line, uint32_t name_col) {
     expect(TokKind::LBrace, "'{'");
     auto s = std::make_unique<StructLit>();
     s->line = line; s->col = col; s->name = std::move(name); s->qualifier = std::move(qualifier);
+    s->name_line = name_line; s->name_col = name_col;
     const bool save = no_struct_lit_; no_struct_lit_ = false;
     skip_terminators();
     while (!check(TokKind::RBrace)) {
@@ -963,6 +1166,7 @@ ExprPtr Parser::parse_interp_string() {
         call->line = l; call->col = c;
         auto callee = std::make_unique<IdentExpr>();
         callee->line = l; callee->col = c; callee->name = fn_name; callee->upper = false;
+        callee->name_line = l; callee->name_col = c;
         call->callee = std::move(callee);
         call->args.push_back(std::move(e));
         return call;
@@ -1117,20 +1321,31 @@ ExprPtr Parser::parse_match() {
     const bool save = no_struct_lit_; no_struct_lit_ = true;
     m->scrut = parse_expr(0);
     no_struct_lit_ = save;
-    expect(TokKind::LBrace, "'{'");
+    layout_brace(ParseLayout::Brace::Match);
+    const Token& open = expect(TokKind::LBrace, "'{'");
     skip_terminators();
     while (!check(TokKind::RBrace)) {
+        if (body_unclosed(open)) return m;
         if (at_end()) error("unterminated match");
-        MatchArm arm;
-        arm.pat = parse_arm_pattern();
-        if (accept(TokKind::KwIf)) arm.guard = parse_expr(0);
-        expect(TokKind::FatArrow, "'=>'");
-        arm.body = parse_expr(0);
-        m->arms.push_back(std::move(arm));
+        const size_t start = pos_;
+        layout_start();
+        const bool nsl = no_struct_lit_;
+        try {
+            MatchArm arm;
+            arm.pat = parse_arm_pattern();
+            if (accept(TokKind::KwIf)) arm.guard = parse_expr(0);
+            expect(TokKind::FatArrow, "'=>'");
+            arm.body = parse_expr(0);
+            m->arms.push_back(std::move(arm));
+        } catch (const ParseError& e) {
+            if (!recover_) throw;
+            no_struct_lit_ = nsl;
+            recover(e, Sync::Arm, start, &open);
+        }
         accept(TokKind::Comma);
         skip_terminators();
     }
-    expect(TokKind::RBrace, "'}'");
+    close_body(open);
     return m;
 }
 
@@ -1144,7 +1359,8 @@ ExprPtr Parser::parse_lambda() {
         for (;;) {
             if (check(TokKind::RParen)) break;
             Param p;
-            p.name = expect(TokKind::LIdent, "parameter name").text;
+            const Token& nm = expect(TokKind::LIdent, "parameter name");
+            p.name = nm.text; p.name_line = nm.line; p.name_col = nm.col;
             if (accept(TokKind::Colon)) p.type = parse_type();
             l->params.push_back(std::move(p));
             if (!accept(TokKind::Comma)) break;
@@ -1156,19 +1372,86 @@ ExprPtr Parser::parse_lambda() {
     return l;
 }
 
+// Recover mode, a block is required here and its `{` is missing: the first `}` ahead (at depth 0,
+// before any item start) closes it if it is on this line, or on the indentation of the line the
+// block belongs to (`if c` / `fn m(..) -> T` then the statements, then that `}`). The tokens up to
+// it are read as the block's statements. Otherwise nothing is consumed and null is returned.
+ExprPtr Parser::parse_braceless_block() {
+    if (pos_ == 0) return nullptr;
+    const uint32_t owner_indent = line_indent(toks_[pos_ - 1]);
+    size_t close = SIZE_MAX;
+    int depth = 0;
+    for (size_t i = pos_; i < toks_.size(); ++i) {
+        const TokKind k = toks_[i].kind;
+        if (k == TokKind::Eof) break;
+        if (depth == 0 && i > pos_) {
+            const size_t save = pos_;
+            pos_ = i;
+            const bool item = at_item_start();
+            pos_ = save;
+            if (item) break;
+        }
+        if (k == TokKind::LBrace || k == TokKind::LParen || k == TokKind::LBracket) ++depth;
+        else if (k == TokKind::RParen || k == TokKind::RBracket) { if (depth > 0) --depth; }
+        else if (k == TokKind::RBrace) {
+            if (depth > 0) { --depth; continue; }
+            if (toks_[i].line == cur().line || toks_[i].col == owner_indent) close = i;
+            break;
+        }
+    }
+    if (close == SIZE_MAX) return nullptr;
+    note(ParseError("expected '{'", cur().line, cur().col));
+    auto blk = std::make_unique<BlockExpr>();
+    blk->line = cur().line; blk->col = cur().col;
+    const bool save = no_struct_lit_; no_struct_lit_ = false;
+    skip_terminators();
+    while (pos_ < close && !at_end()) {
+        const size_t start = pos_;
+        try {
+            blk->stmts.push_back(parse_stmt());
+        } catch (const ParseError& e) {
+            no_struct_lit_ = false;
+            recover(e, Sync::Stmt, start);
+        }
+        skip_terminators();
+    }
+    no_struct_lit_ = save;
+    if (pos_ == close) advance();                   // the `}`
+    return blk;
+}
+
 ExprPtr Parser::parse_block() {
+    if (recover_ && !check(TokKind::LBrace))
+        if (ExprPtr b = parse_braceless_block()) return b;
+    layout_brace(ParseLayout::Brace::Block);
     const Token& kw = expect(TokKind::LBrace, "'{'");
     auto blk = std::make_unique<BlockExpr>();
     blk->line = kw.line; blk->col = kw.col;
     const bool save = no_struct_lit_; no_struct_lit_ = false;
     skip_terminators();
     while (!check(TokKind::RBrace)) {
+        if (body_unclosed(kw)) { no_struct_lit_ = save; return blk; }
+        // `if c { a else { b } }`: a statement cannot start with `else`, so the `}` of this block is
+        // missing right before it. Close here and leave `else` to the `if` that owns it.
+        if (recover_ && check(TokKind::KwElse)) {
+            note(ParseError("expected '}' before 'else'", cur().line, cur().col));
+            no_struct_lit_ = save;
+            return blk;
+        }
         if (at_end()) error("unterminated block");
-        blk->stmts.push_back(parse_stmt());
+        const size_t start = pos_;
+        layout_start();
+        try {
+            blk->stmts.push_back(parse_stmt());
+        } catch (const ParseError& e) {
+            if (!recover_) throw;
+            no_struct_lit_ = false;
+            recover(e, Sync::Stmt, start, &kw);
+        }
         skip_terminators();
     }
     no_struct_lit_ = save;
-    expect(TokKind::RBrace, "'}'");
+    close_body(kw);
     return blk;
 }
 
@@ -1275,11 +1558,13 @@ ExprPtr Parser::parse_range_bound() {
     if (t.kind != TokKind::LIdent && t.kind != TokKind::UIdent) return parse_pattern_literal();
     auto id = std::make_unique<IdentExpr>();
     id->line = t.line; id->col = t.col; id->name = t.text; id->upper = (t.kind == TokKind::UIdent);
+    id->name_line = t.line; id->name_col = t.col;
     advance();
     if (accept(TokKind::ColonColon)) {                 // `mod::LO` / `Enum::LO`
         id->qualifier = std::move(id->name);
         const Token& tail = expect(TokKind::UIdent, "constant name after '::'");
         id->name = tail.text; id->upper = true;
+        id->name_line = tail.line; id->name_col = tail.col;
     }
     return id;
 }
@@ -1317,13 +1602,14 @@ PatPtr Parser::parse_pattern() {
         advance();
         if (accept(TokKind::ColonColon)) {          // module-qualified constructor / struct pattern
             const Token& tail = expect(TokKind::UIdent, "constructor name after 'module::'");
-            return parse_ctor_or_struct_pattern(tail.text, std::move(first), tail.line, tail.col);
+            return parse_ctor_or_struct_pattern(tail.text, std::move(first), tail.line, tail.col, line, col);
         }
         // A lowercase name followed by `..` is a range LOWER bound, not a binding -- the one place
         // in a pattern where an identifier is unambiguous, since a bound is never a binder.
         if (check(TokKind::DotDot) || check(TokKind::DotDotLess)) {
             auto id = std::make_unique<IdentExpr>();
             id->line = line; id->col = col; id->name = std::move(first); id->upper = false;
+            id->name_line = line; id->name_col = col;
             return finish_range_pattern(std::move(id), line, col);
         }
         return finish_binding_pattern(std::move(first), /*is_mut=*/false, line, col);
@@ -1333,9 +1619,9 @@ PatPtr Parser::parse_pattern() {
         advance();
         if (accept(TokKind::ColonColon)) {          // `Enum::Variant` qualified pattern (S1)
             const Token& tail = expect(TokKind::UIdent, "variant name after 'Enum::'");
-            return parse_ctor_or_struct_pattern(tail.text, std::move(name), tail.line, tail.col);
+            return parse_ctor_or_struct_pattern(tail.text, std::move(name), tail.line, tail.col, line, col);
         }
-        return parse_ctor_or_struct_pattern(std::move(name), "", line, col);
+        return parse_ctor_or_struct_pattern(std::move(name), "", line, col, 0, 0);
     }
     case TokKind::LParen: {                         // tuple / grouping / parenthesized or-pattern
         const uint32_t l = t.line, c = t.col;
@@ -1429,10 +1715,11 @@ PatPtr Parser::parse_pattern() {
 // `Name(p0, ...)` (CtorPat, has_parens), or a bare nullary `Name` (CtorPat). `qualifier`
 // is the module path (empty for a bare `Name`), carried onto the node for the checker.
 PatPtr Parser::parse_ctor_or_struct_pattern(std::string name, std::string qualifier,
-                                            uint32_t line, uint32_t col) {
+                                            uint32_t line, uint32_t col, uint32_t qual_line, uint32_t qual_col) {
     if (check(TokKind::LBrace)) {                  // Name { f: p, ... }
         auto sp = std::make_unique<StructPat>();
         sp->line = line; sp->col = col; sp->name = std::move(name); sp->qualifier = std::move(qualifier);
+        sp->qual_line = qual_line; sp->qual_col = qual_col;
         expect(TokKind::LBrace, "'{'");
         skip_terminators();
         while (!check(TokKind::RBrace)) {
@@ -1450,6 +1737,7 @@ PatPtr Parser::parse_ctor_or_struct_pattern(std::string name, std::string qualif
     if (accept(TokKind::LParen)) {                 // Name(p0, ...)
         auto cp = std::make_unique<CtorPat>();
         cp->line = line; cp->col = col; cp->name = std::move(name); cp->qualifier = std::move(qualifier); cp->has_parens = true;
+        cp->qual_line = qual_line; cp->qual_col = qual_col;
         if (!check(TokKind::RParen)) {
             cp->elems.push_back(parse_nested_pattern());
             while (accept(TokKind::Comma)) {
@@ -1467,10 +1755,12 @@ PatPtr Parser::parse_ctor_or_struct_pattern(std::string name, std::string qualif
         auto id = std::make_unique<IdentExpr>();
         id->line = line; id->col = col; id->name = std::move(name);
         id->qualifier = std::move(qualifier); id->upper = true;
+        id->name_line = line; id->name_col = col;
         return finish_range_pattern(std::move(id), line, col);
     }
     auto cp = std::make_unique<CtorPat>();         // bare Name (nullary, e.g. None)
     cp->line = line; cp->col = col; cp->name = std::move(name); cp->qualifier = std::move(qualifier); cp->has_parens = false;
+    cp->qual_line = qual_line; cp->qual_col = qual_col;
     return cp;
 }
 
@@ -1524,6 +1814,7 @@ TypePtr Parser::parse_type() {
         advance();
         auto nt = std::make_unique<NamedType>();
         nt->line = l; nt->col = c; nt->name = std::move(name);
+        nt->name_line = l; nt->name_col = c;
         parse_type_args(nt->args);
         return nt;
     }
@@ -1537,6 +1828,7 @@ TypePtr Parser::parse_type() {
         const Token& nm = expect(TokKind::UIdent, "type name after 'module::'");
         auto nt = std::make_unique<NamedType>();
         nt->line = l; nt->col = c; nt->qualifier = std::move(qual); nt->name = nm.text;
+        nt->name_line = nm.line; nt->name_col = nm.col;
         parse_type_args(nt->args);
         return nt;
     }
@@ -1573,6 +1865,7 @@ TypePtr Parser::parse_dyn_type() {
     }
     const Token& nm = expect(TokKind::UIdent, "a trait name after 'dyn'");
     dt->trait = nm.text;
+    dt->name_line = nm.line; dt->name_col = nm.col;
     parse_type_args(dt->args);
     return dt;
 }

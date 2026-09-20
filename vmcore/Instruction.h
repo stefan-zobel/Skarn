@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <cassert>
+#include "Inline.h"   // SKARN_FORCEINLINE -- the hints on the bytecode decoders below
 
 // =============================================================================
 // Instruction encoding -- all layouts share the same 32-bit raw word.
@@ -103,7 +104,7 @@ union Instruction {
         uint32_t payload : 16; // lower 16 bits of the extended constant
     } wide;
 
-    [[msvc::forceinline]] static constexpr Instruction from_raw(uint32_t v) {
+    SKARN_FORCEINLINE static constexpr Instruction from_raw(uint32_t v) {
         Instruction i{}; i.raw = v; return i;
     }
 
@@ -111,11 +112,11 @@ union Instruction {
     // across the r6 rb(6) and flags(6) fields (index = rb | flags<<6). Decoded via
     // Layout::Prop so the frame validator / disassembler treat those two fields as
     // an immediate, not registers (rd/ra remain real registers).
-    [[nodiscard]] [[msvc::forceinline]] constexpr uint32_t prop_slot() const noexcept {
+    [[nodiscard]] SKARN_FORCEINLINE constexpr uint32_t prop_slot() const noexcept {
         return static_cast<uint32_t>(r6.rb) | (static_cast<uint32_t>(r6.flags) << 6);
     }
 
-    [[msvc::forceinline]] static constexpr Instruction R6(uint8_t op, uint8_t rd, uint8_t ra, uint8_t rb, uint8_t flags = 0) {
+    SKARN_FORCEINLINE static constexpr Instruction R6(uint8_t op, uint8_t rd, uint8_t ra, uint8_t rb, uint8_t flags = 0) {
         // r6 fields are 6-bit -- a wider index would silently truncate (and slip
         // past validate_frames, which reads the field after truncation).
         assert(rd < 64 && ra < 64 && rb < 64 && flags < 64 && "R6 field exceeds 6 bits");
@@ -124,25 +125,25 @@ union Instruction {
         return i;
     }
 
-    [[msvc::forceinline]] static constexpr Instruction R8(uint8_t op, uint8_t rd, uint8_t ra, uint8_t rb) {
+    SKARN_FORCEINLINE static constexpr Instruction R8(uint8_t op, uint8_t rd, uint8_t ra, uint8_t rb) {
         Instruction i{};
         i.r8.opcode = op; i.r8.rd = rd; i.r8.ra = ra; i.r8.rb = rb;
         return i;
     }
 
-    [[msvc::forceinline]] static constexpr Instruction C2(uint8_t op, uint8_t rd, int16_t val) {
+    SKARN_FORCEINLINE static constexpr Instruction C2(uint8_t op, uint8_t rd, int16_t val) {
         Instruction i{};
         i.c2.opcode = op; i.c2.rd = rd; i.c2.cnst = val;
         return i;
     }
 
-    [[msvc::forceinline]] static constexpr Instruction J(uint8_t op, int32_t offset = 0) {
+    SKARN_FORCEINLINE static constexpr Instruction J(uint8_t op, int32_t offset = 0) {
         Instruction i{};
         i.j.opcode = op; i.j.offset = offset;
         return i;
     }
 
-    [[msvc::forceinline]] static constexpr Instruction CALL(uint8_t op, uint8_t window_size, int16_t offset = 0) {
+    SKARN_FORCEINLINE static constexpr Instruction CALL(uint8_t op, uint8_t window_size, int16_t offset = 0) {
         Instruction i{};
         i.call.opcode      = op;
         i.call.window_size = window_size;
@@ -150,7 +151,7 @@ union Instruction {
         return i;
     }
 
-    [[msvc::forceinline]] static constexpr Instruction Q4(uint8_t op, uint8_t rd, uint8_t ra, uint8_t rb, uint8_t rc, uint8_t flags = 0) {
+    SKARN_FORCEINLINE static constexpr Instruction Q4(uint8_t op, uint8_t rd, uint8_t ra, uint8_t rb, uint8_t rc, uint8_t flags = 0) {
         // q4 registers are 5-bit, extra is 4-bit.
         assert(rd < 32 && ra < 32 && rb < 32 && rc < 32 && flags < 16 && "Q4 field out of range");
         Instruction i{};
@@ -166,7 +167,7 @@ union Instruction {
     // It was q4-encoded (5-bit fields) earlier; a frame with >= 32 live
     // registers then truncated the id/result fields in Release, silently calling a
     // DIFFERENT native and writing its result to a DIFFERENT register.
-    [[msvc::forceinline]] static constexpr Instruction CallNative(uint8_t op, uint8_t rd, uint8_t ra, uint8_t rb, uint8_t nargs) {
+    SKARN_FORCEINLINE static constexpr Instruction CallNative(uint8_t op, uint8_t rd, uint8_t ra, uint8_t rb, uint8_t nargs) {
         assert(rd < 64 && ra < 64 && rb < 64 && "CallNative register field exceeds 6 bits");
         assert(nargs < 64 && "CallNative nargs exceeds 6 bits");
         Instruction i{};
@@ -174,7 +175,7 @@ union Instruction {
         return i;
     }
 
-    [[msvc::forceinline]] static constexpr Instruction B(uint8_t op, uint8_t ra, uint8_t rb, int16_t offset = 0) {
+    SKARN_FORCEINLINE static constexpr Instruction B(uint8_t op, uint8_t ra, uint8_t rb, int16_t offset = 0) {
         // b registers are 6-bit (the 12-bit offset is range-checked in Assembler::patch).
         assert(ra < 64 && rb < 64 && "B register field exceeds 6 bits");
         Instruction i{};
@@ -182,7 +183,7 @@ union Instruction {
         return i;
     }
 
-    [[msvc::forceinline]] static constexpr Instruction B1(uint8_t op, uint8_t ra, int16_t offset = 0) {
+    SKARN_FORCEINLINE static constexpr Instruction B1(uint8_t op, uint8_t ra, int16_t offset = 0) {
         Instruction i{};
         i.b1.opcode = op; i.b1.ra = ra; i.b1.offset = offset;
         return i;
@@ -193,7 +194,7 @@ union Instruction {
     // (0..4095), decoded via prop_slot() / Layout::Prop. rd/ra are real registers:
     //   GET_PROP: rd = destination, ra = object
     //   SET_PROP: rd = value source, ra = object
-    [[msvc::forceinline]] static constexpr Instruction Prop(uint8_t op, uint8_t rd, uint8_t ra, uint16_t slot) {
+    SKARN_FORCEINLINE static constexpr Instruction Prop(uint8_t op, uint8_t rd, uint8_t ra, uint16_t slot) {
         assert(rd < 64 && ra < 64 && "Prop register field exceeds 6 bits");
         assert(slot < 4096 && "Prop slot index exceeds 12 bits");
         Instruction i{};
@@ -203,7 +204,7 @@ union Instruction {
     }
 
     // LOAD_CONST_WIDE part 2: rd + lower 16-bit payload
-    [[msvc::forceinline]] static constexpr Instruction Wide(uint8_t op, uint8_t rd, uint16_t payload) {
+    SKARN_FORCEINLINE static constexpr Instruction Wide(uint8_t op, uint8_t rd, uint16_t payload) {
         Instruction i{};
         i.wide.opcode  = op;
         i.wide.rd      = rd;

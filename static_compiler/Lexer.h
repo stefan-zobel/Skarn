@@ -32,12 +32,29 @@ private:
     uint32_t col_;
 };
 
+// A comment the lexer skipped, for editor tooling: its source bytes [begin, end) and where it starts
+// (1-based). A `//` comment ends before its line break.
+struct Comment {
+    uint32_t begin = 0, end = 0;
+    uint32_t line = 0, col = 0;
+};
+
 class Lexer {
 public:
     explicit Lexer(std::string source);
 
     // Tokenize the whole input. Throws LexError on malformed input.
     std::vector<Token> tokenize();
+
+    // Editor tooling: never throws a LexError. Each error is appended to `errors` and the rest of
+    // that source line is skipped (a token never spans the line it started on after an error, so an
+    // unterminated raw string cannot swallow the file); an unterminated block comment ends the
+    // input. On valid input the result equals tokenize().
+    std::vector<Token> tokenize_tolerant(std::vector<LexError>& errors);
+
+    // Editor tooling: tokenize() that also appends every comment it skips to `comments`, in source
+    // order. Throws like tokenize(); the tokens are identical.
+    std::vector<Token> tokenize_with_comments(std::vector<Comment>& comments);
 
 private:
     // scanning primitives
@@ -74,6 +91,7 @@ private:
     Token emit(TokKind k, size_t len, uint32_t line, uint32_t col);
 
     std::vector<Token> apply_asi(const std::vector<Token>& raw);
+    std::vector<Token> tokenize_impl(std::vector<LexError>* errors);   // null = throw
 
     std::string src_;
     size_t   pos_  = 0;
@@ -101,6 +119,7 @@ private:
         std::string pending_spec;
     };
     std::vector<InterpFrame> interp_stack_;
+    std::vector<Comment>* comments_ = nullptr;   // tokenize_with_comments: where skipped comments go
 };
 
 } // namespace svc

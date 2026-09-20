@@ -35,6 +35,7 @@
 #include "Types.h"
 
 #include <cstdint>
+#include <functional>   // for_each_expr
 #include <memory>
 #include <string>
 #include <string_view>   // BUILTIN_FN_NAMES -- the enumerable builtin-name table
@@ -84,7 +85,13 @@ struct Type    { TypeKind kind; uint32_t line = 0, col = 0; virtual ~Type() = de
 // DEFAULT is PRIVATE (Rust model) -- a bare item is visible only inside its own module. Fields and
 // enum VARIANTS inherit their container's visibility (no per-field `pub`). Moot for a single-module
 // program (same-module access is always allowed); every prelude item is auto-`pub` (Compiler.cpp).
-struct Item    { ItemKind kind; uint32_t line = 0, col = 0; std::string module_prefix; bool is_pub = false; virtual ~Item() = default; protected: explicit Item(ItemKind k) : kind(k) {} };
+// `name_line`/`name_col` anchor the declared NAME of a fn / struct / enum / trait / const (`line`/`col`
+// are its keyword). Read by editor tooling only; 0 for the item kinds that declare no name.
+// `has_syntax_error`: set only by Parser::parse_program_tolerant, when a syntax error was recovered
+// inside this item (a statement, arm or member of it was dropped). Never read by the compiler.
+struct Item    { ItemKind kind; uint32_t line = 0, col = 0; std::string module_prefix; bool is_pub = false;
+                 uint32_t name_line = 0, name_col = 0; bool has_syntax_error = false;
+                 virtual ~Item() = default; protected: explicit Item(ItemKind k) : kind(k) {} };
 
 using ExprPtr = std::unique_ptr<Expr>;
 using StmtPtr = std::unique_ptr<Stmt>;
@@ -108,8 +115,10 @@ struct GenericParam { std::string name; std::vector<BoundRef> bounds; };
 // checker's expected type). The invariant is enforced by the parser/checker.
 // `is_mut` (from a leading `mut`) permits in-place mutation of the binding; the
 // checker restricts it to aggregate types (structs/tuples/Array/Vec/Bytes/Map) and
-// binds a mutable scope var. `line`/`col` anchor the `mut` token for diagnostics.
-struct Param { std::string name; TypePtr type; bool is_mut = false; uint32_t line = 0, col = 0; };
+// binds a mutable scope var. `line`/`col` anchor the `mut` token for diagnostics (0 without `mut`);
+// `name_line`/`name_col` anchor the name itself, always set by the parser, for editor tooling.
+struct Param { std::string name; TypePtr type; bool is_mut = false; uint32_t line = 0, col = 0;
+               uint32_t name_line = 0, name_col = 0; };
 
 // A struct/enum-variant *definition* field: `name: Type` (type mandatory).
 struct Field { std::string name; TypePtr type; };
@@ -129,9 +138,10 @@ struct MatchArm { PatPtr pat; ExprPtr guard; ExprPtr body; };
 // marks a `mut self` receiver (a binding-local qualifier, NOT part of the method
 // signature); the checker binds `self` mutable and gates it to aggregate receivers.
 // `self_line`/`self_col` anchor the `mut`/`self` token for diagnostics. Methods may
-// carry their own generics (`fn m[T](...)`).
+// carry their own generics (`fn m[T](...)`). `line`/`col` anchor the method NAME (editor tooling).
 struct Method {
     std::string name;
+    uint32_t line = 0, col = 0;
     std::vector<GenericParam> generics;
     bool has_self = false;
     bool self_mut = false;
@@ -160,6 +170,9 @@ struct BoolLit   : Expr { bool    value = false;    BoolLit()   : Expr(ExprKind:
 // same question is exactly what let a user `fn toInt` hijack the name inside `std::math`.
 // Default false = the historical routing, so any path that bypasses the checker is unchanged.
 //
+// `name_line`/`name_col` anchor the NAME token -- the tail of a qualified path (the node itself sits at
+// the head), the name itself otherwise. Editor tooling only.
+//
 // `inherent` is the same kind of written-back decision for an UPPERCASE qualifier: true means
 // "`Head::method` where Head is a TYPE with an inherent method", false means the trait path.
 // The two live in separate tables (`traits_` vs `structs_`/`enums_`) under the SAME mangled key
@@ -167,6 +180,7 @@ struct BoolLit   : Expr { bool    value = false;    BoolLit()   : Expr(ExprKind:
 // the other one and silently call the wrong function. `qualifier` then holds the MANGLED head.
 struct IdentExpr : Expr { std::string name; std::string qualifier; bool upper = false;
                           bool ambient = false; bool inherent = false;
+                          uint32_t name_line = 0, name_col = 0;
                                                     IdentExpr() : Expr(ExprKind::Ident)     {} };
 
 struct UnaryExpr : Expr { TokKind op = TokKind::Eof; ExprPtr operand;        UnaryExpr() : Expr(ExprKind::Unary) {} };
@@ -175,8 +189,10 @@ struct PipeExpr  : Expr { ExprPtr lhs, rhs;                                  Pip
 struct CallExpr  : Expr { ExprPtr callee; std::vector<ExprPtr> args;         CallExpr()  : Expr(ExprKind::Call) {} };
 // `obj.name` -- struct field access. `tuple_index` marks the `t.N` tuple-index form
 // (`name` is then the synthetic `_N`, `index` the numeric slot); the checker resolves
-// it against the receiver's static tuple type instead of a declared field name.
-struct FieldExpr : Expr { ExprPtr obj; std::string name; bool tuple_index = false; uint32_t index = 0; FieldExpr() : Expr(ExprKind::Field) {} };
+// it against the receiver's static tuple type instead of a declared field name. The node sits at the
+// `.`; `name_line`/`name_col` anchor the member token after it (editor tooling).
+struct FieldExpr : Expr { ExprPtr obj; std::string name; bool tuple_index = false; uint32_t index = 0;
+                          uint32_t name_line = 0, name_col = 0; FieldExpr() : Expr(ExprKind::Field) {} };
 // `a[i]` -- the sole index form (bounds-checked, total-ish). Map lookup is the
 // ordinary call `get(m, k) -> Option[V]`, so there is no map-index flag.
 struct IndexExpr : Expr { ExprPtr obj; ExprPtr index;                        IndexExpr() : Expr(ExprKind::Index) {} };
@@ -209,7 +225,9 @@ struct LambdaExpr: Expr { std::vector<Param> params; TypePtr ret; ExprPtr body; 
 // into `name` and clears `qualifier` (so codegen reads only `name`, exactly as bare form).
 // `base` (record update `Name { f: v, ..base }`) is null unless a trailing `..expr` is present; the unlisted
 // fields are then copied from it (same struct type; evaluated once). Front-end only -- no VM change.
-struct StructLit : Expr { std::string name; std::string qualifier; std::vector<FieldInit> fields; ExprPtr base;   StructLit() : Expr(ExprKind::StructLit) {} };
+// `name_line`/`name_col`: the name token (the tail of `mod::Name`); editor tooling only.
+struct StructLit : Expr { std::string name; std::string qualifier; std::vector<FieldInit> fields; ExprPtr base;
+                          uint32_t name_line = 0, name_col = 0; StructLit() : Expr(ExprKind::StructLit) {} };
 struct TupleExpr : Expr { std::vector<ExprPtr> elems;                        TupleExpr() : Expr(ExprKind::Tuple) {} };
 // `[a, b, c]` -- the sequence (list) literal. No sigil variants: `array([...])` and
 // `vec([...])` are ordinary calls on this literal.
@@ -246,12 +264,16 @@ struct IdentPat    : Pattern { bool is_mut = false; std::string name;       Iden
 // A uident constructor pattern: nullary `None` (has_parens=false, elems empty) or a
 // tuple-struct / enum-variant `Some(x)` (has_parens=true). The case-split lexer makes
 // this unambiguous vs. a binding IdentPat.
-struct CtorPat     : Pattern { std::string name; std::string qualifier; std::vector<PatPtr> elems; bool has_parens = false; CtorPat() : Pattern(PatKind::Ctor) {} };
+// A qualified pattern sits at its TAIL; `qual_line`/`qual_col`
+// anchor the head (`Shape` in `Shape::Square(w)`), 0 for a bare name. Editor tooling only.
+struct CtorPat     : Pattern { std::string name; std::string qualifier; std::vector<PatPtr> elems; bool has_parens = false;
+                               uint32_t qual_line = 0, qual_col = 0; CtorPat() : Pattern(PatKind::Ctor) {} };
 // `(p0, p1)` -- an anonymous tuple pattern (matches the tuple type of the scrutinee).
 struct TuplePat    : Pattern { std::vector<PatPtr> elems;                   TuplePat() : Pattern(PatKind::Tuple) {} };
 // `[a, b, ..rest]` -- `rest` is null when there is no `..` tail.
 struct ListPat     : Pattern { std::vector<PatPtr> elems; PatPtr rest;      ListPat()    : Pattern(PatKind::List) {} };
-struct StructPat   : Pattern { std::string name; std::string qualifier; std::vector<FieldPat> fields; StructPat() : Pattern(PatKind::Struct) {} };
+struct StructPat   : Pattern { std::string name; std::string qualifier; std::vector<FieldPat> fields;
+                               uint32_t qual_line = 0, qual_col = 0; StructPat() : Pattern(PatKind::Struct) {} };
 // `#{ key => pat, .. }` -- a map pattern (match-only, partial). Keys are literal exprs.
 struct MapPat      : Pattern { std::vector<std::pair<ExprPtr, PatPtr>> entries; MapPat() : Pattern(PatKind::Map) {} };
 // `A | B | C` -- an or-pattern. Allowed anywhere a pattern is (bare where the terminator is
@@ -294,7 +316,10 @@ struct BindPat     : Pattern { bool is_mut = false; std::string name; PatPtr sub
 // `Name`, `Name[T,...]`, or module-qualified `mod::Name[...]`. A non-empty `qualifier`
 // (only set for `mod::Name`, never for a primitive/generic/builtin) is resolved against
 // the named module by the checker's resolve_type.
-struct NamedType : Type { std::string name; std::string qualifier; std::vector<TypePtr> args;      NamedType() : Type(TypeKind::Named) {} };
+// The node sits at the head; `name_line`/`name_col`
+// anchor the name token (editor tooling).
+struct NamedType : Type { std::string name; std::string qualifier; std::vector<TypePtr> args;
+                          uint32_t name_line = 0, name_col = 0; NamedType() : Type(TypeKind::Named) {} };
 struct FnType    : Type { std::vector<TypePtr> params; TypePtr ret;         FnType()    : Type(TypeKind::Fn) {} };
 struct TupleType : Type { std::vector<TypePtr> elems;                       TupleType() : Type(TypeKind::Tuple) {} };
 // `dyn Trait` / `dyn Trait[A, ...]` / `dyn mod::Trait` -- a TRAIT OBJECT (existential):
@@ -303,7 +328,9 @@ struct TupleType : Type { std::vector<TypePtr> elems;                       Tupl
 // concrete type -- that is what makes `Vec[dyn Show]` heterogeneous. `trait` is the written
 // name (the checker mangles it); `args` are the parametric trait's arguments, which must be
 // written in full (there is no impl here to solve them from -- see resolve_type).
-struct DynType   : Type { std::string trait; std::string qualifier; std::vector<TypePtr> args; DynType() : Type(TypeKind::Dyn) {} };
+// The node sits at `dyn`; `name_line`/`name_col` anchor the trait name (editor tooling).
+struct DynType   : Type { std::string trait; std::string qualifier; std::vector<TypePtr> args;
+                          uint32_t name_line = 0, name_col = 0; DynType() : Type(TypeKind::Dyn) {} };
 
 // ----- item nodes (top level) -----------------------------------------------
 
@@ -343,21 +370,27 @@ struct ImportItem : Item { std::vector<std::string> path; ImportItem() : Item(It
 // segments; `names` = the imported leaf names (one element for the `::name` form,
 // empty for a glob); `glob` = the `::*` wildcard. A glob binds WEAKLY (a local def or
 // an explicit `use` overrides it silently); resolution + shadowing land in Slice 2.
-struct UseItem    : Item { std::vector<std::string> path; std::vector<std::string> names; bool glob = false; UseItem() : Item(ItemKind::Use) {} };
+// `name_pos` holds each imported name's position, parallel to `names` (editor tooling).
+struct UseItem    : Item { std::vector<std::string> path; std::vector<std::string> names; bool glob = false;
+                           std::vector<std::pair<uint32_t, uint32_t>> name_pos; UseItem() : Item(ItemKind::Use) {} };
 
 // `trait Name [generic_params] [: Super1, Super2] { fn m(self) -> T [{ default }] … }`.
 // Trait names + supertraits are UPPERCASE. `generics` are the trait's own type params
 // (`trait Iterable[T]`), distinct from `Self` and from method-level generics; they may
 // appear in method signatures (`fn iter(self) -> Vec[T]`).
+// `supertrait_pos` is parallel to `supertraits` (editor tooling).
 struct TraitDecl  : Item { std::string name; std::vector<GenericParam> generics;
                            std::vector<std::string> supertraits;
+                           std::vector<std::pair<uint32_t, uint32_t>> supertrait_pos;
                            std::vector<Method> methods;                     TraitDecl() : Item(ItemKind::Trait) {} };
 // `impl [generic_params] TraitName [trait_args] for TargetType { fn m(self){…} … }`.
 // `target` is a NamedType (`List[T]`), so generic impls (`impl[T] Trait for List[T]`) are
 // expressible; `trait_args` are the trait's type arguments (`impl[X] Iterable[X] for …`).
 // A traitless `impl [G] Target { … }` (inherent methods) sets `is_inherent` + empty `trait_name`.
+// `trait_line`/`trait_col` anchor the trait name of a trait impl (editor tooling).
 struct ImplDecl   : Item { std::vector<GenericParam> generics; std::string trait_name;
                            std::vector<TypePtr> trait_args; TypePtr target; bool is_inherent = false;
+                           uint32_t trait_line = 0, trait_col = 0;
                            std::vector<Method> methods;                     ImplDecl()  : Item(ItemKind::Impl) {} };
 
 // A whole compilation unit: an ordered list of top-level items.
@@ -492,5 +525,10 @@ std::string dump_stmt(const Stmt& s);
 std::string dump_pat(const Pattern& p);
 std::string dump_type(const Type& t);
 std::string dump_item(const Item& i);
+
+// Visit every expression of `item` in pre-order: fn / method / lambda bodies, match guards, the
+// literal, range-bound and map-key expressions inside patterns, and const initializers. Types are
+// syntax (`Type`), not expressions, and are not visited.
+void for_each_expr(Item& item, const std::function<void(Expr&)>& fn);
 
 } // namespace svc

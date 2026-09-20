@@ -91,14 +91,17 @@
     <ClInclude Include="Disassembler.h" />
     <ClInclude Include="BytecodeIO.h" />
     <ClInclude Include="Execute.h" />
+    <ClInclude Include="FaultSignals.h" />
     <ClInclude Include="GlobalEnv.h" />
     <ClInclude Include="HashingPolicy.h" />
     <ClInclude Include="HashTable.h" />
     <ClInclude Include="Heap.h" />
+    <ClInclude Include="Inline.h" />
     <ClInclude Include="Instruction.h" />
     <ClInclude Include="Interpreter.h" />
     <ClInclude Include="NumericOps.h" />
     <ClInclude Include="Opcodes.h" />
+    <ClInclude Include="Platform.h" />
     <ClInclude Include="opcodes\op_string.h" />
     <ClInclude Include="StringInterner.h" />
     <ClInclude Include="StructType.h" />

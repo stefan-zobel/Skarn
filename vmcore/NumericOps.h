@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cmath>
-#include "Windows.h"
+#include "Platform.h"
 #include "Value.h"
 
 // =============================================================================
@@ -23,21 +23,21 @@
 // caught by run_switch's __except, exactly like the tail-call handlers.
 // =============================================================================
 
-[[nodiscard]] [[msvc::forceinline]] inline Value num_sub(Value a, Value b) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline Value num_sub(Value a, Value b) noexcept {
     a.assertNumeric(); b.assertNumeric();
     if (a.isInt() && b.isInt())
         return Value::fromSigned48(a.asSigned48() - b.asSigned48());
     return Value::fromDouble(a.numAsDouble() - b.numAsDouble());
 }
 
-[[nodiscard]] [[msvc::forceinline]] inline Value num_mul(Value a, Value b) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline Value num_mul(Value a, Value b) noexcept {
     a.assertNumeric(); b.assertNumeric();
     if (a.isInt() && b.isInt())
         return Value::fromSigned48(a.asSigned48() * b.asSigned48());
     return Value::fromDouble(a.numAsDouble() * b.numAsDouble());
 }
 
-[[nodiscard]] [[msvc::forceinline]] inline Value num_div(Value a, Value b) {
+[[nodiscard]] SKARN_FORCEINLINE inline Value num_div(Value a, Value b) {
     a.assertNumeric(); b.assertNumeric();
     if (a.isInt() && b.isInt()) {
         const int64_t vb = b.asSigned48();
@@ -49,7 +49,7 @@
     return Value::fromDouble(a.numAsDouble() / b.numAsDouble());
 }
 
-[[nodiscard]] [[msvc::forceinline]] inline Value num_mod(Value a, Value b) {
+[[nodiscard]] SKARN_FORCEINLINE inline Value num_mod(Value a, Value b) {
     a.assertNumeric(); b.assertNumeric();
     if (a.isInt() && b.isInt()) {
         const int64_t vb = b.asSigned48();
@@ -61,7 +61,7 @@
     return Value::fromDouble(std::fmod(a.numAsDouble(), b.numAsDouble()));
 }
 
-[[nodiscard]] [[msvc::forceinline]] inline Value num_neg(Value a) noexcept {
+[[nodiscard]] SKARN_FORCEINLINE inline Value num_neg(Value a) noexcept {
     a.assertNumeric();
     return a.isInt() ? Value::fromSigned48(-a.asSigned48())
                      : Value::fromDouble(-a.asDouble());

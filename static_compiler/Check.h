@@ -59,15 +59,38 @@ struct TypeError {
 // `warnings` is an ADVISORY tier (must-use Result/Option + unused bindings): a logic-bug
 // nudge, never a soundness signal, so it does NOT affect `ok()`. A future `static_vmrun
 // --strict` can escalate a non-empty `warnings` list to fatal (mirroring `static_vmrun --strict`).
+// An AMBIENT function -- a builtin or native, which belongs to no module's item list. `module` is
+// the opt-in module whose `use` makes a gated native reachable ("" = always reachable);
+// `signature` is `fn name(A, B) -> R`; a builtin typed per call (`len`, `get`, `print`) has a
+// hand-written one, one line per accepted shape (`get` has four), separated by '\n'.
+struct AmbientFn {
+    std::string name;
+    std::string module;
+    std::string signature;
+};
+
 struct CheckResult {
     std::vector<TypeError> errors;
     std::vector<TypeError> warnings;
+    std::vector<AmbientFn> ambient;   // filled only with CheckOptions::list_ambient
     bool ok() const { return errors.empty(); }
+};
+
+// Options for a check. `resolve_types`: after inference has finished, re-apply the final solution
+// to every `Expr::ty` of the non-prelude items. A slot is otherwise written when its node is checked,
+// so it can still hold a variable a LATER statement solved (`vec()` reads `Vec[T]` although `push(v, 3)`
+// fixed it to `Vec[Int]`). Editor tooling shows these types; the compile paths leave it off, so what
+// codegen reads is unchanged.
+// `list_ambient`: report every ambient function a user may call (CheckResult::ambient) -- editor
+// completion needs them, and only the checker knows which module gates a native.
+struct CheckOptions {
+    bool resolve_types = false;
+    bool list_ambient  = false;
 };
 
 // Typecheck a parsed program. Fills each `Expr::ty` the checker reaches with a
 // resolved `svc::Ty` and returns all diagnostics found. The program is taken by
 // non-const reference because the checker annotates the tree (the `ty` slots).
-CheckResult check(Program& program);
+CheckResult check(Program& program, const CheckOptions& options = {});
 
 } // namespace svc

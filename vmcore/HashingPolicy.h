@@ -19,21 +19,22 @@
 #include <cstdint>
 #include <cstring>
 #include <string_view>
+#include "Inline.h"   // SKARN_FORCEINLINE
 #include "Value.h"
 #include "Heap.h"
 
 struct DefaultHashPolicy {
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static uint32_t hash(const Value& v) noexcept {
         return v.hash();
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static bool isEqual(const Value& a, const Value& b) noexcept {
         return a == b;
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static bool shouldRemove(const Value& /*v*/) noexcept {
         return false;
     }
@@ -41,7 +42,7 @@ struct DefaultHashPolicy {
 
 struct StringPoolPolicy {
 private:
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static const GcObject* asStringObject(const Value& v) noexcept {
         assert(v.isPtr() && "StringPoolPolicy requires pointer Values");
         const GcObject* obj = GcObject::from_slots(v.asPtr());
@@ -50,7 +51,7 @@ private:
     }
 
 public:
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static uint32_t hashBytes(const char* data, uint32_t len) noexcept {
         // FNV-1a 32-bit
         uint32_t h = 2166136261u;
@@ -61,18 +62,18 @@ public:
         return h;
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static uint32_t hashBytes(std::string_view s) noexcept {
         return hashBytes(s.data(), static_cast<uint32_t>(s.size()));
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static uint32_t hash(const Value& v) noexcept {
         const GcObject* s = asStringObject(v);
         return hashBytes(s->bytes(), s->string_length());
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static bool isEqual(const Value& a, const Value& b) noexcept {
         if (a == b) return true;
         if (!a.isPtr() || !b.isPtr()) return false;
@@ -91,7 +92,7 @@ public:
         return std::memcmp(sA->bytes(), sB->bytes(), sA->string_length()) == 0;
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static bool shouldRemove(const Value& v) noexcept {
         const GcObject* s = asStringObject(v);
         return s->color == GcObject::WHITE;

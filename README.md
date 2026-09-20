@@ -75,6 +75,7 @@ total 15.07
   [raytracer](demo/raytracer/README.md) and a small benchmark against CPython.
 - [docs/VirtualMachine.md](docs/VirtualMachine.md): how the VM works: values, bytecode, calls, the garbage collector.
 - [docs/Compiler.md](docs/Compiler.md): how the compiler works: checker, modules, code generation, verification.
+- [docs/LanguageServer.md](docs/LanguageServer.md): how the language server works: analysis, error recovery, queries, completion, signature help.
 - [`docs/skarn_grammar.ebnf`](docs/skarn_grammar.ebnf): the grammar, also rendered as
   [syntax-highlighted text](docs/skarn_grammar.svg) and as [railroad diagrams](docs/skarn_grammar_railroad.svg).
 
@@ -83,8 +84,26 @@ must print exactly the output shown.
 
 ## Building
 
-The project targets **Windows x64 with Visual Studio 2022** (MSVC toolset v143, C++20). It is a Visual Studio
-solution without CMake. From a developer command prompt:
+### macOS (Apple Silicon)
+
+Requires Xcode Command Line Tools (Clang) and CMake 3.21+. **arm64 only** — no Intel support.
+
+```bash
+# Install CMake if needed
+brew install cmake
+
+# Configure (once)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+# Build
+cmake --build build -- -j$(sysctl -n hw.logicalcpu)
+```
+
+The driver binary is `build/skarnvm`.
+
+### Windows (x64, Visual Studio 2022)
+
+The project also ships a Visual Studio solution for Windows. From a developer command prompt:
 
 ```bash
 msbuild vMachine.sln /p:Configuration=Release /p:Platform=x64
@@ -94,6 +113,12 @@ Everything is built into `x64\Release\`. The Debug configuration works the same 
 
 ## Running a program
 
+**macOS:**
+```bash
+./build/skarnvm hello.skn
+```
+
+**Windows:**
 ```bash
 x64\Release\static_vmrun.exe hello.skn
 ```
@@ -104,16 +129,27 @@ Arguments after the script are passed to the program. Useful flags:
 - `--dump-ast` type-checks the program and prints the typed syntax tree without running it.
 - `--emit-bytecode <file>` / `--run-bytecode <file>` compile to a `.skbc` image and run it later.
 
-Run `static_vmrun` without arguments for the full list. A multi-file program is a directory of `.skn` files:
+Run the driver without arguments for the full list. A multi-file program is a directory of `.skn` files:
 `import net::http` loads `net/http.skn` relative to the entry file.
 
 ## Tests
+
+**Windows:**
 
 | command | what it checks |
 |---|---|
 | `x64\Release\vm_tests.exe` | the VM: opcodes, the heap and the collector, natives, the bytecode format |
 | `x64\Release\static_compiler_tests.exe` | the compiler: checker, codegen, and differential runs against a reference interpreter over generated programs |
 | `powershell -File tests\guide_claims\run_guide_claims.ps1` | the documentation: guide claims, every guide example, and every program under `examples/` |
+| `x64\Release\skarn_lsp.exe --selftest` | the language server: JSON, message framing, diagnostics, error recovery, outline, hover, go to definition, references, rename, completion, signature help, formatting, a scripted session |
+
+## Editor support
+
+`tools/vscode-skarn` is a VS Code extension: syntax highlighting, plus live type checking, an outline, hover
+types, go to definition, find references, rename, completion, signature help and formatting through the language server `skarn_lsp` (built with the
+rest of the project). The Windows release zip contains both, `skarn_lsp.exe` and the extension as a `.vsix`;
+the extension's README explains how to install it and point it at the server. Syntax highlighting alone is also available for Notepad++ (`tools/skarn.npp-udl.xml`) and any
+TextMate-compatible editor (`docs/skarn.tmLanguage.json`).
 
 ## Repository layout
 
@@ -122,9 +158,10 @@ Run `static_vmrun` without arguments for the full list. A multi-file program is 
 | `vmcore/` | the VM: value representation, instruction set, interpreter, heap and GC, natives |
 | `static_compiler/` | the Skarn front end: lexer, parser, type checker, code generator, module loader; `std/` holds the standard library in Skarn |
 | `static_vmrun/` | the command-line driver |
+| `skarn_lsp/` | the language server (diagnostics, outline, hover, go to definition, references, rename, completion, signature help, formatting) |
 | `vm_tests/`, `static_compiler_tests/`, `tests/` | the test suites and the documentation harness |
 | `examples/`, `demo/` | Skarn programs |
-| `docs/`, `tools/` | the VM and compiler documents and the grammar; editor syntax highlighting |
+| `docs/`, `tools/` | the VM and compiler documents and the grammar; editor syntax highlighting and the VS Code extension |
 
 ## License
 

@@ -67,6 +67,25 @@ public:
 // missing module or an import cycle; propagates LexError/ParseError from a malformed module.
 ModuleSet load_modules(const char* entry_source, const ModuleResolver& resolve);
 
+// One recovered syntax error of the tool-mode loader: the module key ("" = the entry), the
+// 1-based position in that module's source, and "lex error: ..." / "parse error: ...".
+struct SyntaxError {
+    std::string module;
+    uint32_t    line = 0, col = 0;
+    std::string message;
+};
+
+struct ToolLoad {
+    ModuleSet                modules;
+    std::vector<SyntaxError> syntax_errors;
+};
+
+// Editor tooling: load_modules with Lexer::tokenize_tolerant + Parser::parse_program_tolerant, so a
+// module with syntax errors still yields its recovered tree (and its imports are still followed);
+// the errors are collected instead of thrown. A missing module or an import cycle still throws
+// LoadError. On valid sources the modules equal load_modules'.
+ToolLoad load_modules_for_tools(const char* entry_source, const ModuleResolver& resolve);
+
 // Join module-path segments with "::" (a canonical key / display name). "" for an empty path.
 std::string join_module_path(const std::vector<std::string>& path);
 

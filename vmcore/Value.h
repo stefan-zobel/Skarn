@@ -19,6 +19,7 @@
 #include <cassert>
 #include <cstdint>
 #include <format>
+#include "Inline.h"   // SKARN_FORCEINLINE -- the hints on the NaN-boxing predicates below
 
 union Value {
 
@@ -37,30 +38,30 @@ union Value {
         Unknown
     };
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool isDouble()  const noexcept { return bits < TAG_FUNCPTR; }
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool isInt()    const noexcept { return (bits & ~PAYLOAD_MASK) == TAG_INT; }
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool isPtr()     const noexcept { return (bits & ~PAYLOAD_MASK) == TAG_PTR;     }
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool isBool()   const noexcept { return (bits & ~PAYLOAD_MASK) == TAG_BOOL; }
     // Basic check: Is it even the "Special"-Space (0xFFFA)?
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool isSpecial() const noexcept {
         return (bits & ~PAYLOAD_MASK) == TAG_SPECIAL;
     }
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool isNil()    const noexcept { return bits == TAG_SPECIAL; } // (TAG_SPECIAL | 0)
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool isUndefined() const noexcept {
         return bits == (TAG_SPECIAL | 1ULL);
     }
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool isError() const noexcept {
         return (bits & ~PAYLOAD_MASK) == TAG_SPECIAL && (bits & 0xFFULL) == static_cast<uint64_t>(SpecialType::Error);
     }
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool isAtom() const noexcept {
         // Check the Special-Tag (0xFFFA) AND Sub-Tag 3 in the lowest byte
         return (bits & ~PAYLOAD_MASK) == TAG_SPECIAL && (bits & 0xFFULL) == static_cast<uint64_t>(SpecialType::Atom);
@@ -70,19 +71,19 @@ union Value {
     // representation (a named fn or a non-capturing lambda referenced as a value);
     // capturing closures are a heap KIND_CLOSURE instead. Distinct from TAG_FUNCPTR,
     // which stays reserved for NATIVE function pointers.
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool isFunc() const noexcept {
         return (bits & ~PAYLOAD_MASK) == TAG_SPECIAL && (bits & 0xFFULL) == static_cast<uint64_t>(SpecialType::Func);
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr uint32_t asErrorCode() const noexcept {
         // Since the lower 8 Bit are reserved fo the Sub-Tag (2), 
         // we shift to the right by 8 bit to get to the code
         return static_cast<uint32_t>((bits & PAYLOAD_MASK) >> 8);
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr uint32_t asAtomId() const noexcept {
         assert(isAtom() && "Value is not an atom!");
         // move the lower 8 bit (Sub-Tag) away, to get to the ID
@@ -90,21 +91,21 @@ union Value {
     }
 
     // Function-table id of a Func immediate (the low 16 bits after the sub-tag).
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr uint32_t asFuncId() const noexcept {
         assert(isFunc() && "Value is not a function!");
         // move the lower 8 bit (Sub-Tag) away, to get to the id
         return static_cast<uint32_t>((bits & PAYLOAD_MASK) >> 8);
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr double asDouble() const noexcept { return dbl; }
 
     // Numeric value as a double, applying the int->double promotion rule: an Int
     // is converted through its signed 48-bit value, a Double is returned as-is.
     // For non-numeric Values the result is unspecified (this is a fast-path helper
     // used by the promoting arithmetic ops, which assume numeric operands).
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr double numAsDouble() const noexcept {
         return isInt() ? static_cast<double>(asSigned48()) : dbl;
     }
@@ -115,11 +116,11 @@ union Value {
     // mis-typed operand -- mis-emitted bytecode / a compiler bug -- into a loud
     // failure at the source instead of a silent wrong result read out of the raw
     // tagged bits downstream.
-    [[msvc::forceinline]]
+    SKARN_FORCEINLINE
     void assertInt() const noexcept {
         assert(isInt() && "typed int fast-path opcode: operand must be Int");
     }
-    [[msvc::forceinline]]
+    SKARN_FORCEINLINE
     void assertNumeric() const noexcept {
         assert((isInt() || isDouble()) &&
             "numeric fast-path opcode: operand must be Int or Double");
@@ -135,7 +136,7 @@ union Value {
     // TO_BOOL nor LNOT: its checker requires Bool at every conditional position, so this
     // is a facility for hand-written bytecode only.
     // See "The instruction set" in docs/VirtualMachine.md.
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool isTruthy() const noexcept {
         if (isBool())   return (bits & 1ULL) != 0;
         if (isInt())    return asRaw48() != 0;      // Int(0) is the only falsy int
@@ -148,52 +149,52 @@ union Value {
     // Falsy-ness: the exact negation of isTruthy(), factored out so the LNOT opcode
     // (`!x` with truthiness) can share TYPE_CHECK_BODY exactly as TO_BOOL shares it
     // with isTruthy(). rd = Bool(isFalsy(ra)) is `!x` for any Value.
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool isFalsy() const noexcept { return !isTruthy(); }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr int64_t asSigned48() const noexcept {
         // Extract 48 bit and do the Sign-Extension to 64 bit
         return (static_cast<int64_t>(bits & PAYLOAD_MASK) << 16) >> 16;
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr uint64_t asRaw48() const noexcept {
         return bits & PAYLOAD_MASK;
     }
 
     // can't be constexpr because of reinterpret_cast
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static Value fromPtr(void* p) noexcept {
         return Value{ reinterpret_cast<uint64_t>(p) | TAG_PTR };
     }
 
     // Native C++ function pointer -- tagged separately so GC can skip it.
     // Must NOT be treated as a heap object.
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static Value fromFuncPtr(void* p) noexcept {
         return Value{ reinterpret_cast<uint64_t>(p) | TAG_FUNCPTR };
     }
 
     // Works for both TAG_PTR and TAG_FUNCPTR -- strips the tag, returns the raw address.
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     void* asPtr() const noexcept {
         return reinterpret_cast<void*>(bits & PAYLOAD_MASK);
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool isFuncPtr() const noexcept {
         // No special case needed anymore -- TAG_FUNCPTR | 0x1 no longer exists
         return (bits & ~PAYLOAD_MASK) == TAG_FUNCPTR;
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool asBool() const noexcept {
         assert(isBool() && "Value is not a boolean!");
         return (bits & 1ULL) != 0;
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool operator==(const Value& other) const noexcept {
 
         // Fast path: identical bit patterns are equal for Int, Bool, Ptr, and
@@ -226,7 +227,7 @@ union Value {
     }
 
     // For arithmetic: Takes signed 64-bit, truncates to 48-bit and tags it as Int
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static constexpr Value fromSigned48(int64_t i) noexcept {
         // The masking ' & PAYLOAD_MASK' is essential here, when i < 0 
         // or a 64-bit overflow occurred.
@@ -234,12 +235,12 @@ union Value {
     }
 
     // For logic shifts: Takes uint64_t (must be already < 2^48 !) and tag it as Int
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static constexpr Value fromRaw48(uint64_t r) noexcept {
         return Value{ (r & PAYLOAD_MASK) | TAG_INT };
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static constexpr Value fromDouble(double d) noexcept {
         if (d == -0.0) {
             // map -0.0 to 0.0 to avoid the problem that
@@ -260,31 +261,31 @@ union Value {
         return Value{ d_bits };
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static constexpr Value fromBool(bool b) noexcept {
         // Take the TAG_BOOL and set the lowest bit to 0 or 1
         return Value{ TAG_BOOL | (b ? 1ULL : 0ULL) };
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static constexpr Value fromNil() noexcept {
         return Value{ TAG_SPECIAL | static_cast<uint64_t>(SpecialType::Nil) };
     }
 
     // Construct a Undefined
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static constexpr Value fromUndefined() noexcept {
         return Value{ TAG_SPECIAL | static_cast<uint64_t>(SpecialType::Undefined) };
     }
 
     // Create a specific Error-Code (e.g., NotFound = 404)
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static constexpr Value fromError(uint32_t errorCode) noexcept {
         // Set the Error-Flag and then the code in the remaining bits
         return Value{ TAG_SPECIAL | static_cast<uint64_t>(SpecialType::Error) | (static_cast<uint64_t>(errorCode) << 8) };
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static constexpr Value fromAtom(uint32_t atomId) noexcept {
         // Sub-Tag 3 for Atoms, shift the ID by 8 Bits to the left
         return Value{ TAG_SPECIAL | static_cast<uint64_t>(SpecialType::Atom) | (static_cast<uint64_t>(atomId) << 8) };
@@ -292,12 +293,12 @@ union Value {
 
     // Construct a first-class script function value from a function-table id.
     // Sub-Tag 5; the id is shifted left by 8 bits, exactly like an Atom.
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static constexpr Value fromFunc(uint32_t fnId) noexcept {
         return Value{ TAG_SPECIAL | static_cast<uint64_t>(SpecialType::Func) | (static_cast<uint64_t>(fnId) << 8) };
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr uint32_t hash() const noexcept {
         uint64_t x = bits;
         x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
@@ -306,7 +307,7 @@ union Value {
         return static_cast<uint32_t>(x);
     }
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     static constexpr Value tombstone() noexcept {
         // Encoded as TAG_SPECIAL | SpecialType::Tombstone (sub-tag 4).
         // Completely separate from TAG_FUNCPTR -- no overlap, no special cases needed.
@@ -318,13 +319,13 @@ union Value {
     }
 
     // Helper method for an open addressing HashTable (since 'bits' is private)
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr bool isTombstone() const noexcept {
         return bits == (TAG_SPECIAL | static_cast<uint64_t>(SpecialType::Tombstone));
     }
 
     // Only used for debugging
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr Type type() const noexcept {
         if (isSpecial()) {
             if (isNil()) {
@@ -365,14 +366,14 @@ union Value {
     }
 
     // default constructor with Undefined as standard value
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr Value() noexcept : bits(TAG_SPECIAL | static_cast<uint64_t>(SpecialType::Undefined)) {}
 
 private:
     uint64_t bits;
     double dbl;
 
-    [[nodiscard]] [[msvc::forceinline]]
+    [[nodiscard]] SKARN_FORCEINLINE
     constexpr explicit Value(uint64_t value) noexcept : bits(value) {}
 
     enum class SpecialType : uint64_t {
