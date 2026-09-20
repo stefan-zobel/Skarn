@@ -2745,6 +2745,9 @@ void test_import_matrix() {
         // that an erased enum travels the import forms like any other item. A fixed variant, not
         // currentOs(), so the cell means the same on every platform.
         { "std_int_enum","std::process", "Os",           "currentOs",    "match Os::Windows { Os::Windows => 7, _ => 0 }", 7 },
+        // std::poll is the one module that `use`s another (std::net). This row pins that its own
+        // items still travel every import form -- and, via the `_other` cell, that a const does too.
+        { "std_poll",    "std::poll",    "READABLE",     "WRITABLE",     "READABLE | 6", 7 },
     };
     for (const auto& r : std_rows) {
         const std::string id = std::string("imx_") + r.id;
@@ -4516,6 +4519,24 @@ void test_tree_shake_prelude() {
     try_bool("shake_sh_keeps_current_os", [&] {
         return has_fn(svc::compile("use std::process::*\nlet r = sh(\"echo\")\n 0",
                                    svc::builtin_prelude()), "currentOs");
+    });
+
+    // (7) std::poll is the 16th prelude module and the first one reachable only through another
+    // (it `use`s std::net). Unlike `Os`, its enums CARRY payloads, so they are real struct types and
+    // `has_struct` can see them -- a program that never opens a socket must keep none of it.
+    try_bool("shake_default_drops_poll", [&] {
+        const svc::Module m = svc::compile("42", svc::builtin_prelude());
+        return !has_struct(m, "WouldBlock") && !has_fn(m, "rawPoll");
+    });
+    // ... and one that runs a loop keeps the enum it matches on.
+    try_bool("shake_poll_keeps_received", [&] {
+        return has_struct(svc::compile(
+            "use std::net::*\nuse std::poll::*\n"
+            "fn f() -> Result[Int, String] {\n"
+            "  let c = nonBlockingConn(connect(\"127.0.0.1\", 1)?)?\n"
+            "  match c.recv(8)? { Received::Data(b) => Ok(len(b)), _ => Ok(0) }\n"
+            "}\n"
+            "let r = f()\n0", svc::builtin_prelude()), "WouldBlock");
     });
 }
 
@@ -8504,6 +8525,180 @@ void test_std_net() {
 }
 
 // =============================================================================
+// std::poll -- non-blocking I/O + readiness (rawSetNonBlocking/rawPoll/rawAcceptNb/rawRecvNb/
+// rawSendNb; NativeRegistry ids 52-56). Like std::net these are side-effecting and OS-timed, so they
+// are excluded from the differential and verified by single-thread LOOPBACK instead -- which works
+// here for the same reason it works there, and better: one thread can now drive a server AND several
+// clients, because nothing blocks.
+//
+// What these tests are really for is the three-way distinction the module exists to make. Before this
+// round a socket could only say "bytes" or "error", and an empty read meant EOF; "nothing yet" had
+// nowhere to go. So the assertions below deliberately separate WouldBlock from Closed on the same
+// socket, in the same program, a few lines apart.
+// =============================================================================
+void test_std_poll() {
+    std::cout << "[codegen: std::poll]\n";
+    auto p_fails = [](const std::string& s) {
+        try { svc::compile(s.c_str(), svc::builtin_prelude()); return false; }
+        catch (const svc::CheckFailure&) { return true; }
+        catch (...) { return false; }
+    };
+    // Gating: the raw natives are out of scope without `use std::poll`, exactly like the tcp* ones.
+    check_true("poll_gate_rejects", p_fails("let r = rawPoll(vec(), vec(), 0)\n0"));
+    check_true("poll_gate_ok",     !p_fails("use std::poll::*\nlet r = rawPoll(vec(), vec(), 0)\n0"));
+    // std::poll does NOT re-export std::net: taking the event loop must not silently hand out the
+    // blocking API too (the wrappers `use` it, but a `use` is not transitive).
+    check_true("poll_does_not_reexport_net", p_fails("use std::poll::*\nlet l = listen(0)\n0"));
+
+    // The assertion that was impossible before: a listener with nobody waiting REPORTS that, instead
+    // of blocking the program or failing. Port from the OS (tcpListen(0)), never hardcoded.
+    check_str("poll_accept_would_block",
+        cg_run_native("use std::net::*\nuse std::poll::*\n"
+                      "fn probe() -> Result[String, String] {\n"
+                      "  let srv = nonBlocking(listen(0)?)?\n"
+                      "  let out = match srv.accept()? {\n"
+                      "    Accepted::Conn(_)    => \"connected\",\n"
+                      "    Accepted::WouldBlock => \"would-block\"\n"
+                      "  }\n"
+                      "  srv.close()?\n"
+                      "  Ok(out)\n"
+                      "}\n"
+                      "match probe() { Ok(s) => println(s), Err(e) => println(\"ERR: \" + e) }\n"),
+        "would-block\n");
+
+    // THE distinction, on one socket: nothing sent yet -> WouldBlock; peer closed -> Closed. If these
+    // two ever collapse into the same answer a server can no longer tell a quiet connection from a
+    // dead one, which is the defect this module was built to remove.
+    const std::string three =
+        "use std::net::*\nuse std::poll::*\n"
+        "fn probe() -> Result[String, String] {\n"
+        "  let lst = listen(0)?\n"
+        "  let port = lst.localPort()?\n"
+        "  let srv = nonBlocking(lst)?\n"
+        "  let cli = nonBlockingConn(connect(\"127.0.0.1\", port)?)?\n"
+        "  let mut fds: Vec[Int] = vec()\n"
+        "  let mut want: Vec[Int] = vec()\n"
+        "  push(fds, srv.fd)  push(want, READABLE)\n"
+        "  poll(fds, want, 2000)?\n"
+        "  let con = match srv.accept()? {\n"
+        "    Accepted::Conn(c)    => c,\n"
+        "    Accepted::WouldBlock => return Err(\"no connection after poll said readable\")\n"
+        "  }\n"
+        "  let quiet = match con.recv(64)? {\n"
+        "    Received::Data(_)    => \"data\",\n"
+        "    Received::WouldBlock => \"would-block\",\n"
+        "    Received::Closed     => \"closed\"\n"
+        "  }\n"
+        "  cli.close()?\n"
+        "  let mut f2: Vec[Int] = vec()\n"
+        "  let mut w2: Vec[Int] = vec()\n"
+        "  push(f2, con.fd)  push(w2, READABLE)\n"
+        "  poll(f2, w2, 2000)?\n"
+        "  let dead = match con.recv(64)? {\n"
+        "    Received::Data(_)    => \"data\",\n"
+        "    Received::WouldBlock => \"would-block\",\n"
+        "    Received::Closed     => \"closed\"\n"
+        "  }\n"
+        "  con.close()?\n"
+        "  srv.close()?\n"
+        "  Ok(quiet + \" then \" + dead)\n"
+        "}\n"
+        "match probe() { Ok(s) => println(s), Err(e) => println(\"ERR: \" + e) }\n";
+    check_str("poll_would_block_is_not_closed", cg_run_native(three), "would-block then closed\n");
+
+    // send reports a COUNT, not success/failure, and the loop that drains the remainder terminates.
+    // (A forced SHORT write needs a full kernel buffer and is timing-dependent, so what is pinned is
+    // the contract the caller depends on: the count is what went out, and looping on it transfers all.)
+    check_str("poll_send_returns_count",
+        cg_run_native("use std::net::*\nuse std::poll::*\n"
+                      "fn probe() -> Result[Bool, String] {\n"
+                      "  let lst = listen(0)?\n"
+                      "  let port = lst.localPort()?\n"
+                      "  let srv = nonBlocking(lst)?\n"
+                      "  let cli = nonBlockingConn(connect(\"127.0.0.1\", port)?)?\n"
+                      "  let n = cli.sendStr(\"0123456789\")?\n"
+                      "  cli.close()?\n"
+                      "  srv.close()?\n"
+                      "  Ok(n > 0 && n <= 10)\n"
+                      "}\n"
+                      "match probe() { Ok(b) => println(b), Err(e) => println(\"ERR: \" + e) }\n"),
+        "true\n");
+
+    // Asking for NOTHING is a legitimate state -- a loop round with no outstanding work. POSIX poll()
+    // accepts an all-zero interest set; WSAPoll rejects it with WSAEINVAL. Without the levelling in
+    // rawPoll this is green on one platform and an inexplicable error on the other, which is exactly
+    // the class of split this project keeps out of the language surface.
+    check_str("poll_zero_interest_is_not_an_error",
+        cg_run_native("use std::net::*\nuse std::poll::*\n"
+                      "fn probe() -> Result[Bool, String] {\n"
+                      "  let srv = nonBlocking(listen(0)?)?\n"
+                      "  let mut fds: Vec[Int] = vec()\n"
+                      "  let mut want: Vec[Int] = vec()\n"
+                      "  push(fds, srv.fd)  push(want, 0)\n"
+                      "  let r = poll(fds, want, 0)?\n"
+                      "  srv.close()?\n"
+                      "  Ok(len(r) == 1 && r[0] == 0)\n"
+                      "}\n"
+                      "match probe() { Ok(b) => println(b), Err(e) => println(\"ERR: \" + e) }\n"),
+        "true\n");
+
+    // An empty socket set is the degenerate case of the same thing: no call, no error, no results.
+    check_str("poll_empty_set_is_not_an_error",
+        cg_run_native("use std::poll::*\n"
+                      "match poll(vec(), vec(), 0) {\n"
+                      "  Ok(r)  => println(len(r)),\n"
+                      "  Err(e) => println(\"ERR: \" + e)\n"
+                      "}\n"),
+        "0\n");
+
+    // The claim of the whole round, in one program: ONE thread, ONE loop, TWO clients served without
+    // either waiting for the other. The two arrive in whatever order the OS reports them, so the
+    // result is sorted -- asserting an arrival ORDER would be asserting a race.
+    const std::string loop_prog =
+        "use std::net::*\nuse std::poll::*\n"
+        "fn serve() -> Result[String, String] {\n"
+        "  let lst = listen(0)?\n"
+        "  let port = lst.localPort()?\n"
+        "  let srv = nonBlocking(lst)?\n"
+        "  let a = nonBlockingConn(connect(\"127.0.0.1\", port)?)?\n"
+        "  let b = nonBlockingConn(connect(\"127.0.0.1\", port)?)?\n"
+        "  a.sendStr(\"alpha\")?\n"
+        "  b.sendStr(\"beta\")?\n"
+        "  let mut conns: Vec[NbConn] = vec()\n"
+        "  let mut got: Vec[String] = vec()\n"
+        "  let mut spins = 0\n"
+        "  while len(got) < 2 && spins < 400 {\n"
+        "    let mut fds: Vec[Int] = vec()\n"
+        "    let mut want: Vec[Int] = vec()\n"
+        "    push(fds, srv.fd)  push(want, READABLE)\n"
+        "    for c in conns { push(fds, c.fd)  push(want, READABLE) }\n"
+        "    let live = len(conns)\n"
+        "    let r = poll(fds, want, 50)?\n"
+        "    if (r[0] & READABLE) != 0 {\n"
+        "      if let Accepted::Conn(c) = srv.accept()? { push(conns, c) }\n"
+        "    }\n"
+        "    let mut i = 0\n"
+        "    while i < live {\n"
+        "      if (r[i + 1] & READABLE) != 0 {\n"
+        "        if let Received::Data(bs) = conns[i].recv(256)? { push(got, fromBytes(bs)) }\n"
+        "      }\n"
+        "      i = i + 1\n"
+        "    }\n"
+        "    spins = spins + 1\n"
+        "  }\n"
+        "  for c in conns { c.close()? }\n"
+        "  a.close()?\n"
+        "  b.close()?\n"
+        "  srv.close()?\n"
+        "  let mut out = \"\"\n"
+        "  for s in sorted(got) { out = out + s + \" \" }\n"
+        "  Ok(trim(out))\n"
+        "}\n"
+        "match serve() { Ok(s) => println(s), Err(e) => println(\"ERR: \" + e) }\n";
+    check_str("poll_two_clients_one_loop", cg_run_native(loop_prog), "alpha beta\n");
+}
+
+// =============================================================================
 // std::regex -- the opt-in byte-level Pike-VM regex engine, pure prelude (compile / isMatch /
 // find / findFrom first). A `use std::regex::*` prefix + gate pair, then KAT triples. isMatch cases use
 // check_bool_p; find cases encode start*1000+end as an Int (-1 = no match); plus check_same diffs.
@@ -9184,7 +9379,12 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // `tcpLocalPort` (id 50) is deliberately NOT differentiable: the port it reports is chosen by the OS.
 // `rawOsId` (id 51) IS differentiable: it answers the same on every run of one machine, and the oracle
 // mirrors it with the same #ifdef -- so a disagreement about the platform is a test failure, not a skip.
-static_assert(NATIVE_COUNT == 52,
+// The std::poll five (ids 52-56) are NOT differentiable, and no fixture could make them so: each one
+// touches a live socket, and four of them answer from the kernel's momentary state -- whether a peer
+// has connected, whether bytes have arrived, how much buffer space happens to be free. Two runs of the
+// SAME implementation need not agree, so two implementations certainly need not. They are exercised by
+// the std::poll loopback tests instead, which is where their real behaviour is pinned.
+static_assert(NATIVE_COUNT == 57,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 
@@ -11160,6 +11360,7 @@ int main(int argc, char** argv) {
     test_std_cli();
     test_std_hash();
     test_std_net();
+    test_std_poll();
     test_interpolation();
     test_format();
     test_string_iter();

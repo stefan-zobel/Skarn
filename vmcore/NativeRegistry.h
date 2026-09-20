@@ -87,7 +87,17 @@ enum NativeId : uint16_t {
                                 //   listener actually bound -- the point of `tcpListen(0)`, which asks
                                 //   the OS for a free one instead of guessing a fixed number)
     NATIVE_OS_ID       = 51,    // rawOsId()              -> Int (0 Windows, 1 macOS, 2 other; Plain, total)
-    NATIVE_COUNT       = 52,
+    // std::poll -- non-blocking I/O + readiness. "Would block" is neither a value nor an error, so
+    // each of these encodes it in the SUCCESS channel and the prelude turns it into an enum arm.
+    NATIVE_SET_NON_BLOCKING = 52, // rawSetNonBlocking(sock, on) -> nil | String
+    NATIVE_POLL        = 53,    // rawPoll(fds, interest, timeoutMs) -> Array[Int] | String (flags
+                                //   index-parallel to fds; 1 readable, 2 writable, 4 closed/error)
+    NATIVE_ACCEPT_NB   = 54,    // rawAcceptNb(sock)      -> Int    | String (>= 0 descriptor, -1 would block)
+    NATIVE_RECV_NB     = 55,    // rawRecvNb(sock, max)   -> Array[Bytes] | String (0 elements = would
+                                //   block; 1 element = the read, EMPTY = peer closed)
+    NATIVE_SEND_NB     = 56,    // rawSendNb(sock, data)  -> Int    | String (bytes ACCEPTED, may be
+                                //   short; 0 = would block -- there is no send-all on a nb socket)
+    NATIVE_COUNT       = 57,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -151,6 +161,11 @@ inline int native_id_of(const std::string& name) {
     if (name == "tcpSetTimeout") return NATIVE_TCP_SET_TIMEOUT;
     if (name == "sha256")     return NATIVE_SHA256;
     if (name == "rawOsId")    return NATIVE_OS_ID;
+    if (name == "rawSetNonBlocking") return NATIVE_SET_NON_BLOCKING;
+    if (name == "rawPoll")    return NATIVE_POLL;
+    if (name == "rawAcceptNb") return NATIVE_ACCEPT_NB;
+    if (name == "rawRecvNb")  return NATIVE_RECV_NB;
+    if (name == "rawSendNb")  return NATIVE_SEND_NB;
     return -1;
 }
 
@@ -176,6 +191,11 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_TCP_ACCEPT:
         case NATIVE_TCP_SET_TIMEOUT:
         case NATIVE_TCP_LOCAL_PORT:
+        case NATIVE_SET_NON_BLOCKING:
+        case NATIVE_POLL:
+        case NATIVE_ACCEPT_NB:
+        case NATIVE_RECV_NB:
+        case NATIVE_SEND_NB:
         case NATIVE_RUN_PROCESS: return NRET_RESULT;
         case NATIVE_GET_ENV:
         case NATIVE_READ_LINE:   return NRET_OPTION;
@@ -214,7 +234,11 @@ inline int native_arity(int id) {
         case NATIVE_TCP_SEND:
         case NATIVE_TCP_RECV:
         case NATIVE_TCP_SET_TIMEOUT:
+        case NATIVE_SET_NON_BLOCKING:
+        case NATIVE_RECV_NB:
+        case NATIVE_SEND_NB:
         case NATIVE_RUN_PROCESS: return 2;
+        case NATIVE_POLL:        return 3;
         case NATIVE_READ_FILE:
         case NATIVE_GET_ENV:
         case NATIVE_FILE_EXISTS:
@@ -234,6 +258,7 @@ inline int native_arity(int id) {
         case NATIVE_TCP_LISTEN:
         case NATIVE_TCP_ACCEPT:
         case NATIVE_TCP_LOCAL_PORT:
+        case NATIVE_ACCEPT_NB:
         case NATIVE_SHA256:
         case NATIVE_F64_TO_BYTES: return 1;
         case NATIVE_NANO_TIME:

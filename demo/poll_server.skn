@@ -1,0 +1,188 @@
+// A concurrent HTTP server -- one thread, one loop, several clients at once. Self-contained: no
+// external server and no network, just loopback. The point is what the old blocking std::net could
+// not do: while one client is being served, the other is not waiting its turn.
+//
+// The shape is the whole idiom. Ask `poll` which sockets can move, move each one a single step,
+// come back. No callbacks (a closure captures by value and could not update the server's state) and
+// no scheduler -- the loop belongs to the program, and so does the per-connection state, which is
+// why it can live in an ordinary Map keyed by the descriptor.
+//
+// Deterministic output, always exits 0: the two clients are answered in whatever order the OS
+// reports them ready, so the replies are sorted before printing. Asserting an arrival order would
+// be asserting a race.
+use std::net::*
+use std::poll::*
+
+
+// What one connection still owes us: the request bytes read so far, the reply not yet sent, and
+// whether it is finished. A closed socket must leave the watch set -- its descriptor is gone from
+// the registry, and handing a freed one to `poll` is an error, not a no-op.
+struct Session {
+    inbox: Bytes,
+    outbox: String,
+    done: Bool
+}
+
+// A fresh session -- nothing read, nothing owed, not finished.
+fn blank() -> Session {
+    Session { inbox: bytes(), outbox: "", done: false }
+}
+
+fn httpReply(path: String) -> String {
+    let body = "you asked for " + path
+    "HTTP/1.0 200 OK\r\nContent-Length: "
+        + toString(len(body))
+        + "\r\n\r\n"
+        + body
+}
+
+// The request target of "GET /a HTTP/1.0", or "" while the request head is still incomplete.
+fn requestPath(raw: Bytes) -> String {
+    let text = fromBytes(raw)
+    if indexOf(text, "\r\n\r\n") < 0 {
+        ""
+    } else {
+        let sp1 = indexOf(text, " ")
+        if sp1 < 0 {
+            "/"
+        } else {
+            let rest = slice(text, sp1 + 1, len(text))
+            let sp2 = indexOf(rest, " ")
+            if sp2 < 0 {
+                "/"
+            } else {
+                slice(rest, 0, sp2)
+            }
+        }
+    }
+}
+
+fn run() -> Result[(), String] {
+    let lst = listen(0)? // port 0 = one the OS picks for us
+    let port = lst.localPort()?
+    let srv = nonBlocking(lst)?
+
+    // Two clients, dialled before the loop starts. connect stays BLOCKING -- there is no
+    // non-blocking dial in this stage -- and each is switched over right afterwards.
+    let mut clients: Vec[NbConn] = vec()
+    for path in ["/alpha", "/beta"] {
+        let c = nonBlockingConn(connect("127.0.0.1", port)?)?
+        c.sendStr("GET " + path + " HTTP/1.0\r\nHost: localhost\r\n\r\n")?
+        push(clients, c)
+    }
+
+    let mut conns: Vec[NbConn] = vec() // the live server-side sockets
+    let mut state: Map[Int, Session] = #{} // their sessions, keyed by descriptor
+    let mut waiting: Vec[NbConn] = vec() // clients whose answer has not arrived
+    for c in clients {
+        push(waiting, c)
+    }
+    let mut replies: Vec[String] = vec()
+    let mut served = 0
+    let mut spins = 0
+
+    while (served < 2 || len(replies) < 2) && spins < 400 {
+        // Build the interest set fresh each round, from the LIVE sockets only: the listener is always
+        // worth watching, a server socket while its reply is unsent, a client until its answer arrives.
+        let mut fds: Vec[Int] = vec()
+        let mut want: Vec[Int] = vec()
+        push(fds, srv.fd)
+        push(want, READABLE)
+        for c in conns {
+            let s = getOr(state, c.fd, blank())
+            push(fds, c.fd)
+            push(want, if len(s.outbox) > 0 { WRITABLE } else { READABLE })
+        }
+        for c in waiting {
+            push(fds, c.fd)
+            push(want, READABLE)
+        }
+
+        let nconns = len(conns)
+        let ready = poll(fds, want, 50)?
+
+        // A new connection is waiting.
+        if (ready[0] & READABLE) != 0 {
+            if let Accepted::Conn(c) = srv.accept()? {
+                state[c.fd] = blank()
+                push(conns, c)
+            }
+        }
+
+        // Each server-side socket advances by exactly one step per round.
+        let mut i = 0
+        while i < nconns {
+            let c = conns[i]
+            let flags = ready[i + 1]
+            let mut s = getOr(state, c.fd, blank())
+            if (flags & READABLE) != 0 {
+                if let Received::Data(chunk) = c.recv(1024)? {
+                    appendBytes(s.inbox, chunk)
+                    let path = requestPath(s.inbox)
+                    if len(path) > 0 {
+                        s.outbox = httpReply(path)
+                    }
+                }
+            }
+            if (flags & WRITABLE) != 0 && len(s.outbox) > 0 {
+                // send takes what the kernel has room for and no more; the tail stays here for next round.
+                let n = c.sendStr(s.outbox)?
+                s.outbox = slice(s.outbox, n, len(s.outbox))
+                if len(s.outbox) == 0 {
+                    c.close()?
+                    s.done = true
+                    served = served + 1
+                }
+            }
+            state[c.fd] = s
+            i = i + 1
+        }
+
+        // The clients read their answers on the same loop.
+        let mut j = 0
+        let mut stillWaiting: Vec[NbConn] = vec()
+        while j < len(waiting) {
+            let cl = waiting[j]
+            let mut answered = false
+            if (ready[1 + nconns + j] & READABLE) != 0 {
+                if let Received::Data(chunk) = cl.recv(1024)? {
+                    let text = fromBytes(chunk)
+                    let sep = indexOf(text, "\r\n\r\n")
+                    if sep >= 0 {
+                        push(replies, slice(text, sep + 4, len(text)))
+                        answered = true
+                    }
+                }
+            }
+            if !answered {
+                push(stillWaiting, cl)
+            }
+            j = j + 1
+        }
+        waiting = stillWaiting
+
+        // Drop the finished server sockets: a closed descriptor must not reach the next poll.
+        let mut live: Vec[NbConn] = vec()
+        for c in conns {
+            if !getOr(state, c.fd, blank()).done {
+                push(live, c)
+            }
+        }
+        conns = live
+        spins = spins + 1
+    }
+
+    for r in sorted(replies) {
+        println(r)
+    }
+    for c in clients {
+        c.close()?
+    }
+    srv.close()?
+    Ok(())
+}
+
+match run() {
+    Ok(_) => print(""),
+    Err(e) => println("server failed: " + e)
+}

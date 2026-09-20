@@ -491,6 +491,7 @@ constexpr const char* STD_BYTES   = "std::bytes";   // LE binary reader/writer +
 constexpr const char* STD_MATH    = "std::math";    // math natives (sqrt/pow/... ) + toIntChecked   (opt-in)
 constexpr const char* STD_NET     = "std::net";     // TCP networking natives (tcpConnect/tcpSend/...) (opt-in)
 constexpr const char* STD_HASH    = "std::hash";    // hashing: crc32 (prelude) + the sha256 native       (opt-in)
+constexpr const char* STD_POLL    = "std::poll";    // non-blocking I/O + readiness (rawPoll/rawRecvNb/...) (opt-in)
 
 // Canonical (currently-mangled) names of the compiler-referenced prelude entities.
 inline std::string std_Option()       { return mangle_name(STD_CORE, "Option"); }

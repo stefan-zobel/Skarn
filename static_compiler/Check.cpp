@@ -1281,6 +1281,17 @@ private:
         // sha256 is a native (32-bit modular arithmetic is awkward in a 48-bit-Int language) returning the
         // raw 32-byte digest as Bytes; the prelude sha256Hex/sha256HexStr render it.
         add_native("sha256",       { B },    B,                                                 STD_HASH);
+        // Non-blocking I/O + readiness -- std::poll (opt-in). Gated separately from std::net so that
+        // taking the event loop is a deliberate `use`, and so the mode of a socket is visible in the
+        // program's imports. The "would block" outcome rides in the SUCCESS channel of each Result
+        // (-1 / an empty array / a 0 count) and the poll.skn wrappers turn it into an enum arm.
+        add_native("rawSetNonBlocking", { ty_int(), ty_bool() }, make_named(std_Result(), { ty_unit(), S }), STD_POLL);
+        add_native("rawPoll",      { make_named("Vec", { ty_int() }), make_named("Vec", { ty_int() }), ty_int() },
+                                   make_named(std_Result(), { make_named("Array", { ty_int() }), S }), STD_POLL);
+        add_native("rawAcceptNb",  { ty_int() },    make_named(std_Result(), { ty_int(),   S }), STD_POLL);
+        add_native("rawRecvNb",    { ty_int(), ty_int() },
+                                   make_named(std_Result(), { make_named("Array", { B }), S }), STD_POLL);
+        add_native("rawSendNb",    { ty_int(), B },  make_named(std_Result(), { ty_int(),  S }), STD_POLL);
     }
 
     // Is a gated native `name` callable from the module currently being checked? A native NOT in

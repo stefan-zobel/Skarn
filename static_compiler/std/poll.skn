@@ -1,0 +1,112 @@
+// Non-blocking I/O and readiness polling -- serving MANY connections from one thread. A program
+// asks `poll` which of its sockets can be acted on right now, then advances each one a step and
+// comes back. There is no callback and no scheduler: the loop is the program's own, which is what
+// lets it keep per-connection state in an ordinary Map.
+//
+// OPT-IN: reach these wrappers AND the raw natives via `use std::poll::*`. Builds on std::net --
+// a listener or connection is created there (blocking) and taken over here.
+//
+// THE THREE OUTCOMES. On a non-blocking socket, "nothing right now" is neither a value nor an
+// error, and it is NOT the same as "the peer closed". `accept` and `recv` therefore answer with an
+// enum, not with an empty result -- confusing the two is what makes a server either drop live
+// connections or keep dead ones forever.
+//
+// SENDING IS PARTIAL. `send` returns how many bytes the kernel ACCEPTED, which may be fewer than
+// offered, or zero. There is deliberately no send-all: waiting for the rest is exactly the blocking
+// this module exists to avoid. The caller keeps the unsent tail and retries when `poll` reports the
+// socket writable.
+//
+// LIMITS (deliberate): ONE core -- this is concurrency, not parallelism; a CPU-heavy handler blocks
+// every connection, and so does a garbage-collection pause; `connect` stays BLOCKING (std::net's
+// has its own timeout), so there is no non-blocking client dial; plaintext only, as in std::net.
+use std::net::*
+
+// Readiness flags, as returned by `poll` and passed to it as interest. They are a packed Int, not
+// an enum, because a socket can be several of these at once -- which is the one thing an enum
+// cannot say. Test with `(flags & READABLE) != 0`.
+pub const READABLE: Int = 1     // data can be read, or a connection is waiting to be accepted
+pub const WRITABLE: Int = 2     // a send has room in the kernel buffer
+pub const CLOSED:   Int = 4     // hangup or error; the socket is done either way
+
+// A listening socket in non-blocking mode. `fd` is the descriptor -- the key to use when the
+// program keeps its own per-socket state, and what goes into the vector handed to `poll`.
+pub struct NbListener { fd: Int }
+
+// An accepted or taken-over connection in non-blocking mode.
+pub struct NbConn { fd: Int }
+
+// The outcome of a non-blocking accept: either a connection or nobody waiting.
+pub enum Accepted { Conn(NbConn), WouldBlock }
+
+// The outcome of a non-blocking read. `Closed` is the peer having shut down -- final, the socket
+// will never produce data again. `WouldBlock` is the opposite: nothing has arrived YET.
+pub enum Received { Data(Bytes), WouldBlock, Closed }
+
+// --- taking a std::net socket over ---
+
+// Switch a listener into non-blocking mode. The blocking `l` must not be used afterwards; its
+// `accept` would no longer wait.
+pub fn nonBlocking(l: TcpListener) -> Result[NbListener, String] {
+  rawSetNonBlocking(l.fd, true)?
+  Ok(NbListener { fd: l.fd })
+}
+
+// Switch a connection into non-blocking mode -- the client side of a loop, since `connect` itself
+// stays blocking.
+pub fn nonBlockingConn(c: TcpConn) -> Result[NbConn, String] {
+  rawSetNonBlocking(c.fd, true)?
+  Ok(NbConn { fd: c.fd })
+}
+
+// --- the readiness scan ---
+
+// Wait until at least one socket is ready or `timeoutMs` expires (0 = return at once, a negative
+// value = wait indefinitely). `interest` says per socket what to watch for, as an OR of READABLE
+// and WRITABLE; asking for WRITABLE with nothing to send makes `poll` return immediately every
+// time, which turns the loop into a spin.
+//
+// The result is INDEX-PARALLEL to `fds`: element i holds the flags for fds[i], 0 when nothing
+// happened. Both vectors must have the same length.
+pub fn poll(fds: Vec[Int], interest: Vec[Int], timeoutMs: Int) -> Result[Array[Int], String] {
+  rawPoll(fds, interest, timeoutMs)
+}
+
+// --- a listener's own API ---
+
+impl NbListener {
+  // Take the next waiting connection, or report that none is waiting. Never blocks. The returned
+  // connection is already non-blocking.
+  fn accept(self) -> Result[Accepted, String] {
+    let fd = rawAcceptNb(self.fd)?
+    if fd < 0 { Ok(Accepted::WouldBlock) } else { Ok(Accepted::Conn(NbConn { fd: fd })) }
+  }
+
+  // Stop listening.
+  fn close(self) -> Result[(), String] { tcpClose(self.fd) }
+}
+
+// --- a connection's own API ---
+
+impl NbConn {
+  // Read up to `n` bytes without waiting. `Data` carries at least one byte; `Closed` means the peer
+  // shut down; `WouldBlock` means nothing has arrived yet.
+  fn recv(self, n: Int) -> Result[Received, String] {
+    let got = rawRecvNb(self.fd, n)?
+    if len(got) == 0 {
+      Ok(Received::WouldBlock)
+    } else {
+      let b = got[0]
+      if len(b) == 0 { Ok(Received::Closed) } else { Ok(Received::Data(b)) }
+    }
+  }
+
+  // Offer `data` to the kernel and report how many bytes it took -- possibly fewer than offered,
+  // possibly none. Retry the remainder when `poll` next reports the socket writable.
+  fn send(self, data: Bytes) -> Result[Int, String] { rawSendNb(self.fd, data) }
+
+  // Offer a string's bytes; same partial-write rule as `send`.
+  fn sendStr(self, s: String) -> Result[Int, String] { rawSendNb(self.fd, toBytes(s)) }
+
+  // Close the connection and free its descriptor.
+  fn close(self) -> Result[(), String] { tcpClose(self.fd) }
+}

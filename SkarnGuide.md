@@ -64,9 +64,10 @@ points are an opt-in layer). It targets a compact interpreter, not native code, 
 that removes Rust's single hardest concept. Where Rust asks "who owns this, and for how long?", Skarn's answer
 is "the GC does — write the obvious code."
 
-Skarn is also **single-threaded**, by design: there are no threads, no `async`, and no channels; the
-garbage collector is stop-the-world; and `std::net` is blocking (one connection at a time). Concurrency is a
-deliberate non-goal here — when you need parallelism, shell out to OS processes with `std::process`.
+Skarn is also **single-threaded**, by design: there are no threads, no `async`, and no channels, and the
+garbage collector is stop-the-world. One thread can still serve many connections at once — `std::poll`
+turns waiting into asking, so a program advances whichever socket is ready — but that is concurrency on
+one core, not parallelism. For parallelism, shell out to OS processes with `std::process`.
 
 Let's be honest about the rest, though: what Skarn removes is Rust's **difficulty** (ownership, lifetimes, the borrow
 checker), not Rust's **feature count**. The surface is Rust-family-sized — traits, generics, `dyn`, exhaustive
@@ -3463,6 +3464,7 @@ the filesystem, and one without `use std::process` cannot start a program.
 | `std::cli` | a spec-free command-line parser: `--name=value` options, `--name` / `-abc` flags, `--`, positionals |
 | `std::hash` | CRC-32 and MurmurHash3 (fast, **not** secure) plus SHA-256 (cryptographic) and hex encoding |
 | `std::net` | blocking TCP (IPv4 + IPv6) and a minimal HTTP/1.0 `httpGet` — one connection at a time, **plaintext only** (no TLS, so `http://` not `https://`) |
+| `std::poll` | non-blocking sockets and readiness polling — many connections from one thread, with the loop written by the program; builds on `std::net` |
 | `std::regex` | linear-time byte-level regular expressions (Thompson NFA / Pike VM) — no catastrophic backtracking, and therefore **no** backreferences or lookaround |
 
 This table says only what each module is *for*. **Every function of every module, with its signature, is listed
@@ -3654,6 +3656,69 @@ match httpGet("example.com", 80, "/") {
   Err(e) => println(e)
 }
 ```
+
+### Serving more than one connection
+
+Everything above blocks: `accept` waits for a client, `recv` waits for bytes, and while it waits the
+program does nothing else. That is fine for a client and hopeless for a server — a second visitor is
+not slow, it is ignored until the first one leaves.
+
+`std::poll` removes the waiting. A socket switched to non-blocking mode answers *"nothing right now"*
+instead of stopping, and `poll` says which of a set of sockets can actually be acted on. The loop
+belongs to the program, which is what lets it keep per-connection state in an ordinary `Map`:
+
+```rust check
+use std::net::*
+use std::poll::*
+
+fn serve() -> Result[(), String] {
+  let srv = nonBlocking(listen(8080)?)?
+  let mut conns: Vec[NbConn] = vec()
+
+  loop {
+    let mut fds: Vec[Int] = vec()
+    let mut want: Vec[Int] = vec()
+    push(fds, srv.fd)  push(want, READABLE)         // interest: what to watch per socket
+    for c in conns { push(fds, c.fd)  push(want, READABLE) }
+
+    let live = len(conns)
+    let ready = poll(fds, want, 50)?                // index-parallel to fds; 50 ms timeout
+    if (ready[0] & READABLE) != 0 {
+      if let Accepted::Conn(c) = srv.accept()? { push(conns, c) }   // never blocks
+    }
+    let mut i = 0
+    while i < live {
+      match conns[i].recv(1024)? {
+        Received::Data(b)    => println("got " + toString(len(b)) + " bytes"),
+        Received::WouldBlock => println("nothing yet"),   // come back next round
+        Received::Closed     => println("peer hung up")
+      }
+      i = i + 1
+    }
+  }
+}
+match serve() { Ok(_) => println("done"), Err(e) => println(e) }
+```
+
+Three things in that loop are worth naming, because each one is a rule rather than a detail.
+
+**"Nothing yet" and "the peer left" are different answers.** `Received::WouldBlock` means come back;
+`Received::Closed` is final. A server that confuses them either drops live connections or keeps dead
+ones forever, so `recv` returns an enum and makes you say which one you mean.
+
+**Readiness is flags, not a state.** A socket can be readable and writable at once, so `poll` answers
+with a packed `Int` you test with `&`, using the constants `READABLE`, `WRITABLE` and `CLOSED`. Ask for
+`WRITABLE` only while you actually have something to send — a socket with a free buffer is writable
+essentially always, so watching for it with an empty outbox turns the loop into a spin.
+
+**Sending is partial.** `send` returns how many bytes the kernel *accepted*, which may be fewer than
+offered, or none. There is no send-all here, because waiting for the rest is precisely the blocking
+being avoided; keep the tail and retry when `poll` next reports the socket writable.
+
+What does **not** change: this is one thread on one core. Two connections make progress in turn, not at
+the same time, and a slow handler — or a garbage-collection pause — still holds up everyone. `connect`
+also stays blocking; a client dials with `std::net` and is switched over with `nonBlockingConn`.
+`demo/poll_server.skn` runs a small HTTP server and two clients this way, in a single process.
 
 And `std::regex` matches, captures, and rewrites text with a linear-time engine (compile once, reuse):
 
@@ -4363,6 +4428,19 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `listen(port)` (free) / `l.accept()` / `l.close()` | server: bind+listen → `TcpListener`; block for a client → `TcpConn`; stop listening |
 | `l.localPort()` | the port actually bound → `Result[Int, String]`. Pass **`listen(0)`** to let the OS pick a free one and read it back here — safer than naming a fixed port, which may already be in use |
 | `httpGet(host, port, path)` | a minimal HTTP/1.0 GET → `Result[HttpResponse, String]` (`.status: Int`, `.body: String`; free) |
+
+**Non-blocking I/O** *(all `std::poll` — `use std::poll::*`; one thread, many connections; `connect` stays blocking)*
+
+| Function | Purpose |
+|----------|---------|
+| `nonBlocking(l)` / `nonBlockingConn(c)` | take a `std::net` listener / connection over → `Result[NbListener, String]` / `Result[NbConn, String]` (free) |
+| `poll(fds, interest, timeoutMs)` | wait for readiness → `Result[Array[Int], String]`, **index-parallel to `fds`**. `timeoutMs` 0 = return at once, negative = wait indefinitely (free) |
+| `READABLE` / `WRITABLE` / `CLOSED` | the flag constants, packed in an `Int` — test with `(flags & READABLE) != 0`, combine with `\|` |
+| `l.accept()` | take a waiting connection → `Result[Accepted, String]`: `Accepted::Conn(c)` or `Accepted::WouldBlock`. Never blocks |
+| `c.recv(n)` | read up to `n` bytes → `Result[Received, String]`: `Received::Data(b)`, `Received::WouldBlock` (nothing **yet**) or `Received::Closed` (peer gone — **not** the same thing) |
+| `c.send(bytes)` / `c.sendStr(s)` | offer bytes → `Result[Int, String]`, the count the kernel **accepted** (may be short, or 0). There is no send-all: keep the tail and retry when `WRITABLE` |
+| `l.close()` / `c.close()` | close and free the descriptor → `Result[(), String]`. A closed descriptor must leave the `fds` vector |
+| `l.fd` / `c.fd` | the descriptor — what goes into `fds`, and the natural key for the program's own state `Map` |
 
 **Regex** *(all `std::regex` — `use std::regex::*`; byte-level, linear-time Pike VM; no backrefs/lookaround. Note the names: matching anywhere is `search`, not `find`, and rewriting is `replaceRe`, not `replace` — those two belong to `std::iter` / `std::string`)*
 

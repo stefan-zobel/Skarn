@@ -1,0 +1,53 @@
+// CLAIM: on a non-blocking socket "nothing has arrived YET" and "the peer closed" are DIFFERENT
+//        answers -- Received::WouldBlock vs Received::Closed. Confusing them is what makes a server
+//        either drop live connections or keep dead ones forever, so recv reports which one it is.
+// GUIDE: 21 (Serving more than one connection)
+// EXPECT: ok would-block then closed
+use std::net::*
+use std::poll::*
+
+
+fn describe(r: Received) -> String {
+  match r {
+    Received::Data(_)    => "data",
+    Received::WouldBlock => "would-block",
+    Received::Closed     => "closed"
+  }
+}
+
+
+fn probe() -> Result[String, String] {
+  let lst = listen(0)?
+  let port = lst.localPort()?
+  let srv = nonBlocking(lst)?
+  let cli = nonBlockingConn(connect("127.0.0.1", port)?)?
+
+  let mut fds: Vec[Int] = vec()
+  let mut want: Vec[Int] = vec()
+  push(fds, srv.fd)  push(want, READABLE)
+  poll(fds, want, 2000)?
+  let con = match srv.accept()? {
+    Accepted::Conn(c)    => c,
+    Accepted::WouldBlock => return Err("no connection although poll reported the listener ready")
+  }
+
+  // Connected, but nothing sent: not an error, not an end -- just nothing yet.
+  let quiet = describe(con.recv(64)?)
+
+  cli.close()?
+  let mut f2: Vec[Int] = vec()
+  let mut w2: Vec[Int] = vec()
+  push(f2, con.fd)  push(w2, READABLE)
+  poll(f2, w2, 2000)?
+  let dead = describe(con.recv(64)?)
+
+  con.close()?
+  srv.close()?
+  Ok(quiet + " then " + dead)
+}
+
+
+match probe() {
+  Ok(s)  => println(s),
+  Err(e) => println("ERR " + e)
+}

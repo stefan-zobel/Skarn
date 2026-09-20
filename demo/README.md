@@ -38,6 +38,7 @@ x64\Release\static_vmrun.exe demo\json.skn
 | `file_io.skn` | `std::io`: writes, reads and removes a file in the current directory |
 | `net_echo.skn` | `std::net`: a TCP echo over the loopback interface |
 | `http_get.skn` | `std::net`: an HTTP GET to example.com; needs a network connection |
+| `poll_server.skn` | `std::poll`: an HTTP server and two clients on ONE thread, driven by one readiness loop |
 | `gc_stats.skn` | `gcResetStats` / `gcStats`: measuring garbage-collector activity from Skarn |
 
 ## Larger programs

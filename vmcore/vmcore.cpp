@@ -40,6 +40,7 @@
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <fcntl.h>
+#  include <poll.h>     // poll() -- the readiness scan behind the std::poll natives
 #  include <unistd.h>
 #  include <cerrno>
 #  include <cstring>    // std::strerror
@@ -68,6 +69,48 @@ static void sock_close(socket_t s) { closesocket(s); }
 using socket_t = int;
 static constexpr socket_t INVALID_SOCK = -1;
 static void sock_close(socket_t s) { ::close(s); }
+#endif
+
+// ---- Portable readiness poll (std::poll natives) ----------------------------
+// WSAPoll (Winsock 2.2) and POSIX poll() take the same {fd, events, revents} triple with the same
+// meaning for the flags used here; only the spelling differs, including the event masks -- Winsock
+// wants the *NORM variants, POSIX names the plain ones.
+//
+// KNOWN Windows limitation, deliberately not worked around: WSAPoll does not report a FAILED
+// connection through POLLERR. It does not bite here because a connection is still established by
+// the blocking tcpConnect (which has its own select() timeout) and only then switched to
+// non-blocking -- stage 1 has no non-blocking connect.
+#ifdef _WIN32
+using pollfd_t = WSAPOLLFD;
+static int sock_poll(pollfd_t* fds, unsigned n, int timeout_ms) { return WSAPoll(fds, n, timeout_ms); }
+static constexpr short POLL_READ  = POLLRDNORM;
+static constexpr short POLL_WRITE = POLLWRNORM;
+#else
+using pollfd_t = struct pollfd;
+static int sock_poll(pollfd_t* fds, unsigned n, int timeout_ms) { return ::poll(fds, n, timeout_ms); }
+static constexpr short POLL_READ  = POLLIN;
+static constexpr short POLL_WRITE = POLLOUT;
+#endif
+
+// Writing to a socket whose peer has already closed raises SIGPIPE on BSD-derived systems (macOS),
+// and SIGPIPE's default action TERMINATES the process -- a silent kill, not a returned error. With
+// one short-lived connection per program this was nearly unreachable; under an event loop, peers
+// disconnecting mid-write are routine, so it is suppressed at the source on every socket the
+// registry takes ownership of. Windows has no such signal. Linux offers no SO_NOSIGPIPE and uses
+// the per-call MSG_NOSIGNAL below instead.
+static void sock_suppress_sigpipe(socket_t s) {
+#ifdef SO_NOSIGPIPE
+    int on = 1;
+    setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, reinterpret_cast<char*>(&on), sizeof(on));
+#else
+    (void)s;
+#endif
+}
+
+#ifdef MSG_NOSIGNAL
+static constexpr int SOCK_SEND_FLAGS = MSG_NOSIGNAL;  // Linux: suppress SIGPIPE per send() call
+#else
+static constexpr int SOCK_SEND_FLAGS = 0;             // Windows: no signal; macOS: SO_NOSIGPIPE above
 #endif
 
 // TCP socket registry for the std::net natives -- defined here (before execute()) so execute() can
@@ -1200,13 +1243,19 @@ static std::string net_error_msg(const char* op) {
 #endif
 }
 
-#ifndef _WIN32
-static int set_nonblocking(int s, bool nb) {
+// Switch a socket between blocking and non-blocking mode; 0 on success, -1 on failure. Both
+// platforms in one place: the timed connect below uses it to bound a dead host, and the std::poll
+// natives use it for their whole purpose -- a socket that answers "would block" instead of waiting.
+static int set_nonblocking(socket_t s, bool nb) {
+#ifdef _WIN32
+    u_long v = nb ? 1u : 0u;
+    return (ioctlsocket(s, FIONBIO, &v) == 0) ? 0 : -1;
+#else
     int flags = fcntl(s, F_GETFL, 0);
     if (flags < 0) return -1;
     return fcntl(s, F_SETFL, nb ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK));
-}
 #endif
+}
 static const long NET_CONNECT_TIMEOUT_SEC = 10;   // connect() select() timeout
 static const long NET_RECV_CHUNK_MAX      = 1 << 20; // cap a single tcpRecv at 1 MiB
 
@@ -1234,11 +1283,8 @@ static Value native_tcp_connect(Value* args, uint8_t nargs, Context* ctx) {
     for (addrinfo* ai = res; ai && sock == INVALID_SOCK; ai = ai->ai_next) {
         socket_t s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (s == INVALID_SOCK) continue;
-#ifdef _WIN32
-        u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
-#else
+        sock_suppress_sigpipe(s);
         set_nonblocking(s, true);
-#endif
         int rc = connect(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
         bool ok = (rc == 0);
 #ifdef _WIN32
@@ -1258,11 +1304,7 @@ static Value native_tcp_connect(Value* args, uint8_t nargs, Context* ctx) {
                 ok = (soErr == 0);
             }
         }
-#ifdef _WIN32
-        u_long bl = 0; ioctlsocket(s, FIONBIO, &bl);
-#else
-        set_nonblocking(s, false);
-#endif
+        set_nonblocking(s, false);   // every descriptor Skarn sees from std::net is blocking
         if (ok) sock = s; else sock_close(s);
     }
     freeaddrinfo(res);
@@ -1289,7 +1331,7 @@ static Value native_tcp_send(Value* args, uint8_t nargs, Context* ctx) {
     }
     size_t sent = 0;
     while (sent < data.size()) {
-        int n = ::send(s, data.data() + sent, static_cast<int>(data.size() - sent), 0);
+        int n = ::send(s, data.data() + sent, static_cast<int>(data.size() - sent), SOCK_SEND_FLAGS);
         if (n < 0) return native_make_error(ctx, "tcpSend: " + net_error_msg("send"));
         sent += static_cast<size_t>(n);
     }
@@ -1347,6 +1389,7 @@ static Value native_tcp_listen(Value* args, uint8_t nargs, Context* ctx) {
     if (!ensure_wsa()) return native_make_error(ctx, "tcpListen: WSAStartup failed");
     socket_t s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCK) return native_make_error(ctx, "tcpListen: " + net_error_msg("socket"));
+    sock_suppress_sigpipe(s);
 #ifdef _WIN32
     DWORD v6only = 0; setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<char*>(&v6only), sizeof(v6only));
     BOOL  reuse  = TRUE; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char*>(&reuse), sizeof(reuse));
@@ -1374,6 +1417,7 @@ static Value native_tcp_accept(Value* args, uint8_t nargs, Context* ctx) {
     if (s == INVALID_SOCK) return native_make_error(ctx, "tcpAccept: invalid socket");
     socket_t c = accept(s, nullptr, nullptr);
     if (c == INVALID_SOCK) return native_make_error(ctx, "tcpAccept: " + net_error_msg("accept"));
+    sock_suppress_sigpipe(c);
     return Value::fromSigned48(ctx->vm->net->add(c));
 }
 
@@ -1419,6 +1463,221 @@ static Value native_tcp_set_timeout(Value* args, uint8_t nargs, Context* ctx) {
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
     return Value::fromNil();
+}
+
+// =============================================================================
+// Non-blocking I/O + readiness polling (std::poll). The natives behind the prelude's event loop:
+// a socket switched to non-blocking mode answers "would block" instead of waiting, and rawPoll
+// reports which of a set of sockets can be acted on. Everything else -- the loop, the per-connection
+// state, the unsent-tail bookkeeping -- is written in Skarn on top of these five.
+//
+// The "would block" outcome is neither a value nor an error, so each native encodes it in the
+// SUCCESS channel and the prelude turns it into an enum arm: -1 for accept, a 0-element array for
+// recv, a 0 count for send. It must never be folded into an empty read, because an empty read
+// already means the peer closed -- the exact conflation this module exists to remove.
+// =============================================================================
+
+// Skarn-side readiness flags, mirrored by the `READABLE` / `WRITABLE` / `CLOSED` consts in
+// std/poll.skn. They are a packed Int rather than an enum because a socket can be several of these
+// at once, which is precisely what an enum cannot say.
+static constexpr int64_t SK_POLL_READABLE = 1;
+static constexpr int64_t SK_POLL_WRITABLE = 2;
+static constexpr int64_t SK_POLL_CLOSED   = 4;
+
+// Read a Vec[Int] or Array[Int] argument into host memory. Same shape as rawRun's argv walk: the
+// whole read happens BEFORE any allocation, so nothing here can be moved out from under us.
+static bool read_int_seq(Value v, std::vector<int64_t>* out) {
+    if (!v.isPtr()) return false;
+    GcObject* hdr   = GcObject::from_slots(v.asPtr());
+    Value*    elems = nullptr;
+    uint32_t  n     = 0;
+    if (hdr->kind == GcObject::KIND_ARRAY) {
+        elems = hdr->slots();
+        n     = static_cast<uint32_t>(hdr->slot_count());
+    } else if (hdr->kind == GcObject::KIND_VEC) {
+        GcObject* backing = GcObject::from_slots(hdr->slots()[VEC_SLOT_BACKING].asPtr());
+        n     = static_cast<uint32_t>(hdr->slots()[VEC_SLOT_COUNT].asSigned48());
+        elems = backing->slots();
+    } else {
+        return false;
+    }
+    out->reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!elems[i].isInt()) return false;
+        out->push_back(elems[i].asSigned48());
+    }
+    return true;
+}
+
+// True when the last socket call failed only because it would have blocked -- the one "error" that
+// is not one. Windows reports it through WSAGetLastError, POSIX through errno, and POSIX is allowed
+// to use either of two spellings that may or may not be the same value.
+static bool sock_would_block() {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
+
+// rawSetNonBlocking(sock, on) -> nil (success) | String (error). Switches an existing descriptor
+// between the two modes. std::net hands out blocking sockets only, so this is what the std::poll
+// wrappers call to take one over.
+static Value native_raw_set_non_blocking(Value* args, uint8_t nargs, Context* ctx) {
+    if (!ctx->vm->net) return native_make_error(ctx, "rawSetNonBlocking: networking unavailable");
+    if (nargs < 2 || !args[0].isInt() || !args[1].isBool())
+        return native_make_error(ctx, "rawSetNonBlocking: expected (sock: Int, on: Bool)");
+    socket_t s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
+    if (s == INVALID_SOCK) return native_make_error(ctx, "rawSetNonBlocking: invalid socket");
+    if (set_nonblocking(s, args[1].asBool()) != 0)
+        return native_make_error(ctx, "rawSetNonBlocking: " + net_error_msg("fcntl/ioctlsocket"));
+    return Value::fromNil();
+}
+
+// rawPoll(fds, interest, timeoutMs) -> Array[Int] (success) | String (error). Waits until at least
+// one socket is ready or the timeout expires, and answers INDEX-PARALLEL to `fds`: element i holds
+// the ready flags for fds[i], 0 when nothing happened. `interest` is the per-socket mask of what the
+// caller cares about -- a server with nothing to write must be able NOT to ask for writability, or
+// poll returns immediately every time and the loop spins.
+//
+// Allocation: exactly one, for the result array, and its elements are immediates -- so nothing can
+// move after the array exists and no rooting is needed (the native_raw_gc_stats shape, not the
+// native_args one).
+static Value native_raw_poll(Value* args, uint8_t nargs, Context* ctx) {
+    if (!ctx->vm->net) return native_make_error(ctx, "rawPoll: networking unavailable");
+    if (nargs < 3 || !args[2].isInt())
+        return native_make_error(ctx, "rawPoll: expected (fds: Vec[Int], interest: Vec[Int], timeoutMs: Int)");
+    std::vector<int64_t> fds, interest;
+    if (!read_int_seq(args[0], &fds) || !read_int_seq(args[1], &interest))
+        return native_make_error(ctx, "rawPoll: fds and interest must be sequences of Int");
+    if (fds.size() != interest.size())
+        return native_make_error(ctx, "rawPoll: fds and interest must have the same length");
+
+    std::vector<pollfd_t> pfds;
+    pfds.reserve(fds.size());
+    bool any_interest = false;
+    for (size_t i = 0; i < fds.size(); ++i) {
+        socket_t s = ctx->vm->net->get(static_cast<int>(fds[i]));
+        if (s == INVALID_SOCK) return native_make_error(ctx, "rawPoll: invalid socket");
+        pollfd_t p{};
+        p.fd     = s;
+        p.events = static_cast<short>(((interest[i] & SK_POLL_READABLE) ? POLL_READ  : 0) |
+                                      ((interest[i] & SK_POLL_WRITABLE) ? POLL_WRITE : 0));
+        if (p.events != 0) any_interest = true;
+        pfds.push_back(p);
+    }
+
+    // A platform difference that would otherwise surface as a baffling error: POSIX poll() accepts an
+    // all-zero events set (it still reports hangups), WSAPoll REJECTS it with WSAEINVAL. Asking for
+    // nothing is a legitimate state for a loop with nothing outstanding, so it answers "nothing is
+    // ready" on both rather than failing on one.
+    const long timeout_ms = static_cast<long>(args[2].asSigned48());
+    if (!pfds.empty() && any_interest) {
+        const int rc = sock_poll(pfds.data(), static_cast<unsigned>(pfds.size()),
+                                 static_cast<int>(timeout_ms));
+        if (rc < 0) return native_make_error(ctx, "rawPoll: " + net_error_msg("poll"));
+    } else {
+        for (pollfd_t& p : pfds) p.revents = 0;
+    }
+
+    const uint32_t n = static_cast<uint32_t>(pfds.size());
+    GcObject* arrObj = ctx->vm->heap->alloc_slots_gc(GcObject::KIND_ARRAY, n, ctx);
+    Value     arr    = Value::fromPtr(arrObj->payload());
+    Value*    slots  = GcObject::from_slots(arr.asPtr())->slots();
+    for (uint32_t i = 0; i < n; ++i) {
+        const short re = pfds[i].revents;
+        int64_t flags = 0;
+        if (re & POLL_READ)                            flags |= SK_POLL_READABLE;
+        if (re & POLL_WRITE)                           flags |= SK_POLL_WRITABLE;
+        if (re & (POLLERR | POLLHUP | POLLNVAL))       flags |= SK_POLL_CLOSED;
+        slots[i] = Value::fromSigned48(flags);   // immediates only -> no further allocation, no root
+    }
+    return arr;
+}
+
+// rawAcceptNb(listenSock) -> Int (success) | String (error). >= 0 is the descriptor of an accepted
+// connection, -1 means "would block" -- nobody is waiting. The accepted socket is explicitly put
+// into non-blocking mode: whether it INHERITS the listener's mode differs between platforms
+// (Windows inherits, BSD/macOS does not), and the loop must not depend on which one it is on.
+static Value native_raw_accept_nb(Value* args, uint8_t nargs, Context* ctx) {
+    if (!ctx->vm->net) return native_make_error(ctx, "rawAcceptNb: networking unavailable");
+    if (nargs < 1 || !args[0].isInt()) return native_make_error(ctx, "rawAcceptNb: expected (sock: Int)");
+    socket_t s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
+    if (s == INVALID_SOCK) return native_make_error(ctx, "rawAcceptNb: invalid socket");
+    socket_t c = accept(s, nullptr, nullptr);
+    if (c == INVALID_SOCK) {
+        if (sock_would_block()) return Value::fromSigned48(-1);
+        return native_make_error(ctx, "rawAcceptNb: " + net_error_msg("accept"));
+    }
+    sock_suppress_sigpipe(c);
+    set_nonblocking(c, true);
+    return Value::fromSigned48(ctx->vm->net->add(c));
+}
+
+// rawRecvNb(sock, maxBytes) -> Array[Bytes] (success) | String (error). THREE outcomes in one call:
+// an EMPTY array means "would block", a 1-element array holds the read, and that element being
+// empty means the peer closed. The array is the carrier because Bytes alone cannot say three
+// things -- empty is already taken by EOF -- and a homogeneous Array[Bytes] types without a codegen
+// special case, unlike rawRun's heterogeneous Array[3]. The prelude hides it behind `Received`.
+static Value native_raw_recv_nb(Value* args, uint8_t nargs, Context* ctx) {
+    if (!ctx->vm->net) return native_make_error(ctx, "rawRecvNb: networking unavailable");
+    if (nargs < 2 || !args[0].isInt() || !args[1].isInt())
+        return native_make_error(ctx, "rawRecvNb: expected (sock: Int, maxBytes: Int)");
+    socket_t s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
+    if (s == INVALID_SOCK) return native_make_error(ctx, "rawRecvNb: invalid socket");
+    long maxB = static_cast<long>(args[1].asSigned48());
+    if (maxB < 0) return native_make_error(ctx, "rawRecvNb: maxBytes must be non-negative");
+    if (maxB > NET_RECV_CHUNK_MAX) maxB = NET_RECV_CHUNK_MAX;
+
+    std::string buf;
+    buf.resize(static_cast<size_t>(maxB));
+    const int n = (maxB == 0) ? 0 : ::recv(s, buf.data(), static_cast<int>(maxB), 0);
+    Heap* heap = ctx->vm->heap;
+    if (n < 0) {
+        if (sock_would_block())                       // the empty array: nothing to read YET
+            return Value::fromPtr(heap->alloc_slots_gc(GcObject::KIND_ARRAY, 0, ctx)->payload());
+        return native_make_error(ctx, "rawRecvNb: " + net_error_msg("recv"));
+    }
+    const std::string got(buf.data(), static_cast<size_t>(n));  // host copy before the allocating build
+
+    // Build the payload FIRST and keep it rooted across the array allocation: bytes_from_str
+    // allocates twice internally, and the array allocation below can move what it produced.
+    Value payload = Value::fromNil();
+    heap->add_root(&payload);
+    bytes_from_str(ctx, &payload, got);
+    GcObject* arrObj = heap->alloc_slots_gc(GcObject::KIND_ARRAY, 1, ctx);   // may collect -> payload moves
+    Value     arr    = Value::fromPtr(arrObj->payload());
+    GcObject::from_slots(arr.asPtr())->slots()[0] = payload;                 // re-read through the root
+    heap->remove_root(&payload);
+    return arr;
+}
+
+// rawSendNb(sock, data) -> Int (success) | String (error). The count of bytes the kernel ACCEPTED,
+// which may be less than what was offered: on a non-blocking socket a full send buffer is normal,
+// not an error. 0 means nothing went out (would block). There is deliberately no send-all loop --
+// it cannot exist here; the caller keeps the unsent tail and tries again when poll says writable.
+static Value native_raw_send_nb(Value* args, uint8_t nargs, Context* ctx) {
+    if (!ctx->vm->net) return native_make_error(ctx, "rawSendNb: networking unavailable");
+    if (nargs < 2 || !args[0].isInt())
+        return native_make_error(ctx, "rawSendNb: expected (sock: Int, data: Bytes)");
+    if (!args[1].isPtr() || GcObject::from_slots(args[1].asPtr())->kind != GcObject::KIND_BYTES)
+        return native_make_error(ctx, "rawSendNb: data must be a byte buffer");
+    socket_t s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
+    if (s == INVALID_SOCK) return native_make_error(ctx, "rawSendNb: invalid socket");
+    std::string data;
+    {
+        GcObject*      hdr     = GcObject::from_slots(args[1].asPtr());
+        GcObject*      backing = GcObject::from_slots(hdr->slots()[BYTES_SLOT_BACKING].asPtr());
+        const uint32_t count   = static_cast<uint32_t>(hdr->slots()[BYTES_SLOT_COUNT].asSigned48());
+        data.assign(backing->bytes(), count);   // host copy; nothing allocates before the send
+    }
+    if (data.empty()) return Value::fromSigned48(0);
+    const int n = ::send(s, data.data(), static_cast<int>(data.size()), SOCK_SEND_FLAGS);
+    if (n < 0) {
+        if (sock_would_block()) return Value::fromSigned48(0);
+        return native_make_error(ctx, "rawSendNb: " + net_error_msg("send"));
+    }
+    return Value::fromSigned48(static_cast<int64_t>(n));
 }
 
 // =============================================================================
@@ -1534,5 +1793,10 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_TCP_LOCAL_PORT] = native_tcp_local_port;
     t[NATIVE_SHA256]       = native_sha256;
     t[NATIVE_OS_ID]        = native_os_id;
+    t[NATIVE_SET_NON_BLOCKING] = native_raw_set_non_blocking;
+    t[NATIVE_POLL]         = native_raw_poll;
+    t[NATIVE_ACCEPT_NB]    = native_raw_accept_nb;
+    t[NATIVE_RECV_NB]      = native_raw_recv_nb;
+    t[NATIVE_SEND_NB]      = native_raw_send_nb;
     return t;
 }

@@ -26,4 +26,5 @@ std::time     time.skn
 std::cli      cli.skn
 std::hash     hash.skn
 std::net      net.skn
+std::poll     poll.skn
 std::regex    regex.skn

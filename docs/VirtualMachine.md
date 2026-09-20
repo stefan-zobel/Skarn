@@ -233,6 +233,13 @@ returned string means `Err(message)` and anything else means `Ok(value)`; for an
 means `None`. The VM never needs to know the `Result` and `Option` types. `CALL_NATIVE` is a GC safepoint,
 so a native copies its argument bytes out before it allocates.
 
+That leaves two channels, which is a limit worth knowing when a native has a third thing to say. The
+non-blocking socket natives are the case in point: "would block" is neither a value nor an error, so each
+one carries it inside its success value — a negative descriptor, an empty array, a zero count — and the
+standard library turns that into an ordinary enum before a program sees it. Picking a carrier the type
+system can already describe keeps this out of the compiler; a heterogeneous array would need a special
+case in code generation, as the process-spawning native does.
+
 **Adding a native:**
 
 1. Append a `NativeId` and extend `native_id_of`, `native_return_of` and `native_arity`.
