@@ -3709,7 +3709,9 @@ ones forever, so `recv` returns an enum and makes you say which one you mean.
 **Readiness is flags, not a state.** A socket can be readable and writable at once, so `poll` answers
 with a packed `Int` you test with `&`, using the constants `READABLE`, `WRITABLE` and `CLOSED`. Ask for
 `WRITABLE` only while you actually have something to send — a socket with a free buffer is writable
-essentially always, so watching for it with an empty outbox turns the loop into a spin.
+essentially always, so watching for it with an empty outbox turns the loop into a spin. Watching
+*nothing*, on the other hand, is safe: an empty socket list or an all-zero interest set still sleeps
+out the timeout, so a round with no outstanding work costs no CPU either.
 
 **Sending is partial.** `send` returns how many bytes the kernel *accepted*, which may be fewer than
 offered, or none. There is no send-all here, because waiting for the rest is precisely the blocking
@@ -4434,7 +4436,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | Function | Purpose |
 |----------|---------|
 | `nonBlocking(l)` / `nonBlockingConn(c)` | take a `std::net` listener / connection over → `Result[NbListener, String]` / `Result[NbConn, String]` (free) |
-| `poll(fds, interest, timeoutMs)` | wait for readiness → `Result[Array[Int], String]`, **index-parallel to `fds`**. `timeoutMs` 0 = return at once, negative = wait indefinitely (free) |
+| `poll(fds, interest, timeoutMs)` | wait for readiness → `Result[Array[Int], String]`, **index-parallel to `fds`**. `timeoutMs` 0 = return at once, negative = wait indefinitely (free). Watching nothing still waits, so `poll(vec(), vec(), ms)` is a plain sleep — but a negative timeout with no interest is an `Err`, since nothing could end that wait |
 | `READABLE` / `WRITABLE` / `CLOSED` | the flag constants, packed in an `Int` — test with `(flags & READABLE) != 0`, combine with `\|` |
 | `l.accept()` | take a waiting connection → `Result[Accepted, String]`: `Accepted::Conn(c)` or `Accepted::WouldBlock`. Never blocks |
 | `c.recv(n)` | read up to `n` bytes → `Result[Received, String]`: `Received::Data(b)`, `Received::WouldBlock` (nothing **yet**) or `Received::Closed` (peer gone — **not** the same thing) |

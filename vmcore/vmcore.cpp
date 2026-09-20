@@ -1568,15 +1568,27 @@ static Value native_raw_poll(Value* args, uint8_t nargs, Context* ctx) {
     }
 
     // A platform difference that would otherwise surface as a baffling error: POSIX poll() accepts an
-    // all-zero events set (it still reports hangups), WSAPoll REJECTS it with WSAEINVAL. Asking for
-    // nothing is a legitimate state for a loop with nothing outstanding, so it answers "nothing is
-    // ready" on both rather than failing on one.
+    // all-zero events set -- and SLEEPS out the timeout, which is what makes poll(NULL, 0, ms) the
+    // canonical portable sleep -- while WSAPoll REJECTS it with WSAEINVAL. Asking for nothing is a
+    // legitimate state for a loop with nothing outstanding this round.
+    //
+    // So the set is levelled by EMULATING what POSIX does, not by adopting what Winsock can express:
+    // wait out the timeout, then report nothing ready. Returning early here instead would turn such a
+    // round into a 100 % CPU spin -- on POSIX that would be a REGRESSION, since its own poll() got
+    // this right. Do not "simplify" this branch back into an immediate return.
     const long timeout_ms = static_cast<long>(args[2].asSigned48());
     if (!pfds.empty() && any_interest) {
         const int rc = sock_poll(pfds.data(), static_cast<unsigned>(pfds.size()),
                                  static_cast<int>(timeout_ms));
         if (rc < 0) return native_make_error(ctx, "rawPoll: " + net_error_msg("poll"));
     } else {
+        // Nothing to watch. A negative timeout means "wait indefinitely", and with no interest at all
+        // nothing could ever end that wait -- a guaranteed hang, so it is an error rather than a VM
+        // that freezes indistinguishably from a crash. (A deliberate departure from poll(NULL, 0, -1).)
+        if (timeout_ms < 0)
+            return native_make_error(ctx, "rawPoll: a negative timeout with no interest would wait forever");
+        if (timeout_ms > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
         for (pollfd_t& p : pfds) p.revents = 0;
     }
 

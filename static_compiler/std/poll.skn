@@ -65,6 +65,12 @@ pub fn nonBlockingConn(c: TcpConn) -> Result[NbConn, String] {
 // and WRITABLE; asking for WRITABLE with nothing to send makes `poll` return immediately every
 // time, which turns the loop into a spin.
 //
+// WATCHING NOTHING IS ALLOWED and still waits: an empty `fds`, or an interest set that is all
+// zeros, sleeps out the timeout and then reports nothing ready -- so a loop round with no
+// outstanding work costs no CPU, and `poll(vec(), vec(), ms)` is a plain sleep. The one refusal is
+// a NEGATIVE timeout with no interest at all: nothing could ever end that wait, so it is an Err
+// rather than a program that hangs with no output.
+//
 // The result is INDEX-PARALLEL to `fds`: element i holds the flags for fds[i], 0 when nothing
 // happened. Both vectors must have the same length.
 pub fn poll(fds: Vec[Int], interest: Vec[Int], timeoutMs: Int) -> Result[Array[Int], String] {

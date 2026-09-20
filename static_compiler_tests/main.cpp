@@ -8624,32 +8624,77 @@ void test_std_poll() {
                       "match probe() { Ok(b) => println(b), Err(e) => println(\"ERR: \" + e) }\n"),
         "true\n");
 
-    // Asking for NOTHING is a legitimate state -- a loop round with no outstanding work. POSIX poll()
-    // accepts an all-zero interest set; WSAPoll rejects it with WSAEINVAL. Without the levelling in
-    // rawPoll this is green on one platform and an inexplicable error on the other, which is exactly
-    // the class of split this project keeps out of the language surface.
-    check_str("poll_zero_interest_is_not_an_error",
-        cg_run_native("use std::net::*\nuse std::poll::*\n"
+    // poll must WAIT. These four exist because the first version of the two "no interest" guards
+    // asserted only that no error came back -- which a call returning instantly satisfies just as
+    // well as a correct one. They were green against a live defect (an empty interest set skipped the
+    // syscall AND discarded the timeout, turning such a round into a 100 % CPU spin), so they pinned
+    // it instead of catching it. A guard that only checks "did not fail" pins whatever behaviour
+    // happens to exist.
+    //
+    // The assertion is a LOWER bound on elapsed time. An upper bound would be flaky on a loaded
+    // machine; a lower bound is not reachable by a call that returned at once, which is the whole
+    // defect. Time is read with nanoTime() inside the program, so nothing here depends on the harness.
+    const std::string waits_prefix =
+        "use std::net::*\nuse std::poll::*\nuse std::env::*\n"
+        "fn probe() -> Result[Bool, String] {\n"
+        "  let srv = nonBlocking(listen(0)?)?\n"
+        "  let mut fds: Vec[Int] = vec()\n"
+        "  let mut want: Vec[Int] = vec()\n"
+        "  push(fds, srv.fd)\n";
+    const std::string waits_suffix =
+        "  let t0 = nanoTime()\n"
+        "  let mut i = 0\n"
+        "  while i < 4 { poll(fds, want, 200)?  i = i + 1 }\n"
+        "  let ms = (nanoTime() - t0) / 1000000\n"
+        "  srv.close()?\n"
+        "  Ok(ms >= 400)\n"
+        "}\n"
+        "match probe() { Ok(b) => println(b), Err(e) => println(\"ERR: \" + e) }\n";
+
+    // (a) An all-zero interest set waits out the timeout. WSAPoll cannot express the set at all, so
+    // rawPoll emulates what POSIX poll() does with it rather than adopting Winsock's limitation.
+    check_str("poll_zero_interest_waits",
+        cg_run_native(waits_prefix + "  push(want, 0)\n" + waits_suffix), "true\n");
+
+    // (b) The NORMAL path waits too -- the case the original round never pinned at all, which is how
+    // a future "skip the syscall when nothing can be ready" change could regress it unseen.
+    check_str("poll_readable_waits",
+        cg_run_native(waits_prefix + "  push(want, READABLE)\n" + waits_suffix), "true\n");
+
+    // (c) An empty socket set is the degenerate case, and is also the portable-sleep idiom.
+    check_str("poll_empty_set_waits",
+        cg_run_native("use std::poll::*\nuse std::env::*\n"
                       "fn probe() -> Result[Bool, String] {\n"
-                      "  let srv = nonBlocking(listen(0)?)?\n"
-                      "  let mut fds: Vec[Int] = vec()\n"
-                      "  let mut want: Vec[Int] = vec()\n"
-                      "  push(fds, srv.fd)  push(want, 0)\n"
-                      "  let r = poll(fds, want, 0)?\n"
-                      "  srv.close()?\n"
-                      "  Ok(len(r) == 1 && r[0] == 0)\n"
+                      "  let t0 = nanoTime()\n"
+                      "  let mut i = 0\n"
+                      "  while i < 4 { poll(vec(), vec(), 200)?  i = i + 1 }\n"
+                      "  Ok((nanoTime() - t0) / 1000000 >= 400)\n"
                       "}\n"
                       "match probe() { Ok(b) => println(b), Err(e) => println(\"ERR: \" + e) }\n"),
         "true\n");
 
-    // An empty socket set is the degenerate case of the same thing: no call, no error, no results.
-    check_str("poll_empty_set_is_not_an_error",
+    // (d) ... but "wait indefinitely" with nothing to wait ON is a guaranteed hang, so it is refused
+    // rather than freezing the VM indistinguishably from a crash. A deliberate departure from POSIX,
+    // where poll(NULL, 0, -1) blocks forever.
+    check_str("poll_negative_timeout_no_interest_errs",
         cg_run_native("use std::poll::*\n"
-                      "match poll(vec(), vec(), 0) {\n"
-                      "  Ok(r)  => println(len(r)),\n"
-                      "  Err(e) => println(\"ERR: \" + e)\n"
+                      "match poll(vec(), vec(), -1) {\n"
+                      "  Ok(r)  => println(\"unexpectedly ok \" + toString(len(r))),\n"
+                      "  Err(e) => println(e)\n"
                       "}\n"),
-        "0\n");
+        "rawPoll: a negative timeout with no interest would wait forever\n");
+
+    // A zero timeout still means "return at once" -- the one case that must NOT wait.
+    check_str("poll_zero_timeout_returns_at_once",
+        cg_run_native("use std::poll::*\nuse std::env::*\n"
+                      "fn probe() -> Result[Bool, String] {\n"
+                      "  let t0 = nanoTime()\n"
+                      "  let mut i = 0\n"
+                      "  while i < 20 { poll(vec(), vec(), 0)?  i = i + 1 }\n"
+                      "  Ok((nanoTime() - t0) / 1000000 < 100)\n"
+                      "}\n"
+                      "match probe() { Ok(b) => println(b), Err(e) => println(\"ERR: \" + e) }\n"),
+        "true\n");
 
     // The claim of the whole round, in one program: ONE thread, ONE loop, TWO clients served without
     // either waiting for the other. The two arrive in whatever order the OS reports them, so the
