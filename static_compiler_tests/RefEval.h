@@ -175,6 +175,8 @@ inline constexpr std::string_view DIFFERENTIABLE_NATIVES[] = {
     "fileExists", "isFile", "isDir", "fileSize", "readFile",
     // Pure parsing
     "parseInt", "parseDouble",
+    // The running platform -- one answer per machine, mirrored below with the same #ifdef
+    "rawOsId",
     // std::math -- pure libm, bit-identical on both sides
     "sqrt", "cbrt", "exp", "ln", "pow", "hypot", "abs",
     "sin", "cos", "tan", "asin", "acos", "atan",

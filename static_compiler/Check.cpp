@@ -1262,6 +1262,10 @@ private:
         // from the native's raw [stdout, stderr, exitCode] array).
         add_native("rawRun",       { make_named("Vec", { S }), B },
                                    make_named(std_Result(), { make_named(std_ProcessOutput(), {}), S }), STD_PROCESS);
+        // The running platform as a raw id (0 Windows, 1 macOS, 2 other). Gated to std::process like
+        // rawRun, so the prelude's currentOs() wrapper reaches it as same-module code; that wrapper is
+        // what sh() branches on to pick the platform's shell.
+        add_native("rawOsId",      {},       ty_int(),                                        STD_PROCESS);
         // TCP networking -- std::net (opt-in; the prelude connect/send/recv/... wrappers live there too,
         // so they may call the tcp* natives as same-module code). A socket is an Int descriptor; every
         // native returns a Result (success = Int/Bytes/unit, failure = a String error message).

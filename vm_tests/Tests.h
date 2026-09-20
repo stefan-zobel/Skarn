@@ -602,7 +602,8 @@ inline void test_native_stdin() {
 // semantics: a non-zero exit is a SUCCESS whose exitCode is data; only "could not
 // start" is the error String). The one program per case: build the argv KIND_ARRAY,
 // call rawRun, GET_KIND-branch the result, and on the array path decode stdout via
-// BYTES_TO_STR + read the exit slot. Uses cmd.exe (always present) for determinism.
+// BYTES_TO_STR + read the exit slot. The program spawned per case is the one each platform is
+// guaranteed to have -- cmd.exe on Windows, the POSIX shell elsewhere -- for determinism.
 // =============================================================================
 inline void test_native_process() {
     std::cout << "=== native_process (rawRun) ===\n";
@@ -699,7 +700,32 @@ inline void test_native_process() {
         std::cout << std::format("bad program -> is_err (spawn failure): {}\n",
             bad.is_err ? "yes" : "no");
 
-        check(echo_ok && exit_ok && sort_ok && bad_ok);
+        // 5) rawOsId -- the zero-arg sibling that tells a program which platform it is on (the
+        // prelude's currentOs wraps it, and sh() branches on the answer to pick the shell above).
+        // Plain Int return: no Ok/Err wrap, no allocation, so the register holds the id directly.
+        Assembler os_as;
+        os_as.label("main");
+        os_as.call_native_id(1, 0, 0, 0, NATIVE_OS_ID);   // r1 = rawOsId() -- 0 args, dummy window base
+        os_as.J(OpCode::HALT);
+        const auto os_code = os_as.assemble();
+        Heap os_heap;
+        StringInterner os_interner;
+        std::vector<NativeFunc> os_ntab = build_native_table();
+        auto os_res = execute(os_code, &os_heap, nullptr, &os_interner, 8, nullptr, nullptr,
+                              nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                              nullptr, nullptr, nullptr, &os_ntab);
+        const long long os_id = os_res.get_reg_base()[1].asSigned48();
+#ifdef _WIN32
+        const long long os_want = 0;
+#elif defined(__APPLE__)
+        const long long os_want = 1;
+#else
+        const long long os_want = 2;
+#endif
+        const bool os_ok = os_id == os_want;
+        std::cout << std::format("rawOsId -> {} (expect {} for this build)\n", os_id, os_want);
+
+        check(echo_ok && exit_ok && sort_ok && bad_ok && os_ok);
     }
     catch (const std::exception& e) { record_fail(e.what()); }
 }

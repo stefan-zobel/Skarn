@@ -40,8 +40,10 @@ of the runtime sees:
   The two supported toolchains lay them out the same way; a bytecode file carries a sentinel so that a
   reader which does not is rejected rather than misled (see "Bytecode container format").
 
-The compiler and the driver contain no platform-specific code at all. What remains Windows-only is the
-`sh()` helper in `std::process`, which runs `cmd.exe` by name.
+The compiler and the driver contain no platform-specific code at all, and neither does the language
+surface: the one place where a platform is named, `std::process`'s `sh()`, asks which one it is running on
+(`rawOsId`, wrapped as `currentOs()`) and picks `cmd /c` or `/bin/sh -c` accordingly. What remains
+Windows-only is the PowerShell documentation and example gates.
 
 ## Source files
 
