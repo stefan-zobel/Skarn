@@ -53,7 +53,9 @@
 // a fn; `recv.m` through the receiver's type, with `self` shown but no argument; `Type::m`
 // / `Trait::m` with `self` as the first argument; a tuple variant or tuple struct; a local of
 // `fn` type; a builtin or native from its ambient signature, one signature per line; for a
-// bare trait-method call `m(x)`, every trait's `m`. The right side of `x |> f(a)` counts `x`.
+// bare trait-method call `m(x)`, the `m` of the trait the checker dispatched it to, else of the
+// traits its first argument's type reaches, else of every trait declaring `m` (nothing typed
+// there yet). The right side of `x |> f(a)` counts `x`.
 // =============================================================================
 
 #include "Analyze.h"

@@ -2433,6 +2433,28 @@ println("square=" + sq.area())                 // => square=9.0   (method form, 
 The receiver parameter is named `self`, and its type is the type being implemented. Inside the method you read
 its fields as `self.field`.
 
+Two traits may declare a method with the same name. The **receiver decides** which one a call means:
+`x.name()`, `name(x)` and `x |> name` call the method of the trait that `x`'s type implements — for a `dyn Tr`
+or a type parameter `T: Tr`, the trait named there. Only a receiver that implements **both** makes the call
+ambiguous; the compiler then asks for the qualified form, which names one. A trait that is private to another
+module never competes, so adding one there cannot break your calls.
+
+```rust
+trait Shape { fn name(self) -> String }
+trait Pet   { fn name(self) -> String }
+struct Circle {}
+struct Dog {}
+impl Shape for Circle { fn name(self) -> String { "circle" } }
+impl Pet for Dog      { fn name(self) -> String { "Rex" } }
+impl Shape for Dog    { fn name(self) -> String { "dog-shaped" } }
+
+println(Circle {}.name())      // => circle
+println(Pet::name(Dog {}))     // => Rex
+println(Shape::name(Dog {}))   // => dog-shaped
+```
+
+`Dog {}.name()` is rejected: *ambiguous method 'name': type Dog implements 'Pet' and 'Shape'*.
+
 ### Default methods
 
 A trait can provide a default implementation for a method in terms of the others. Implementers get it for free

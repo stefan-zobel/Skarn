@@ -294,6 +294,12 @@ private:
     // toString name recovery (mirrors Codegen::int_enum_variants_).
     std::unordered_map<std::string, std::vector<std::pair<int64_t, std::string>>> int_enum_names_;
     std::unordered_map<std::string, std::string>   method_owner_;   // method -> trait, "" if ambiguous
+    // The only trait declaring `method`, or "" (none, or several). The fallback for a trait-method call
+    // the checker recorded no `resolved_trait` for.
+    std::string owner_of(const std::string& method) const {
+        const auto mo = method_owner_.find(method);
+        return mo != method_owner_.end() ? mo->second : std::string();
+    }
     std::unordered_map<std::string, std::unordered_map<std::string, const Method*>> inherent_;  // head -> method -> fn (S2)
     std::unordered_map<std::string, std::unordered_map<std::string, const Method*>> impls_;    // trait\x1fhead -> {method -> Method*}
     std::unordered_map<std::string, std::unordered_map<std::string, const Method*>> blanket_;  // trait -> {method -> Method*}
@@ -1085,11 +1091,13 @@ private:
                         return call_method(*im->second, std::move(margs));
                     }
                 }
-                auto mo = method_owner_.find(fld.name);
-                if (mo != method_owner_.end() && !mo->second.empty()) {
+                // The trait the checker dispatched this call to (several may declare the name); the
+                // by-name owner only for a call it recorded none for.
+                const std::string trait = !fld.resolved_trait.empty() ? fld.resolved_trait : owner_of(fld.name);
+                if (!trait.empty()) {
                     std::vector<RtValue> margs; margs.push_back(recv);
                     for (const Expr* a : argx) margs.push_back(eval(*a, env));
-                    return dispatch_trait(fld.name, mo->second, std::move(margs), env);
+                    return dispatch_trait(fld.name, trait, std::move(margs), env);
                 }
                 throw NotModelled{"no field or method '" + fld.name + "'"};
             }
@@ -1131,9 +1139,10 @@ private:
             // The sixth cov_ probe, and the only one keyed by NAME rather than node kind. On the
             // HANDLED path only: an unhandled name falls through to trait dispatch or a decline.
             if (RtValue r; try_builtin(id.name, argx, env, r)) { record_builtin_call(cov_, id.name); return r; }
-            auto mo = method_owner_.find(id.name);
-            if (mo != method_owner_.end() && !mo->second.empty())
-                return dispatch_trait(id.name, mo->second, eval_all(argx, env), env);
+            // As for `recv.m(..)`: the checker's pick first (IdentExpr::resolved_trait).
+            if (const std::string trait = !id.resolved_trait.empty() ? id.resolved_trait : owner_of(id.name);
+                !trait.empty())
+                return dispatch_trait(id.name, trait, eval_all(argx, env), env);
             // The one site where the two decline categories MEET, which is why the split has to be
             // made here and could never be made from the message: a non-differentiable native
             // (write/delete/mkdir/listDir/time/process -- side-effecting or non-deterministic) falls

@@ -363,14 +363,16 @@ public:
 
     // ---- signature help -------------------------------------------------------------
 
-    // The signatures the callee of `c` may have: one, or one per trait for a bare trait-method
-    // call (the checker does not record which impl it picked), one per shape for a builtin.
+    // The signatures the callee of `c` may have: one, one per shape for a builtin, and for a trait
+    // method one per candidate trait while the call has not checked (the pick the checker records is
+    // there only once it has).
     std::vector<SignatureInfo> signatures(const svc::CallExpr& c) const {
         std::vector<SignatureInfo> out;
         const svc::Expr* callee = c.callee.get();
         if (!callee) return out;
         if (callee->kind == svc::ExprKind::Field) {   // `recv.m(..)`: `self` is the receiver
             const auto& f = static_cast<const svc::FieldExpr&>(*callee);
+            if (trait_method_signature(f.resolved_trait, f.name, /*self_is_arg=*/false, out)) return out;
             for (const svc::Method* m : methods_named(f.obj ? f.obj->ty : svc::TyPtr(), f.name))
                 out.push_back(method_signature(*m, /*self_is_arg=*/false));
             if (out.empty()) fn_type_signature(f.name, callee->ty, out);   // a field of `fn` type
@@ -414,10 +416,32 @@ public:
                 ambient_signatures(a.signature, out);
                 return out;
             }
-        for (const auto& [name, tr] : traits_)   // `area(s)`: dispatched on the first argument
+        // `area(s)`: dispatched on the first argument. The trait the checker picked when the call
+        // checked; else the ones the first argument's type reaches; else, with no argument typed yet,
+        // every trait declaring the name.
+        if (trait_method_signature(id.resolved_trait, bare, /*self_is_arg=*/true, out)) return out;
+        if (!c.args.empty() && c.args[0] && c.args[0]->ty) {
+            for (const svc::Method* m : methods_named(c.args[0]->ty, bare))
+                out.push_back(method_signature(*m, /*self_is_arg=*/true));
+            if (!out.empty()) return out;
+        }
+        for (const auto& [name, tr] : traits_)
             for (const svc::Method& m : tr->methods)
                 if (m.has_self && m.name == bare) out.push_back(method_signature(m, /*self_is_arg=*/true));
         return out;
+    }
+
+    // The one signature of `method` in the trait the checker dispatched the call to, if it recorded
+    // one and the trait is a user declaration (a std trait's methods are rendered from the tree too,
+    // so this holds for them as well). False = nothing recorded, the caller falls back.
+    bool trait_method_signature(const std::string& picked, const std::string& method, bool self_is_arg,
+                                std::vector<SignatureInfo>& out) const {
+        if (picked.empty()) return false;
+        const svc::TraitDecl* tr = trait(picked);
+        if (!tr) return false;
+        for (const svc::Method& m : tr->methods)
+            if (m.name == method) { out.push_back(method_signature(m, self_is_arg)); return true; }
+        return false;
     }
 
 private:

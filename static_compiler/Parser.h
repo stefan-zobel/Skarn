@@ -221,6 +221,40 @@ private:
     // to keep the `{` for the following block.
     bool no_struct_lit_ = false;
 
+    // ----- the nesting-depth limit -------------------------------------------------------
+    // Parsing is recursive descent, so source nesting costs STACK and deep enough input used to
+    // overflow it -- the process died with no diagnostic (5 000 nested parentheses still do, in a
+    // Debug build). The limit turns that into an ordinary syntax error, which the tolerant parser
+    // then recovers from like any other. It matches the checker's `MAX_EXPR_DEPTH`; parentheses
+    // build no AST node, so this counter is the only thing that bounds them.
+    static constexpr int MAX_NESTING = 200;
+    int depth_ = 0;
+    struct DepthGuard {
+        Parser& p;
+        explicit DepthGuard(Parser& parser) : p(parser) {
+            if (++p.depth_ > MAX_NESTING) { --p.depth_; p.error("expression nested too deeply (more than " +
+                                                                std::to_string(MAX_NESTING) + " levels)"); }
+        }
+        ~DepthGuard() { --p.depth_; }
+    };
+    // The Pratt loop builds a LEFT-NESTED chain (`a + b + c`, `x |> f |> g`, `a.b().c()`) without
+    // recursing, so `DepthGuard` alone does not see how deep the TREE it returns is -- and depth the
+    // parser never counted is depth that has to be walked later: the checker's own limit rejects such a
+    // chain, but simply DESTROYING it recurses once per link (`~BinaryExpr` -> `~unique_ptr` -> ...),
+    // which overflowed the stack on a 20 000-term chain after everything else was already guarded.
+    // Counting each wrap keeps the tree bounded by construction. Releases exactly what it added.
+    struct ChainDepth {
+        Parser& p;
+        int n = 0;
+        explicit ChainDepth(Parser& parser) : p(parser) {}
+        void add() {
+            ++p.depth_; ++n;
+            if (p.depth_ > MAX_NESTING)
+                p.error("expression nested too deeply (more than " + std::to_string(MAX_NESTING) + " levels)");
+        }
+        ~ChainDepth() { p.depth_ -= n; }
+    };
+
     bool recover_ = false;
     std::vector<ParseError>* errors_ = nullptr;
     size_t unclosed_at_ = SIZE_MAX;   // token index where an unclosed body was last reported

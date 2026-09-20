@@ -771,9 +771,12 @@ int infix_bp(TokKind k) {
 } // namespace
 
 ExprPtr Parser::parse_expr(int min_bp) {
+    DepthGuard depth(*this);   // recursive descent: bound the nesting (see MAX_NESTING)
+    ChainDepth chain(*this);   // ... and the left-nested chain this loop builds without recursing
     ExprPtr lhs = parse_prefix();
 
-    for (;;) {
+    for (bool wrapped = false;; wrapped = true) {
+        if (wrapped) chain.add();   // the previous iteration wrapped `lhs` in one more node
         TokKind k = cur().kind;
 
         // ---- postfix (bind tightest) ----
@@ -1146,8 +1149,13 @@ ExprPtr Parser::parse_interp_string() {
     advance();
 
     ExprPtr acc;                                   // running `+`-chain (null until the first piece)
+    // The chain is built HERE, not by the Pratt loop, so it needs its own counting: a string with
+    // 20 000 holes is a 20 000-deep tree that nothing else bounds, and merely destroying it recurses
+    // once per link. Same counter, same limit (see MAX_NESTING).
+    ChainDepth chain(*this);
     auto add_piece = [&](ExprPtr piece) {
         if (!acc) { acc = std::move(piece); return; }
+        chain.add();
         auto b = std::make_unique<BinaryExpr>();
         b->line = line; b->col = col; b->op = TokKind::Plus;
         b->lhs = std::move(acc); b->rhs = std::move(piece);
@@ -1580,6 +1588,7 @@ PatPtr Parser::finish_range_pattern(ExprPtr lo, uint32_t line, uint32_t col) {
 }
 
 PatPtr Parser::parse_pattern() {
+    DepthGuard depth(*this);
     const Token& t = cur();
     switch (t.kind) {
     case TokKind::Underscore: {
@@ -1767,6 +1776,7 @@ PatPtr Parser::parse_ctor_or_struct_pattern(std::string name, std::string qualif
 // ---- types ------------------------------------------------------------------
 
 TypePtr Parser::parse_type() {
+    DepthGuard depth(*this);
     const Token& t = cur();
     switch (t.kind) {
     case TokKind::KwFn: {                           // fn(T, U) -> R

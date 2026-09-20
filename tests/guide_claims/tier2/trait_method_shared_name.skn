@@ -1,0 +1,18 @@
+// CLAIM: two traits may declare a method with the same name -- the RECEIVER decides which one
+//        `x.m()`, `m(x)` and `x |> m` call (the trait its type implements; for `dyn Tr` / `T: Tr` the
+//        trait named there), and the qualified form names one when the receiver implements both.
+// GUIDE: 16 (Calling a trait method)
+// EXPECT: ok circle Rex Rex dog-shaped Rex
+trait Shape { fn name(self) -> String }
+trait Pet   { fn name(self) -> String }
+struct Circle {}
+struct Dog {}
+struct Cat {}
+impl Shape for Circle { fn name(self) -> String { "circle" } }
+impl Pet for Dog      { fn name(self) -> String { "Rex" } }
+impl Shape for Dog    { fn name(self) -> String { "dog-shaped" } }
+impl Pet for Cat      { fn name(self) -> String { "Rex" } }
+
+fn petName(p: dyn Pet) -> String { p.name() }
+println(Circle {}.name() + " " + name(Cat {}) + " " + petName(Dog {}) + " " +
+        Shape::name(Dog {}) + " " + (Cat {} |> name))

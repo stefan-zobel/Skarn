@@ -773,6 +773,12 @@ private:
             } else if (Binding* b = lookup(id.name)) {
                 o.local = b;
                 if (b->type.empty()) b->type = type_text(e.ty);       // a pattern binding learns its type from a use
+            } else if (!id.resolved_trait.empty()) {
+                // A bare trait-method call `m(x)`: the checker recorded the trait it dispatched to, so
+                // this is the same identity `recv.m()` gets (method_key maps an impl's method to the
+                // trait's). Nothing is recorded for a std trait -- it has no declaration to point at,
+                // which is a known limit, not an unattributable name.
+                if (const std::string k = id.resolved_trait + "::" + id.name; decl(k)) o.global = k;
             } else {
                 unresolved_.push_back(Unresolved{ Unresolved::Kind::Bare, id.name, o.line, o.col });
             }
@@ -808,7 +814,11 @@ private:
                 occ_.back().expr == c.callee.get()) {
                 const auto& f = static_cast<const svc::FieldExpr&>(*c.callee);
                 Occurrence& o = occ_.back();
-                o.global   = f.obj ? method_key(f.obj->ty, f.name) : std::string();
+                // The trait the checker dispatched to, when it recorded one (several traits may declare
+                // the name, and only the checker knows which the receiver meant); else by the receiver.
+                o.global = !f.resolved_trait.empty() && decl(f.resolved_trait + "::" + f.name)
+                           ? f.resolved_trait + "::" + f.name
+                           : (f.obj ? method_key(f.obj->ty, f.name) : std::string());
                 o.field_of.clear();
                 // Unattributable only when the receiver's type is unknown; a named or `dyn`
                 // receiver that reaches no user method is a std type's method.

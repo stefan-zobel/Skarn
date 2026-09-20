@@ -15,17 +15,18 @@
 //     also the declaration's name -- an exact match across all modules;
 //   * `Trait::m` / `Type::m`: the mangled head plus the method name; the head itself
 //     refers to the trait / type, and the head of `Enum::V` to the enum;
-//   * `recv.m(..)`: through the receiver's static type -- the inherent method of that
-//     type, else the trait method its impl provides (for `dyn Tr` or a bounded type
-//     parameter, the trait's method); a trait impl's method refers to the trait's;
+//   * `recv.m(..)` and a bare `m(x)`: the trait the checker dispatched the call to
+//     (`resolved_trait`), else through the receiver's static type -- the inherent method
+//     of that type, else the trait method its impl provides (for `dyn Tr` or a bounded
+//     type parameter, the trait's method); a trait impl's method refers to the trait's;
 //   * `recv.field`: the field in the receiver's struct declaration;
 //   * a local (let, parameter, match / for / lambda binding): the query walks the file
 //     with a scope stack that mirrors the checker's, since the checker keeps no link;
 //   * a type name in an annotation is not written back: this module's declaration of
 //     that name, else the only user declaration with that name;
 //   * a name in a `use` list: the declaration it imports.
-// Not resolved: an unqualified trait-method call `m(x)` (the checker records which
-// impl it picked nowhere), and anything declared in the std, which has no file to open.
+// Not resolved: a call the checker could not resolve (an ambiguous `m(x)` records no
+// trait), and anything declared in the std, which has no file to open.
 //
 // Hover shows a declaration's signature for a declared name, and otherwise the type
 // the checker inferred for the expression. A builtin such as `len` has no signature of
@@ -33,7 +34,7 @@
 // `len(..) -> Int`. Nothing is shown where the checker has no type at all.
 //
 // Rename never guesses. It refuses what it cannot rename completely (a field, anything
-// in the std, a trait method while an unattributed call `m(x)` of that name exists, a
+// in the std, a trait method while an UNRESOLVED call `m(x)` of that name exists, a
 // type name the annotation lookup could not decide), and before answering it applies
 // the edits in memory, re-checks every affected program and requires that no new error
 // appears and that exactly the edited names -- no more, no fewer -- now refer to the

@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -57,6 +57,10 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- The front end is a recursive-descent parser + checker: one level of expression
+           nesting costs up to ~21 KB of stack in a Debug build, so the 1 MB default died on a
+           50-link pipe chain. The checker's depth limit (200) is sized against this reserve. -->
+      <StackReserveSize>8388608</StackReserveSize>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -75,6 +79,10 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- The front end is a recursive-descent parser + checker: one level of expression
+           nesting costs up to ~21 KB of stack in a Debug build, so the 1 MB default died on a
+           50-link pipe chain. The checker's depth limit (200) is sized against this reserve. -->
+      <StackReserveSize>8388608</StackReserveSize>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

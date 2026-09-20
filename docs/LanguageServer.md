@@ -94,7 +94,8 @@ the syntax errors are fixed, because text left out of the tree could hold a use.
 - **Hover** shows a declaration's signature, or the type the checker inferred. A builtin is typed per call,
   so its hover shows what the call produces (`len(..) -> Int`).
 - **Go to definition** follows a name to its declaration in any module of the program: a top-level name
-  through the mangled name the checker writes back into each use, a method call or a field through the
+  through the mangled name the checker writes back into each use, a method call through the trait the checker
+  dispatched it to (a bare `m(x)` as well as `x.m()`) or through the receiver's type, a field through the
   receiver's type, a type name in an annotation by its name (this module first), and a local through a scope
   walk of the file that mirrors the checker's. Names declared in the standard library have no file to go to.
 
@@ -108,7 +109,8 @@ the syntax errors are fixed, because text left out of the tree could hold a use.
   rename is refused unless no new error appears and exactly the edited names now refer to the renamed
   declaration. That rules out capturing another binding and colliding with another declaration. What it
   cannot see completely is refused with the reason: fields, names from the standard library, and a trait
-  method while a bare call `m(x)` of that name exists (the checker records no resolution for it).
+  method while a call `m(x)` of that name exists that the checker could not resolve (a call it did resolve
+  is renamed with the method, since the trait it dispatched to is recorded in the tree).
 
 ## Completion
 
@@ -147,8 +149,8 @@ The callee resolves like go to definition, the standard library included: a func
 receiver's type (its `self` is shown but is no argument there); `Type::m` and `Trait::m`, where `self` is the
 first argument; a tuple variant or tuple struct; a local of function type; a builtin or native. A builtin the
 checker types per call (`len`, `get`, `print`) has a hand-written signature per accepted shape. A bare
-trait-method call `m(x)` shows the method of every trait with that name, and after `x |> f(` the first
-argument is `x`. Declared types are shown, not those a call instantiates.
+trait-method call `m(x)` shows the method of the trait the receiver picks — every trait with that name only
+while nothing is typed there yet — and after `x |> f(` the first argument is `x`. Declared types are shown, not those a call instantiates.
 
 ## Formatting
 

@@ -1,0 +1,12 @@
+// CLAIM: a trait PRIVATE to one module never competes with a same-named method elsewhere -- adding
+//        `trait Named { fn name(self) .. }` here breaks neither this file's calls nor `shapes`' own.
+// GUIDE: 16 (Calling a trait method)
+// EXPECT: ok t square
+import shapes
+use shapes::{Square, describe}
+
+trait Named { fn name(self) -> String }
+struct T { v: Int }
+impl Named for T { fn name(self) -> String { "t" } }
+
+println(T { v: 1 }.name() + " " + describe(Square { side: 2 }))

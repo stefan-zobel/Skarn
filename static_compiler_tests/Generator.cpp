@@ -1337,7 +1337,11 @@ struct Gen {
             if (!chance(45)) continue;
             const int k = (int)traits.size();
             const std::string tn = "Tr" + std::to_string(k);
-            const std::string mn = "m" + std::to_string(k);
+            // Sometimes the method name is SHARED by several traits of the program (each implemented on a
+            // different struct -- this loop gives a struct one trait), so every spelling of the call makes
+            // the checker pick the trait by the receiver, and codegen and the oracle must obey that pick
+            // (IdentExpr / FieldExpr::resolved_trait) instead of re-deriving it from the name.
+            const std::string mn = chance(60) ? std::string("shm") : "m" + std::to_string(k);
             const std::string wn = "w" + std::to_string(k);
             const GType ret = random_scalar();
             const std::string rn = ty_name(ret);

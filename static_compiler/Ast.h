@@ -178,8 +178,13 @@ struct BoolLit   : Expr { bool    value = false;    BoolLit()   : Expr(ExprKind:
 // The two live in separate tables (`traits_` vs `structs_`/`enums_`) under the SAME mangled key
 // -- `trait Foo` and `struct Foo` may coexist -- so re-deriving the answer in codegen could pick
 // the other one and silently call the wrong function. `qualifier` then holds the MANGLED head.
+//
+// `resolved_trait` is the third one, for an unqualified trait-method call `m(x)` / `x |> m`: the
+// MANGLED trait the checker dispatched it to (empty = not such a call). Several traits may declare
+// `m`; the checker picks by the receiver, so codegen and the oracle must not re-derive it by name.
 struct IdentExpr : Expr { std::string name; std::string qualifier; bool upper = false;
                           bool ambient = false; bool inherent = false;
+                          std::string resolved_trait;
                           uint32_t name_line = 0, name_col = 0;
                                                     IdentExpr() : Expr(ExprKind::Ident)     {} };
 
@@ -190,8 +195,11 @@ struct CallExpr  : Expr { ExprPtr callee; std::vector<ExprPtr> args;         Cal
 // `obj.name` -- struct field access. `tuple_index` marks the `t.N` tuple-index form
 // (`name` is then the synthetic `_N`, `index` the numeric slot); the checker resolves
 // it against the receiver's static tuple type instead of a declared field name. The node sits at the
-// `.`; `name_line`/`name_col` anchor the member token after it (editor tooling).
+// `.`; `name_line`/`name_col` anchor the member token after it (editor tooling). As the callee of
+// `recv.m(..)` resolved to a trait method, `resolved_trait` holds the MANGLED trait the checker
+// dispatched it to (see IdentExpr::resolved_trait); empty for a field, an inherent method, or unchecked.
 struct FieldExpr : Expr { ExprPtr obj; std::string name; bool tuple_index = false; uint32_t index = 0;
+                          std::string resolved_trait;
                           uint32_t name_line = 0, name_col = 0; FieldExpr() : Expr(ExprKind::Field) {} };
 // `a[i]` -- the sole index form (bounds-checked, total-ish). Map lookup is the
 // ordinary call `get(m, k) -> Option[V]`, so there is no map-index flag.

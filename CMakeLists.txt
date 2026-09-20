@@ -101,6 +101,20 @@ target_include_directories(skarn_lsp PRIVATE skarn_lsp)
 target_link_libraries(skarn_lsp PRIVATE skarnclib vmcore)
 add_test(NAME skarn_lsp_selftest COMMAND skarn_lsp --selftest)
 
+# ---- stack reserve for the front-end executables ----------------------------
+# Parsing and checking are recursive descent: one level of expression nesting costs up to
+# ~21 KB of stack in a debug build, and MSVC reserves only 1 MB by default -- a long pipe
+# chain overflowed it. The checker's own depth limit is sized against this reserve. A POSIX
+# main thread already gets 8 MB, so only the MSVC link needs saying. (vm_tests runs no front
+# end and is left alone.)
+if(MSVC)
+    foreach(front_end_target skarnvm static_compiler_tests skarn_lsp)
+        if(TARGET ${front_end_target})
+            target_link_options(${front_end_target} PRIVATE /STACK:8388608)
+        endif()
+    endforeach()
+endif()
+
 # The switch rot-guards in static_compiler/Codegen.cpp are `#pragma warning(error: 4062)`,
 # which only MSVC honours. Keep the guard alive on the Clang/GCC side with its equivalent,
 # so an enumerator added to an AST node still fails the build instead of falling through.

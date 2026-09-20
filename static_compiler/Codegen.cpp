@@ -3160,7 +3160,7 @@ int Codegen::compile_call_dispatch(const Expr* callee, const std::vector<const E
         if (is_ctor_name(id.name))                   // a tuple-struct / enum-variant constructor
             return compile_ctor_call(id.name, args);
         if (is_trait_method_name(id.name))           // an unqualified trait-method call
-            return compile_trait_call(resolve_method("", id.name), args, site);
+            return compile_trait_call(resolve_method(id.resolved_trait, id.name), args, site);
         if (is_builtin_name(id.name))                // a container builtin (array / vec / push / len)
             return compile_builtin_call(id.name, args, result_ty);
         if (native_id_of(id.name) >= 0)              // a native I/O call -> CALL_NATIVE (user won above)
@@ -3186,7 +3186,7 @@ int Codegen::compile_call_dispatch(const Expr* callee, const std::vector<const E
                 return inl >= 0 ? inl : compile_call(tgt, margs);
             }
             if (is_trait_method_name(fld.name))              // trait -> devirt / fused RESOLVE_CALL
-                return compile_trait_call(resolve_method("", fld.name), margs, site);
+                return compile_trait_call(resolve_method(fld.resolved_trait, fld.name), margs, site);
         }
     }
     return compile_call_indirect(*callee, args);     // an arbitrary function-valued expression
@@ -4023,13 +4023,17 @@ bool Codegen::head_satisfies_trait(const std::string& head, const std::string& t
 
 Codegen::MRef Codegen::resolve_method(const std::string& qualifier,
                                       const std::string& method) const {
-    // The checker already rejected an ambiguous unqualified call and an unknown trait/method,
-    // so this is a straight lookup (defensive throws only for an internal inconsistency).
+    // `qualifier` is the trait as written (`Trait::m`) or, for an unqualified call, the one the checker
+    // dispatched it to (IdentExpr / FieldExpr::resolved_trait). Several traits may declare `method`, so
+    // the name alone decides nothing; the fallback serves only a call the checker recorded no trait for,
+    // and only while the name is unique. Defensive throws only for an internal inconsistency.
     std::string trait = qualifier;
     if (trait.empty()) {
         auto oit = method_owners_.find(method);
         if (oit == method_owners_.end() || oit->second.empty())
             throw CodegenError("internal: '" + method + "' is not a trait method");
+        if (oit->second.size() > 1)
+            throw CodegenError("internal: no trait recorded for the call of '" + method + "'");
         trait = oit->second.front();
     }
     auto tit = traits_.find(trait);
@@ -4885,7 +4889,8 @@ void Codegen::compile_tail_call_shape(const Expr* callee, bool callee_is_ident,
     // fn when the receiver is concrete (the static-types win -- O(1) self-through-trait recursion),
     // else dispatch dynamically via TCO_CALL_INDIRECT when the args fit below the temp region.
     if (callee_is_ident && is_trait_call(callee)) {
-        const MRef ref = resolve_method(qualifier, name);
+        const MRef ref = resolve_method(
+            qualifier.empty() ? static_cast<const IdentExpr&>(*callee).resolved_trait : qualifier, name);
         const std::string head = args.empty() ? std::string() : concrete_head_of(args[0]->ty);
         const std::string target = head.empty() ? std::string()
                                                  : devirt_target(ref.trait, ref.method, head);
@@ -4912,7 +4917,7 @@ void Codegen::compile_tail_call_shape(const Expr* callee, bool callee_is_ident,
                 return;
             }
             if (is_trait_method_name(fld.name)) {
-                const MRef ref = resolve_method("", fld.name);
+                const MRef ref = resolve_method(fld.resolved_trait, fld.name);
                 const std::string head = concrete_head_of(fld.obj->ty);
                 const std::string target = head.empty() ? std::string()
                                                          : devirt_target(ref.trait, ref.method, head);
@@ -5412,7 +5417,7 @@ std::string Codegen::direct_call_target(const Expr* callee, const std::vector<co
         // they would answer differently in the two passes. Emit checks them and declines.
         if (user_fn_ref(id)) return id.name;                                // top-level fn
         if (is_trait_method_name(id.name) && !is_ctor_name(id.name) && !args.empty()) {
-            const MRef r = resolve_method("", id.name);                     // devirtualized trait call
+            const MRef r = resolve_method(id.resolved_trait, id.name);      // devirtualized trait call
             return devirt_target(r.trait, r.method, concrete_head_of(args[0]->ty));
         }
         return {};
@@ -5425,7 +5430,7 @@ std::string Codegen::direct_call_target(const Expr* callee, const std::vector<co
                                  ? fld.obj->ty->name : std::string();
         if (is_inherent_method(head, fld.name)) return "$inherent$" + head + "$" + fld.name;
         if (is_trait_method_name(fld.name)) {
-            const MRef r = resolve_method("", fld.name);
+            const MRef r = resolve_method(fld.resolved_trait, fld.name);
             return devirt_target(r.trait, r.method, concrete_head_of(fld.obj->ty));
         }
     }

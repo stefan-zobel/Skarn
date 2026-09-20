@@ -1,0 +1,11 @@
+// CLAIM: a call is ambiguous only when its RECEIVER implements two traits that declare the method --
+//        then it is rejected naming both, never resolved by picking one silently.
+// GUIDE: 16 (Calling a trait method)
+// EXPECT: fail ambiguous method 'name': type Dog implements 'Pet' and 'Shape'
+trait Shape { fn name(self) -> String }
+trait Pet   { fn name(self) -> String }
+struct Dog {}
+impl Pet for Dog   { fn name(self) -> String { "Rex" } }
+impl Shape for Dog { fn name(self) -> String { "dog-shaped" } }
+
+println(Dog {}.name())

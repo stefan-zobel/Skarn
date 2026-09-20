@@ -1,0 +1,5 @@
+// Support module (no EXPECT directive): calls its own trait's `name` on a `dyn Shape`.
+pub trait Shape { fn name(self) -> String }
+pub struct Square { side: Int }
+impl Shape for Square { fn name(self) -> String { "square" } }
+pub fn describe(s: dyn Shape) -> String { s.name() }

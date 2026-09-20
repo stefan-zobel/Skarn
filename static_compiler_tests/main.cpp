@@ -6318,6 +6318,81 @@ void test_qualified_inherent_call() {
 // (sixteen nested `inc(..)` = 387 million). Each shape below reaches the measure's Call/Pipe cases by a
 // different route; without the memo every one of them effectively hangs.
 // Depth 50 stays inside the 63-register frame for all four (the measure's temp bound grows with depth).
+// Nesting is bounded so that deep input is REJECTED with a diagnostic instead of overflowing the
+// stack (which killed the process with nothing said, at a depth that differed between Debug and
+// Release). The limit is 200 AST levels in the checker and 200 recursion levels in the parser.
+void test_nesting_depth() {
+    std::cout << "[nesting depth: a diagnostic instead of a stack overflow]\n";
+    // The limit is reported by whichever layer meets it first -- the parser bounds what it BUILDS
+    // (a left-nested chain grows the tree without recursing), the checker what it walks -- and the
+    // test must not care which, only that the program is rejected with the reason and nothing dies.
+    auto rejected = [](const std::string& src, const std::string& substr) {
+        try {
+            svc::Lexer lex(src);
+            svc::Parser p(lex.tokenize());
+            auto prog = p.parse_program();
+            for (const auto& e : svc::check(prog).errors)
+                if (e.message.find(substr) != std::string::npos) return true;
+            return false;
+        } catch (const svc::ParseError& e) { return std::string(e.what()).find(substr) != std::string::npos; }
+          catch (const svc::LexError&)    { return false; }
+    };
+    auto chain = [](int n) {   // `0 + 1 + 1 ...`, n levels deep and worth n
+        std::string s = "0";
+        for (int i = 0; i < n; ++i) s += " + 1";
+        return s;
+    };
+    // Accepted right up to the limit -- and it RUNS, so Debug (where a level costs the most stack)
+    // is exercised too, not just the checker.
+    check_int("nest_deep_ok", chain(150), 150);
+    check_int("nest_deep_ok_pipe", "fn inc(x: Int) -> Int { x + 1 }\n 0" + [] {
+        std::string s;                      // the costliest shape per level (~21 KB in Debug),
+        for (int i = 0; i < 40; ++i) s += " |> inc";   // below codegen's own 63-register limit
+        return s;
+    }(), 40);
+    // Past it: one located error, not a crash and not one error per level.
+    check_true("nest_too_deep", rejected(chain(400), "expression nested too deeply"));
+    // Debug and Release agree, because the limit is a COUNT, not whatever the stack happened to
+    // allow: the same program is rejected in both.
+    check_true("nest_too_deep_pipe", rejected(
+        "fn inc(x: Int) -> Int { x + 1 }\n" + [] {
+            std::string s = "0";
+            for (int i = 0; i < 400; ++i) s += " |> inc";
+            return s;
+        }(), "expression nested too deeply"));
+
+    // String interpolation desugars to a `+` chain the parser builds ITSELF (neither its recursion
+    // nor its Pratt loop sees it), so that chain is counted where it is built.
+    auto holes = [](int n) {
+        std::string s = "let a = 1\n \"";
+        for (int i = 0; i < n; ++i) s += "${a}";
+        return s + "\"";
+    };
+    check_true("nest_interp_ok", check_errc(holes(50)) == 0);
+    check_true("nest_interp_too_deep", rejected(holes(400), "expression nested too deeply"));
+
+    // Parentheses build no AST node, so only the PARSER's counter bounds them.
+    auto parens = [](int n) {
+        std::string s(n, '(');
+        s += "7";
+        s.append(n, ')');
+        return s;
+    };
+    check_int("nest_parens_ok", parens(80), 7);
+    check_true("nest_parens_too_deep", parse_throws(parens(5000)));
+    // A deep TYPE and a deep PATTERN go through the same counter.
+    check_true("nest_type_too_deep", parse_throws("let x: " + std::string(400, '[') + "Int" +
+                                                  std::string(400, ']') + " = 0"));
+    // The tolerant parser treats it as an ordinary syntax error: the item after it survives.
+    {
+        const TolerantParse t = parse_tolerant("fn bad() -> Int { " + parens(3000) + " }\nfn good() -> Int { 7 }\n");
+        bool has_good = false;
+        for (const auto& it : t.prog.items)
+            if (it->kind == svc::ItemKind::Fn && static_cast<const svc::FnItem&>(*it).name == "good") has_good = true;
+        check_true("nest_tolerant_keeps_next_item", !t.parse.empty() && has_good);
+    }
+}
+
 void test_measure_linear() {
     std::cout << "[test_measure_linear: deeply nested calls compile in linear measure time]\n";
     const int depth = 50;
@@ -6625,6 +6700,116 @@ void test_generic_method_bounds() {
 // The `MustUse` marker: a user type opts into the must-use WARNING with `impl MustUse for T {}`. Warning only
 // (the tail-position error stays Result/Option's), open to erasure types, propagated through bounded impls,
 // never a trait object and never a blanket selector. MU occupies lines 1-6.
+// An unqualified trait-method call whose name several traits declare is resolved by the RECEIVER (the
+// traits its type may implement, then visibility), not by the name alone; the pick is written back into
+// the call and obeyed by codegen and the RefEval oracle. Each run test mixes both traits' results, so a
+// codegen or oracle that re-derived the trait by name would produce a different number.
+void test_trait_method_resolution() {
+    std::cout << "[trait-method resolution by receiver]\n";
+    const std::string AB =
+        "trait A { fn m(self) -> Int }\n"
+        "trait B { fn m(self) -> Int }\n"
+        "struct P { x: Int }\n"
+        "struct Q { x: Int }\n"
+        "impl A for P { fn m(self) -> Int { self.x + 1 } }\n"
+        "impl B for Q { fn m(self) -> Int { self.x + 100 } }\n";
+    // Every spelling of the call, each receiver implementing one of the two traits.
+    check_int("tmr_dot", AB + "P { x: 1 }.m() * 1000 + Q { x: 2 }.m()", 2102);
+    check_int("tmr_bare", AB + "m(P { x: 1 }) * 1000 + m(Q { x: 2 })", 2102);
+    check_int("tmr_pipe", AB + "(P { x: 1 } |> m) * 1000 + (Q { x: 2 } |> m)", 2102);
+    check_int("tmr_tail", AB + "fn f(q: Q) -> Int { q.m() }\nfn g(p: P) -> Int { m(p) }\n"
+                               "g(P { x: 1 }) * 1000 + f(Q { x: 2 })", 2102);
+    check_int("tmr_bounded", AB + "fn w[X: B](x: X) -> Int { m(x) }\nfn v[X: A](x: X) -> Int { x.m() }\n"
+                                  "v(P { x: 1 }) * 1000 + w(Q { x: 2 })", 2102);
+    check_int("tmr_dyn", AB + "fn d(x: dyn B) -> Int { x.m() }\nfn e(x: dyn A) -> Int { m(x) }\n"
+                              "e(P { x: 1 }) * 1000 + d(Q { x: 2 })", 2102);
+    check_int("tmr_supertrait", AB + "trait S : B { fn s(self) -> Int }\nimpl S for Q { fn s(self) -> Int { 0 } }\n"
+                                     "fn d(x: dyn S) -> Int { x.m() }\nd(Q { x: 2 })", 102);
+    check_int("tmr_blanket",
+        "trait A { fn m(self) -> Int }\ntrait B { fn m(self) -> Int }\ntrait Base { fn base(self) -> Int }\n"
+        "struct P { x: Int }\nstruct Q { x: Int }\n"
+        "impl A for P { fn m(self) -> Int { 1 } }\n"
+        "impl[T: Base] B for T { fn m(self) -> Int { base(self) + 10 } }\n"
+        "impl Base for Q { fn base(self) -> Int { self.x } }\n"
+        "Q { x: 5 }.m() * 100 + P { x: 0 }.m()", 1501);
+    const std::string CD =
+        "trait C { fn k(self, n: Int) -> Int }\ntrait D { fn k(self, n: Int) -> Int }\n"
+        "struct P { x: Int }\nstruct Q { x: Int }\n"
+        "impl C for P { fn k(self, n: Int) -> Int { self.x + n } }\n"
+        "impl D for Q { fn k(self, n: Int) -> Int { self.x * n } }\n";
+    check_int("tmr_pipe_args", CD + "(P { x: 1 } |> k(3)) * 100 + (Q { x: 2 } |> k(3)) + k(Q { x: 1 }, 1000)", 1406);
+    // The oracle follows the same pick (a differential over the dispatching shapes).
+    check_same("tmr_diff_spellings", AB + "fn w[X: B](x: X) -> Int { m(x) }\nfn d(x: dyn A) -> Int { x.m() }\n"
+                                        "m(P { x: 1 }) * 1000000 + (Q { x: 2 } |> m) * 1000 + w(Q { x: 3 }) + d(P { x: 4 })", false);
+    check_same("tmr_diff_args", CD + "(P { x: 1 } |> k(3)) * 100 + Q { x: 2 }.k(3)", false);
+
+    // A receiver implementing BOTH traits stays ambiguous; the qualified forms pick one.
+    const std::string BOTH = AB + "impl B for P { fn m(self) -> Int { 7 } }\n";
+    check_true("tmr_both_dot", check_has(BOTH + "P { x: 1 }.m()",
+        "ambiguous method 'm': type P implements 'A' and 'B'; qualify it as A::m(..) or B::m(..)"));
+    check_true("tmr_both_bare", check_has(BOTH + "m(P { x: 1 })", "type P implements 'A' and 'B'"));
+    check_true("tmr_both_bounds", check_has(AB + "fn w[X: A + B](x: X) -> Int { x.m() }\n0", "implements 'A' and 'B'"));
+    check_int("tmr_both_qualified", BOTH + "B::m(P { x: 1 }) * 10 + A::m(P { x: 1 })", 72);
+    // A receiver implementing neither is named as such; a poisoned one adds nothing.
+    check_true("tmr_neither", check_has(AB + "7.m()",
+        "type Int has no method 'm' (declared by 'A' and 'B', which it does not implement)"));
+    check_true("tmr_poisoned", check_errc(AB + "nosuch.m()") == 1);
+    check_true("tmr_poisoned_bare", check_errc(AB + "m(nosuch)") == 1);
+    // One declaring trait: exactly the old rule, including its message.
+    check_true("tmr_single_not_impl", check_has("trait A { fn m(self) -> Int }\n7.m()",
+                                                "does not implement trait 'A'"));
+
+    // Inside a trait's DEFAULT body `self` is a rigid var bounded by that trait, and inside an impl it
+    // is the impl's type -- both must reach their own trait's `m`, not the other's.
+    check_int("tmr_default_body", AB +
+        "trait C { fn m(self) -> Int\n fn twice(self) -> Int { m(self) + self.m() } }\n"
+        "struct R { x: Int }\nimpl C for R { fn m(self) -> Int { self.x } }\n"
+        "R { x: 3 }.twice() * 1000 + P { x: 1 }.m() * 100 + Q { x: 2 }.m()", 6302);
+    check_int("tmr_impl_body_other_trait", AB +
+        "trait C { fn c(self) -> Int }\nimpl C for P { fn c(self) -> Int { self.m() + m(self) } }\n"
+        "P { x: 1 }.c() * 1000 + Q { x: 2 }.m()", 4102);
+
+    // A user trait may reuse a method name of a std trait (`next`, `clone`); the std's own bodies,
+    // which call `next(s)` on a `dyn Iterator`, keep dispatching to Iterator.
+    check_int_p("tmr_user_next",
+        "trait Counter { fn next(self) -> Int }\ntrait Dup { fn clone(self) -> Int }\nstruct C { n: Int }\n"
+        "impl Counter for C { fn next(self) -> Int { self.n + 1 } }\n"
+        "impl Dup for C { fn clone(self) -> Int { self.n * 2 } }\n"
+        "let mut it = range(1, 3)\nlet first = match it.next() { Some(v) => v, None => 0 }\n"
+        "C { n: 4 }.next() * 1000 + (range(1, 3) |> sum) * 100 + C { n: 4 }.clone() * 10 + first", 5381);
+
+    // Across modules: a trait private to one module never competes in another (the reported repro).
+    const std::unordered_map<std::string, std::string> shapes = { { "m",
+        "pub trait Shape { fn name(self) -> Int }\n"
+        "pub struct Sq { s: Int }\n"
+        "impl Shape for Sq { fn name(self) -> Int { self.s * self.s } }\n"
+        "pub fn show(s: dyn Shape) -> Int { s.name() }\n" } };
+    check_int_modules("tmr_modules_repro",
+        "import m\nuse m::{Sq, show}\n"
+        "trait Named { fn name(self) -> Int }\nstruct T { v: Int }\n"
+        "impl Named for T { fn name(self) -> Int { self.v } }\n"
+        "T { v: 1 }.name() * 1000 + name(T { v: 2 }) * 100 + show(Sq { s: 3 })", shapes, 1209);
+    // Visibility breaks a tie: `Tagged` is private to `m`, and its blanket impl covers every type, so
+    // `x.tag()` in the entry means the entry's own trait -- while inside `m` both are candidates.
+    const std::unordered_map<std::string, std::string> tagged = { { "m",
+        "trait Tagged { fn tag(self) -> Int }\n"
+        "impl[T] Tagged for T { fn tag(self) -> Int { 5 } }\n"
+        "pub fn five(x: Int) -> Int { Tagged::tag(x) }\n" } };
+    check_int_modules("tmr_modules_visibility",
+        "import m\nuse m::five\ntrait Tag { fn tag(self) -> Int }\nimpl Tag for Int { fn tag(self) -> Int { self * 2 } }\n"
+        "4.tag() * 10 + five(1)", tagged, 85);
+    auto modules_error_has = [](const std::string& entry, const std::unordered_map<std::string, std::string>& mods,
+                                const std::string& substr) {
+        try { svc::compile_modules(svc::load_modules(entry.c_str(), mem_resolver(mods)), nullptr); return false; }
+        catch (const std::exception& e) { return std::string(e.what()).find(substr) != std::string::npos; }
+    };
+    std::unordered_map<std::string, std::string> tagged_inside = tagged;
+    tagged_inside["m"] += "trait Tag2 { fn tag(self) -> Int }\nimpl Tag2 for Int { fn tag(self) -> Int { 1 } }\n"
+                          "pub fn amb(x: Int) -> Int { x.tag() }\n";
+    check_true("tmr_modules_same_module_ambiguous",
+               modules_error_has("import m\nuse m::amb\namb(1)", tagged_inside, "implements 'Tag2' and 'Tagged'"));
+}
+
 void test_must_use_marker() {
     std::cout << "[MustUse marker: user-extensible must-use warning]\n";
     const char* MU = "enum Outcome { Accepted, Rejected(String) }\n"
@@ -10849,10 +11034,12 @@ int main(int argc, char** argv) {
     test_inherent_impl();
     test_qualified_inherent_call();
     test_receiver_inferred_once();
+    test_nesting_depth();
     test_measure_linear();
     test_associated_fn();
     test_impl_bounds();
     test_generic_method_bounds();
+    test_trait_method_resolution();
     test_must_use_marker();
     test_char_utf8();
     test_char_literals();

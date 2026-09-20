@@ -136,10 +136,18 @@ it out again:
 
 - the `Int` → `Double` widening at a node (`Expr::widen_double`);
 - whether a name refers to a user function or a built-in (`IdentExpr::ambient`);
-- whether `Head::m(x)` names an inherent method or a trait method (`IdentExpr::inherent`).
+- whether `Head::m(x)` names an inherent method or a trait method (`IdentExpr::inherent`);
+- which trait an unqualified trait-method call `x.m()` / `m(x)` dispatches to (`IdentExpr::resolved_trait`,
+  `FieldExpr::resolved_trait`).
 
 Several real defects came from two parts of the compiler answering one question independently and
 disagreeing.
+
+**Expressions may nest 200 levels deep.** Parsing and checking are recursive descent, so nesting costs
+stack; beyond the limit the program is rejected with *expression nested too deeply* instead of the compiler
+running out of stack. No realistic program comes close — a chain of calls or pipes is already limited to
+about 64 by the register window — and the limit is a count, so every build rejects exactly the same
+programs.
 
 ### Inference
 
@@ -171,6 +179,11 @@ branch types (in `if`, `match`, or the `break` values of a `loop`) is exact.
     call, a `dyn` coercion, a blanket built on top. When the wrapped type is still open at that place, the
     bound is settled later, like a deferred type argument. An impl of a subtrait must require at least what
     the supertrait's impl for the same type requires.
+  - Several traits may declare a method with the same name. An unqualified call `x.m()`, `m(x)` or `x |> m`
+    is resolved by its receiver: the trait its type may implement (an impl for its head, a `dyn` trait and
+    its supertraits, a type parameter's bounds, a blanket impl). A tie goes to the trait visible in the
+    calling module (its own, the standard library's, or a `pub` one); a receiver that implements two of them
+    is an error naming both. With a single declaring trait the rule is the plain lookup it always was.
   - A trait method may have its own bounded type parameters. An impl must match the trait's signature; it may
     drop a bound or narrow it to a supertrait the trait's bound implies, but not add one or change a bound's
     type arguments, since callers prove only the trait's bounds. A trait with a generic method cannot be used

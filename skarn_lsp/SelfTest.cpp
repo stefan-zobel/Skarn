@@ -159,6 +159,22 @@ void test_analysis(Suite& t) {
                         it->second[0].range.end.character == 21;
         t.check(ok, "type error: 0-based position, range covers the identifier", describe(r));
     }
+    {   // A file nested past the front end's depth limit reports instead of killing the server:
+        // the parser and the checker both bound their recursion, which used to overflow the stack.
+        std::string pipeline = "fn inc(x: Int) -> Int { x + 1 }\nprintln(0";
+        for (int i = 0; i < 400; ++i) pipeline += " |> inc";
+        pipeline += ")\n";
+        const AnalysisResult deep = analyze(ENTRY, pipeline, none);
+        const auto it = deep.by_path.find(ENTRY);
+        t.check(it != deep.by_path.end() && !it->second.empty() &&
+                contains(it->second[0].message, "nested too deeply"),
+                "a too-deeply nested file is reported, not a crash", describe(deep));
+        std::string parens = "println(" + std::string(5000, '(') + "7" + std::string(5000, ')') + ")\n";
+        const AnalysisResult deep2 = analyze(ENTRY, parens, none);
+        t.check(deep2.by_path.count(ENTRY) == 1, "so is one the PARSER cannot descend into", describe(deep2));
+        // and the server keeps working afterwards
+        t.check(analyze(ENTRY, "println(1 + 2)\n", none).by_path.empty(), "analysis after a deep file still works");
+    }
     {   // argument mismatch: a secondary note pointing at the parameter
         const AnalysisResult r = analyze(ENTRY, "fn f(n: Int) -> Int { n }\nprintln(f(\"a\"))\n", none);
         const auto it = r.by_path.find(ENTRY);
@@ -429,6 +445,22 @@ void test_references(Suite& t, const AnalysisResult& r) {
     expect(refs(20, "b"), "main.skn:20:30 util.skn:2:27 util.skn:3:49 ", "a field: accesses in both modules and the declaration");
     expect(refs(19, "Some"), "", "a std name has no references here");
 
+    {   // a BARE trait-method call `nm(x)`: the checker records the trait it dispatched to, so the call
+        // is one more reference of that method -- even where a second trait declares the same name.
+        const std::string src = "trait T { fn nm(self) -> Int }\ntrait U { fn nm(self) -> Int }\n"
+                                "impl T for Int { fn nm(self) -> Int { 1 } }\n"
+                                "impl U for Bool { fn nm(self) -> Int { 2 } }\n"
+                                "println(nm(3) + nm(true) + 4.nm())\n";
+        const AnalysisResult c = analyze(ENTRY, src, Overlay());
+        const std::vector<const AnalysisResult*> one{ &c };
+        t.check(show(references(one, ENTRY, at(src, 1, "nm"), true)) == "main.skn:1:14 main.skn:3:21 main.skn:5:9 main.skn:5:30 ",
+                "a bare call counts for the trait the receiver picked, not for the other trait's method",
+                show(references(one, ENTRY, at(src, 1, "nm"), true)));
+        t.check(show(definition(c, ENTRY, at(src, 5, "nm"))) == "main.skn:1:14-16",
+                "go to definition from a bare trait-method call",
+                show(definition(c, ENTRY, at(src, 5, "nm"))));
+    }
+
     const AnalysisResult c = analyze(ENTRY, "let mut c = 0\nc = c + 1\nprintln(c)\n", Overlay());
     std::string kinds;
     for (const Highlight& h : highlights(c, ENTRY, Position{ 2, 8 }))
@@ -490,9 +522,18 @@ void test_rename(Suite& t, const AnalysisResult& r) {
         const AnalysisResult c = analyze(ENTRY, src, Overlay());
         refused(ren(c, src, 1, "f()", "g"), "would", "a collision is refused");
     }
-    {   // a bare trait-method call cannot be attributed, so the rename could miss it
+    {   // a bare trait-method call is attributed (the checker records its trait), so it is renamed too
         const std::string src = "trait T { fn nm(self) -> Int }\nimpl T for Int { fn nm(self) -> Int { 1 } }\n"
                                 "println(nm(3))\n";
+        const AnalysisResult c = analyze(ENTRY, src, Overlay());
+        expect(ren(c, src, 1, "nm", "num"), "main.skn:1:14=num main.skn:2:21=num main.skn:3:9=num ",
+               "a bare trait-method call is renamed with the method");
+    }
+    {   // a call the checker could NOT resolve records no trait -- here the one ambiguous case left, a
+        // receiver implementing both traits -- so the rename still refuses rather than miss it
+        const std::string src = "trait T { fn nm(self) -> Int }\ntrait U { fn nm(self) -> Int }\n"
+                                "impl T for Int { fn nm(self) -> Int { 1 } }\n"
+                                "impl U for Int { fn nm(self) -> Int { 2 } }\nprintln(nm(3))\n";
         const AnalysisResult c = analyze(ENTRY, src, Overlay());
         refused(ren(c, src, 1, "nm", "num"), "cannot be attributed", "an unattributable same-named call blocks the rename");
     }
@@ -837,7 +878,10 @@ void test_signature_help(Suite& t) {
         t.check(active_param(i) == "self", "a qualified method call: self is the first argument", show(i));
         const auto j = help_entry(SIGNATURE_DECLS + "fn f(q: Sq) -> Double { area(<|>) }\n");
         t.check(j && j->signatures.size() == 2 && active_param(j) == "self",
-                "a bare trait-method call: one signature per trait", show(j));
+                "a bare trait-method call with nothing typed yet: one signature per trait", show(j));
+        const auto k = help_entry(SIGNATURE_DECLS + "fn f(q: Sq) -> Double { area(q<|>) }\n");
+        t.check(k && k->signatures.size() == 1 && label_of(k) == "fn area(self) -> Double",
+                "once the receiver is typed, only the trait it implements", show(k));
     }
     {
         const auto h = help_entry(SIGNATURE_DECLS + "fn f() -> E { E::A(1, <|>) }\n");

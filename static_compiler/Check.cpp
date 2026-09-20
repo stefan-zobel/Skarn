@@ -702,6 +702,46 @@ private:
         ~QuietGuard() { --d; }
     };
 
+    // ----- the nesting-depth limit -------------------------------------------------------
+    // Checking is recursive descent over the AST, so expression nesting costs STACK: one level of a
+    // pipe chain costs ~21 KB in a Debug build (`infer_pipe` alone 11 KB), and without a limit a deep
+    // enough expression simply overflows -- the process dies with no diagnostic at all, at a depth
+    // that differs between Debug and Release, i.e. the two configurations would accept different
+    // programs. The limit makes that a located, deterministic error instead.
+    //
+    // 200 is chosen against the 8 MB stack the front-end executables reserve (see their vcxproj /
+    // CMakeLists): 200 x 21 KB = 4.2 MB, about half. It cannot reject anything that would otherwise
+    // compile: codegen already refuses a call/pipe nest beyond ~64 registers, and no real expression
+    // nests 200 deep. The AST depth is what matters, NOT the source nesting -- a left-nested chain
+    // (`1 + 1 + 1 ...`, `x |> f |> g`) is read by a LOOP in the parser but is n levels deep here.
+    static constexpr int MAX_EXPR_DEPTH = 200;
+    int expr_depth_ = 0;
+    const Expr* depth_node_ = nullptr;   // the node the innermost level belongs to
+    bool too_deep_reported_ = false;   // latch: report once per run, not at every level on the way out
+    // Counts AST LEVELS, not calls: `check_expr` hands most nodes on to `infer`, so the two funnels
+    // would otherwise count one node twice and halve the real limit. Entering the node that already
+    // owns the innermost level is free.
+    struct DepthGuard {
+        Checker& c;
+        const Expr* prev;
+        bool counted;
+        DepthGuard(Checker& ch, const Expr& e) : c(ch), prev(ch.depth_node_), counted(ch.depth_node_ != &e) {
+            if (counted) { ++c.expr_depth_; c.depth_node_ = &e; }
+        }
+        ~DepthGuard() { if (counted) { --c.expr_depth_; c.depth_node_ = prev; } }
+    };
+    // True (and reports, once) when this node is past the limit. The caller poisons its subtree with
+    // `ty_error()`, which every consumer already handles.
+    bool too_deep(const Expr& e) {
+        if (expr_depth_ <= MAX_EXPR_DEPTH) return false;
+        if (!too_deep_reported_ && quiet_depth_ == 0) {
+            too_deep_reported_ = true;
+            error(e.line, e.col, "expression nested too deeply (more than " +
+                  std::to_string(MAX_EXPR_DEPTH) + " levels); split it into several statements");
+        }
+        return true;
+    }
+
     // A generic argument a call site could not yet decide, re-examined once every body has been
     // checked (`drain_pending_generics`). A type argument is often fixed only AFTER the call that
     // introduced it -- by a later argument (`fold(xs, Set::new(), fn(acc: Set[Int], x: Int) ...)`) or a
@@ -3232,6 +3272,8 @@ private:
 
     // ----- expressions ------------------------------------------------------
     TyPtr infer(Expr& e) {
+        DepthGuard depth(*this, e);
+        if (too_deep(e)) { e.ty = ty_error(); return e.ty; }
         TyPtr t = infer_impl(e);
         // Store the APPLIED type on the node: the solver's union-find is torn down when
         // check() returns, so codegen (erasure) must read a resolved type off Expr::ty --
@@ -3275,6 +3317,10 @@ private:
     }
 
     void check_expr(Expr& e, TyPtr expected, const DiagLabel* origin = nullptr) {
+        // The second funnel of the recursion, next to `infer` -- a delegating construct
+        // (Block/If/Match/Loop) recurses through here without passing `infer` at all.
+        DepthGuard depth(*this, e);
+        if (too_deep(e)) { e.ty = ty_error(); return; }
         // Bidirectional cases: push the expected type inward so lambda params,
         // block/if/match tails, and empty container literals get their types from
         // context (e.g. `fn f() -> List[Int] { [] }`).
@@ -3864,13 +3910,22 @@ private:
                 if (id.name == "toBytes")   { callee.ty = ty_error(); return check_mono1(args, node, "toBytes", ty_string(), make_named("Bytes", {})); }
                 if (id.name == "fromBytes") { callee.ty = ty_error(); return check_mono1(args, node, "fromBytes", make_named("Bytes", {}), ty_string()); }
                 if (id.name == "bytes")     { callee.ty = ty_error(); return check_bytes(args, node); }
-                // An unqualified trait-method call -> dispatch on the receiver (arg 0).
+                // An unqualified trait-method call -> dispatch on the receiver (arg 0), which also
+                // decides WHICH trait's method when several declare the name. The receiver is inferred
+                // once, here, and handed on (the `pre_self` rule of call_trait_method).
                 if (auto oit = method_owners_.find(id.name); oit != method_owners_.end()) {
                     callee.ty = ty_error();
-                    if (oit->second.size() > 1)
-                        error(node.line, node.col, "ambiguous method '" + id.name +
-                              "'; qualify it as Trait::" + id.name);
-                    return call_trait_method(oit->second[0], id.name, args, node);
+                    // Only a choice among several `self` methods needs the receiver first; otherwise
+                    // call_trait_method infers (or checks) arg 0 itself, exactly as it always has.
+                    const bool pre = oit->second.size() > 1 && !args.empty() && all_take_self(id.name);
+                    TyPtr recvTy = pre ? apply(infer(*args[0])) : nullptr;
+                    const std::string trait = pick_trait(id.name, recvTy, node.line, node.col);
+                    if (trait.empty()) {
+                        for (size_t i = pre ? 1 : 0; i < args.size(); ++i) infer(*args[i]);
+                        return ty_error();
+                    }
+                    id.resolved_trait = trait;   // the routing decision; codegen + the oracle obey it
+                    return call_trait_method(trait, id.name, args, node, recvTy);
                 }
             }
         }
@@ -3947,16 +4002,127 @@ private:
             for (Expr* a : args) infer(*a);
             return ty_error();
         }
-        if (oit->second.size() > 1) {
-            error(node.line, node.col, "ambiguous method '" + fld.name +
-                  "'; qualify it as Trait::" + fld.name);
+        const std::string trait = pick_trait(fld.name, recvTy, node.line, node.col);
+        if (trait.empty()) {
             for (Expr* a : args) infer(*a);
             return ty_error();
         }
         std::vector<Expr*> margs;
         margs.push_back(fld.obj.get());
         for (Expr* a : args) margs.push_back(a);
-        return call_trait_method(oit->second[0], fld.name, margs, node, recvTy);
+        fld.resolved_trait = trait;   // the routing decision; codegen + the oracle obey it
+        return call_trait_method(trait, fld.name, margs, node, recvTy);
+    }
+
+    // The trait an unqualified trait-method call (`recv.m(..)`, `m(recv, ..)`, `recv |> m`) dispatches to,
+    // or "" after reporting why there is none. Every trait of the whole program that declares `m` is a
+    // candidate (method_owners_), so the name alone must not decide: a private trait in one module would
+    // make a correct call in another ambiguous. The RECEIVER decides -- the traits its type may implement
+    // (an impl for its head, a `dyn` trait and its supertraits, a type parameter's bounds, a blanket impl);
+    // a tie is broken by visibility (a trait private to another module cannot be meant). The pick is
+    // written back (IdentExpr / FieldExpr::resolved_trait) and obeyed by codegen and the RefEval oracle.
+    //
+    // A strict relaxation of the old rule "ambiguous as soon as two traits declare `m`": with one
+    // declaring trait the pick is that trait, as before. A receiver whose type is not known yet is not
+    // waited for (its trait fixes the parameter types the arguments are checked against), so without a
+    // receiver the visible traits decide -- over-rejecting at worst, never picking a wrong trait.
+    std::string pick_trait(const std::string& method, const TyPtr& recvIn, uint32_t line, uint32_t col) {
+        const std::vector<std::string>& owners = method_owners_.at(method);
+        if (owners.size() == 1) return owners[0];
+        const TyPtr rs = recvIn ? apply(recvIn) : nullptr;
+        if (rs && (rs->kind == TyKind::Error || rs->kind == TyKind::Never)) return owners[0];   // already reported
+        auto visible = [&](const std::vector<std::string>& from) {
+            std::vector<std::string> out;
+            for (const auto& t : from) if (trait_visible_here(t)) out.push_back(t);
+            return out;
+        };
+        std::vector<std::string> may;
+        if (rs) for (const auto& t : owners) if (may_implement(rs, t)) may.push_back(t);
+        if (may.size() == 1) return may[0];
+        if (may.size() > 1) {
+            const std::vector<std::string> vis = visible(may);
+            if (vis.size() == 1) return vis[0];
+            const std::vector<std::string>& named = vis.empty() ? may : vis;
+            error(line, col, "ambiguous method '" + method + "': type " + describe(rs) + " implements " +
+                  trait_list(named, " and ") + "; qualify it as " + qualified_forms(named, method));
+            return {};
+        }
+        const std::vector<std::string> vis = visible(owners);
+        if (vis.size() == 1) return vis[0];   // call_trait_method reports "does not implement", as before
+        const std::vector<std::string>& named = vis.empty() ? owners : vis;
+        if (!rs)
+            error(line, col, "ambiguous method '" + method + "' (declared by " + trait_list(named, " and ") +
+                  "); qualify it as " + qualified_forms(named, method));
+        else if (rs->kind == TyKind::Var && !rs->rigid && rs->bounds.empty())
+            error(line, col, "ambiguous method '" + method + "' (declared by " + trait_list(named, " and ") +
+                  ") on a receiver whose type is not known here; qualify it as " +
+                  qualified_forms(named, method));
+        else
+            error(line, col, "type " + describe(rs) + " has no method '" + method + "' (declared by " +
+                  trait_list(named, " and ") + ", which it does not implement)");
+        return {};
+    }
+
+    // Does every trait declaring `method` declare it with `self` (so the first argument is a receiver)?
+    bool all_take_self(const std::string& method) const {
+        for (const auto& t : method_owners_.at(method))
+            for (const auto& ms : traits_.at(t).methods)
+                if (ms.name == method && !ms.has_self) return false;
+        return true;
+    }
+
+    // Could `rs` implement `trait`? For a named head, an impl of the trait for that head counts whatever
+    // its own bounds say (call_trait_method checks those, and records what it cannot decide yet); else
+    // satisfies_bound: a `dyn` trait and its supertraits, a type parameter's bounds, a blanket impl. A
+    // pure probe: nothing is deferred from here.
+    bool may_implement(const TyPtr& rs, const std::string& trait) {
+        const std::string head = type_head(rs);
+        if (!head.empty()) {
+            const std::string key = trait + "\x1f" + head;
+            if (impl_index_.count(key) || impl_keys_.count(key)) return true;
+        }
+        ObligationScope pure(impl_obligations_, nullptr);
+        return satisfies_bound(rs, trait);
+    }
+
+    // May code in the current module mean the trait `t`? Its own module's, a bare / prelude one, or a
+    // `pub` one -- a private trait of another module cannot be named there. (Not visible_across, which
+    // counts the entry program's items as visible from everywhere.)
+    bool trait_visible_here(const std::string& t) const {
+        const std::string owner = module_prefix_of(t);
+        return owner.empty() || owner == PRELUDE_MODULE_PREFIX || owner == cur_module_ || pub_items_.count(t) > 0;
+    }
+
+    // How to NAME the candidate traits in a diagnostic: the short name, or the mangled one where two
+    // candidates share it (`util::Named` vs. `Named`), which `error` renders without the entry prefix.
+    // Sorted -- the owner list follows an unordered map.
+    static std::vector<std::string> trait_names(const std::vector<std::string>& traits) {
+        std::vector<std::string> names;
+        for (const auto& t : traits) {
+            const std::string s = short_name(t);
+            bool shared = false;
+            for (const auto& o : traits) if (o != t && short_name(o) == s) { shared = true; break; }
+            names.push_back(shared ? t : s);
+        }
+        std::sort(names.begin(), names.end());
+        return names;
+    }
+
+    // "'A' and 'B'" / "'A', 'B' and 'C'".
+    static std::string trait_list(const std::vector<std::string>& traits, const char* last_sep) {
+        const std::vector<std::string> names = trait_names(traits);
+        std::string s;
+        for (size_t i = 0; i < names.size(); ++i)
+            s += (i == 0 ? "" : i + 1 == names.size() ? last_sep : ", ") + ("'" + names[i] + "'");
+        return s;
+    }
+    // "A::m(..) or B::m(..)" for the same list.
+    static std::string qualified_forms(const std::vector<std::string>& traits, const std::string& method) {
+        const std::vector<std::string> names = trait_names(traits);
+        std::string s;
+        for (size_t i = 0; i < names.size(); ++i)
+            s += (i == 0 ? "" : i + 1 == names.size() ? " or " : ", ") + (names[i] + "::" + method + "(..)");
+        return s;
     }
 
     // Instantiate a generic fn's scheme with fresh (bound-carrying) vars, check the
