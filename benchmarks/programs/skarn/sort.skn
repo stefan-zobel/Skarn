@@ -1,0 +1,44 @@
+// Benchmark: insertion sort on a fixed-size Array[Int].
+// n=5_000 — identical across Skarn, Python, C++.
+use std::env::*
+use std::random::*
+
+let n = 5000
+let mut rng = Rng::fromSeed(42)
+let mut arr = array(n, 0)
+let mut i = 0
+while i < n {
+    arr[i] = rng.nextInt(0, 1000000)
+    i = i + 1
+}
+
+gcResetStats()
+let t0 = nanoTime()
+
+let mut ii = 1
+while ii < n {
+    let key = arr[ii]
+    let mut j = ii - 1
+    while j >= 0 && arr[j] > key {
+        arr[j + 1] = arr[j]
+        j = j - 1
+    }
+    arr[j + 1] = key
+    ii = ii + 1
+}
+
+let wall_ns = nanoTime() - t0
+let g = gcStats()
+
+let mut sorted = true
+let mut k = 1
+while k < n {
+    if arr[k] < arr[k - 1] { sorted = false }
+    k = k + 1
+}
+
+println("benchmark=sort  n=" + toString(n) + "  sorted=" + toString(sorted)
+        + "  wall_ns=" + toString(wall_ns) + "  ns/elem=" + toString(wall_ns / n))
+println("gc_collections=" + toString(toInt(g.collections))
+        + "  gc_bytes=" + toString(toInt(g.bytesAlloced))
+        + "  gc_ns=" + toString(toInt(g.gcNanosTotal)))

@@ -1,0 +1,18 @@
+// Benchmark: naive recursive Fibonacci (call-bound).
+// k=35 — identical across Skarn, Python, C++.
+use std::env::*
+
+fn fib(k: Int) -> Int { if k < 2 { k } else { fib(k - 1) + fib(k - 2) } }
+
+let k = 35
+gcResetStats()
+let t0 = nanoTime()
+let r = fib(k)
+let wall_ns = nanoTime() - t0
+let g = gcStats()
+
+println("benchmark=fib  k=" + toString(k) + "  result=" + toString(r)
+        + "  wall_ns=" + toString(wall_ns))
+println("gc_collections=" + toString(toInt(g.collections))
+        + "  gc_bytes=" + toString(toInt(g.bytesAlloced))
+        + "  gc_ns=" + toString(toInt(g.gcNanosTotal)))
