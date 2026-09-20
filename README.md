@@ -134,6 +134,11 @@ Run the driver without arguments for the full list. A multi-file program is a di
 
 ## Tests
 
+**macOS:** `ctest --test-dir build` runs the VM suite, the hardware-fault probe, the compiler suite and the
+language-server self-test. The individual binaries are `build/vm_tests`, `build/static_compiler_tests` and
+`build/skarn_lsp --selftest`. The documentation harnesses in the table below are PowerShell scripts and have
+only been run on Windows, so the macOS gate is the smaller one.
+
 **Windows:**
 
 | command | what it checks |
@@ -148,7 +153,8 @@ Run the driver without arguments for the full list. A multi-file program is a di
 `tools/vscode-skarn` is a VS Code extension: syntax highlighting, plus live type checking, an outline, hover
 types, go to definition, find references, rename, completion, signature help and formatting through the language server `skarn_lsp` (built with the
 rest of the project). The Windows release zip contains both, `skarn_lsp.exe` and the extension as a `.vsix`;
-the extension's README explains how to install it and point it at the server. Syntax highlighting alone is also available for Notepad++ (`tools/skarn.npp-udl.xml`) and any
+on macOS the server is `build/skarn_lsp` and the same `.vsix` drives it, since the extension is JavaScript
+and ships no binary. The extension's README explains how to install it and point it at the server. Syntax highlighting alone is also available for Notepad++ (`tools/skarn.npp-udl.xml`) and any
 TextMate-compatible editor (`docs/skarn.tmLanguage.json`).
 
 ## Repository layout

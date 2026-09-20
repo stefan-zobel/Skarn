@@ -2,8 +2,10 @@
 
 This document describes `skarn_lsp`, the language server that gives an editor live diagnostics, an outline,
 hover, go to definition, find references, rename, completion, signature help and formatting for Skarn. It is written for
-someone who wants to read or change the server. `tools/vscode-skarn` is its VS Code client; the Windows
-release zip ships both, `skarn_lsp.exe` and the extension as a `.vsix`. The compiler whose
+someone who wants to read or change the server. `tools/vscode-skarn` is its VS Code client. The Windows
+release zip ships both, `skarn_lsp.exe` and the extension as a `.vsix`; elsewhere the server is the CMake
+target `skarn_lsp`, built with the rest of the project, and the same `.vsix` drives it (the extension is
+JavaScript and carries no binary). The compiler whose
 front half it runs is described in [Compiler.md](Compiler.md), the language in the
 [Skarn Guide](../SkarnGuide.md).
 
@@ -48,8 +50,9 @@ Everything lives in namespace `lsp`.
 | `Server` | the message loop: text synchronization, re-checking, publishing diagnostics, answering requests |
 | `SelfTest` | `skarn_lsp --selftest` |
 
-Standard output carries nothing but protocol frames: on Windows it is switched to binary mode, and
-`std::cout` is redirected to standard error.
+Standard output carries nothing but protocol frames: on Windows it is switched to binary mode so that no
+line ending is rewritten (elsewhere there is nothing to switch), and `std::cout` is redirected to standard
+error.
 
 ## Analysis and diagnostics
 
@@ -188,4 +191,6 @@ Otherwise nothing changes and the reason is shown. A file with a syntax error is
 `skarn_lsp --selftest` runs the server's own test suite and exits non-zero on a failure: the JSON reader and
 writer, the message framing, the mapping from compiler errors to diagnostics, error recovery, outline, hover,
 definition, references and rename (including the refusals) over a two-module program, completion, signature
-help, formatting (every rule, idempotence, refusals), and a scripted protocol session.
+help, formatting (every rule, idempotence, refusals), and a scripted protocol session. It is expected to
+print the same totals on every platform: the server runs the compiler's front half only, so it has nothing
+in it that depends on the operating system.

@@ -24,9 +24,24 @@ vMachine is a register-based bytecode interpreter in C++20. Its design choices:
   allocation, no fragmentation, and collection cost proportional to the live data.
 - **Index-addressed globals, heap strings and string interning.**
 
-The VM is single-threaded and runs on **Windows x64 with MSVC** only. It uses `VirtualAlloc` for its stacks
-and heap, structured exception handling for fatal faults, and relies on MSVC's bit-field layout for the
-instruction encoding.
+The VM is single-threaded. It runs on **Windows x64 with MSVC** and on **macOS arm64 with Clang**; both
+build the whole project and pass every suite. A small platform layer (`vmcore/Platform.h`) is what the rest
+of the runtime sees:
+
+- **Memory** is reserved and committed with `VirtualAlloc` on Windows and with `mmap` + `mprotect`
+  elsewhere. Every stack ends in a guard page — 4 KiB, or 16 KiB on Apple Silicon, where that is the page
+  size.
+- **Fatal faults** (a guard-page hit, an illegal instruction, integer division by zero) reach one handler
+  wrapped around the dispatch loop: a structured-exception frame on Windows, and a signal handler on POSIX
+  that records the faulting address and jumps to a landing point set with `sigsetjmp`. Both SIGSEGV and
+  SIGBUS are installed there, because a `PROT_NONE` guard page is reported as SIGBUS on macOS and as SIGSEGV
+  on Linux.
+- **The instruction encoding** uses bit-fields, whose layout the C++ standard leaves to the implementation.
+  The two supported toolchains lay them out the same way; a bytecode file carries a sentinel so that a
+  reader which does not is rejected rather than misled (see "Bytecode container format").
+
+The compiler and the driver contain no platform-specific code at all. What remains Windows-only is the
+`sh()` helper in `std::process`, which runs `cmd.exe` by name.
 
 ## Source files
 
@@ -316,10 +331,16 @@ error: division by zero at line 2 (in boom)
 
 A frame replaced by a tail call does not appear in the trace.
 
-The dispatch loop itself contains no exception handler. `run_switch` wraps it in one structured-exception
-frame for the faults that cannot be located: an access violation, an illegal opcode, heap exhaustion. An
-access violation is classified by its address: inside a VM stack region it is a stack overflow, anywhere
-else it indicates a dangling pointer.
+The dispatch loop itself contains no exception handler. `run_switch` wraps it in one frame for the faults
+that cannot be located: an access violation, an illegal opcode, heap exhaustion. On Windows that frame is a
+structured-exception handler; on POSIX it is a `sigsetjmp` landing point that the SIGSEGV/SIGBUS handler
+jumps to after recording the faulting address. Either way the access violation is classified by that
+address: inside a VM stack region it is a stack overflow, anywhere else it indicates a dangling pointer.
+
+Heap exhaustion is reported only where the operating system says so. Windows fails the commit and the VM
+raises "Heap exhausted"; on POSIX, committing an already-reserved mapping costs nothing and therefore
+succeeds, so genuine exhaustion surfaces later, when the memory is first touched. That is a platform
+limitation, not something the fault ladder can recover.
 
 ## Bytecode files (SKBC)
 
@@ -331,8 +352,10 @@ A compiled program can be saved as a `.skbc` file and run later without recompil
   table, metadata, and an optional debug chunk with line, column, function and module tables;
 - a CRC-32 footer.
 
-Integers in the container are little-endian. The instruction words are stored as MSVC packs them; the layout
-sentinel makes a reader built with a different bit-field layout reject the file instead of misreading it.
+Integers in the container are little-endian. The instruction words are stored exactly as the compiler that
+wrote them packed their bit-fields — the C++ standard does not fix that layout — and the header carries a
+sentinel word built from a signed bit-field, so a reader that packs them differently rejects the file
+instead of misreading it.
 `BYTECODE_ISA_VERSION` changes whenever the meaning or encoding of an instruction changes, so older bytecode
 is rejected. `CONTAINER_FORMAT_VERSION` versions the file structure. Unknown optional chunks are skipped;
 unknown required chunks are rejected.
@@ -369,9 +392,10 @@ copies in `Context` are allowed to be stale.
 **Why a switch.** Threaded dispatch (a tail call per handler) is not faster here: the dispatch branch is
 predicted almost perfectly, and the real cost is the work around each instruction and interpreter state
 spilled to memory. A single loop with its state held in registers is faster than threading, and it builds
-with the default `/sdl` and whole-program optimization settings. The structured-exception frame sits
-outside the loop in a separate, non-inlined function, because a handler inside the loop would force that
-state back into memory.
+with the default `/sdl` and whole-program optimization settings. The fault frame sits outside the loop in a
+separate, non-inlined function: on Windows because a handler inside the loop would force that state back
+into memory, and on POSIX because `sigsetjmp` returns twice, which would leave the caller's own variables
+indeterminate if the two were inlined together.
 
 ## Invariants
 
@@ -386,7 +410,9 @@ These are design decisions guarded by `static_assert`s or tests; change them onl
    only at allocation safepoints.
 6. `TAG_PTR` (traced) and `TAG_FUNCPTR` (untraced) stay distinct.
 7. `frame_size` bounds, and is bounded by, the live pointer registers of each frame.
-8. The bytecode encoding is MSVC-specific by design.
+8. The bytecode encoding rests on an implementation-defined bit-field layout. The supported toolchains
+   agree on it; the layout sentinel in a `.skbc` header is what turns a disagreement into a rejected file
+   rather than a silent misread.
 
 Integer, boolean and generic numeric opcodes do not check operand types in Release builds; the compiler
 guarantees them, and Debug builds assert them. Heap operations do check their receiver and raise a located
@@ -413,7 +439,22 @@ code that actually runs often.
 any failure. It covers every opcode family, the calling convention and frame-size contract, the collector,
 containers, strings, closures, trait dispatch, natives and the bytecode format.
 
+On Windows:
+
 ```bash
 msbuild vMachine.sln /p:Configuration=Release /p:Platform=x64
 x64\Release\vm_tests.exe
 ```
+
+On macOS, through CMake:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build
+```
+
+`ctest` runs `vm_tests`, the compiler suite and the language-server self-test. The hardware-fault probe is a
+separate entry (`vm_tests --fault-probe`), because it deliberately dereferences a bad pointer to prove the
+fault frame classifies and recovers it — its failure mode is a killed process rather than a failed
+assertion.

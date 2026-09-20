@@ -66,32 +66,37 @@ warnings of that file. Rename waits until the syntax errors are fixed.
 - Case-based identifiers: `UIdent` → type, `fn name` → function name
 - Operators and punctuation (`|>`, `->`/`=>`, `>>>`, `..`, `?`, `::`, …)
 
-## Installing from a Skarn release
+## Installing the extension and the server
 
-The Windows release zip contains this extension (`skarn-language-<version>.vsix`) and the
-language server `skarn_lsp.exe`, which the extension starts.
+This extension is pure JavaScript and works on every platform; it carries no binary. What it
+needs is the language server `skarn_lsp`, which it starts. On Windows the release zip contains
+both, this extension (`skarn-language-<version>.vsix`) and `skarn_lsp.exe`; elsewhere the server
+is built from source with CMake and ends up as `build/skarn_lsp`.
 
 1. Install the extension: in the Extensions view choose **…** → **Install from VSIX…** and
    pick the `.vsix`, or run `code --install-extension skarn-language-0.2.0.vsix`.
 2. Tell it where the server is: open the Settings, search for `skarn`, and set
-   **Skarn › Server: Path** to the full path of `skarn_lsp.exe` in the unpacked folder —
-   in `settings.json`:
+   **Skarn › Server: Path** to the full path of the server binary — in `settings.json`:
 
    ```json
    "skarn.server.path": "C:/path/to/skarn-0.2.0/skarn_lsp.exe"
    ```
 
-   Or add that folder to the PATH; the default value is just `skarn_lsp`.
+   ```json
+   "skarn.server.path": "/path/to/vMachine/build/skarn_lsp"
+   ```
+
+   Or put that folder on the PATH; the default value is just `skarn_lsp`.
 3. Reload the window (*Developer: Reload Window*).
 
-`skarn_lsp.exe` needs the Visual C++ runtime DLLs that lie next to it in the release
-folder; keep them together.
+On Windows, `skarn_lsp.exe` needs the Visual C++ runtime DLLs that lie next to it in the release
+folder; keep them together. A server built from source has no such companions.
 
 ## The language server
 
-`skarn_lsp` is built with the rest of the solution (`x64/Release/skarn_lsp.exe`) or by
-the CMake build, and found through the same setting (or the PATH). Reload the window after
-changing the setting.
+`skarn_lsp` is built with the rest of the project — `x64/Release/skarn_lsp.exe` from the Visual
+Studio solution, `build/skarn_lsp` from the CMake build — and found through the same setting (or
+the PATH). Reload the window after changing the setting.
 
 How files are checked: every open `.skn` file that no other open file imports is
 checked as a program, together with everything it imports — so open the program's entry
@@ -121,7 +126,8 @@ code --install-extension skarn-language-0.2.0.vsix
 ```
 
 The package contains the extension, its `vscode-languageclient` dependency, this README,
-the changelog and the license — not `skarn_lsp.exe`, which is installed separately.
+the changelog and the license — not the `skarn_lsp` binary, which is installed separately and is
+what makes one `.vsix` usable on every platform.
 
 ## Grammar source
 

@@ -8,9 +8,10 @@
 //
 // The threaded tail-call handlers and their dispatch_table are gone entirely:
 // they were retired to a separate benchmark project (vm_bench) when vmcore moved
-// to while{switch}, and that project was removed earlier. run_switch owns the
-// SEH __try/__except frame that translates guard-page / illegal-instruction /
-// divide-by-zero faults into std::runtime_error. See "Dispatch" in docs/VirtualMachine.md.
+// to while{switch}, and that project was removed earlier. run_switch owns the fault
+// frame that translates guard-page / illegal-instruction / divide-by-zero faults into
+// std::runtime_error -- an SEH __try/__except on Windows, a sigsetjmp landing with a
+// SIGSEGV/SIGBUS handler elsewhere (FaultSignals.h). See "Dispatch" in docs/VirtualMachine.md.
 // =============================================================================
 
 #include <stdexcept>
@@ -1153,7 +1154,8 @@ static Value native_gc_reset_stats(Value*, uint8_t, Context* ctx) {
 }
 
 // =============================================================================
-// TCP networking natives (std::net). Blocking sockets over Winsock. A socket is
+// TCP networking natives (std::net). Blocking sockets over Winsock on Windows and
+// over the BSD socket API elsewhere (Platform.h hides the difference). A socket is
 // exposed to Skarn as a small Int DESCRIPTOR -- an index into this per-execution
 // registry (VM::net) -- never a raw OS SOCKET (a 64-bit kernel handle that need
 // not fit a 48-bit Int). The registry closes any still-open socket at execute()

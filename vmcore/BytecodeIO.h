@@ -26,9 +26,10 @@
 // Chunk tags: CODE CPOL CARR STRC STRL FNTB TRTB META (critical) + DBGL (ancillary,
 // strippable debug info: line/column tables + function names).
 //
-// ENCODING CHOICE (owner-approved "Option A"): the bytecode travels as the raw,
-// MSVC-packed 32-bit instruction words -- fast, and correct on the one supported
-// toolchain (MSVC/x64). The `layout_sentinel` (a known packed Instruction word the
+// ENCODING CHOICE (owner-approved "Option A"): the bytecode travels as the raw
+// 32-bit instruction words, packed the way the writing toolchain lays bitfields out
+// -- fast, and correct wherever reader and writer agree, which the two supported
+// toolchains (MSVC/x64 and Clang/arm64) do. The `layout_sentinel` (a known packed Instruction word the
 // reader recomputes and compares) turns a mismatched-bitfield-ABI read into a clean
 // REJECT rather than a silent misread. A portable field-by-field re-encode would be a
 // non-breaking `container_version` bump later.

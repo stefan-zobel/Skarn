@@ -2,9 +2,9 @@
 //
 // The server speaks the Language Server Protocol over stdin/stdout and reports the
 // type checker's errors and warnings while a file is edited. Its location comes from
-// the `skarn.server.path` setting: an absolute path to skarn_lsp(.exe) -- the Windows release
-// zip ships it -- or just `skarn_lsp` when it is on the PATH. Changing the setting takes effect after
-// "Developer: Reload Window".
+// the `skarn.server.path` setting: an absolute path to the server binary -- skarn_lsp.exe from the
+// Windows release zip, or the skarn_lsp built by CMake elsewhere -- or just `skarn_lsp` when it is on
+// the PATH. Changing the setting takes effect after "Developer: Reload Window".
 
 'use strict';
 
@@ -24,8 +24,8 @@ function activate(context) {
     client.start().catch((err) => {
         vscode.window.showErrorMessage(
             `Skarn: could not start the language server '${command}' (${err.message || err}). ` +
-            'Set "skarn.server.path" to the full path of skarn_lsp.exe from the Skarn release, ' +
-            'or put its folder on the PATH.');
+            'Set "skarn.server.path" to the full path of the skarn_lsp binary (skarn_lsp.exe in the ' +
+            'Windows release zip), or put its folder on the PATH.');
     });
 }
 
