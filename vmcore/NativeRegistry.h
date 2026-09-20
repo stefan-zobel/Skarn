@@ -86,7 +86,8 @@ enum NativeId : uint16_t {
     NATIVE_TCP_LOCAL_PORT = 50, // tcpLocalPort(sock)   -> Int    | String (getsockname; the port a
                                 //   listener actually bound -- the point of `tcpListen(0)`, which asks
                                 //   the OS for a free one instead of guessing a fixed number)
-    NATIVE_COUNT       = 51,
+    NATIVE_OS_ID       = 51,    // rawOsId()              -> Int (0 Windows, 1 macOS, 2 other; Plain, total)
+    NATIVE_COUNT       = 52,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -149,6 +150,7 @@ inline int native_id_of(const std::string& name) {
     if (name == "tcpLocalPort") return NATIVE_TCP_LOCAL_PORT;
     if (name == "tcpSetTimeout") return NATIVE_TCP_SET_TIMEOUT;
     if (name == "sha256")     return NATIVE_SHA256;
+    if (name == "rawOsId")    return NATIVE_OS_ID;
     return -1;
 }
 
@@ -192,6 +194,7 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_ISNAN: case NATIVE_ISINF:
         case NATIVE_F64_TO_BYTES:
         case NATIVE_SHA256:
+        case NATIVE_OS_ID:
         case NATIVE_READ_ALL_STDIN: return NRET_PLAIN;
         default:                 return NRET_RESULT;
     }
@@ -239,6 +242,7 @@ inline int native_arity(int id) {
         case NATIVE_READ_LINE:
         case NATIVE_RAW_GC_STATS:
         case NATIVE_GC_RESET_STATS:
+        case NATIVE_OS_ID:
         case NATIVE_READ_ALL_STDIN: return 0;
         default:                return 0;
     }

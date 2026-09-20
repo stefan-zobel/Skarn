@@ -1,13 +1,22 @@
 // Process spawn (over the rawRun native). ProcessOutput holds raw Bytes; ProcessText is the
 // UTF-8-decoded view. run/runWith take a List literal and convert it to the Vec the native wants;
-// runText decodes and keeps the exit code; sh wraps cmd.exe (Windows-only!). OPT-IN: reach
-// these (and the rawRun native they wrap) via `use std::process::*`. Same-module code (these very
-// wrappers) may use rawRun freely (the native's home module is std::process).
+// runText decodes and keeps the exit code; sh runs a command line through the platform's shell,
+// which is what currentOs is for. OPT-IN: reach these (and the rawRun / rawOsId natives they wrap)
+// via `use std::process::*`. Same-module code (these very wrappers) may use both natives freely
+// (their home module is std::process).
+// Which platform the program is RUNNING on. Other covers everything that is neither Windows nor
+// macOS: the two supported platforms are named, the rest is honestly one bucket rather than a
+// guess. Int-backed, so an Os value IS its discriminant at runtime and costs no allocation.
+pub enum Os : Int { Windows = 0, MacOS = 1, Other = 2 }
+// Int -> enum has no built-in inverse (an arbitrary Int need not be a valid discriminant), so the
+// mapping is written out. It is total: every id that is not 0 or 1 lands in Other.
+pub fn currentOs() -> Os { let id = rawOsId() if id == 0 { Os::Windows } else if id == 1 { Os::MacOS } else { Os::Other } }
 pub struct ProcessOutput { stdout: Bytes, stderr: Bytes, exitCode: Int }
 pub struct ProcessText { stdout: String, stderr: String, exitCode: Int }
 fn _toArgv(argv: List[String]) -> Vec[String] { let mut v: Vec[String] = vec() for a in argv { push(v, a) } v }
 pub fn run(argv: List[String]) -> Result[ProcessOutput, String] { rawRun(_toArgv(argv), bytes()) }
 pub fn runWith(argv: List[String], input: Bytes) -> Result[ProcessOutput, String] { rawRun(_toArgv(argv), input) }
 pub fn runText(argv: List[String]) -> Result[ProcessText, String] { let o = run(argv)? Ok(ProcessText { stdout: fromBytes(o.stdout), stderr: fromBytes(o.stderr), exitCode: o.exitCode }) }
-pub fn sh(cmdline: String) -> Result[ProcessOutput, String] { run(["cmd", "/c", cmdline]) }
+// cmd on Windows, /bin/sh elsewhere -- the absolute path, since execvp would otherwise search PATH.
+pub fn sh(cmdline: String) -> Result[ProcessOutput, String] { match currentOs() { Os::Windows => run(["cmd", "/c", cmdline]), _ => run(["/bin/sh", "-c", cmdline]) } }
 

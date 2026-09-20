@@ -1500,6 +1500,16 @@ private:
             std::vector<RtValue> f; f.push_back(std::string("no such file"));
             out = construct(c, std::move(f)); return true;
         }
+        if (name == "rawOsId") {                          // the running platform, same mapping as the
+#ifdef _WIN32                                             // native -- a disagreement here means the two
+            out = static_cast<int64_t>(0);                // sides were built for different platforms,
+#elif defined(__APPLE__)                                  // which is exactly what the differential
+            out = static_cast<int64_t>(1);                // should call a failure
+#else
+            out = static_cast<int64_t>(2);
+#endif
+            return true;
+        }
         if (name == "readAllStdin") {                     // the rest of the shared stdin cursor
             out = nenv_.stdin_text.substr(std::min(stdin_pos_, nenv_.stdin_text.size()));
             stdin_pos_ = nenv_.stdin_text.size(); return true;

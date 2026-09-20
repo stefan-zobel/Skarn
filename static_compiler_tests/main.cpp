@@ -2741,6 +2741,10 @@ void test_import_matrix() {
         { "std_const",   "std::math",    "PI",           "E",            "toInt(PI)", 3 },
         { "std_type",    "std::random",  "Rng",          nullptr,        "let mut r = Rng::fromSeed(1)\n r.nextInt(5, 6)", 5 },
         { "std_enum",    "std::json",    "Json",         "JsonEntry",    "match Json::Integer(3) { Json::Integer(n) => n, _ => 0 }", 3 },
+        // The prelude's one INT-BACKED enum: its variants erase to bare Ints, so this row also pins
+        // that an erased enum travels the import forms like any other item. A fixed variant, not
+        // currentOs(), so the cell means the same on every platform.
+        { "std_int_enum","std::process", "Os",           "currentOs",    "match Os::Windows { Os::Windows => 7, _ => 0 }", 7 },
     };
     for (const auto& r : std_rows) {
         const std::string id = std::string("imx_") + r.id;
@@ -4496,6 +4500,23 @@ void test_tree_shake_prelude() {
     try_bool("shake_keeps_option_enum", [&] {
         return has_struct(svc::compile("Some(1)", svc::builtin_prelude()), "Some");
     });
+
+    // `Os` is an INT-BACKED enum, so it contributes no struct type at all -- its variants erase to
+    // bare Ints. What tells whether it survived is its wrapper: `currentOs` is a real function, and
+    // reaching it is the only way a program can name the platform.
+    auto has_fn = [](const svc::Module& m, const char* nm) {
+        for (const auto& s : m.function_names) if (s.find(nm) != std::string::npos) return true;
+        return false;
+    };
+    // (6) The platform query shakes out with the rest of std::process when nothing asks for it ...
+    try_bool("shake_default_drops_current_os", [&] {
+        return !has_fn(svc::compile("42", svc::builtin_prelude()), "currentOs");
+    });
+    // ... and `sh` drags it in, because sh() is what branches on it.
+    try_bool("shake_sh_keeps_current_os", [&] {
+        return has_fn(svc::compile("use std::process::*\nlet r = sh(\"echo\")\n 0",
+                                   svc::builtin_prelude()), "currentOs");
+    });
 }
 
 // `trait Iterable[T]` + impls for every builtin container + `toVec` are baked into
@@ -5534,9 +5555,10 @@ void test_codegen_natives() {
     fs::remove_all(base, ec);
 }
 
-// Process spawn (run / runWith / runText / sh). These launch real cmd.exe children via the rawRun
-// native; the results are reshaped into the ProcessOutput / ProcessText prelude structs by codegen's
-// emit_wrap_process. Assertions use deterministic exit codes + `echo` output.
+// Process spawn (run / runWith / runText / sh) + the platform query behind sh. These launch real
+// child processes via the rawRun native -- cmd.exe on Windows, /bin/sh elsewhere; the results are
+// reshaped into the ProcessOutput / ProcessText prelude structs by codegen's emit_wrap_process.
+// Assertions use deterministic exit codes + `echo` output.
 void test_codegen_process() {
     std::cout << "[codegen: process spawn]\n";
 
@@ -5566,17 +5588,33 @@ void test_codegen_process() {
         == "hi\n");
 #endif
 
-    // sh() hard-wires cmd.exe and is Windows-only; on POSIX it must return Err (cmd not found).
+    // sh() picks the platform's shell (cmd /c or /bin/sh -c), so ONE source must give ONE result on
+    // both platforms -- the point of the whole exercise. The trim is load-bearing: cmd prints
+    // "ok\r\n" and /bin/sh "ok\n", so an untrimmed comparison could only pass on one of them.
     check_true("process_sh", cg_run_native(
+        "match sh(\"echo ok\") { Ok(o) => print(trim(fromBytes(o.stdout))), Err(e) => print(\"err \" + e) }")
+        == "ok");
+
+    // currentOs is total: every platform maps to one of the three known discriminants.
+    check_true("process_current_os_known", cg_run_native(
+        "let n = ordinal(currentOs())\nprintln(toString(n == 0 || n == 1 || n == 2))")
+        == "true\n");
+
+    // ... and it names the platform this build actually runs on. The #ifdef asserts a platform FACT
+    // here, unlike the one process_sh used to carry, which asserted a defect.
+    check_true("process_current_os_value", cg_run_native(
+        "match currentOs() { Os::Windows => print(\"w\"), Os::MacOS => print(\"m\"), Os::Other => print(\"o\") }")
 #ifdef _WIN32
-        "match sh(\"echo ok\") { Ok(o) => print(fromBytes(o.stdout)), Err(_) => print(\"err\") }")
-        == "ok\r\n");
+        == "w");
+#elif defined(__APPLE__)
+        == "m");
 #else
-        "match sh(\"echo ok\") { Ok(_) => print(\"ran\"), Err(_) => print(\"err\") }")
-        == "err");
+        == "o");
 #endif
 
-    // runWith feeds stdin (Bytes) to the child; `sort` reads it and exits 0.
+    // runWith feeds stdin (Bytes) to the child; `sort` reads it and exits 0. The #ifdef stays: which
+    // argv names `sort` is the CALLER's choice per platform, which is what run/runWith are for --
+    // no defect here, unlike the sh() case above.
     check_true("process_run_with", cg_run_native(
 #ifdef _WIN32
         "match runWith([\"cmd\", \"/c\", \"sort\"], toBytes(\"b\\na\\n\")) { Ok(o) => println(toString(o.exitCode)), Err(_) => println(\"err\") }")
@@ -9144,7 +9182,9 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // a new native lands in neither set and is simply never cross-checked, which is the whole failure
 // class these coverage assertions exist to end.
 // `tcpLocalPort` (id 50) is deliberately NOT differentiable: the port it reports is chosen by the OS.
-static_assert(NATIVE_COUNT == 51,
+// `rawOsId` (id 51) IS differentiable: it answers the same on every run of one machine, and the oracle
+// mirrors it with the same #ifdef -- so a disagreement about the platform is a test failure, not a skip.
+static_assert(NATIVE_COUNT == 52,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 
@@ -10828,6 +10868,7 @@ void test_differential() {
     check_same("diff_native_filesize_err","use std::io::*\nisErr(fileSize(\"svc_diff_no_such_file_zzz_9x7\"))", true); // Result wrap (discriminant)
     check_same("diff_native_readfile_err","use std::io::*\nisErr(readFile(\"svc_diff_no_such_file_zzz_9x7\"))", true); // Result wrap (discriminant)
     check_same("diff_native_readall",     "use std::io::*\nreadAllStdin()", true);                                // Plain String
+    check_same("diff_native_rawosid",     "use std::process::*\nrawOsId()", true);                                // Plain Int
     check_same("diff_native_readline",    "use std::io::*\nmatch readLine() { Some(s) => s, None => \"eof\" }", true); // Option wrap
     check_same("diff_native_in_lambda",   // a lambda body referencing a NATIVE -- capture analysis must
         "use std::io::*\n"

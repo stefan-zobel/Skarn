@@ -3453,7 +3453,7 @@ the filesystem, and one without `use std::process` cannot start a program.
 |---|---|
 | `std::io` | files — read / write / append, copy, rename, delete, `mkdir`, `listDir`, stat — and standard input |
 | `std::env` | command-line arguments, environment variables, and the clocks `nanoTime` / `millisTime` |
-| `std::process` | run an external command and capture its output |
+| `std::process` | run an external command and capture its output, and ask which platform you are on |
 | `std::math` | roots, powers, logarithms, trigonometry, `gcd`/`lcm`, generic `minOf`/`maxOf`/`clamp`, `PI`/`E`, the fallible `toIntChecked`. (The rounding builtins `floor`/`ceil`/`trunc`/`round`/`roundHalfToEven`, `toInt` and `toDouble` are **always** available — no `use`.) |
 | `std::bytes` | a little-endian binary reader/writer over `Bytes`, with varints and length-prefixed strings |
 | `std::json` | a JSON parser and serializer over a `Json` value tree |
@@ -3770,16 +3770,42 @@ to end of input as one `String`.
 ### Running processes
 
 `run(argv)` runs a child process and returns a `Result` describing its output and exit code; `runText(argv)`
-is the same with the output decoded to `String`; `sh(cmdline)` is a convenience wrapper.
+is the same with the output decoded to `String`. With `run` you name the program yourself, so the argv is
+yours to get right on each platform. `sh(cmdline)` hands the whole command line to the platform's shell
+instead — `cmd /c` on Windows, `/bin/sh -c` elsewhere — so one call works on both.
+
+A child's output ends with the line terminator the shell wrote (`\r\n` on Windows, `\n` elsewhere); `trim`
+is the usual way to get rid of it.
 
 ```rust
 use std::process::*
 
-match runText(["cmd", "/c", "echo", "from-child"]) {
-    Ok(out) => println("child said: " + slice(out.stdout, 0, 10)),   // => child said: from-child
+match sh("echo from-child") {
+    Ok(out) => println("child said: " + trim(fromBytes(out.stdout))),   // => child said: from-child
     Err(e)  => println("spawn failed: " + e)
 }
 ```
+
+Only a *failure to start* is an `Err` — a program that runs and exits non-zero is an `Ok` whose `exitCode`
+says so.
+
+### Which platform am I on?
+
+`currentOs()` answers with the enum `Os`, so you match on it:
+
+```rust
+use std::process::{Os, currentOs}
+
+let label = match currentOs() {
+    Os::Windows => "Windows",
+    Os::MacOS   => "macOS",
+    Os::Other   => "another platform"
+}
+println("running on " + label)
+```
+
+`Os::Other` covers everything that is neither: Skarn is built and tested on Windows x64 and macOS on Apple
+Silicon, and rather than guess at a third platform's name it puts them all in one arm.
 
 ---
 
@@ -4482,7 +4508,8 @@ case), `m` (multiline), `s` (dotall) — as `Regex::compileWith(pattern, "ims")`
 | `fileExists` / `isFile` / `isDir` / `fileSize` | entry / regular-file / directory query, byte length |
 | `deleteFile` / `rename` / `copyFile` / `listDir` / `mkdir` | delete / move / copy / list / make directory |
 | `readLine()` / `readAllStdin()` | read a line / all of standard input |
-| `run(argv)` / `runText(argv)` / `sh(cmdline)` | spawn a process and capture its output |
+| `run(argv)` / `runText(argv)` / `sh(cmdline)` | spawn a process and capture its output (`sh` goes through the platform's shell) |
+| `currentOs()` | which platform the program is running on (`Os::Windows` / `Os::MacOS` / `Os::Other`) |
 
 ---
 

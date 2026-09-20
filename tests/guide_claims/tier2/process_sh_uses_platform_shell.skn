@@ -1,0 +1,16 @@
+// CLAIM: sh(cmdline) runs the command line through the PLATFORM's shell -- cmd /c on Windows,
+//        /bin/sh -c elsewhere -- so one source works on both. Only a failure to START is an Err.
+// GUIDE: 21 (Running processes)
+// EXPECT: ok child said: from-child
+use std::process::*
+
+
+fn main() -> () {
+    match sh("echo from-child") {
+        Ok(out) => println("child said: " + trim(fromBytes(out.stdout))),
+        Err(e)  => println("spawn failed: " + e)
+    }
+}
+
+
+main()

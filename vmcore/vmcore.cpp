@@ -457,6 +457,21 @@ static Value native_millis_time(Value*, uint8_t, Context*) {
         duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count()));
 }
 
+// rawOsId() -> Int. Which platform the program is RUNNING on: 0 Windows, 1 macOS, 2 anything
+// else. Decided at compile time of this file, but read at run time by the program, so a .skbc
+// answers for the machine that executes it, not the one that produced it. Plain return kind,
+// total, does not allocate. The surface is the prelude's `currentOs() -> Os` (std/process.skn),
+// which is what lets `sh` pick the platform's shell.
+static Value native_os_id(Value*, uint8_t, Context*) {
+#ifdef _WIN32
+    return Value::fromSigned48(0);
+#elif defined(__APPLE__)
+    return Value::fromSigned48(1);
+#else
+    return Value::fromSigned48(2);
+#endif
+}
+
 // args() -> Array[String] (Plain -- no Ok/Err wrap). Builds a fresh KIND_ARRAY of the
 // driver-supplied command-line args (host std::strings in VM::script_args, stable across
 // a collection). Each element string is a separate allocation (a safepoint that can move
@@ -1518,5 +1533,6 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_TCP_SET_TIMEOUT] = native_tcp_set_timeout;
     t[NATIVE_TCP_LOCAL_PORT] = native_tcp_local_port;
     t[NATIVE_SHA256]       = native_sha256;
+    t[NATIVE_OS_ID]        = native_os_id;
     return t;
 }
