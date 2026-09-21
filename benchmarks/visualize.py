@@ -24,7 +24,7 @@ LANG_COLORS = {
 }
 LANG_ORDER = ["cpp", "python", "skarn"]
 
-BENCH_ORDER = ["arith", "fib", "iter", "sort", "strings", "alloc", "hashmap"]
+BENCH_ORDER = ["arith", "fib", "iter", "sort", "strings", "strings_build", "alloc", "hashmap"]
 
 
 def fmt_ns(ns: float) -> str:

@@ -1,0 +1,25 @@
+// Benchmark: idiomatic string building via StringBuilder (O(n)).
+// n=1_000_000 — identical across Skarn, Python, C++.
+// Measures the builder path; strings.skn measures the O(n^2) concat path.
+use std::env::*
+
+let n = 1000000
+gcResetStats()
+let t0 = nanoTime()
+
+let mut sb = stringBuilder()
+let mut i = 0
+while i < n {
+    sb.append("x")
+    i = i + 1
+}
+let s = sb.build()
+
+let wall_ns = nanoTime() - t0
+let g = gcStats()
+
+println("benchmark=strings_build  n=" + toString(n) + "  len=" + toString(len(s))
+        + "  wall_ns=" + toString(wall_ns) + "  ns/iter=" + toString(wall_ns / n))
+println("gc_collections=" + toString(toInt(g.collections))
+        + "  gc_bytes=" + toString(toInt(g.bytesAlloced))
+        + "  gc_ns=" + toString(toInt(g.gcNanosTotal)))

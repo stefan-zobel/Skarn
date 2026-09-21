@@ -109,34 +109,47 @@ def make_lang_configs(vm: str) -> dict:
 
 # ── Run one benchmark ─────────────────────────────────────────────────────────
 
-def run_benchmark(cmd: list, name: str, lang: str) -> dict:
+def run_benchmark(cmd: list, name: str, lang: str, runs: int = 1) -> dict:
     is_mac = platform.system() == "Darwin"
     timed_cmd = (["/usr/bin/time", "-l"] if is_mac else ["/usr/bin/time", "-v"]) + cmd
 
-    t0 = time.perf_counter_ns()
-    result = subprocess.run(timed_cmd, capture_output=True, text=True)
-    wall_total_ns = time.perf_counter_ns() - t0
+    def _one():
+        t0 = time.perf_counter_ns()
+        res = subprocess.run(timed_cmd, capture_output=True, text=True)
+        wall_total_ns = time.perf_counter_ns() - t0
+        rss_bytes, user_ns, sys_ns = _parse_time_output(res.stderr, is_mac)
+        vm_metrics = _parse_vm_output(res.stdout)
+        return res.returncode, wall_total_ns, rss_bytes, user_ns, sys_ns, vm_metrics, res.stdout
 
-    rss_bytes, user_ns, sys_ns = _parse_time_output(result.stderr, is_mac)
-    vm_metrics = _parse_vm_output(result.stdout)
+    if runs > 1:
+        _one()  # warmup, discarded
 
-    return {
-        "language":      lang,
-        "name":          name,
-        "exit_code":     result.returncode,
-        "wall_vm_ns":    vm_metrics.get("wall_ns"),
-        "wall_total_ns": wall_total_ns,
-        "user_ns":       user_ns,
-        "sys_ns":        sys_ns,
-        "rss_bytes":     rss_bytes,
-        "gc_collections":vm_metrics.get("gc_collections", 0),
-        "gc_bytes":      vm_metrics.get("gc_bytes", 0),
-        "gc_ns":         vm_metrics.get("gc_ns", 0),
-        "extra":         {k: v for k, v in vm_metrics.items()
-                         if k not in ("benchmark", "wall_ns", "gc_pct",
-                                      "gc_collections", "gc_bytes", "gc_ns")},
-        "_stdout":       result.stdout,
-    }
+    best: dict | None = None
+    for _ in range(runs):
+        exit_code, wall_total_ns, rss_bytes, user_ns, sys_ns, vm_metrics, stdout = _one()
+        r = {
+            "language":       lang,
+            "name":           name,
+            "exit_code":      exit_code,
+            "wall_vm_ns":     vm_metrics.get("wall_ns"),
+            "wall_total_ns":  wall_total_ns,
+            "user_ns":        user_ns,
+            "sys_ns":         sys_ns,
+            "rss_bytes":      rss_bytes,
+            "gc_collections": vm_metrics.get("gc_collections", 0),
+            "gc_bytes":       vm_metrics.get("gc_bytes", 0),
+            "gc_ns":          vm_metrics.get("gc_ns", 0),
+            "extra":          {k: v for k, v in vm_metrics.items()
+                              if k not in ("benchmark", "wall_ns", "gc_pct",
+                                           "gc_collections", "gc_bytes", "gc_ns")},
+            "_stdout":        stdout,
+            "runs":           runs,
+        }
+        if best is None or (r["wall_vm_ns"] is not None and
+                            (best["wall_vm_ns"] is None or
+                             r["wall_vm_ns"] < best["wall_vm_ns"])):
+            best = r
+    return best
 
 
 def _parse_time_output(stderr: str, is_mac: bool):
@@ -265,7 +278,7 @@ def save_csv(results: list[dict], path: Path, meta: dict):
 
     fixed = [
         "timestamp", "vm", "os", "cpu",
-        "language", "benchmark", "exit_code",
+        "language", "benchmark", "exit_code", "runs",
         "wall_vm_ns",    "wall_vm_ms",
         "wall_total_ns", "wall_total_ms",
         "user_ns",       "user_ms",
@@ -292,6 +305,7 @@ def save_csv(results: list[dict], path: Path, meta: dict):
                 "language":      r["language"],
                 "benchmark":     r["name"],
                 "exit_code":     r["exit_code"],
+                "runs":          _i(r.get("runs", 1)),
                 "wall_vm_ns":    _i(r["wall_vm_ns"]),
                 "wall_vm_ms":    _f(r["wall_vm_ns"], 1e6),
                 "wall_total_ns": _i(r["wall_total_ns"]),
@@ -364,7 +378,8 @@ _CHECKSUM_FIELDS: dict[str, str] = {
     "strings": "len",
     "hashmap": "checksum",
     "alloc":   "checksum",
-    "sort":    "checksum",
+    "sort":          "checksum",
+    "strings_build": "len",
 }
 
 
@@ -410,6 +425,8 @@ def main():
                     default=str(BENCHMARKS_DIR / "results" / "results.json"))
     ap.add_argument("--csv",    metavar="FILE",
                     default=str(BENCHMARKS_DIR / "results" / "results.csv"))
+    ap.add_argument("--runs",     metavar="N", type=int, default=1,
+                    help="measured runs per benchmark (+ 1 warmup when N > 1; default: 1)")
     ap.add_argument("--no-compile", action="store_true",
                     help="skip C++ compilation step")
     args = ap.parse_args()
@@ -432,7 +449,8 @@ def main():
     print(f"OS:   {os_str}")
     print(f"CPU:  {cpu}")
     print(f"Date: {ts}")
-    print(f"Langs: {', '.join(langs)}\n")
+    print(f"Langs: {', '.join(langs)}")
+    print(f"Runs:  {args.runs}{' (+ 1 warmup)' if args.runs > 1 else ''}\n")
 
     meta = {"timestamp": ts, "vm": vm, "os": os_str, "cpu": cpu}
 
@@ -453,7 +471,7 @@ def main():
             cmd = cfg["cmd"](prog)
             label = f"{lang}/{prog.stem}"
             print(f"  {label}...", end="", flush=True)
-            r = run_benchmark(cmd, prog.stem, lang)
+            r = run_benchmark(cmd, prog.stem, lang, runs=args.runs)
             results.append(r)
             status = "ok" if r["exit_code"] == 0 else f"exit {r['exit_code']}"
             print(f"\r  {label:<26} {fmt_ns(r['wall_vm_ns']):>10}  [{status}]")
