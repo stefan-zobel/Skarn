@@ -459,6 +459,23 @@ fn f(x: dyn Eq) -> Int { 0 }      // error: 'Eq' is a compile-time marker, not u
 > `NaN`-containing value, `contains(v, x)` answers differently depending on whether `v` holds `x` *itself* or a
 > structural copy of it — the only case where that distinction is observable.
 
+**Cyclic values.** A `mut` field can make a value refer back to itself, and `==` still answers. Two values
+are equal when they *unfold* alike — whatever the number of objects behind them — and a difference is found
+wherever it sits, even in a field next to the cycle:
+
+```rust
+struct Node { v: Int, next: Option[Node] }
+fn loop1(v: Int) -> Node {
+    let mut n = Node { v: v, next: None }
+    n.next = Some(n)                                    // n now refers to itself
+    n
+}
+struct Tagged { tag: Int, node: Node }
+println(loop1(1) == loop1(1))                           // => true
+println(loop1(1) == loop1(2))                           // => false
+println(Tagged { tag: 1, node: loop1(1) } == Tagged { tag: 2, node: loop1(1) })   // => false
+```
+
 `< <= > >=` compare **two numbers, two strings, or two `Char`s** (there is no ordering on composites). The
 `Ord` *trait* — what `sort` / `sorted` / `minOf` / `maxOf` require — is a separate thing from the operators: it
 has **built-in** impls for `Int` / `Double` / `String` (see [§19](#19-iterators)), and your own `struct` / `enum`

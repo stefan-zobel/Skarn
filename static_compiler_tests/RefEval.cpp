@@ -22,7 +22,9 @@
 #include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <set>
 #include <stdexcept>
+#include <utility>
 
 using namespace svc;
 
@@ -675,7 +677,18 @@ private:
     // old reference-`==` bug -- before, heap `==` was Unsupported (skipped), so the oracle silently
     // agreed with the buggy VM. A function value has no structural equality (the checker forbids `==`
     // on it), so it stays Unsupported.
+    //
+    // CYCLES: an object pair met again during one comparison counts as equal (the co-inductive
+    // reading the VM uses), so two identical cyclic values compare EQUAL and a difference anywhere
+    // is still found. The VM starts remembering pairs only after a step threshold, which changes
+    // when it starts, never the answer; here remembering from the first pair is simpler and gives
+    // the same results. The set lives for one top-level comparison (eq_depth_ tracks nesting).
     RtValue equal(const RtValue& a, const RtValue& c) {
+        ++eq_depth_;
+        struct Leave {
+            Interp* self;
+            ~Leave() { if (--self->eq_depth_ == 0) self->eq_seen_.clear(); }
+        } leave{this};
         if (is_num(a) && is_num(c)) return as_double(a) == as_double(c);
         if (a.index() != c.index()) return false;
         switch (a.index()) {
@@ -691,9 +704,13 @@ private:
     }
     bool eq(const RtValue& a, const RtValue& c) { return std::get<bool>(equal(a, c)); }
 
+    int eq_depth_ = 0;
+    std::set<std::pair<const Obj*, const Obj*>> eq_seen_;
+
     bool obj_deep_eq(const std::shared_ptr<Obj>& a, const std::shared_ptr<Obj>& c) {
         if (a == c) return true;                              // same object
         if (!a || !c || a->kind != c->kind) return false;
+        if (!eq_seen_.emplace(a.get(), c.get()).second) return true;   // met before: equal so far
         switch (a->kind) {
         case ObjKind::Bytes:
             return a->bytes == c->bytes;

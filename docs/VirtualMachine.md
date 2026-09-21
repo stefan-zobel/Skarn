@@ -168,8 +168,11 @@ type index, and the dispatch opcodes look up `trait_table[method_id * width + ty
 function id. A missing implementation traps.
 
 **Structural equality** (`EQ_DEEP`) compares structs, arrays, vectors, maps and byte buffers by content with
-an explicit worklist, so a long list or deep tree never overflows the native stack. A cyclic value exhausts
-the work budget and raises a fault instead of returning a wrong answer.
+an explicit worklist, so a long list or deep tree never overflows the native stack. Cyclic values are
+compared too: once a comparison runs past a small number of steps, it remembers object pairs it has
+already expanded and treats a pair met again as equal. Two values are therefore equal when they unfold
+alike, a difference is found wherever it sits, and every comparison terminates. Small comparisons never
+reach that point and pay nothing for it.
 
 **`TO_STRING`** renders any value: numbers and booleans as text, structs as `Name { field: value }`, tuples
 and lists in their surface syntax, arrays, vectors and maps as their contents, closures as `<fn>`. Nested

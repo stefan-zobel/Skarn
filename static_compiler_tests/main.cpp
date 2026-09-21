@@ -3214,6 +3214,68 @@ void test_codegen_core() {
                                       " eqp(P{x:1}, P{x:2})", false);
     check_bool_p("eq_generic_int",    "fn eqp[T: Eq](a:T,b:T)->Bool{a==b}\n eqp(5, 5)", true);
     check_bool_p("eq_generic_vec",    "fn eqp[T: Eq](a:T,b:T)->Bool{a==b}\n eqp(toVec([1,2]), toVec([1,2]))", true);
+
+    // CYCLIC values (buildable with a `mut` field). `==` answers: two values are equal when they
+    // unfold alike, and a difference is found wherever it sits. Every case is small and fast in
+    // Debug too -- none of them may depend on exhausting a budget (there is none). See "Structural
+    // equality" in docs/VirtualMachine.md.
+    const std::string CYC =
+        "struct Node { v: Int, next: Option[Node] }\n"
+        "fn selfCycle(v: Int) -> Node {\n let mut n = Node { v: v, next: None }\n n.next = Some(n)\n n\n}\n"
+        // A ring of n nodes, all holding 7 except the one at `diffAt` (pass -1 for none).
+        "fn ring(n: Int, diffAt: Int) -> Node {\n"
+        " let mut tail = Node { v: if n - 1 == diffAt { 8 } else { 7 }, next: None }\n"
+        " let mut head = tail\n let mut i = n - 2\n"
+        " while i >= 0 {\n  head = Node { v: if i == diffAt { 8 } else { 7 }, next: Some(head) }\n  i = i - 1\n }\n"
+        " tail.next = Some(head)\n head\n}\n";
+    check_bool_p("eq_cycle_self",        CYC + "let a = selfCycle(1)\n a == a", true);
+    check_bool_p("eq_cycle_equal",       CYC + "selfCycle(1) == selfCycle(1)", true);
+    check_bool_p("eq_cycle_differs",     CYC + "selfCycle(1) == selfCycle(2)", false);
+    check_bool_p("eq_cycle_ne",          CYC + "selfCycle(1) != selfCycle(1)", false);
+    check_bool_p("eq_cycle_ring3",       CYC + "ring(3, 0 - 1) == ring(3, 0 - 1)", true);
+    check_bool_p("eq_cycle_ring3_diff",  CYC + "ring(3, 0 - 1) == ring(3, 1)", false);
+    // The decided semantics: a one-node ring and a two-node ring holding the same data unfold alike.
+    check_bool_p("eq_cycle_unrolled",    CYC + "ring(1, 0 - 1) == ring(2, 0 - 1)", true);
+    // Long rings run past the point where pair tracking starts; the difference sits deep inside.
+    check_bool_p("eq_cycle_long_equal",  CYC + "ring(3000, 0 - 1) == ring(3000, 0 - 1)", true);
+    check_bool_p("eq_cycle_long_diff",   CYC + "ring(3000, 2500) == ring(3000, 0 - 1)", false);
+    // Ring lengths 1..12 against each other, straddling the interval at which EQ_DEEP records a
+    // pair: every uniform pair unfolds alike, and a ring with one differing node never matches.
+    check_bool_p("eq_cycle_ring_lengths", CYC +
+        "let mut ok = true\n let mut n = 1\n"
+        "while n <= 12 {\n let mut m = 1\n"
+        " while m <= 12 {\n"
+        "  if ring(n, 0 - 1) != ring(m, 0 - 1) { ok = false }\n"
+        "  if ring(n, n / 2) == ring(m, 0 - 1) { ok = false }\n"
+        "  m = m + 1\n }\n n = n + 1\n}\n ok", true);
+    // The defect this guards: the walk used to disappear into the cycle behind field `n` and never
+    // reach the differing field `x`, so a provably unequal pair raised a fault instead of `false`.
+    check_bool_p("eq_cycle_field_order", CYC + "struct W { x: Int, n: Node, y: Int }\n"
+                                         "W { x: 1, n: selfCycle(1), y: 1 } == W { x: 2, n: selfCycle(1), y: 1 }", false);
+    check_bool_p("eq_cycle_branch",
+        "struct N2 { v: Int, l: Option[N2], r: Option[N2] }\n"
+        "fn mk(v: Int) -> N2 {\n let mut n = N2 { v: v, l: None, r: None }\n n.l = Some(n)\n n.r = Some(n)\n n\n}\n"
+        "mk(1) == mk(1)", true);
+    check_bool_p("eq_cycle_vec",
+        "struct NV { v: Int, kids: Vec[NV] }\n"
+        "fn mk(v: Int) -> NV {\n let mut ks: Vec[NV] = vec()\n let n = NV { v: v, kids: ks }\n push(ks, n)\n n\n}\n"
+        "mk(1) == mk(1)", true);
+    check_bool_p("eq_cycle_map",
+        "struct NM { v: Int, m: Map[Int, NM] }\n"
+        "fn mk(v: Int) -> NM {\n let mut m: Map[Int, NM] = #{}\n let n = NM { v: v, m: m }\n m[0] = n\n n\n}\n"
+        "mk(1) == mk(1)", true);
+    check_bool_p("eq_cycle_mutual",
+        "struct A { v: Int, b: Option[B] }\n struct B { v: Int, a: Option[A] }\n"
+        "fn mk() -> A {\n let mut x = A { v: 1, b: None }\n let y = B { v: 2, a: Some(x) }\n x.b = Some(y)\n x\n}\n"
+        "mk() == mk()", true);
+    // A FINITE value whose paths fan out exponentially (both fields share one child, 40 levels):
+    // 2^40 paths, but only 40 distinct pairs -- it must answer, in linear time.
+    const std::string DAG =
+        "struct D { v: Int, l: Option[D], r: Option[D] }\n"
+        "fn dag(depth: Int, leaf: Int) -> D {\n let mut d = D { v: leaf, l: None, r: None }\n let mut i = 0\n"
+        " while i < depth {\n  d = D { v: 0, l: Some(d), r: Some(d) }\n  i = i + 1\n }\n d\n}\n";
+    check_bool_p("eq_dag_shared",        DAG + "dag(40, 1) == dag(40, 1)", true);
+    check_bool_p("eq_dag_shared_diff",   DAG + "dag(40, 1) == dag(40, 2)", false);
     // D4 (NaN): `Double` is an Eq leaf with IEEE `NaN != NaN`, so a NaN-containing composite inherits it
     // -- a struct/Vec with a NaN field is NOT equal to a structurally-equal COPY. The same-pointer fast
     // path still makes a value equal to ITSELF (aliased). Locked so nobody "fixes" it later (route A).
@@ -10624,6 +10686,14 @@ void test_differential() {
     check_same("diff_struct_result",   "struct P { x: Int, y: Int }\n P { x: 1, y: 2 }");
     check_same("diff_struct_double",   "struct P { x: Double }\n let n = 3\n P { x: n }");
     check_same("diff_struct_mut",      "struct P { x: Int }\n let mut p = P { x: 1 }\n p.x = 42\n p.x");
+    // `==` on CYCLIC values, VM against the oracle: equal cycles, a difference behind a cycle.
+    check_same("diff_eq_cycles",
+        "struct Node { v: Int, next: Option[Node] }\n"
+        "struct W { x: Int, n: Node }\n"
+        "fn selfCycle(v: Int) -> Node {\n let mut n = Node { v: v, next: None }\n n.next = Some(n)\n n\n}\n"
+        "let same = selfCycle(1) == selfCycle(1)\n"
+        "let differ = W { x: 1, n: selfCycle(1) } == W { x: 2, n: selfCycle(1) }\n"
+        "same && !differ", true);
     check_same("diff_tuple",           "let t = (1, 2, 3)\n t.0 + t.1 * t.2");
     check_same("diff_tuple_result",    "(1, \"a\", true)");
     check_same("diff_enum_ctor",       "enum Color { Red, Green, Blue }\n Green");

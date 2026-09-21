@@ -4,6 +4,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include <iostream>
 #include "Platform.h"
@@ -451,15 +452,65 @@ static void raise_located(Context* ctx, const char* what) {
     throw VmFault(std::move(msg), std::string(what), std::move(frames));
 }
 
-// Work budget for EQ_DEEP. A structural compare touches at most O(reachable nodes) pairs
-// for any FINITE value; a semispace caps at 1 GiB (~64M minimal 16-byte objects), so
-// exceeding this bound means the value graph is CYCLIC (buildable only via a `mut` field).
-// The budget is on total WORK, not depth, so no finite structure is ever truncated to a
-// wrong answer -- it only bounds the non-terminating cyclic case, which then raises a
-// located "stack overflow" fault (a deliberate choice; Rust's derived PartialEq
-// likewise loops on an Rc cycle). Contrast TO_STRING's depth cap, which truncates DISPLAY
-// where a wrong-but-shorter dump is harmless.
-inline constexpr int64_t EQ_DEEP_MAX_WORK = 200'000'000;
+// How many worklist steps EQ_DEEP takes before it starts remembering the object pairs it
+// has already expanded (see value_deep_eq). Below this, a compare runs exactly as a plain
+// worklist walk and pays nothing for cycle handling -- which is every compare of an
+// ordinary small value (a Point, an Option, a short Vec). Above it, a cyclic or heavily
+// shared graph is cut short. The constant decides only WHEN tracking starts, never the
+// answer: any value compares the same way on either side of it.
+inline constexpr int64_t EQ_DEEP_TRACK_AFTER = 1024;
+
+// Once tracking runs, every expandable pair is LOOKED UP, but only every Nth one is
+// RECORDED. Recording is what costs (a table slot, growth, and a bigger table for every
+// later lookup to miss in); looking up is one probe. Thinning it keeps a large acyclic
+// compare -- a million-element Vec of structs, which meets no pair twice -- from paying a
+// record per element. Measured on such compares, N = 8 / 32 / 128 left them 1.9x / 1.7x /
+// 1.5x slower than without tracking; the remainder is the lookup itself. A cycle pays for a
+// large N with at most N extra expansions per recorded pair. See value_deep_eq for why the
+// answer and termination do not depend on N.
+inline constexpr uint32_t EQ_DEEP_RECORD_EVERY = 128;
+
+// The set of object pairs EQ_DEEP has recorded: open addressing over a flat vector,
+// linear probing, grown at half load. No per-entry allocation -- a node-based set cost
+// ~380 ns per pair here, which is what made large compares 20x slower. {nullptr, nullptr}
+// marks an empty slot; it can never be a real pair (both sides are live heap payloads).
+struct EqPairSet {
+    struct Slot { const void* a = nullptr; const void* b = nullptr; };
+    std::vector<Slot> slots;
+    size_t            used = 0;
+
+    static size_t hash(const void* a, const void* b) noexcept {
+        uint64_t x = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(a));
+        const uint64_t y = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(b));
+        x ^= y + 0x9E3779B97F4A7C15ull + (x << 6) + (x >> 2);
+        x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 29;
+        return static_cast<size_t>(x);
+    }
+    bool contains(const void* a, const void* b) const noexcept {
+        if (slots.empty()) return false;
+        const size_t mask = slots.size() - 1;
+        for (size_t i = hash(a, b) & mask;; i = (i + 1) & mask) {
+            const Slot& s = slots[i];
+            if (s.a == a && s.b == b) return true;
+            if (s.a == nullptr) return false;
+        }
+    }
+    void insert(const void* a, const void* b) {                // caller: !contains(a, b)
+        if ((used + 1) * 2 > slots.size()) grow();
+        const size_t mask = slots.size() - 1;
+        size_t i = hash(a, b) & mask;
+        while (slots[i].a != nullptr) i = (i + 1) & mask;
+        slots[i] = Slot{ a, b };
+        ++used;
+    }
+    void grow() {
+        std::vector<Slot> old = std::move(slots);
+        slots.assign(old.empty() ? 1024 : old.size() * 2, Slot{});
+        used = 0;
+        for (const Slot& s : old)
+            if (s.a != nullptr) insert(s.a, s.b);
+    }
+};
 
 // Structural (deep / value) equality behind the EQ_DEEP opcode. Immediates + String defer
 // to the general EQ semantics (operator== + string content); two heap composites compare
@@ -467,17 +518,44 @@ inline constexpr int64_t EQ_DEEP_MAX_WORK = 200'000'000;
 // native C++ recursion, so a deep-but-finite value (a long cons list, a deep tree) compares
 // correctly and can never overflow the native stack -- which the SEH filter cannot cleanly
 // catch anyway (it handles only the VM's own guard-page AV, not EXCEPTION_STACK_OVERFLOW).
-// SKARN_NOINLINE keeps run_switch's __try frame free of the std::vector's unwind state
-// (mirrors raise_located). Read-only: does NO allocation, so the value graph cannot move
-// mid-compare and the queued Values need no rooting. May THROW via raise_located (cycle
-// budget / closure operand), so the caller must SYNC_TO_CTX() first.
+//
+// CYCLES AND SHARING. Ordinary Skarn builds a cyclic value through a `mut` field, and a
+// plain walk would never finish on one. So once a compare has run EQ_DEEP_TRACK_AFTER
+// steps, every object pair (a, b) about to be expanded is looked up in a set of recorded
+// pairs: a recorded pair is skipped as equal, and every EQ_DEEP_RECORD_EVERY-th expanded
+// pair is recorded. That is the standard co-inductive reading of structural equality:
+// the answer is `false` only where a real difference is found, and `true` when the walk
+// ends without one. Why this is right and why it ends:
+//   * SOUND: a pair is skipped only if it was recorded, and it was recorded as it was
+//     expanded -- its children were queued and checked. The expanded pairs therefore form
+//     a bisimulation, i.e. the two values are equal when unfolded.
+//   * TERMINATES: a recorded pair is never expanded again, so each record is a pair not
+//     recorded before, and there are finitely many pairs. Between two records lie at most
+//     EQ_DEEP_RECORD_EVERY - 1 expansions, so the walk is finite -- no work budget needed.
+//     (Thinning the RECORDING is safe; thinning the LOOKUP would not be: a recorded pair
+//     on a cycle could then be re-expanded forever.)
+// Consequences, all intended:
+//   * two separately built but identical cycles compare EQUAL (and so does a one-node
+//     ring against a two-node ring holding the same data -- they unfold alike);
+//   * a difference is found wherever it sits: the walk no longer disappears into a cycle
+//     reached through one field before it looks at the others;
+//   * a heavily shared FINITE graph (a DAG whose paths fan out exponentially) is compared
+//     in time proportional to its distinct pairs, not its paths.
+//
+// SKARN_NOINLINE keeps run_switch's __try frame free of the containers' unwind state
+// (mirrors raise_located). Read-only on the GC heap: the worklist and the pair set are host
+// memory, and no GC allocation happens, so the value graph cannot move mid-compare and
+// the queued Values need no rooting. May THROW via raise_located (a closure operand), so
+// the caller must SYNC_TO_CTX() first.
 [[nodiscard]] SKARN_NOINLINE
 static bool value_deep_eq(Value a0, Value b0, Context* ctx) {
     std::vector<std::pair<Value, Value>> work;
+    EqPairSet seen;                                   // allocates nothing until the first record
+    uint32_t  until_record = 1;                       // record the first tracked pair, then every Nth
     work.emplace_back(a0, b0);
-    int64_t budget = EQ_DEEP_MAX_WORK;
+    int64_t steps = 0;
     while (!work.empty()) {
-        if (--budget < 0) raise_located(ctx, "stack overflow");   // cyclic value graph
+        const bool tracking = ++steps > EQ_DEEP_TRACK_AFTER;
         const std::pair<Value, Value> pr = work.back();
         work.pop_back();
         const Value a = pr.first;
@@ -494,6 +572,18 @@ static bool value_deep_eq(Value a0, Value b0, Context* ctx) {
         const GcObject* oa = GcObject::from_slots(a.asPtr());
         const GcObject* ob = GcObject::from_slots(b.asPtr());
         if (oa->kind != ob->kind) return false;                  // different heap kind
+        if (tracking) {
+            const auto k = oa->kind;                             // only kinds whose expansion
+            if (k == GcObject::KIND_OBJECT || k == GcObject::KIND_ARRAY ||    // queues more pairs
+                k == GcObject::KIND_VEC    || k == GcObject::KIND_MAP) {
+                if (seen.contains(a.asPtr(), b.asPtr()))
+                    continue;                                    // recorded: equal so far
+                if (--until_record == 0) {
+                    seen.insert(a.asPtr(), b.asPtr());
+                    until_record = EQ_DEEP_RECORD_EVERY;
+                }
+            }
+        }
         switch (oa->kind) {
         case GcObject::KIND_STRING:
             if (!str_eq(a, b)) return false;                     // content
@@ -1240,8 +1330,8 @@ SKARN_NOINLINE static void run_switch_loop(Context* ctx) {
             }
 
             // ---- structural (deep) equality: the surface `==` on a composite ----
-            // value_deep_eq can THROW (raise_located) on a cyclic value or a closure
-            // operand, so SYNC first (like the other faulting ops) -- ctx->ip and the
+            // value_deep_eq can THROW (raise_located) on a closure operand -- a cyclic
+            // value is answered, not refused -- so SYNC first (like the other faulting ops) -- ctx->ip and the
             // return-stack cursor must be current for the located fault. NOT a safepoint
             // (the compare allocates nothing), so no reload afterward.
             case OpCode::EQ_DEEP: {
