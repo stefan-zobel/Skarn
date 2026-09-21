@@ -25,11 +25,11 @@ int main() {
     auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::high_resolution_clock::now() - t0).count();
 
-    bool sorted = true;
-    for (int i = 1; i < n; ++i) if (arr[i] < arr[i-1]) { sorted = false; break; }
+    long long checksum = 0;
+    for (int i = 0; i < n; ++i) checksum += (long long)arr[i] * i;
 
-    std::printf("benchmark=sort  n=%d  sorted=%s  wall_ns=%lld  ns/elem=%lld\n",
-                n, sorted ? "true" : "false", wall_ns, wall_ns / n);
+    std::printf("benchmark=sort  n=%d  checksum=%lld  wall_ns=%lld  ns/elem=%lld\n",
+                n, checksum, wall_ns, wall_ns / n);
     std::printf("gc_collections=0  gc_bytes=0  gc_ns=0\n");
     return 0;
 }

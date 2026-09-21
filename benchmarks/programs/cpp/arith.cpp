@@ -10,7 +10,7 @@ int main() {
     auto t0 = std::chrono::high_resolution_clock::now();
 
     long long s = 0;
-    for (long long i = 0; i < n; ++i) s += i;
+    for (long long i = 0; i < n; ++i) { s += i; asm volatile("" : "+r"(s)); }
 
     auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::high_resolution_clock::now() - t0).count();

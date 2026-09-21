@@ -9,7 +9,7 @@ let t0 = nanoTime()
 
 let mut i = 0
 while i < n {
-    m[i] = i * i
+    m[i] = i % 1000
     i = i + 1
 }
 

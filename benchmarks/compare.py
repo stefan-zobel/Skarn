@@ -93,12 +93,12 @@ def main():
         label = f"{lang}/{name}" if lang else name
         b = before.get(key, {})
         a = after.get(key,  {})
-        wb = b.get("wall_vm_ns") or 0
-        wa = a.get("wall_vm_ns") or 0
-        ub = b.get("user_ns") or 0
-        ua = a.get("user_ns") or 0
-        rb = b.get("rss_bytes") or 0
-        ra = a.get("rss_bytes") or 0
+        wb = b.get("wall_vm_ns")
+        wa = a.get("wall_vm_ns")
+        ub = b.get("user_ns")
+        ua = a.get("user_ns")
+        rb = b.get("rss_bytes")
+        ra = a.get("rss_bytes")
         ratio = (wa / wb) if wb else None
         rows.append((label, wb, wa, ub, ua, rb, ra, ratio))
 

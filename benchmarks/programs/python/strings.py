@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Benchmark: string concatenation pressure (O(n^2) copies).
 # n=10_000 — identical across Skarn, Python, C++.
-# s = s + "x" avoids the refcount-1 in-place realloc fast path, matching Skarn semantics.
+# s = s + "x" and s += "x" are identical at module level; CPython's in-place fast path
+# only applies inside a function (where refcount == 1 reliably).
 import time, gc
 
 _gc_ns = 0; _gc_start = 0

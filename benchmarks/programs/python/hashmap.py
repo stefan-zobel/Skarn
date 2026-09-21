@@ -15,7 +15,7 @@ n = 200_000
 d = {}
 t0 = time.perf_counter_ns()
 for i in range(n):
-    d[i] = i * i
+    d[i] = i % 1000
 checksum = 0
 for i in range(n):
     checksum += d.get(i, 0)

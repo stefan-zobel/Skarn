@@ -1,14 +1,24 @@
 // Benchmark: insertion sort on a fixed-size Array[Int].
 // n=5_000 — identical across Skarn, Python, C++.
+// Uses the same xorshift32(13, 17, 5) as C++ and Python so all three
+// languages sort the same input permutation.
 use std::env::*
-use std::random::*
+
+fn xorshift32(s: Int) -> Int {
+    let mut x = s
+    x = x ^ ((x << 13) & 0xFFFFFFFF)
+    x = x ^ (x >> 17)
+    x = x ^ ((x << 5) & 0xFFFFFFFF)
+    x
+}
 
 let n = 5000
-let mut rng = Rng::fromSeed(42)
+let mut state = 42
 let mut arr = array(n, 0)
 let mut i = 0
 while i < n {
-    arr[i] = rng.nextInt(0, 1000000)
+    state = xorshift32(state)
+    arr[i] = state % 1000000
     i = i + 1
 }
 
@@ -30,14 +40,14 @@ while ii < n {
 let wall_ns = nanoTime() - t0
 let g = gcStats()
 
-let mut sorted = true
-let mut k = 1
+let mut checksum = 0
+let mut k = 0
 while k < n {
-    if arr[k] < arr[k - 1] { sorted = false }
+    checksum = checksum + arr[k] * k
     k = k + 1
 }
 
-println("benchmark=sort  n=" + toString(n) + "  sorted=" + toString(sorted)
+println("benchmark=sort  n=" + toString(n) + "  checksum=" + toString(checksum)
         + "  wall_ns=" + toString(wall_ns) + "  ns/elem=" + toString(wall_ns / n))
 println("gc_collections=" + toString(toInt(g.collections))
         + "  gc_bytes=" + toString(toInt(g.bytesAlloced))

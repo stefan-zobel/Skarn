@@ -364,7 +364,7 @@ _CHECKSUM_FIELDS: dict[str, str] = {
     "strings": "len",
     "hashmap": "checksum",
     "alloc":   "checksum",
-    "sort":    "sorted",
+    "sort":    "checksum",
 }
 
 
@@ -463,7 +463,8 @@ def main():
     print()
 
     print("Cross-language checksum verification:")
-    if verify_checksums(results):
+    checksums_ok = verify_checksums(results)
+    if checksums_ok:
         print("  all checksums agree")
     print()
 
@@ -478,6 +479,7 @@ def main():
         for r in failed:
             print(f"  {r['language']}/{r['name']}  exit={r['exit_code']}"
                   f"{'  (no wall_ns)' if r['wall_vm_ns'] is None else ''}")
+    if failed or not checksums_ok:
         sys.exit(1)
 
 

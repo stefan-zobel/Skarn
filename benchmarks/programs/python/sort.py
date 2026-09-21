@@ -34,7 +34,7 @@ for i in range(1, n):
     arr[j + 1] = key
 wall_ns = time.perf_counter_ns() - t0
 
-sorted_ok = all(arr[i] <= arr[i+1] for i in range(n-1))
+checksum = sum(arr[i] * i for i in range(n))
 gc_collections = sum(s['collections'] for s in gc.get_stats()) - gc_before
-print(f"benchmark=sort  n={n}  sorted={str(sorted_ok).lower()}  wall_ns={wall_ns}  ns/elem={wall_ns // n}")
+print(f"benchmark=sort  n={n}  checksum={checksum}  wall_ns={wall_ns}  ns/elem={wall_ns // n}")
 print(f"gc_collections={gc_collections}  gc_bytes=0  gc_ns={_gc_ns}")
