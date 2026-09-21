@@ -1,0 +1,19 @@
+// Benchmark: lazy iterator pipeline — filter -> map -> fold.
+// n=2_000_000 — identical across Skarn, Python, C++.
+use std::env::*
+
+let n = 2000000
+gcResetStats()
+let t0 = nanoTime()
+let total = fold(
+    map(filter(range(0, n), fn(x: Int) -> Bool { x % 2 == 0 }),
+        fn(x: Int) -> Int { x + 1 }),
+    0, fn(a: Int, b: Int) -> Int { a + b })
+let wall_ns = nanoTime() - t0
+let g = gcStats()
+
+println("benchmark=iter  n=" + toString(n) + "  total=" + toString(total)
+        + "  wall_ns=" + toString(wall_ns) + "  ns/elem=" + toString(wall_ns / n))
+println("gc_collections=" + toString(toInt(g.collections))
+        + "  gc_bytes=" + toString(toInt(g.bytesAlloced))
+        + "  gc_ns=" + toString(toInt(g.gcNanosTotal)))

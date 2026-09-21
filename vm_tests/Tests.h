@@ -3963,9 +3963,9 @@ inline void test_struct() {
 // isolation (no compiler involved): two separately-built equal composites compare
 // EQUAL where the reference-identity EQ would say false. Covers structs (equal /
 // unequal / nested), distinct type-ids (the enum None-vs-Some shape), arrays,
-// vectors, byte buffers, ORDER-INDEPENDENT maps, same-pointer short-circuit, and
-// the fresh-string content path. Cyclic-value -> "stack overflow" and the closure
-// trap are defensive (checker-forbidden) and not exercised here.
+// vectors, byte buffers, ORDER-INDEPENDENT maps, same-pointer short-circuit, the
+// fresh-string content path, and CYCLIC graphs (Block G), which are answered rather
+// than refused. The closure trap is defensive (checker-forbidden) and not exercised here.
 // =============================================================================
 inline void test_eq_deep() {
     std::cout << "=== eq_deep (EQ_DEEP structural equality) ===\n";
@@ -4162,6 +4162,47 @@ inline void test_eq_deep() {
             const bool ok = B(1,true) && B(6,true) && B(7,false);
             std::cout << std::format("  same-pointer -> true          : {}\n", B(1,true)?"PASS":"FAIL");
             std::cout << std::format("  fresh-string content equal    : {}\n", (B(6,true)&&B(7,false))?"PASS":"FAIL");
+            check(ok);
+        } catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block G: CYCLIC graphs -- answered, never refused ----
+    // Two separately built self-cycles are equal; so is a self-cycle against a two-node ring
+    // holding the same data (they unfold alike); a differing value is unequal. The last case is
+    // the field-order guard: W{x, n} pushes `n` last, so the walk meets the cycle first and must
+    // still come back to the differing `x`.
+    {
+        Heap heap(64 * 1024);
+        Assembler as;
+        const uint16_t Node = as.define_struct("Node", { "v", "next" });
+        const uint16_t W    = as.define_struct("W",    { "x", "n" });
+        as.label("main");
+        auto node = [&](uint8_t dst, int16_t v) {
+            as.NEW_STRUCT(dst, Node); as.load_const(10, v); as.SET_PROP(dst, as.field("Node","v"), 10);
+        };
+        const uint16_t NEXT = as.field("Node", "next");
+        node(0, 1); as.SET_PROP(0, NEXT, 0);                          // r0: self-cycle, v=1
+        node(1, 1); as.SET_PROP(1, NEXT, 1);                          // r1: another one
+        node(2, 1); node(3, 1);
+        as.SET_PROP(2, NEXT, 3); as.SET_PROP(3, NEXT, 2);             // r2 <-> r3: two-node ring, v=1
+        node(4, 2); as.SET_PROP(4, NEXT, 4);                          // r4: self-cycle, v=2
+        as.R6(OpCode::EQ_DEEP, 5, 0, 1);   // equal self-cycles        -> true
+        as.R6(OpCode::EQ_DEEP, 6, 0, 2);   // self-cycle vs 2-ring     -> true (unfold alike)
+        as.R6(OpCode::EQ_DEEP, 7, 0, 4);   // v=1 vs v=2               -> false
+        as.NEW_STRUCT(8, W); as.load_const(10, 1); as.SET_PROP(8, as.field("W","x"), 10); as.SET_PROP(8, as.field("W","n"), 0);
+        as.NEW_STRUCT(9, W); as.load_const(10, 2); as.SET_PROP(9, as.field("W","x"), 10); as.SET_PROP(9, as.field("W","n"), 1);
+        as.R6(OpCode::EQ_DEEP, 11, 8, 9);  // W{x:1,n:cycle} vs W{x:2,n:cycle} -> false
+        as.J(OpCode::HALT);
+        std::cout << "Running Block G (cyclic graphs)...\n";
+        try {
+            auto res = execute(as.assemble(), &heap, nullptr, nullptr, 16, nullptr, &as.struct_types());
+            auto* r = res.get_reg_base();
+            auto B = [&](int i, bool want){ return r[i].isBool() && r[i].asBool() == want; };
+            const bool ok = B(5,true) && B(6,true) && B(7,false) && B(11,false);
+            std::cout << std::format("  equal self-cycles -> true         : {}\n", B(5,true)?"PASS":"FAIL");
+            std::cout << std::format("  self-cycle vs 2-ring -> true      : {}\n", B(6,true)?"PASS":"FAIL");
+            std::cout << std::format("  differing cycles -> false         : {}\n", B(7,false)?"PASS":"FAIL");
+            std::cout << std::format("  difference behind a cycle -> false: {}\n", B(11,false)?"PASS":"FAIL");
             check(ok);
         } catch (const std::exception& e) { record_fail(e.what()); }
     }

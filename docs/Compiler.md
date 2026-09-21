@@ -254,7 +254,8 @@ division by zero traps; bitwise operators are `Int`-only.
 
 `==` is structural. On a scalar or a string it lowers to the VM's general `EQ`. On a struct, tuple, enum,
 `Vec`, `Array`, `Map` or `Bytes` it lowers to `EQ_DEEP`, which compares by content. A map compares
-independently of order.
+independently of order. A value that refers back to itself through a `mut` field compares like any other:
+two values are equal when they unfold alike.
 
 A type is comparable only if all its components are. A function anywhere inside makes `==` a compile error,
 and a generic `==` needs a `T: Eq` bound. Doubles keep IEEE semantics inside composites, so a struct holding
