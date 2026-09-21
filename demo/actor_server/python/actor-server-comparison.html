@@ -1,0 +1,643 @@
+<title>Skarn versus Python</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap">
+<style>
+  :root {
+    --bg: #f4f6f8;
+    --surface: #ffffff;
+    --ink: #17202c;
+    --muted: #586476;
+    --faint: #8b95a5;
+    --rule: #dbe0e7;
+    --grid: #e7ebf0;
+    --c-skarn: #0b7d74;
+    --c-subinterp: #3572a5;
+    --c-threads: #8a94a6;
+    --c-procs: #b07d12;
+    --c-prefork: #7a4fa3;
+    --c-ft-threads: #b3306b;
+    --good: #0b7d74;
+    --sans: "IBM Plex Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #11161d;
+      --surface: #19202a;
+      --ink: #e6ebf1;
+      --muted: #a2adbd;
+      --faint: #74808f;
+      --rule: #2b3440;
+      --grid: #232b36;
+      --c-skarn: #3cc2b4;
+      --c-subinterp: #6aa6dc;
+      --c-threads: #9aa4b5;
+      --c-procs: #deaa3c;
+      --c-prefork: #b38ae0;
+      --c-ft-threads: #ec79a8;
+      --good: #3cc2b4;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #11161d;
+    --surface: #19202a;
+    --ink: #e6ebf1;
+    --muted: #a2adbd;
+    --faint: #74808f;
+    --rule: #2b3440;
+    --grid: #232b36;
+    --c-skarn: #3cc2b4;
+    --c-subinterp: #6aa6dc;
+    --c-threads: #9aa4b5;
+    --c-procs: #deaa3c;
+    --c-prefork: #b38ae0;
+    --c-ft-threads: #ec79a8;
+    --good: #3cc2b4;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.55;
+  }
+  .page {
+    max-width: 980px;
+    margin: 0 auto;
+    padding-inline: 20px;
+    padding-block: 40px 64px;
+    display: grid;
+    gap: 56px;
+  }
+  h1, h2, h3 { text-wrap: balance; line-height: 1.2; margin: 0; }
+  h1 { font-size: clamp(28px, 4.2vw, 40px); font-weight: 700; letter-spacing: -0.01em; }
+  h2 { font-size: 24px; font-weight: 600; }
+  h3 { font-size: 17px; font-weight: 600; }
+  p { margin: 0; max-width: 68ch; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .lede { font-size: 18px; color: var(--muted); }
+  .stack { display: grid; gap: 14px; }
+  .stack-lg { display: grid; gap: 24px; }
+  code, .num { font-family: var(--mono); font-size: 0.92em; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  header.intro { display: grid; gap: 18px; }
+  .meta {
+    display: flex; flex-wrap: wrap; gap: 8px 20px;
+    font-family: var(--mono); font-size: 13px; color: var(--muted);
+  }
+
+  .verdict {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    padding: 22px 24px;
+    display: grid;
+    gap: 14px;
+  }
+  .verdict ul { margin: 0; padding-left: 20px; display: grid; gap: 8px; max-width: 76ch; }
+  .verdict li::marker { color: var(--faint); }
+
+  .kpis {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .kpi { background: var(--surface); padding: 16px 18px; display: grid; gap: 4px; }
+  .kpi .v { font-family: var(--mono); font-size: 24px; font-weight: 500; font-variant-numeric: tabular-nums; }
+  .kpi .l { font-size: 13px; color: var(--muted); }
+
+  section { display: grid; gap: 20px; }
+  .section-head { display: grid; gap: 8px; border-top: 2px solid var(--ink); padding-top: 14px; }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    padding: 18px 18px 14px;
+    display: grid;
+    gap: 12px;
+  }
+  .panel-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .panel-note { font-size: 13px; color: var(--muted); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+
+  .seg { display: inline-flex; border: 1px solid var(--rule); border-radius: 7px; overflow: hidden; }
+  .seg button {
+    font: 500 13px var(--mono);
+    color: var(--muted);
+    background: transparent;
+    border: 0;
+    padding: 6px 11px;
+    cursor: pointer;
+    font-variant-numeric: tabular-nums;
+  }
+  .seg button + button { border-left: 1px solid var(--rule); }
+  .seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+  .seg button:focus-visible { outline: 2px solid var(--c-subinterp); outline-offset: -2px; }
+
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+  svg text { font-family: var(--mono); font-size: 12px; fill: var(--muted); }
+  svg .axis-title { font-family: var(--sans); font-size: 12px; fill: var(--faint); }
+  svg .val { fill: var(--ink); font-weight: 500; }
+  svg .grid { stroke: var(--grid); stroke-width: 1; }
+  svg .base { stroke: var(--rule); stroke-width: 1; }
+
+  .findings { margin: 0; padding-left: 20px; display: grid; gap: 8px; max-width: 76ch; }
+
+  details { border-top: 1px solid var(--rule); padding-top: 10px; }
+  summary { cursor: pointer; font-size: 14px; color: var(--muted); }
+  summary:focus-visible { outline: 2px solid var(--c-subinterp); outline-offset: 2px; }
+  .table-wrap { overflow-x: auto; margin-top: 10px; }
+  table { border-collapse: collapse; font-size: 13px; min-width: 640px; width: 100%; }
+  th, td { padding: 6px 10px; text-align: right; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { font-weight: 600; color: var(--muted); font-size: 12px; }
+  td { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  td.who { font-family: var(--sans); font-weight: 500; }
+  td.who i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; vertical-align: 0; }
+
+  .fair { margin: 0; padding-left: 20px; display: grid; gap: 10px; max-width: 78ch; }
+  .fair b { font-weight: 600; }
+  footer { font-size: 13px; color: var(--muted); display: grid; gap: 8px; border-top: 1px solid var(--rule); padding-top: 16px; }
+</style>
+
+<div class="page">
+  <header class="intro">
+    <div class="eyebrow">Benchmark report · Concurrency</div>
+    <h1>The same actor web server in Skarn and five ways in Python</h1>
+    <p class="lede">One acceptor, N workers, each connection handed to a free worker. In Skarn with actors, in Python 3.14 with
+      threads (with and without the GIL), subinterpreters, processes and prefork. All of them are driven by the same load
+      generator, in one run, and every answer is checked.</p>
+    <div class="meta">
+      <span>Laptop · 6 cores / 12 threads</span>
+      <span>Windows · CPython 3.14.7, GIL and free-threading builds</span>
+      <span>16 clients · 5 rounds · medians</span>
+      <span>330 load runs · 0 failures</span>
+    </div>
+  </header>
+
+  <div class="verdict">
+    <div class="eyebrow">Summary</div>
+    <ul>
+      <li><b>Skarn is ahead or level on every absolute measure, behind on none:</b> throughput, latency, time per request,
+        start time, memory.</li>
+      <li><b>For CPU-bound requests</b> Skarn serves 2.0 to 2.7 times as many as the best Python contender at every worker
+        count, with a lower p50 and p99. That is mostly the interpreter: one unit of work takes CPython 2.3 times as long.</li>
+      <li><b>For pure I/O</b> prefork draws level at four and six workers (±2.3 %). Elsewhere Skarn leads by 7 to 10 %.</li>
+      <li><b>Scaling is where Python comes closest:</b> subinterpreters reach 4.7× and free-threaded threads 4.4× on twelve
+        workers, Skarn 5.4×. Threads with the GIL do not scale at all.</li>
+      <li><b>Isolation is expensive in Python:</b> twelve subinterpreters take 67 MB and 281 ms to the first answer, twelve
+        Skarn actors 6 MB and 44 ms. Free-threading is cheap (15.5 MB, 76 ms), but its threads share memory.</li>
+    </ul>
+  </div>
+
+  <div class="kpis" aria-label="Key figures at 12 workers">
+    <div class="kpi"><span class="v">5,033 / 1,897</span><span class="l">requests/s, CPU-bound, 12 workers: Skarn / best Python (subinterpreters)</span></div>
+    <div class="kpi"><span class="v">5.4× / 4.7×</span><span class="l">speed-up 1 → 12 workers: Skarn / subinterpreters (free-threaded 4.4×, GIL 1.0×)</span></div>
+    <div class="kpi"><span class="v">1.07 / 2.31 ms</span><span class="l">time per CPU-bound request, one worker: Skarn / fastest Python</span></div>
+    <div class="kpi"><span class="v">6 / 15.5 MB</span><span class="l">private memory, 12 workers: Skarn / free-threaded (subinterpreters 67 MB)</span></div>
+  </div>
+
+  <!-- COMPUTE -->
+  <section id="compute">
+    <div class="section-head">
+      <div class="eyebrow">Part 1 · CPU-bound</div>
+      <h2><code>/work/8000</code>: each request computes for about 1 ms (Skarn) or 2 ms (Python)</h2>
+      <p>The digit sum of all numbers from 1 to 8000, the same loop statement for statement in both languages. More
+        workers can compute more at once, provided the model allows real parallelism.</p>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h3>Throughput by worker count</h3>
+        <div class="seg" role="group" aria-label="View">
+          <button type="button" id="cpu-mode-rps" aria-pressed="true">requests/s</button>
+          <button type="button" id="cpu-mode-speed" aria-pressed="false">speed-up</button>
+        </div>
+      </div>
+      <div class="legend" data-legend></div>
+      <div id="cpu-line"></div>
+      <p class="panel-note" id="cpu-line-note"></p>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h3>Latency per request, as the client sees it</h3>
+        <div class="seg" role="group" aria-label="Workers" id="cpu-n"></div>
+      </div>
+      <div id="cpu-lat"></div>
+      <p class="panel-note">Bar to p50, line to p99, mark at p95. 16 clients wait at the same time, so the latency includes
+        the time spent in the queue. With one worker, that is 16 requests one after another.</p>
+    </div>
+
+    <ul class="findings">
+      <li><b>Threads with the GIL stay at 1.0×</b> at every worker count, and their p99 grows with more threads (39 → 49 ms).
+        The GIL lets only one thread run Python code at a time. This is where classic Python is really weak.</li>
+      <li><b>Without the GIL the same code scales 4.4×.</b> The subinterpreters scale best of the Python contenders (4.7×)
+        and stayed 7 to 15 % ahead of free-threading in every round. Processes and prefork reach 4.3×.</li>
+      <li><b>Up to six workers the subinterpreters scale as well as Skarn</b> (3.3× against 3.1× at four); at twelve Skarn
+        pulls ahead. The factor flatters the slower interpreter, though: accepting and handing over cost both about the same,
+        and next to work that takes twice as long it weighs less.</li>
+      <li><b>In absolute terms Skarn is 2.0 to 2.7× ahead.</b> At twelve workers its p99 (4.7 ms) is below every Python
+        contender's median.</li>
+    </ul>
+
+    <details>
+      <summary>All values: CPU-bound</summary>
+      <div class="table-wrap" id="cpu-table"></div>
+    </details>
+  </section>
+
+  <!-- IO -->
+  <section id="io">
+    <div class="section-head">
+      <div class="eyebrow">Part 2 · Pure I/O</div>
+      <h2><code>/</code>: accept, read a line, answer, close</h2>
+      <p>Almost nothing is computed here. The bottleneck is the connections themselves, the hand-off to the worker, and the
+        load generator running on the same machine. More workers therefore help little.</p>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h3>Throughput by worker count</h3>
+        <div class="seg" role="group" aria-label="View">
+          <button type="button" id="io-mode-rps" aria-pressed="true">requests/s</button>
+          <button type="button" id="io-mode-speed" aria-pressed="false">speed-up</button>
+        </div>
+      </div>
+      <div class="legend" data-legend></div>
+      <div id="io-line"></div>
+      <p class="panel-note" id="io-line-note"></p>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h3>Latency per request, as the client sees it</h3>
+        <div class="seg" role="group" aria-label="Workers" id="io-n"></div>
+      </div>
+      <div id="io-lat"></div>
+      <p class="panel-note">Bar to p50, line to p99, mark at p95.</p>
+    </div>
+
+    <ul class="findings">
+      <li><b>For I/O Python is not weak.</b> Prefork, where every process accepts connections itself (as gunicorn does),
+        is level with Skarn at four and six workers, at about 20,000 requests/s.</li>
+      <li><b>Free-threading is the best Python contender with one worker</b> (15,700 against Skarn's 16,700): the acceptor
+        and the worker do not take turns. At four workers one slow round (10,800) pulls its median down.</li>
+      <li><b>Threads with the GIL keep up but stay between 12,300 and 14,100.</b> Handing each connection to another process halves the
+        throughput (<code>procs</code>).</li>
+    </ul>
+
+    <details>
+      <summary>All values: pure I/O</summary>
+      <div class="table-wrap" id="io-table"></div>
+    </details>
+  </section>
+
+  <!-- TIME PER REQUEST -->
+  <section id="per-request">
+    <div class="section-head">
+      <div class="eyebrow">Part 3 · Time per request</div>
+      <h2>What a single request costs</h2>
+      <p>With one worker that is busy all the time, 1 / throughput is the time a request occupies it, from accepting to
+        closing. Next to it is the pure computing time of <code>work(8000)</code> on one thread, without HTTP.</p>
+    </div>
+    <div class="stack-lg">
+      <div class="panel">
+        <h3>CPU-bound request (<code>/work/8000</code>), one worker</h3>
+        <div id="svc-cpu"></div>
+        <p class="panel-note">The lighter part shows the pure computing time: Skarn 0.83 ms, CPython 1.90 ms, free-threaded
+          1.98 ms. The rest is HTTP and hand-off: about 0.25 ms for Skarn and 0.4 to 0.6 ms for Python.</p>
+      </div>
+      <div class="panel">
+        <h3>I/O request (<code>/</code>), one worker</h3>
+        <div id="svc-io"></div>
+        <p class="panel-note">There is no work here. This is what accepting, handing over, reading, answering and closing cost.
+          The hand-off to another process costs the most.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- START + MEMORY -->
+  <section id="cost">
+    <div class="section-head">
+      <div class="eyebrow">Part 4 · The price of isolation</div>
+      <h2>Start time and memory</h2>
+      <p>This is where the cost of each model itself shows, independent of interpreter speed. A Skarn actor is a thread with
+        its own heap over a shared program image. A Python thread shares everything; a subinterpreter loads its modules
+        itself, a process loads everything.</p>
+    </div>
+    <div class="stack-lg">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Start to first answer</h3>
+          <div class="seg" role="group" aria-label="Workers" id="start-n"></div>
+        </div>
+        <div id="start"></div>
+        <p class="panel-note">Median of ten starts. Skarn compiles from source at start. From a precompiled
+          <code>.skbc</code> image it takes 12 ms.</p>
+      </div>
+      <div class="panel">
+        <h3>Private memory, 12 workers, under load</h3>
+        <div id="mem"></div>
+        <p class="panel-note">Private pages, each counted once. The pale extension shows the RSS: for processes it counts the
+          same libraries several times and rises to 211 MB.</p>
+      </div>
+    </div>
+    <ul class="findings">
+      <li><b>A subinterpreter costs about 5 MB and 17 ms.</b> Twelve take 67 MB and 0.28 s to the first answer, because, as
+        in Skarn, all workers are created before the first <code>accept</code>. Twelve Skarn actors cost 6 MB and 44 ms.</li>
+      <li><b>Processes are heavier still:</b> 122 MB private, just over 0.2 s.</li>
+      <li><b>Threads are cheap, with or without the GIL:</b> 76 to 80 ms and 11 to 16 MB. Without the GIL they also compute
+        in parallel, and that makes free-threading Python's best balance.</li>
+      <li><b>What free-threading costs is safety, not speed.</b> Its threads can change the same object at the same time, and
+        guarding that is the programmer's job. Skarn's actors share nothing: a message is copied, and the checker keeps
+        what cannot be copied out of messages.</li>
+    </ul>
+  </section>
+
+  <!-- FAIRNESS -->
+  <section id="fair">
+    <div class="section-head">
+      <div class="eyebrow">Method</div>
+      <h2>Why the comparison is fair</h2>
+      <p>Python may look bad where it is really weak, but not because of the way it was measured. Every Python variant
+        therefore got its best mechanism from the standard library.</p>
+    </div>
+    <ul class="fair">
+      <li><b>The same client for everyone.</b> The load generator checks every answer, and for <code>/work</code> the exact
+        value (<code>work 8000 = 136008</code>). So both sides provably compute the same thing.</li>
+      <li><b>The same architecture.</b> One acceptor, N workers, one request per connection. Free workers report to the
+        acceptor, and it hands a connection only to a worker that has reported.</li>
+      <li><b>Free-threading on the same code.</b> Both threads contenders run the very same server. One runs on the GIL build
+        of CPython 3.14.7, the other on the official free-threading build of the same version (<code>python-freethreaded</code>).
+        The script checks that the GIL is really off at run time.</li>
+      <li><b>No queue that polls.</b> <code>concurrent.interpreters.Queue.get()</code> sleeps 10 ms whenever the queue is
+        empty. That would have stalled every subinterpreter worker after every connection. The subinterpreters therefore
+        talk over a local socket pair, which blocks in the operating system.</li>
+      <li><b>The fastest hand-off:</b> <code>socket.share()</code> between processes, not the slower pickling path.</li>
+      <li><b>Prefork as a variant of its own,</b> for the fair objection that a Python server would not pass sockets
+        between processes.</li>
+      <li><b>The same start.</b> Every server announces its port right after <code>listen</code> and accepts at once. Only
+        then does the first request go out. Otherwise, on Windows, a connect to a port that is not yet listening costs about 0.5 s.</li>
+      <li><b>One run, rotating order, medians.</b> All six contenders were measured in the same run. Every run starts with a
+        short warm-up, the order of the contenders changes in each of the five rounds, and memory is measured in runs of its
+        own, so sampling it does not slow the throughput runs.</li>
+      <li><b>Interpreter speed and scaling kept apart.</b> The speed-up relates each contender to its own 1-worker value,
+        and <code>work(8000)</code> is timed alone on one thread.</li>
+    </ul>
+    <div class="panel">
+      <h3>The machine slows down under sustained load</h3>
+      <p class="panel-note">At twelve workers every contender lost a quarter or more of its rate from the first round to the
+        last (Skarn 5,495 → 3,959, subinterpreters 2,090 → 1,446), most likely thermal throttling. The ratios stayed put:
+        Skarn served 2.8 to 3.0 times as many requests as free-threaded Python in every single round. Absolute numbers on this
+        laptop are good to about ±15 %; the comparisons within the run are what the rotating order protects.</p>
+    </div>
+    <div class="panel">
+      <h3>Not measured</h3>
+      <ul class="findings">
+        <li><b>asyncio:</b> a single thread, like Skarn's <code>std::poll</code> loop, so not a comparison of actor models.</li>
+        <li><b>Other operating systems:</b> all numbers are from Windows.</li>
+      </ul>
+    </div>
+  </section>
+
+  <footer>
+    <span>The load generator runs on the same machine and shares the cores with the server; that holds for every contender alike.
+      Throughput values are medians of five rounds; the tables show the spread (min–max).</span>
+    <span>Code: <code>demo/actor_server/server.skn</code>, <code>loadgen.skn</code> and <code>demo/actor_server/python/</code>
+      (<code>server.py</code>, <code>workers.py</code>, <code>bench.py</code>).</span>
+  </footer>
+</div>
+
+<script>
+(() => {
+  // Medians of five rounds: [rps, p50 µs, p95 µs, p99 µs, min rps, max rps]
+  const LOAD = {"/": {"skarn": {"0": [14852, 1001, 1367, 1668, 13784, 16287], "1": [16731, 878, 1280, 1782, 13912, 17555], "2": [19889, 712, 982, 1513, 15382, 21037], "4": [20645, 698, 1017, 1566, 17096, 21240], "6": [19511, 725, 1104, 1716, 16980, 21331], "12": [20280, 700, 1163, 1538, 17092, 21053]}, "subinterp": {"1": [11257, 1295, 1974, 2227, 8071, 12327], "2": [14216, 1036, 1468, 2050, 12065, 15132], "4": [15392, 961, 1383, 1977, 12743, 15746], "6": [15282, 966, 1485, 2045, 12963, 16565], "12": [14996, 1003, 1302, 1856, 8602, 16100]}, "ft-threads": {"0": [14514, 1037, 1304, 1595, 9150, 14890], "1": [15682, 945, 1280, 1743, 13011, 15838], "2": [16947, 867, 1132, 1859, 13630, 17702], "4": [14643, 1012, 1421, 1912, 10808, 17444], "6": [16342, 889, 1239, 1621, 13696, 17128], "12": [16882, 869, 1180, 1854, 13545, 17164]}, "threads": {"0": [14213, 1063, 1341, 1515, 11846, 14648], "1": [12320, 1223, 1729, 2082, 10684, 12700], "2": [13389, 1120, 1386, 1690, 11539, 14352], "4": [13766, 1093, 1364, 1674, 11553, 14369], "6": [14056, 1052, 1380, 1873, 11769, 14367], "12": [13624, 1067, 1516, 1881, 11655, 14249]}, "procs": {"1": [6487, 2374, 2783, 3058, 6357, 7718], "2": [9771, 1561, 1970, 2265, 8404, 10711], "4": [10000, 1526, 1858, 2426, 8093, 10180], "6": [9550, 1615, 2005, 2636, 8376, 10115], "12": [9846, 1562, 1950, 2332, 8416, 9872]}, "prefork": {"1": [12746, 1160, 1614, 2010, 10065, 14246], "2": [18187, 795, 1097, 1951, 15530, 19507], "4": [20176, 676, 1129, 1756, 16227, 21756], "6": [19663, 699, 1178, 1928, 17083, 21219], "12": [18430, 710, 1268, 1929, 16649, 19575]}}, "/work/8000": {"skarn": {"0": [1050, 15162, 16011, 17002, 899, 1114], "1": [936, 16995, 17562, 17744, 911, 953], "2": [1743, 9082, 9629, 9858, 1576, 1854], "4": [2907, 5443, 6070, 6375, 2457, 3176], "6": [3614, 4345, 5337, 5666, 3139, 4136], "12": [5033, 3043, 3939, 4678, 3959, 5495]}, "subinterp": {"1": [406, 39236, 41614, 42214, 395, 413], "2": [821, 19301, 20361, 22939, 727, 860], "4": [1347, 11718, 13546, 14394, 1118, 1449], "6": [1562, 10022, 12580, 13499, 1266, 1814], "12": [1897, 7835, 10671, 13670, 1446, 2120]}, "ft-threads": {"0": [412, 38641, 39734, 41333, 396, 432], "1": [385, 41338, 43094, 44067, 369, 401], "2": [763, 20742, 22100, 24789, 678, 791], "4": [1204, 12988, 15393, 17066, 1033, 1371], "6": [1399, 11082, 13663, 14831, 1136, 1567], "12": [1704, 9124, 11525, 12855, 1352, 1882]}, "threads": {"0": [436, 36434, 37216, 37702, 426, 461], "1": [425, 37611, 39056, 39479, 414, 437], "2": [425, 37506, 40082, 41093, 418, 439], "4": [429, 37021, 42030, 46431, 425, 438], "6": [425, 37180, 44220, 49270, 423, 435], "12": [424, 37311, 43799, 48181, 347, 435]}, "procs": {"1": [410, 38555, 41073, 42605, 403, 437], "2": [796, 19821, 22126, 23223, 708, 855], "4": [1134, 13927, 16081, 16810, 994, 1263], "6": [1345, 11829, 13620, 14323, 1137, 1529], "12": [1770, 8712, 11206, 12333, 1404, 2075]}, "prefork": {"1": [432, 36909, 37467, 37762, 426, 459], "2": [858, 18488, 19179, 21481, 747, 893], "4": [1299, 11748, 14669, 16543, 1153, 1535], "6": [1516, 10035, 12918, 13986, 1268, 1757], "12": [1861, 8440, 10210, 11166, 1415, 2006]}}};
+  const START = {"1": {"skarn": 53.8, "subinterp": 99.5, "ft-threads": 79.7, "threads": 76.3, "procs": 150.0, "prefork": 148.1}, "12": {"skarn": 43.8, "subinterp": 280.9, "ft-threads": 76.0, "threads": 77.7, "procs": 212.3, "prefork": 211.5}};
+  const SKBC = {"1": 11.8, "12": 11.7};
+  const MEM = {"skarn": [6.2, 10.8], "subinterp": [67.1, 74.2], "ft-threads": [15.5, 22.4], "threads": [10.7, 17.5], "procs": [122.2, 210.7], "prefork": [122.0, 210.5]};
+  const WORK_MS = {"skarn": 0.826, "subinterp": 1.902, "ft-threads": 1.98, "threads": 1.902, "procs": 1.902, "prefork": 1.902};
+
+  const WHO = [
+    { key: "skarn", name: "Skarn (actors)" },
+    { key: "subinterp", name: "Python subinterp" },
+    { key: "ft-threads", name: "Python free-threaded" },
+    { key: "threads", name: "Python threads (GIL)" },
+    { key: "procs", name: "Python procs" },
+    { key: "prefork", name: "Python prefork" },
+  ];
+  const color = k => `var(--c-${k})`;
+  const de = (v, d = 0) => v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+  const NS = "http://www.w3.org/2000/svg";
+
+  function el(tag, attrs = {}, parent) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function txt(parent, x, y, s, attrs = {}) {
+    const t = el("text", { x, y, ...attrs }, parent);
+    t.textContent = s;
+    return t;
+  }
+  function niceMax(v) {
+    const p = Math.pow(10, Math.floor(Math.log10(v)));
+    for (const m of [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) if (m * p >= v) return m * p;
+    return 10 * p;
+  }
+  function ticks(max, n = 5) {
+    const step = niceMax(max / n);
+    const out = [];
+    for (let v = 0; v <= max + 1e-9; v += step) out.push(v);
+    return out;
+  }
+
+  // Legends
+  document.querySelectorAll("[data-legend]").forEach(box => {
+    box.innerHTML = WHO.map(w => `<span><i style="background:${color(w.key)}"></i>${w.name}</span>`).join("");
+  });
+
+  // --- line chart: rps or speed-up over worker counts ---
+  const XS = [1, 2, 4, 6, 12];
+  function lineChart(host, path, mode) {
+    host.innerHTML = "";
+    const W = 720, H = 300, L = 62, R = 16, T = 14, B = 44;
+    const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+      "aria-label": mode === "rps" ? "Requests per second by worker count" : "Speed-up by worker count" }, host);
+    const data = LOAD[path];
+    const val = (k, n) => mode === "rps" ? data[k][n][0] : data[k][n][0] / data[k][1][0];
+    let max = 0;
+    for (const w of WHO) for (const n of XS) max = Math.max(max, val(w.key, n));
+    max = mode === "rps" ? niceMax(max * 1.05) : Math.max(6, Math.ceil(max));
+    const tk = mode === "rps" ? ticks(max) : Array.from({ length: max + 1 }, (_, i) => i);
+    const x = n => L + ((n - 1) / 11) * (W - L - R);
+    const y = v => T + (1 - v / max) * (H - T - B);
+    for (const v of tk) {
+      el("line", { x1: L, x2: W - R, y1: y(v), y2: y(v), class: v === 0 ? "base" : "grid" }, svg);
+      txt(svg, L - 8, y(v) + 4, mode === "rps" ? de(v) : `${v}×`, { "text-anchor": "end" });
+    }
+    for (const n of XS) txt(svg, x(n), H - B + 20, String(n), { "text-anchor": "middle" });
+    txt(svg, (L + W - R) / 2, H - 6, "workers", { "text-anchor": "middle", class: "axis-title" });
+    if (mode === "speed") {
+      // ideal: speed-up = worker count, clipped to the chart
+      const pts = XS.filter(n => n <= max).map(n => `${x(n)},${y(n)}`).join(" ");
+      el("polyline", { points: pts, fill: "none", stroke: "var(--faint)", "stroke-width": 1, "stroke-dasharray": "3 4" }, svg);
+      const lastIdeal = XS.filter(n => n <= max).pop();
+      txt(svg, x(lastIdeal) + 6, y(lastIdeal) + 4, "ideal", { class: "axis-title" });
+    }
+    for (const w of WHO) {
+      const pts = XS.map(n => `${x(n)},${y(val(w.key, n))}`).join(" ");
+      el("polyline", { points: pts, fill: "none", stroke: color(w.key), "stroke-width": w.key === "skarn" ? 3 : 2,
+        "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+      for (const n of XS) {
+        const c = el("circle", { cx: x(n), cy: y(val(w.key, n)), r: w.key === "skarn" ? 4 : 3, fill: color(w.key) }, svg);
+        const t = el("title", {}, c);
+        const d = data[w.key][n];
+        t.textContent = `${w.name}, ${n} workers: ${de(d[0])} requests/s (${de(d[0] / data[w.key][1][0], 1)}×), p50 ${de(d[1] / 1000, 1)} ms, p99 ${de(d[3] / 1000, 1)} ms`;
+      }
+    }
+  }
+
+  // --- latency bars: p50 bar, whisker to p99, tick at p95 ---
+  function latChart(host, path, n) {
+    host.innerHTML = "";
+    const rows = WHO.filter(w => LOAD[path][w.key][n]);
+    const W = 720, rowH = 34, L = 172, R = 110, T = 8, B = 40;
+    const H = T + rows.length * rowH + B;
+    const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `Latency at ${n} workers` }, host);
+    let max = 0;
+    for (const w of rows) max = Math.max(max, LOAD[path][w.key][n][3]);
+    max = niceMax(max / 1000 * 1.02);
+    const x = ms => L + (ms / max) * (W - L - R);
+    for (const v of ticks(max, 5)) {
+      el("line", { x1: x(v), x2: x(v), y1: T, y2: H - B, class: v === 0 ? "base" : "grid" }, svg);
+      txt(svg, x(v), H - B + 18, de(v, max < 5 ? 1 : 0), { "text-anchor": "middle" });
+    }
+    txt(svg, (L + W - R) / 2, H - 2, "milliseconds", { "text-anchor": "middle", class: "axis-title" });
+    rows.forEach((w, i) => {
+      const [, p50, p95, p99] = LOAD[path][w.key][n].map(v => v / 1000);
+      const cy = T + i * rowH + rowH / 2;
+      txt(svg, L - 10, cy + 4, w.name, { "text-anchor": "end", style: "font-family:var(--sans);font-size:13px;fill:var(--ink)" });
+      el("rect", { x: L, y: cy - 8, width: Math.max(1, x(p50) - L), height: 16, rx: 2, fill: color(w.key) }, svg);
+      el("line", { x1: x(p50), x2: x(p99), y1: cy, y2: cy, stroke: color(w.key), "stroke-width": 2 }, svg);
+      el("line", { x1: x(p95), x2: x(p95), y1: cy - 6, y2: cy + 6, stroke: color(w.key), "stroke-width": 2 }, svg);
+      el("line", { x1: x(p99), x2: x(p99), y1: cy - 4, y2: cy + 4, stroke: color(w.key), "stroke-width": 2 }, svg);
+      txt(svg, x(p99) + 8, cy + 4, `${de(p50, 1)} / ${de(p99, 1)}`, { class: "val" });
+    });
+  }
+
+  // --- horizontal bars with an optional under-layer (work time) or ghost extension (RSS) ---
+  function hbars(host, rows, unit, digits, opts = {}) {
+    host.innerHTML = "";
+    const W = 720, rowH = 34, L = 172, R = 90, T = 8, B = 40;
+    const H = T + rows.length * rowH + B;
+    const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": opts.label || "" }, host);
+    const max = niceMax(Math.max(...rows.map(r => Math.max(r.v, r.ghost || 0))) * 1.02);
+    const x = v => L + (v / max) * (W - L - R);
+    for (const v of ticks(max, 4)) {
+      el("line", { x1: x(v), x2: x(v), y1: T, y2: H - B, class: v === 0 ? "base" : "grid" }, svg);
+      txt(svg, x(v), H - B + 18, de(v, max < 5 ? 1 : 0), { "text-anchor": "middle" });
+    }
+    txt(svg, (L + W - R) / 2, H - 2, unit, { "text-anchor": "middle", class: "axis-title" });
+    rows.forEach((r, i) => {
+      const cy = T + i * rowH + rowH / 2;
+      txt(svg, L - 10, cy + 4, r.name, { "text-anchor": "end", style: "font-family:var(--sans);font-size:13px;fill:var(--ink)" });
+      if (r.ghost) el("rect", { x: L, y: cy - 8, width: x(r.ghost) - L, height: 16, rx: 2, fill: color(r.key), "fill-opacity": 0.22 }, svg);
+      el("rect", { x: L, y: cy - 8, width: Math.max(1, x(r.v) - L), height: 16, rx: 2, fill: color(r.key) }, svg);
+      if (r.under) el("rect", { x: L, y: cy - 8, width: x(r.under) - L, height: 16, rx: 2, fill: "var(--surface)", "fill-opacity": 0.45 }, svg);
+      const end = Math.max(x(r.v), r.ghost ? x(r.ghost) : 0);
+      txt(svg, end + 8, cy + 4, `${de(r.v, digits)}${r.suffix || ""}`, { class: "val" });
+    });
+  }
+
+  // --- tables ---
+  function table(host, path, withZero) {
+    const ns = (withZero ? [0] : []).concat(XS);
+    let h = `<table><thead><tr><th>Contender</th><th>Workers</th><th>requests/s</th><th>min–max</th><th>speed-up</th><th>p50 ms</th><th>p95 ms</th><th>p99 ms</th></tr></thead><tbody>`;
+    for (const w of WHO) for (const n of ns) {
+      const d = LOAD[path][w.key][n];
+      if (!d) continue;
+      const base = LOAD[path][w.key][1][0];
+      h += `<tr><td class="who"><i style="background:${color(w.key)}"></i>${w.name}</td><td>${n}</td><td>${de(d[0])}</td>` +
+           `<td>${de(d[4])}–${de(d[5])}</td><td>${n === 0 ? "–" : de(d[0] / base, 1) + "×"}</td>` +
+           `<td>${de(d[1] / 1000, 1)}</td><td>${de(d[2] / 1000, 1)}</td><td>${de(d[3] / 1000, 1)}</td></tr>`;
+    }
+    host.innerHTML = h + `</tbody></table><p class="panel-note" style="margin-top:8px">0 workers: the acceptor answers itself,
+      without workers, as a baseline. Measured for Skarn and the two threads contenders only.</p>`;
+  }
+
+  // --- wiring ---
+  function segButtons(host, values, initial, label, onPick) {
+    host.innerHTML = "";
+    const btns = values.map(v => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.id = `${host.id}-${v}`;
+      b.textContent = label(v);
+      b.setAttribute("aria-pressed", String(v === initial));
+      b.addEventListener("click", () => { btns.forEach(x => x.setAttribute("aria-pressed", String(x === b))); onPick(v); });
+      host.appendChild(b);
+      return b;
+    });
+    onPick(initial);
+  }
+  function modeToggle(prefix, path) {
+    const a = document.getElementById(`${prefix}-mode-rps`), b = document.getElementById(`${prefix}-mode-speed`);
+    const host = document.getElementById(`${prefix}-line`), note = document.getElementById(`${prefix}-line-note`);
+    const set = mode => {
+      a.setAttribute("aria-pressed", String(mode === "rps"));
+      b.setAttribute("aria-pressed", String(mode === "speed"));
+      lineChart(host, path, mode);
+      note.textContent = mode === "rps"
+        ? "Median of five rounds. Hover over a point to see its values."
+        : "Each contender relative to its own 1-worker value. The dashed line would be perfect scaling.";
+    };
+    a.addEventListener("click", () => set("rps"));
+    b.addEventListener("click", () => set("speed"));
+    set("rps");
+  }
+
+  modeToggle("cpu", "/work/8000");
+  modeToggle("io", "/");
+  segButtons(document.getElementById("cpu-n"), XS, 12, n => n === 1 ? "1 worker" : String(n), n => latChart(document.getElementById("cpu-lat"), "/work/8000", n));
+  segButtons(document.getElementById("io-n"), XS, 12, n => n === 1 ? "1 worker" : String(n), n => latChart(document.getElementById("io-lat"), "/", n));
+  table(document.getElementById("cpu-table"), "/work/8000", true);
+  table(document.getElementById("io-table"), "/", true);
+
+  hbars(document.getElementById("svc-cpu"), WHO.map(w => ({
+    key: w.key, name: w.name, v: 1000 / LOAD["/work/8000"][w.key][1][0],
+    under: WORK_MS[w.key],
+  })), "milliseconds", 2, { label: "Time per CPU-bound request with one worker" });
+  hbars(document.getElementById("svc-io"), WHO.map(w => ({
+    key: w.key, name: w.name, v: 1e6 / LOAD["/"][w.key][1][0],
+  })), "microseconds", 0, { label: "Time per I/O request with one worker" });
+
+  segButtons(document.getElementById("start-n"), [1, 12], 12, n => n === 1 ? "1 worker" : "12 workers", n => {
+    hbars(document.getElementById("start"), [
+      { key: "skarn", name: "Skarn (.skbc)", v: SKBC[n] },
+      ...WHO.map(w => ({ key: w.key, name: w.key === "skarn" ? "Skarn (source)" : w.name, v: START[n][w.key] })),
+    ], "milliseconds", 0, { label: `Start time at ${n} workers` });
+  });
+  hbars(document.getElementById("mem"), WHO.map(w => ({
+    key: w.key, name: w.name, v: MEM[w.key][0], ghost: MEM[w.key][1], suffix: " MB",
+  })), "megabytes", 1, { label: "Private memory at 12 workers" });
+})();
+</script>
