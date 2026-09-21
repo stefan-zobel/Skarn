@@ -1,0 +1,112 @@
+// A load generator for server.skn: C clients at once, each sending R requests one after another, on
+// parallel tasks (std::task). Every answer is CHECKED -- status line and expected body -- and every
+// request is timed.
+//
+// Run:   static_vmrun demo/actor_server/loadgen.skn --port=P [--clients=C] [--requests=R] [--path=/]
+//                                                   [--expect=TEXT]
+//   --port=P       the server's port (required)
+//   --clients=C    clients running at the same time (default 16)
+//   --requests=R   requests per client (default 100)
+//   --path=/x      the path to request (default /)
+//   --expect=TEXT  text the body must contain (default: "hello" for /, "work" otherwise)
+//
+// Prints one summary line: requests, failures, wall time, requests per second, latency percentiles.
+
+use std::net::*
+use std::task::*
+use std::cli::*
+use std::env::*
+
+struct Job { port: Int, path: String, expect: String, requests: Int }
+
+struct Outcome { failed: Int, latencies: Vec[Int], firstError: String }
+
+// One request: connect, send, read everything, check it. Ok(latency in ns) or Err(why).
+fn once(job: Job) -> Result[Int, String] {
+    let t0 = nanoTime()
+    let mut c = connect("127.0.0.1", job.port)?
+    c.sendStr("GET ${job.path} HTTP/1.0\r\nHost: localhost\r\n\r\n")?
+    let answer = fromBytes(c.recvAll()?)
+    c.close()?
+    let dt = nanoTime() - t0
+    if !startsWith(answer, "HTTP/1.0 200") { return Err("bad status: ${slice(answer, 0, 20)}") }
+    if indexOf(answer, job.expect) < 0 {
+        let from = if len(answer) > 60 { len(answer) - 60 } else { 0 }
+        return Err("body lacks '${job.expect}': ...${slice(answer, from, len(answer))}")
+    }
+    Ok(dt)
+}
+
+// One client: `requests` requests in a row.
+fn client(job: Job) -> Outcome {
+    let mut lat: Vec[Int] = vec()
+    let mut failed = 0
+    let mut firstError = ""
+    let mut i = 0
+    while i < job.requests {
+        match once(job) {
+            Ok(dt) => push(lat, dt),
+            Err(e) => {
+                failed = failed + 1
+                if len(firstError) == 0 { firstError = e }
+            },
+        }
+        i = i + 1
+    }
+    Outcome { failed: failed, latencies: lat, firstError: firstError }
+}
+
+fn intOpt(opts: CliArgs, name: String, dflt: Int) -> Int {
+    match parseInt(opts.getOptOr(name, toString(dflt))) {
+        Ok(v) => v,
+        Err(_) => panic("--${name} needs a whole number"),
+    }
+}
+
+// The p-th percentile (0..100) of sorted latencies, in microseconds.
+fn pct(sorted: Vec[Int], p: Int) -> Int {
+    if len(sorted) == 0 { 0 } else {
+        let i = (len(sorted) - 1) * p / 100
+        sorted[i] / 1000
+    }
+}
+
+let opts     = CliArgs::parse(args())
+let port     = intOpt(opts, "port", 0)
+if port == 0 { panic("--port is required") }
+let clients  = intOpt(opts, "clients", 16)
+let requests = intOpt(opts, "requests", 100)
+let path     = opts.getOptOr("path", "/")
+let expect   = opts.getOptOr("expect", if path == "/" { "hello" } else { "work" })
+let job      = Job { port: port, path: path, expect: expect, requests: requests }
+
+let t0 = nanoTime()
+let mut tasks: Vec[Task[Outcome]] = vec()
+let mut k = 0
+while k < clients {
+    push(tasks, spawn(client, job))
+    k = k + 1
+}
+let mut all: Vec[Int] = vec()
+let mut failed = 0
+let mut firstError = ""
+for t in tasks {
+    match t.join() {
+        Ok(o) => {
+            for x in o.latencies { push(all, x) }
+            failed = failed + o.failed
+            if len(firstError) == 0 { firstError = o.firstError }
+        },
+        Err(e) => {
+            failed = failed + requests
+            if len(firstError) == 0 { firstError = e }
+        },
+    }
+}
+let wallNs = nanoTime() - t0
+let sorted = sorted(all)
+let total  = clients * requests
+println("requests ${total}  failed ${failed}  wall ${wallNs / 1000000} ms  " +
+        "rps ${len(all) * 1000000000 / wallNs}  p50 ${pct(sorted, 50)} us  p95 ${pct(sorted, 95)} us  " +
+        "p99 ${pct(sorted, 99)} us")
+if failed > 0 { println("first error: ${firstError}") }

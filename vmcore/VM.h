@@ -14,6 +14,8 @@ struct Context;
 struct StructType;
 struct FnInfo;
 struct NetRegistry;  // opaque per-execution TCP socket registry (defined in vmcore.cpp)
+struct IsolateLocal; // this execution's place among the tasks and actors of its world (vmcore.cpp)
+struct ProgramImage; // the read-only program an execute() runs (Execute.h)
 
 // Native function signature (identical to the alias in Opcodes.h; a typedef may be
 // re-declared to the same type, so both headers can appear in one TU). Declared here
@@ -126,6 +128,18 @@ struct VM {
     // execute() always wires this; null only in the hand-built Contexts of vm_tests (which use no
     // net native), where a net native would return an "invalid socket" error rather than crash.
     NetRegistry* net = nullptr;
+    // Tasks and actors. `image` is the program this execute() runs. `isolate` is this execution's
+    // place in its WORLD -- the tasks and actors started, directly or not, under one root
+    // execute(), which owns the world and waits for all of them before it returns (see World in
+    // vmcore.cpp). `task_input` is the COPIED argument when this execute() IS a task or an actor
+    // (null otherwise); only rawTaskInput reads it. None are GC roots: ids and bytes, no Values.
+    const ProgramImage*  image           = nullptr;
+    IsolateLocal*        isolate         = nullptr;
+    const std::uint8_t*  task_input      = nullptr;
+    std::size_t          task_input_size = 0;
+    // Where the task's entry stub begins (an instruction index; 0 = not a task). The stub is not
+    // program code, so a fault trace leaves out the frames that return into it.
+    std::uint32_t        task_entry_pc   = 0;
     // Serious-fault diagnostics (Phase 1), consulted ONLY at fault time (cold path) by
     // raise_located to build a located message + stacktrace. None are GC roots or touch
     // the hot path. code_base is the bytecode origin (instruction 0), so any ip maps to

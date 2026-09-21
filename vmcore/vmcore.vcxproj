@@ -89,6 +89,7 @@
     <ClInclude Include="Assembler.h" />
     <ClInclude Include="Context.h" />
     <ClInclude Include="Disassembler.h" />
+    <ClInclude Include="ByteIO.h" />
     <ClInclude Include="BytecodeIO.h" />
     <ClInclude Include="Execute.h" />
     <ClInclude Include="FaultSignals.h" />
@@ -105,6 +106,8 @@
     <ClInclude Include="opcodes\op_string.h" />
     <ClInclude Include="StringInterner.h" />
     <ClInclude Include="StructType.h" />
+    <ClInclude Include="ValueCodec.h" />
+    <ClInclude Include="ThreadSlotTable.h" />
     <ClInclude Include="Value.h" />
     <ClInclude Include="VM.h" />
     <ClInclude Include="VM_Resources.h" />

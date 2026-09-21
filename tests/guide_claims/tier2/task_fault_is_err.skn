@@ -1,0 +1,11 @@
+// CLAIM: a task that faults does not take its parent down -- join returns Err and the parent goes on.
+// GUIDE: 20 (Running functions in parallel)
+// EXPECT: ok failed, parent continues
+use std::task::*
+
+fn boom(n: Int) -> Int { if n > 0 { panic("boom") } else { n } }
+
+match spawn(boom, 1).join() {
+  Ok(_) => println("unexpected"),
+  Err(_) => println("failed, parent continues"),
+}

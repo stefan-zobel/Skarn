@@ -25,22 +25,25 @@ static_vmrun demo/raytracer/main.skn
 | `--fast` | use the scalar-inlined intersection kernel instead of the idiomatic one |
 | `--inlined` | use the compiler-style kernel: calls replaced by their bodies, objects kept |
 | `--quiet` | skip the self-tests, so a timing run measures only the render |
+| `--threads=N` | render on N parallel tasks (`std::task`); the default 1 renders on the main thread. The image is identical for every N |
 
 The output file lands in the **current directory**, not next to the source.
 
 ## It is its own regression test
 
-The renderer is deterministic — one seed, one sequential random stream, no threads — so a
-given configuration produces one exact file. `main.skn` pins that file's CRC-32 and checks
-it, and a mismatch `panic`s, which means a **non-zero exit code**. So this is gate-able:
+The renderer is deterministic. There is one seed, and row y draws from its own random stream,
+seeded with `SEED + y`. A row's pixels therefore do not depend on which task renders it, or on
+which rows were rendered before it, and a given configuration produces one exact file for any
+`--threads`. `main.skn` pins that file's CRC-32 and checks it, and a mismatch `panic`s, which
+means a **non-zero exit code**. So this is gate-able:
 
 ```
 static_vmrun demo/raytracer/main.skn --preview
 ```
 
 is a ~2 second check that exits 0 only if all 40-odd self-tests pass *and* every pixel is
-where it was. The same comparison covers the three intersection kernels against each other:
-all must reach the identical checksum.
+where it was. The same comparison covers the three intersection kernels against each other,
+and a parallel render against the sequential one: all must reach the identical checksum.
 
 If a deliberate change moves the image, re-pin `CRC_PREVIEW` **and** `CRC_FULL` together.
 
@@ -122,6 +125,30 @@ This is a more honest number than a loop microbenchmark. The workloads in
 `demo/bench/bench.skn` range from far ahead of CPython to behind it, depending on how much of
 the work CPython hands to C. A real program, dominated by method calls on small short-lived
 objects, lands in between.
+
+### On several cores
+
+`--threads=N` renders on N fork-join tasks (`std::task`). Each task runs `renderRows` on its own thread
+and heap. It receives a small job — which rows, the image size, the kernel — and returns its rows as
+packed pixels. The job is plain data because the argument is copied into the task's heap. For the same
+reason each task builds the four-sphere scene itself: the scene holds `dyn` values, which cannot be sent.
+Task k takes rows k, k+N, k+2N, …, because the sky rows at the top are much cheaper than the ground rows.
+Equal bands would leave some tasks idle.
+
+Same machine, full size, inlining on, three interleaved rounds (median / best):
+
+| tasks | render | speedup |
+|---|---|---|
+| none (main thread) | 28.1 s / 26.9 s | — |
+| 2 | 14.9 s / 13.9 s | 1.9× / 1.9× |
+| 4 | 10.1 s / 8.9 s | 2.8× / 3.0× |
+| 6 | 9.2 s / 8.0 s | 3.1× / 3.3× |
+| 12 | 8.0 s / 6.8 s | 3.5× / 3.9× |
+
+The 5600H has six cores and twelve hardware threads. Two tasks scale almost perfectly. After that the
+curve flattens, because the clock drops as more cores are busy and a hyperthread adds much less than a core.
+The laptop also slowed down from round to round, which is why the best-of-three column is the fairer one.
+Every run reproduced the pinned checksum. Each task adds about 8 MB of memory: its own heap and stacks.
 
 ### What the kernels show
 

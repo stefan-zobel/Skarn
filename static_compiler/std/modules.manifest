@@ -27,4 +27,6 @@ std::cli      cli.skn
 std::hash     hash.skn
 std::net      net.skn
 std::poll     poll.skn
+std::task     task.skn
+std::actor    actor.skn
 std::regex    regex.skn

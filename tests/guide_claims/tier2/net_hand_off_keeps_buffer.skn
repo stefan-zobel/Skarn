@@ -1,0 +1,33 @@
+// CLAIM: a connection handed to an actor (c.handOff() -> h.take()) keeps the bytes the sender already
+//        read past a line boundary, and the sender's own TcpConn is dead afterwards.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: ok root read one | got two | tcpSend: socket was handed to another actor
+use std::net::*
+use std::actor::*
+
+fn greeter(inbox: Inbox[SocketHandOff], unused: Int) -> () {
+  for h in inbox.messages() {
+    match h.take() {
+      Ok(mut c) => {
+        match c.recvLine() { Ok(Some(line)) => { let _ = c.sendStr("got ${line}\n") }, _ => {} }
+        let _ = c.close()
+      },
+      Err(e) => print(e),
+    }
+  }
+}
+
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let port = srv.localPort()?
+  let g = spawnActor(greeter, 0)
+  let mut client = connect("127.0.0.1", port)?
+  client.sendStr("one\ntwo\n")?
+  let mut conn = srv.accept()?
+  match conn.recvLine()? { Some(l) => print("root read ${l}"), None => print("EOF") }
+  send(g, conn.handOff()?)
+  match client.recvLine()? { Some(l) => print(" | ${l}"), None => print(" | EOF") }
+  match conn.sendStr("x") { Ok(_) => print(" | stale send worked"), Err(e) => print(" | ${e}") }
+  Ok(())
+}
+match run() { Ok(_) => {}, Err(e) => print("error: ${e}") }

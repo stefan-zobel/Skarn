@@ -1,7 +1,7 @@
 #pragma once
 // Platform.h -- cross-platform abstractions for vmcore.
 // On Windows: pulls in real Windows/Winsock headers and MSVC attributes.
-// On POSIX (macOS, Linux): stubs the small set of Windows APIs the VM uses
+// On POSIX (macOS): stubs the small set of Windows APIs the VM uses
 // internally so each call site keeps a single, readable form.
 
 #ifdef _WIN32

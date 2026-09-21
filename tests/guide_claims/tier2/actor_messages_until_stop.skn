@@ -1,0 +1,28 @@
+// CLAIM: an actor's `for m in inbox.messages()` loop ends when the program ends (Stop), so the code after
+//        it runs -- and an actor keeps its state between messages.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: ok total 12 counter stopped
+use std::actor::*
+
+enum Cmd { Add(Int), Total(Pid[Int]) }
+
+fn counter(inbox: Inbox[Cmd], start: Int) -> () {
+  let mut total = start
+  for cmd in inbox.messages() {
+    match cmd {
+      Cmd::Add(n) => { total = total + n },
+      Cmd::Total(ask) => { send(ask, total) },
+    }
+  }
+  print(" counter stopped")
+}
+
+let me: Inbox[Int] = mainInbox()
+let c = spawnActor(counter, 0)
+send(c, Cmd::Add(5))
+send(c, Cmd::Add(7))
+send(c, Cmd::Total(me.pid()))
+match me.receive() {
+  Mail::Msg(t) => print("total ${t}"),
+  _ => print("no answer"),
+}

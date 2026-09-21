@@ -1,0 +1,14 @@
+// CLAIM: an actor that crashes does not take the program down -- its starter receives Mail::Exited with
+//        its id, and a send to it returns false from then on.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: ok exited true, send false
+use std::actor::*
+
+fn crasher(inbox: Inbox[Int], unused: Int) -> () { panic("boom") }
+
+let me: Inbox[Int] = mainInbox()
+let x = spawnActor(crasher, 0)
+match me.receive() {
+  Mail::Exited(id, _) => println("exited ${id == x.actorId()}, send ${send(x, 1)}"),
+  _ => println("unexpected"),
+}

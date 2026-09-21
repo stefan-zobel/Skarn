@@ -291,6 +291,74 @@ Every condition must be a `Bool`: `if`, `while`, a match guard, the operands of 
   type is the one relaxation.
 - `panic` aborts with a located fault. There is no in-language exception handling.
 
+### Fork-join tasks
+
+`std::task` runs functions in parallel: `spawn(f, x)` returns a `Task[R]`, and `t.join()` waits for it and
+returns `Result[R, String]`. `Err` carries the message of the fault that ended the task. `spawn` is an
+ordinary generic function in `std/task.skn`; the VM side is described under "Tasks and actors" in
+[VirtualMachine.md](VirtualMachine.md). Because a task works on its own heap, its argument and result are
+copied. The checker therefore adds these rules at every call of `spawn`:
+
+- **`f` must name a top-level function** that is not generic and takes one parameter. A lambda, a closure
+  or a function-typed variable is rejected: a closure is a heap object that cannot be copied, and a
+  `fn(A) -> R` type does not say whether a value is one. A generic function is rejected because the types
+  checked here must be the ones the task actually runs with.
+- **The parameter type and the result type must be sendable.** Sendable means plain data: numbers, `Bool`,
+  `String`, `Bytes`, and tuples, collections, structs and enums built only from sendable parts. It excludes
+  function values, trait objects, type parameters, and handles — a socket (`TcpConn`, `TcpListener`,
+  `NbConn`, `NbListener`) or a `Task`. A handle is a struct over an integer that is meaningful only in the
+  heap that created it. The check walks recursive types, treating a type met again as sendable so far, and
+  caches nothing. A disallowed component behind a mutual recursion is therefore still found.
+- **`spawn` can only be called**, never used as a value, since a value would be called where none of this is
+  checked.
+- **A `Task` is built only by `spawn`.** A struct literal or record update of `Task` outside `std::task` is
+  an error. Otherwise a `Task[String]` could be made from the id of a task that returns an `Int`.
+
+The four natives underneath are generic, and they take the `Task` itself, so a task's result type comes from
+its handle. `rawTaskTake` and `rawTaskError` are one native under two types, and `rawJoin`'s `Bool` says which
+one applies. The usual native convention, "a returned string means failure", cannot work here because a task
+may return a string. The reference interpreter used for differential testing models a task sequentially: it
+copies the argument at `spawn` and runs the function at `join`. That is observably the same, because output
+appears at `join` in both.
+
+### Actors
+
+`std::actor` runs long-lived functions that talk by messages, after Erlang's model, with typed mailboxes and
+one operating-system thread per actor. The runtime is the one tasks use, described under "Tasks and actors"
+in [VirtualMachine.md](VirtualMachine.md).
+- `spawnActor(f, init)` returns a `Pid[M]`.
+- `send(pid, m)` copies a message into that actor's mailbox.
+- The actor loops on `inbox.receive()`, which returns `Mail[M]`: a message, a report that an actor it
+  started has faulted, or `Stop` when the program ends.
+
+Like tasks, all of it is ordinary Skarn in `std/actor.skn` over generic natives. The actor function runs
+behind a small trampoline, which builds the actor's `Inbox` from its own id and calls the function with its
+start value.
+
+A `Pid[M]` promises that the actor it names receives `M`. The checker keeps that promise where a `Pid` is
+**made**, so `send` needs no check of its own:
+- **`spawnActor(f, init)`:** `f` must name a non-generic top-level function
+  `fn(Inbox[M], I) -> ()`, for the same reasons as a task's function. The message type `M` and the start
+  value `I` must be sendable. Every message is copied, so a message may carry a `Pid` (it is plain data)
+  but not an `Inbox`, the receiving end of one actor's mailbox.
+- **`mainInbox()`** gives the main program an inbox. Its message type comes only from an annotation
+  (`let inbox: Inbox[T] = mainInbox()`); it must be known at the call and sendable.
+- **`spawnActor` and `mainInbox` can only be called**, never used as values.
+- **`Pid` and `Inbox` literals are an error outside `std::actor`.**
+
+A connection cannot be a message: `TcpConn` stays unsendable, since its descriptor means something only in
+the actor that opened it. `std::net` moves it in two steps instead. `c.handOff()` detaches the connection
+and returns a `SocketHandOff`, a struct of plain data — a ticket and the bytes `recvLine` had already read
+ahead — which can be sent like any message. The receiving actor calls `h.take()` once to get a `TcpConn`
+back. A `SocketHandOff` literal or record update outside `std::net` is an error, so a program cannot forge a
+ticket for someone else's connection. After the hand-off the sender's `TcpConn` still type-checks; it is a
+rule of the runtime, not of the type system, that every operation on it now returns an `Err` saying the
+socket was handed to another actor.
+
+The reference interpreter used for differential testing does not model actors. A receive depends on which
+actor ran first, and a sequential model would present one schedule as the answer. Actor programs are
+therefore tested through the VM, with programs whose output is the same under every schedule.
+
 ## Code generation
 
 ### Register planning

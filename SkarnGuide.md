@@ -64,10 +64,12 @@ points are an opt-in layer). It targets a compact interpreter, not native code, 
 that removes Rust's single hardest concept. Where Rust asks "who owns this, and for how long?", Skarn's answer
 is "the GC does — write the obvious code."
 
-Skarn is also **single-threaded**, by design: there are no threads, no `async`, and no channels, and the
-garbage collector is stop-the-world. One thread can still serve many connections at once — `std::poll`
-turns waiting into asking, so a program advances whichever socket is ready — but that is concurrency on
-one core, not parallelism. For parallelism, shell out to OS processes with `std::process`.
+Skarn **shares no memory between threads**, by design: there is no `async`, no channel and no lock. One
+thread can still serve many connections at once — `std::poll` turns waiting into asking, so a program
+advances whichever socket is ready — but that is concurrency on one core. For **parallelism**, `std::task`
+runs a function on its own thread with its own heap: its argument is copied in, its result copied back,
+and nothing else is shared, so there is nothing to lock. `std::actor` goes one step further: long-lived
+actors that keep their own state and talk only by messages, which are copied too.
 
 Let's be honest about the rest, though: what Skarn removes is Rust's **difficulty** (ownership, lifetimes, the borrow
 checker), not Rust's **feature count**. The surface is Rust-family-sized — traits, generics, `dyn`, exhaustive
@@ -3480,8 +3482,10 @@ the filesystem, and one without `use std::process` cannot start a program.
 | `std::time` | strict-UTC dates and times at millisecond precision — `Instant`, `Duration`, `DateTime`, `Stopwatch`. An `Instant` spans roughly year −2490..6429; sub-millisecond precision and time zones are out of scope for v1 |
 | `std::cli` | a spec-free command-line parser: `--name=value` options, `--name` / `-abc` flags, `--`, positionals |
 | `std::hash` | CRC-32 and MurmurHash3 (fast, **not** secure) plus SHA-256 (cryptographic) and hex encoding |
-| `std::net` | blocking TCP (IPv4 + IPv6) and a minimal HTTP/1.0 `httpGet` — one connection at a time, **plaintext only** (no TLS, so `http://` not `https://`) |
+| `std::net` | blocking TCP (IPv4 + IPv6) and a minimal HTTP/1.0 `httpGet` — one connection at a time per thread, and a connection can be handed to an actor; **plaintext only** (no TLS, so `http://` not `https://`) |
 | `std::poll` | non-blocking sockets and readiness polling — many connections from one thread, with the loop written by the program; builds on `std::net` |
+| `std::task` | fork-join parallelism — `spawn` runs a function on its own thread and heap, `join` waits for its result; the argument and result are **copied**, nothing else is shared |
+| `std::actor` | actors — long-lived functions on their own threads with a mailbox; `spawnActor`, `send`, `inbox.messages()`; every message is **copied**, a crash is reported to the actor's starter |
 | `std::regex` | linear-time byte-level regular expressions (Thompson NFA / Pike VM) — no catastrophic backtracking, and therefore **no** backreferences or lookaround |
 
 This table says only what each module is *for*. **Every function of every module, with its signature, is listed
@@ -3643,8 +3647,8 @@ println("${d.day}.${d.month}.${d.year}, weekday ${d.weekday()}")   // => 29.2.20
 println(isNone(dateOnly(2023, 2, 29)))                             // => true
 ```
 
-And `std::net` opens a TCP connection. Here a server and a client talk over loopback in one program (the VM is
-single-threaded, so this works because `connect` queues into the listen backlog and `accept` then picks it up):
+And `std::net` opens a TCP connection. Here a server and a client talk over loopback in one program (it runs
+on one thread, so this works because `connect` queues into the listen backlog and `accept` then picks it up):
 
 ```rust check
 use std::net::*
@@ -3738,6 +3742,170 @@ What does **not** change: this is one thread on one core. Two connections make p
 the same time, and a slow handler — or a garbage-collection pause — still holds up everyone. `connect`
 also stays blocking; a client dials with `std::net` and is switched over with `nonBlockingConn`.
 `demo/poll_server.skn` runs a small HTTP server and two clients this way, in a single process.
+
+### Running functions in parallel
+
+`std::task` is the other half: work spread over several cores. `spawn(f, x)` starts `f(x)` on a thread of
+its own and returns a `Task` at once; `t.join()` waits for it and hands back `Ok(result)`, or `Err` with the
+message of the fault that ended it. A failing task never takes its parent down.
+
+```rust
+use std::task::*
+
+struct Range { lo: Int, hi: Int }
+
+fn sumRange(r: Range) -> Int {
+  let mut s = 0
+  let mut i = r.lo
+  while i <= r.hi {
+    s = s + i
+    i = i + 1
+  }
+  s
+}
+
+let a = spawn(sumRange, Range { lo: 1, hi: 500000 })         // starts at once
+let b = spawn(sumRange, Range { lo: 500001, hi: 1000000 })   // runs at the same time as a
+match (a.join(), b.join()) {
+  (Ok(x), Ok(y)) => println(x + y),                           // => 500000500000
+  _ => println("a task failed"),
+}
+```
+
+**Nothing is shared.** Each task has its own heap. The argument is *copied* into it when the task starts,
+and the result is copied back, so a task never sees what its parent changes afterwards and the parent never
+sees what the task changes. That is why there is nothing to lock — and it is also why `spawn` is picky about
+what it takes:
+
+- **`f` must be a named top-level function** with one parameter (pass a struct or a tuple for more). A
+  lambda cannot travel to another heap, and neither can a function-typed variable, because it might hold
+  one.
+- **The argument and the result must be plain data**: numbers, strings, bytes, and collections, tuples,
+  structs and enums made of those. A function value, a `dyn` trait object, a socket or another `Task`
+  inside them is a compile error.
+
+```rust fail
+use std::task::*
+println(spawn(fn(x: Int) -> Int { x * 2 }, 21).join())   // error: spawn needs the name of a top-level function
+```
+
+What a task prints appears when it is **joined**, in join order, so the output does not depend on which
+task happened to run first. A task nobody joins is still waited for when the program ends; what it
+printed is dropped.
+
+### Actors: long-lived, talking by messages
+
+A task computes one result. An **actor** (`std::actor`) keeps running: it waits for messages, answers
+them, and keeps its own state between them.
+
+The model comes from **Erlang**: processes that share nothing, messages that are copied into a mailbox, and a
+crash that stays with the actor that crashed and is reported instead of spreading. Three things differ:
+- **Mailboxes are typed.** A `Pid[M]` says which messages its actor understands, closer to Gleam's typed
+  subjects than to Erlang's untyped ones.
+- **Every actor is an operating-system thread.** Erlang's lightweight processes run on a scheduler of their
+  own. Thousands of actors are fine; millions are not.
+- **There is no selective receive, and no links or supervisors.** A crash is reported to the actor that
+  started the crashed one, and nothing is restarted.
+
+`spawnActor(f, init)` starts `f(inbox, init)` on a thread of its own and returns the actor's **address**, a
+`Pid[M]`. `send(pid, m)` puts a copy of `m` into its mailbox. The actor reads its mail with
+`inbox.messages()`, a lazy iterator that ends when the program ends, so an actor's whole life is a `for`
+loop:
+
+```rust
+use std::actor::*
+
+// Ask the counter for its total: the message carries the address to answer to.
+enum Cmd { Add(Int), Total(Pid[Int]) }
+
+fn counter(inbox: Inbox[Cmd], start: Int) -> () {
+  let mut total = start
+  for cmd in inbox.messages() {
+    match cmd {
+      Cmd::Add(n)     => { total = total + n },
+      Cmd::Total(ask) => { send(ask, total) },
+    }
+  }
+}
+
+let me: Inbox[Int] = mainInbox()          // the main program's own mailbox
+let c = spawnActor(counter, 100)
+send(c, Cmd::Add(5))
+send(c, Cmd::Add(7))
+send(c, Cmd::Total(me.pid()))
+match me.receive() {
+  Mail::Msg(t) => println(t),             // => 112
+  _ => println("no answer"),
+}
+```
+
+`inbox.receive()` is the full form. It returns a `Mail`:
+- `Msg(m)`, a message;
+- `Exited(id, reason)`, when an actor this one started has **crashed**. The crash does not spread; its
+  starter is told, and a `send` to the crashed actor returns `false` from then on;
+- `Stop`, when the program is ending. `messages()` stops there by itself.
+
+`inbox.receiveTimeout(ms)` gives up with `None` after `ms` milliseconds. The main program gets its one
+mailbox with `mainInbox()`, annotated with its message type.
+
+The rules are the ones from tasks, applied to what gets copied: the actor function is a **named top-level
+function**, and the message type and the start value must be **plain data**. An address (`Pid`) is plain data,
+so messages can carry the address to reply to; an `Inbox` is not — only its actor may read it:
+
+```rust fail
+use std::actor::*
+fn keeper(inbox: Inbox[Inbox[Int]], unused: Int) -> () {}
+let k = spawnActor(keeper, 0)   // error: cannot be sent to an actor
+```
+
+Actors print a line at a time into the program's output, so lines from different actors never mix, but
+their order depends on scheduling. When the program ends, every actor gets `Stop` and the program waits for
+them to finish. `demo/actors/wordcount.skn` counts words with a reader, N counter actors and a collector.
+
+A connection is not plain data — its socket belongs to the actor that opened it — so it cannot be a message.
+To give one to another actor, **hand it off**: `c.handOff()` detaches the connection and returns a
+`SocketHandOff`, a ticket that *can* be sent, and the receiving actor turns it back into a `TcpConn` with
+`h.take()`, once. Bytes that `recvLine` had already read ahead travel with it. The sender's `TcpConn` is dead
+from then on: every operation on it returns an `Err`.
+
+```rust
+use std::net::*
+use std::actor::*
+
+// A worker answers on every connection it is handed.
+fn worker(inbox: Inbox[SocketHandOff], unused: Int) -> () {
+  for h in inbox.messages() {
+    match h.take() {
+      Ok(mut c) => {
+        match c.recvLine() {
+          Ok(Some(line)) => { let _ = c.sendStr("echo " + line + "\n") },
+          _ => {},
+        }
+        let _ = c.close()
+      },
+      Err(e) => println(e),
+    }
+  }
+}
+
+fn demo() -> Result[(), String] {
+  let lst = listen(0)?                                  // the system picks a free port
+  let mut client = connect("127.0.0.1", lst.localPort()?)?
+  let conn = lst.accept()?
+  let w = spawnActor(worker, 0)
+  send(w, conn.handOff()?)                              // the ticket travels; the socket follows
+  client.sendStr("hi\n")?
+  println(match client.recvLine()? { Some(s) => s, None => "<eof>" })   // => echo hi
+  match conn.sendStr("late") { Ok(_) => println("sent"), Err(e) => println(e) }   // => tcpSend: socket was handed to another actor
+  client.close()?
+  lst.close()?
+  Ok(())
+}
+match demo() { Ok(_) => {}, Err(e) => println(e) }
+```
+
+That is how a server spreads over several cores: one actor accepts and hands each connection to a worker.
+`demo/actor_server/` is one, with a load generator built on tasks.
 
 And `std::regex` matches, captures, and rewrites text with a linear-time engine (compile once, reuse):
 
@@ -4447,6 +4615,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `listen(port)` (free) / `l.accept()` / `l.close()` | server: bind+listen → `TcpListener`; block for a client → `TcpConn`; stop listening |
 | `l.localPort()` | the port actually bound → `Result[Int, String]`. Pass **`listen(0)`** to let the OS pick a free one and read it back here — safer than naming a fixed port, which may already be in use |
 | `httpGet(host, port, path)` | a minimal HTTP/1.0 GET → `Result[HttpResponse, String]` (`.status: Int`, `.body: String`; free) |
+| `c.handOff()` / `h.take()` | give a connection to another actor: detach it → `Result[SocketHandOff, String]`, a ticket that can be sent; redeem the ticket in the receiver, once → `Result[TcpConn, String]`. After the hand-off every use of the old `TcpConn` returns `Err` |
 
 **Non-blocking I/O** *(all `std::poll` — `use std::poll::*`; one thread, many connections; `connect` stays blocking)*
 
@@ -4460,6 +4629,25 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `c.send(bytes)` / `c.sendStr(s)` | offer bytes → `Result[Int, String]`, the count the kernel **accepted** (may be short, or 0). There is no send-all: keep the tail and retry when `WRITABLE` |
 | `l.close()` / `c.close()` | close and free the descriptor → `Result[(), String]`. A closed descriptor must leave the `fds` vector |
 | `l.fd` / `c.fd` | the descriptor — what goes into `fds`, and the natural key for the program's own state `Map` |
+
+**Parallel tasks** *(all `std::task` — `use std::task::*`; fork-join, one thread and one heap per task, argument and result copied)*
+
+| Function | Purpose |
+|----------|---------|
+| `spawn(f, x)` | start `f(x)` on its own thread → `Task[R]` (free). `f` must be a named, non-generic top-level function with one parameter; its parameter and result types must be plain data — no function values, `dyn` values, sockets or tasks |
+| `t.join()` | wait for the task → `Result[R, String]`: `Ok(result)`, or `Err(message)` if it faulted. Once per task; what the task printed appears here |
+
+**Actors** *(all `std::actor` — `use std::actor::*`; one thread and one heap per actor, every message copied)*
+
+| Function | Purpose |
+|----------|---------|
+| `spawnActor(f, init)` | start `f(inbox, init)` → `Pid[M]` (free). `f` must be a named, non-generic top-level `fn(Inbox[M], I) -> ()`; `M` and `I` must be plain data — no function values, `dyn` values, sockets, tasks or inboxes (a connection travels as a `SocketHandOff`, see `c.handOff()`) |
+| `send(p, m)` | copy `m` into the mailbox of the actor at `p` → `Bool`: `false` if it no longer runs, and the message is dropped (free) |
+| `mainInbox()` | the main program's own mailbox → `Inbox[M]` (free; once; annotate it: `let me: Inbox[T] = mainInbox()`) |
+| `inbox.messages()` | the messages as a lazy `dyn Iterator[M]` that ends when the program ends: `for m in inbox.messages() { … }`. Skips crash reports |
+| `inbox.receive()` | wait for the next mail → `Mail[M]`: `Mail::Msg(m)`, `Mail::Exited(id, reason)` (an actor this one started has crashed), or `Mail::Stop` (the program is ending) |
+| `inbox.receiveTimeout(ms)` | as `receive`, but `None` after `ms` milliseconds → `Option[Mail[M]]` |
+| `inbox.pid()` / `p.actorId()` | this actor's address, to hand out → `Pid[M]` / an actor's id, to compare with the one in `Exited` → `ActorId` |
 
 **Regex** *(all `std::regex` — `use std::regex::*`; byte-level, linear-time Pike VM; no backrefs/lookaround. Note the names: matching anywhere is `search`, not `find`, and rewriting is `replaceRe`, not `replace` — those two belong to `std::iter` / `std::string`)*
 

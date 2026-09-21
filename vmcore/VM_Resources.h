@@ -69,13 +69,29 @@ public:
     static_assert(REG_MAX_SIZE  % GUARD_SIZE == 0, "register stack max must be page-aligned");
     static_assert(RET_MAX_SIZE  % GUARD_SIZE == 0, "return stack max must be page-aligned");
 
-    VM_Resources() {
-        reg_base_ = static_cast<Value*>      (reserve_with_guard(REG_MAX_SIZE, REG_INIT_SIZE));
-        ret_base_ = static_cast<ReturnFrame*>(reserve_with_guard(RET_MAX_SIZE, RET_INIT_SIZE));
-        frame_size_base_    = static_cast<uint8_t*>(reserve_with_guard(FSZ_MAX_SIZE, RET_FRAME_COUNT * sizeof(uint8_t)));
-        closure_stack_base_ = static_cast<Value*>  (reserve_with_guard(CLO_MAX_SIZE, RET_FRAME_COUNT * sizeof(Value)));
-        reg_committed_bytes_ = REG_INIT_SIZE;
-        ret_committed_frames_ = RET_FRAME_COUNT;
+    VM_Resources() : VM_Resources(REG_INIT_SIZE, RET_FRAME_COUNT) {}
+
+    // A SMALLER initial commit, for a task or an actor: a program may run hundreds of actors, and
+    // the historical 1 MiB + 256 KiB per instance is commit charge each of them pays up front.
+    // Sound only where growth is enabled (execute() sets VM::resources): run_switch then grows
+    // on demand, and one doubling step still adds at least the initial commit, which must stay
+    // far above what a single frame needs (VM_REG_MARGIN + 256 register slots, one return frame).
+    // Both sizes must be page-aligned in bytes.
+    static constexpr size_t ISOLATE_REG_INIT_SIZE    = 64 * 1024;   // 8192 Value slots
+    static constexpr size_t ISOLATE_RET_FRAME_COUNT  = 1024;
+    static_assert(ISOLATE_REG_INIT_SIZE / sizeof(Value) >= 4 * (512 + 256),
+                  "an isolate's initial register commit must dwarf one frame plus the grow margin");
+    static_assert(ISOLATE_REG_INIT_SIZE % GUARD_SIZE == 0, "isolate register stack initial must be page-aligned");
+    static_assert((ISOLATE_RET_FRAME_COUNT * sizeof(ReturnFrame)) % GUARD_SIZE == 0,
+                  "isolate return stack initial must be page-aligned");
+
+    VM_Resources(size_t reg_init_bytes, size_t ret_init_frames) {
+        reg_base_ = static_cast<Value*>      (reserve_with_guard(REG_MAX_SIZE, reg_init_bytes));
+        ret_base_ = static_cast<ReturnFrame*>(reserve_with_guard(RET_MAX_SIZE, ret_init_frames * sizeof(ReturnFrame)));
+        frame_size_base_    = static_cast<uint8_t*>(reserve_with_guard(FSZ_MAX_SIZE, ret_init_frames * sizeof(uint8_t)));
+        closure_stack_base_ = static_cast<Value*>  (reserve_with_guard(CLO_MAX_SIZE, ret_init_frames * sizeof(Value)));
+        reg_committed_bytes_ = reg_init_bytes;
+        ret_committed_frames_ = ret_init_frames;
     }
 
     ~VM_Resources() { release_all(); }

@@ -76,7 +76,9 @@ foreach ($raw in [System.IO.File]::ReadAllLines($Manifest)) {
 $wrapped = $sb.ToString()
 
 $existing = if (Test-Path -LiteralPath $Out) { [System.IO.File]::ReadAllText($Out) } else { $null }
-if ($existing -ne $wrapped) {
+# -cne, not -ne: PowerShell's -ne compares strings CASE-INSENSITIVELY, so an edit that only changed
+# case (`Fn` -> `fn`) was reported "up to date" and never embedded.
+if ($existing -cne $wrapped) {
     [System.IO.File]::WriteAllText($Out, $wrapped, (New-Object System.Text.UTF8Encoding($false)))
     Write-Host "gen_prelude_embed: wrote $Out"
 } else {

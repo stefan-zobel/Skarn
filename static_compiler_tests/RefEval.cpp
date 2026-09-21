@@ -40,7 +40,7 @@ struct ContinueSignal {};
 struct PanicSignal   { std::string msg; };
 // The two ways of declining a program. See the RefEval.h header comment for WHY they are distinct:
 // one silent category made the oracle fail by silence. `Unsupported` must be justified at its throw
-// site (there are only three such sites); every other decline is a gap and must be loud.
+// site (there are only four such sites); every other decline is a gap and must be loud.
 struct Unsupported   { std::string what; };   // outside the oracle's remit BY DESIGN -> an honest SKIP
 struct NotModelled   { std::string what; };   // the oracle LACKS this -> a FAILURE, like a disagreement
 
@@ -289,6 +289,18 @@ public:
 
 private:
     Coverage cov_;   // node kinds evaluated by this run (see RefEval.h)
+    // Fork-join tasks, modelled SEQUENTIALLY: rawSpawn records the function and a deep COPY of the
+    // argument, rawJoin runs it right there. The VM runs it on another thread, but the two agree on
+    // everything a program can observe: the task works on a copy taken at spawn (the parent's later
+    // changes cannot reach it), its result is a copy, and its output reaches the parent's stream at
+    // join. Only the text of a fault message differs (the VM adds a location), so the differential
+    // tests do not print one.
+    struct TaskRec {
+        RtValue     fn, arg, result;
+        std::string error;
+        bool        ok = false, joined = false;
+    };
+    std::vector<TaskRec> tasks_;
     std::unordered_map<std::string, const FnItem*> fn_table_;
     std::unordered_map<std::string, const Expr*>   const_defs_;   // module const -> literal (S0; inlined)
     std::unordered_map<std::string, CtorInfo>      ctors_;
@@ -1298,6 +1310,81 @@ private:
     }
 
     // ----- opcode-backed builtins -----
+    // A deep copy that keeps sharing and cycles, as the VM's value codec does -- the model of sending a
+    // value to another heap.
+    static RtValue deep_copy(const RtValue& v, std::unordered_map<const Obj*, std::shared_ptr<Obj>>& memo) {
+        if (!std::holds_alternative<std::shared_ptr<Obj>>(v)) return v;
+        const auto& src = std::get<std::shared_ptr<Obj>>(v);
+        if (!src) return v;
+        if (auto it = memo.find(src.get()); it != memo.end()) return it->second;
+        auto dst = std::make_shared<Obj>(*src);          // scalars, names and bytes by value
+        memo.emplace(src.get(), dst);
+        for (auto& x : dst->items) x = deep_copy(x, memo);
+        for (auto& kv : dst->map) { kv.first = deep_copy(kv.first, memo); kv.second = deep_copy(kv.second, memo); }
+        return dst;
+    }
+    static RtValue deep_copy(const RtValue& v) {
+        std::unordered_map<const Obj*, std::shared_ptr<Obj>> memo;
+        return deep_copy(v, memo);
+    }
+
+    // rawSpawn / rawJoin / rawTaskTake / rawTaskError -- see TaskRec.
+    bool task_native(const std::string& name, const std::vector<const Expr*>& argx, Env& env, RtValue& out) {
+        if (name == "rawSpawn") {
+            TaskRec t;
+            t.fn  = eval(*argx[0], env);
+            t.arg = deep_copy(eval(*argx[1], env));
+            tasks_.push_back(std::move(t));
+            out = static_cast<int64_t>(tasks_.size() - 1);
+            return true;
+        }
+        // The other three take the Task struct; its one field is the id.
+        const RtValue h = eval(*argx[0], env);
+        int64_t id = -1;
+        if (std::holds_alternative<std::shared_ptr<Obj>>(h)) {
+            const auto& o = std::get<std::shared_ptr<Obj>>(h);
+            if (o && !o->items.empty() && std::holds_alternative<int64_t>(o->items[0]))
+                id = std::get<int64_t>(o->items[0]);
+        }
+        if (id < 0 || id >= static_cast<int64_t>(tasks_.size()))
+            throw NotModelled{"task handle not modelled: " + name};
+        const size_t idx = static_cast<size_t>(id);
+        if (name == "rawJoin") {
+            if (tasks_[idx].joined) throw PanicSignal{"join: this task was already joined"};
+            const RtValue fnv = tasks_[idx].fn;
+            const auto* cl = std::holds_alternative<std::shared_ptr<Closure>>(fnv)
+                           ? std::get<std::shared_ptr<Closure>>(fnv).get() : nullptr;
+            if (!cl || !cl->fn) throw NotModelled{"task function is not a named function"};
+            const FnItem& fn = *cl->fn;
+            std::vector<RtValue> args;
+            args.push_back(coerce_dbl(tasks_[idx].arg,
+                                      !fn.params.empty() && syn_is_double(fn.params[0].type.get())));
+            // The task may spawn tasks of its own, which grows tasks_: no reference into it may be
+            // held across this call -- index again afterwards.
+            RtValue     result;
+            std::string error;
+            bool        ok = false;
+            try {
+                result = deep_copy(call_fn(fn, std::move(args)));
+                ok     = true;
+            } catch (const PanicSignal& p) {
+                error = p.msg;
+            }
+            TaskRec& t = tasks_[idx];
+            t.result = std::move(result);
+            t.error  = std::move(error);
+            t.ok     = ok;
+            t.joined = true;
+            out = ok;
+            return true;
+        }
+        const TaskRec& t = tasks_[idx];
+        if (!t.joined) throw NotModelled{name + " before rawJoin"};
+        if (name == "rawTaskTake")  { out = t.result; return true; }
+        out = t.error;                                   // rawTaskError
+        return true;
+    }
+
     bool try_builtin(const std::string& name, const std::vector<const Expr*>& argx, Env& env, RtValue& out) {
         auto ev = [&](size_t i) { return eval(*argx[i], env); };
         auto some = [&](RtValue x) { CtorInfo c; c.type_name = "Some"; c.enum_name = "Option"; c.is_variant = true;
@@ -1517,6 +1604,16 @@ private:
             std::vector<RtValue> f; f.push_back(std::string("no such file"));
             out = construct(c, std::move(f)); return true;
         }
+        if (name == "rawSpawn" || name == "rawJoin" || name == "rawTaskTake" || name == "rawTaskError")
+            return task_native(name, argx, env, out);
+        // Actors are outside the oracle's remit BY DESIGN. Unlike a task, an actor cannot be run to
+        // completion at one point of the parent: it blocks in receive until others send to it, and
+        // several actors interleave freely, so which message a receive gets first is not fixed by the
+        // program. A sequential model would pick one schedule and call it the answer. Programs using
+        // actors are checked through the VM alone (vm_tests' actor_* and the actor_* codegen tests).
+        if (name == "rawSpawnActor" || name == "rawSend" || name == "rawReceive" || name == "rawMailMsg" ||
+            name == "rawMailFrom" || name == "rawMailReason" || name == "rawMainInbox" || name == "rawSelfId")
+            throw Unsupported{"actor native '" + name + "' (free interleaving, not modelled by design)"};   // FAMILY A
         if (name == "rawOsId") {                          // the running platform, same mapping as the
 #ifdef _WIN32                                             // native -- a disagreement here means the two
             out = static_cast<int64_t>(0);                // sides were built for different platforms,

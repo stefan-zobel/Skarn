@@ -492,6 +492,8 @@ constexpr const char* STD_MATH    = "std::math";    // math natives (sqrt/pow/..
 constexpr const char* STD_NET     = "std::net";     // TCP networking natives (tcpConnect/tcpSend/...) (opt-in)
 constexpr const char* STD_HASH    = "std::hash";    // hashing: crc32 (prelude) + the sha256 native       (opt-in)
 constexpr const char* STD_POLL    = "std::poll";    // non-blocking I/O + readiness (rawPoll/rawRecvNb/...) (opt-in)
+constexpr const char* STD_TASK    = "std::task";    // fork-join tasks: Task[R] + spawn + join (rawSpawn/rawJoin/...) (opt-in)
+constexpr const char* STD_ACTOR   = "std::actor";   // actors: Pid/Inbox/Mail + spawnActor/send/receive (rawSpawnActor/...) (opt-in)
 
 // Canonical (currently-mangled) names of the compiler-referenced prelude entities.
 inline std::string std_Option()       { return mangle_name(STD_CORE, "Option"); }
@@ -509,6 +511,12 @@ inline std::string std_MustUse()      { return mangle_name(STD_CORE, "MustUse");
 inline std::string std_ProcessOutput(){ return mangle_name(STD_PROCESS, "ProcessOutput"); }
 inline std::string std_Char()          { return mangle_name(STD_STRING, "Char"); }
 inline std::string std_codePointToStr(){ return mangle_name(STD_STRING, "codePointToStr"); }
+inline std::string std_Task()         { return mangle_name(STD_TASK, "Task"); }       // a fork-join task handle
+inline std::string std_spawn()        { return mangle_name(STD_TASK, "spawn"); }      // its one constructor
+inline std::string std_spawnActor()   { return mangle_name(STD_ACTOR, "spawnActor"); }
+inline std::string std_mainInbox()    { return mangle_name(STD_ACTOR, "mainInbox"); }
+inline std::string std_Pid()          { return mangle_name(STD_ACTOR, "Pid"); }
+inline std::string std_Inbox()        { return mangle_name(STD_ACTOR, "Inbox"); }
 
 // ----- debug rendering ------------------------------------------------------
 

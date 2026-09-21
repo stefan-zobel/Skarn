@@ -1,0 +1,208 @@
+// An HTTP server on actors: one acceptor, N workers, and every connection handed from the first to
+// one of the others.
+//
+//   main (acceptor) --accept--> c.handOff() --send--> worker k (round robin) --h.take()--> answer
+//
+// The acceptor only accepts: it detaches each new connection with `c.handOff()` and sends the ticket to
+// a worker. A worker is a `for h in inbox.messages()` loop that takes the connection, reads the
+// request, answers and closes. Workers run in parallel, each on its own thread and heap; the acceptor
+// never touches a connection again after handing it off.
+//
+// Two ways to choose the worker:
+//   rr     round robin: worker 0, 1, 2, ... -- blind, so a request may wait behind a busy worker
+//          while another one is idle.
+//   pull   the workers ask for work: each reports itself free to the acceptor's own inbox, and the
+//          acceptor hands a connection only to a worker that did. While none is free, new
+//          connections wait in the system's accept queue, in arrival order.
+//
+// Two routes, so the load can be I/O or CPU:
+//   /            a short greeting -- almost pure I/O
+//   /work/<n>    sums the digits of the numbers 1..n first -- work that more cores can share
+//
+// Run:   static_vmrun demo/actor_server/server.skn [--workers=N] [--dispatch=rr|pull] [--credits=C]
+//                                                   [--port=P] [--requests=K] [--port-file=F]
+//   --workers=N    worker actors (default 4). 0 answers on the main thread itself: the baseline.
+//   --dispatch=D   how to choose the worker: rr (default) or pull, see above
+//   --credits=C    pull only: connections a worker may hold at once (default 1). With 2, the next
+//                  one is already waiting when a worker finishes.
+//   --port=P       port to listen on (default 0: the OS picks a free one)
+//   --requests=K   stop after K connections (default 0: serve forever). The workers then finish what
+//                  they were handed and get Stop.
+//   --port-file=F  write the port to file F once listening (for a harness; stdout may be buffered)
+//
+// Try it:  curl http://127.0.0.1:<port>/work/20000
+
+use std::net::*
+use std::actor::*
+use std::cli::*
+use std::env::*
+use std::io::*
+
+// Sum of the decimal digits of 1..n: plain interpreted arithmetic, a stand-in for real work.
+fn work(n: Int) -> Int {
+    let mut total = 0
+    let mut i = 1
+    while i <= n {
+        let mut k = i
+        while k > 0 {
+            total = total + k % 10
+            k = k / 10
+        }
+        i = i + 1
+    }
+    total
+}
+
+// The body for a request path.
+fn route(path: String) -> String {
+    if startsWith(path, "/work/") {
+        match parseInt(slice(path, 6, len(path))) {
+            Ok(n) => "work ${n} = ${work(n)}\n",
+            Err(_) => "bad number\n",
+        }
+    } else {
+        "hello from skarn\n"
+    }
+}
+
+// Read one request, answer it, close. HTTP/1.0 style: one request per connection.
+fn serve(mut c: TcpConn) -> () {
+    match c.recvLine() {
+        Ok(Some(requestLine)) => {
+            // Skip the headers, up to the empty line.
+            let mut reading = true
+            while reading {
+                match c.recvLine() {
+                    Ok(Some(h)) => { if len(trim(h)) == 0 { reading = false } },
+                    _ => { reading = false },
+                }
+            }
+            let parts = collect(words(requestLine))
+            let path = if len(parts) >= 2 { parts[1] } else { "/" }
+            let body = route(path)
+            let _ = c.sendStr("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n" +
+                              "Content-Length: ${len(body)}\r\nConnection: close\r\n\r\n" + body)
+        },
+        _ => {},
+    }
+    let _ = c.close()
+}
+
+// A worker: take every connection it is handed and serve it.
+fn worker(inbox: Inbox[SocketHandOff], unused: Int) -> () {
+    for h in inbox.messages() {
+        match h.take() {
+            Ok(mut c) => serve(c),
+            Err(e) => println("worker: ${e}"),
+        }
+    }
+}
+
+// A pull worker's start value: where to report free, and how many connections it may hold at once.
+struct PullStart { boss: Pid[Pid[SocketHandOff]], credits: Int }
+
+// A worker in pull mode: report free `credits` times, then once more after every connection.
+fn pullWorker(inbox: Inbox[SocketHandOff], start: PullStart) -> () {
+    let me = inbox.pid()
+    let mut k = 0
+    while k < start.credits {
+        send(start.boss, me)
+        k = k + 1
+    }
+    for h in inbox.messages() {
+        match h.take() {
+            Ok(mut c) => serve(c),
+            Err(e) => println("worker: ${e}"),
+        }
+        send(start.boss, me)
+    }
+}
+
+// The acceptor in pull mode. Reports are not collected ahead: they wait in the inbox until the list
+// of free workers runs empty.
+fn runPull(srv: TcpListener, nWorkers: Int, limit: Int, credits: Int) -> Result[(), String] {
+    let boss: Inbox[Pid[SocketHandOff]] = mainInbox()
+    let mut k = 0
+    while k < nWorkers {
+        spawnActor(pullWorker, PullStart { boss: boss.pid(), credits: credits })
+        k = k + 1
+    }
+    let mut alive = nWorkers
+    let mut free: Vec[Pid[SocketHandOff]] = vec()
+    let mut served = 0
+    while limit == 0 || served < limit {
+        let mut conn = srv.accept()?
+        let ticket = conn.handOff()?
+        let mut placed = false
+        while !placed {
+            match pop(free) {
+                // A send to a worker that has died since it reported returns false: try the next.
+                Some(p) => { placed = send(p, ticket) },
+                None => {
+                    if alive == 0 { return Err("all workers exited") }
+                    match boss.receive() {
+                        Mail::Msg(p) => push(free, p),
+                        Mail::Exited(_, why) => {
+                            println("worker exited: ${why}")
+                            alive = alive - 1
+                        },
+                        Mail::Stop => { return Err("stopped") },
+                    }
+                }
+            }
+        }
+        served = served + 1
+    }
+    srv.close()?
+    Ok(())
+}
+
+fn intOpt(opts: CliArgs, name: String, dflt: Int) -> Int {
+    match parseInt(opts.getOptOr(name, toString(dflt))) {
+        Ok(v) => v,
+        Err(_) => panic("--${name} needs a whole number"),
+    }
+}
+
+fn run() -> Result[(), String] {
+    let opts     = CliArgs::parse(args())
+    let nWorkers = intOpt(opts, "workers", 4)
+    let limit    = intOpt(opts, "requests", 0)
+    let srv      = listen(intOpt(opts, "port", 0))?
+    let port     = srv.localPort()?
+    match opts.getOpt("port-file") {
+        Some(f) => { writeFile(f, toBytes(toString(port)))? },
+        None => {},
+    }
+    let dispatch = opts.getOptOr("dispatch", "rr")
+    if dispatch != "rr" && dispatch != "pull" { return Err("--dispatch must be rr or pull") }
+    println("listening on port ${port} with ${nWorkers} workers (${dispatch})")
+    if dispatch == "pull" && nWorkers > 0 {
+        return runPull(srv, nWorkers, limit, intOpt(opts, "credits", 1))
+    }
+
+    let mut workers: Vec[Pid[SocketHandOff]] = vec()
+    let mut k = 0
+    while k < nWorkers {
+        push(workers, spawnActor(worker, 0))
+        k = k + 1
+    }
+
+    let mut served = 0
+    while limit == 0 || served < limit {
+        let mut conn = srv.accept()?
+        if nWorkers == 0 {
+            serve(conn)
+        } else {
+            send(workers[served % nWorkers], conn.handOff()?)
+        }
+        served = served + 1
+    }
+    srv.close()?
+    Ok(())
+}
+
+match run() {
+    Ok(_) => {},
+    Err(e) => panic("server: ${e}"),
+}

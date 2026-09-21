@@ -30,6 +30,45 @@
 struct Context;
 using NativeFunc = Value(*)(Value* args, uint8_t nargs, Context* ctx);
 
+// The read-only program one execute() runs: every table its parameters name, bundled. execute()
+// builds one from its own arguments (no caller passes it) and publishes it as VM::image, so a
+// native can start a second execute() over the same program -- which is how a fork-join task
+// runs. All pointers are non-owning and valid for the whole execute() call; the image is shared,
+// read-only, by every task, which is what makes a struct type id or a function id mean the same
+// thing on both sides of a copy.
+struct ProgramImage {
+    const std::vector<uint32_t>*           bytecode           = nullptr;
+    const std::vector<Value>*              const_pool         = nullptr;
+    const std::vector<StructType>*         struct_types       = nullptr;
+    const std::vector<std::string>*        string_literals    = nullptr;
+    const std::vector<std::string>*        atom_names         = nullptr;
+    const std::vector<FnInfo>*             fn_table           = nullptr;
+    const std::vector<uint16_t>*           trait_table        = nullptr;
+    uint32_t                               trait_table_width  = 0;
+    uint32_t                               trait_method_count = 0;
+    const std::vector<uint32_t>*           line_table         = nullptr;
+    const std::vector<std::string>*        function_names     = nullptr;
+    const std::vector<uint32_t>*           column_table       = nullptr;
+    const std::vector<NativeFunc>*         native_table       = nullptr;
+    const std::vector<std::string>*        script_args        = nullptr;
+    const std::vector<std::string>*        function_modules   = nullptr;
+    const std::vector<std::vector<Value>>* const_arrays       = nullptr;
+};
+
+// When an execute() IS a task or an actor: where to start (the entry stub appended after the
+// program's own code), its copied argument, and the world it belongs to. Supplied only by the
+// isolate runner in vmcore.cpp; every other caller leaves it null, execution starts at
+// instruction 0, and that execute() is the ROOT of a new world.
+struct World;     // the isolates started under one root execute() (vmcore.cpp)
+struct Isolate;   // one task or actor of a world (vmcore.cpp)
+struct TaskEntry {
+    uint32_t       entry_pc   = 0;         // instruction index of the entry stub
+    const uint8_t* input      = nullptr;   // the argument, as a value-codec buffer
+    size_t         input_size = 0;
+    World*         world      = nullptr;   // the world this isolate runs in
+    Isolate*       isolate    = nullptr;   // this isolate's own record in it
+};
+
 // Sets up VM_Resources + Context, runs the bytecode, and returns the resources
 // so the caller can inspect registers after HALT. Default arguments live here
 // (the sole declaration); the definition in vmcore.cpp must not repeat them.
@@ -82,4 +121,7 @@ VM_Resources execute(const std::vector<uint32_t>&    bytecode,
                      // Array[T] = [...]`, holding its scalar (Int/Double/Bool) element immediates.
                      // execute() builds each into a GC-rooted KIND_ARRAY once at setup. Optional and
                      // placed last, so existing positional callers are unaffected. See VM::const_array_pool.
-                     const std::vector<std::vector<Value>>* const_arrays = nullptr);
+                     const std::vector<std::vector<Value>>* const_arrays = nullptr,
+                     // Set only when this execute() runs a fork-join task (see TaskEntry). Placed
+                     // last, so existing positional callers are unaffected.
+                     const TaskEntry*                task              = nullptr);

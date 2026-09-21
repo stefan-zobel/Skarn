@@ -1277,6 +1277,10 @@ private:
         add_native("tcpAccept",    { ty_int() },    make_named(std_Result(), { ty_int(),   S }), STD_NET);
         add_native("tcpSetTimeout",{ ty_int(), ty_int() }, make_named(std_Result(), { ty_unit(), S }), STD_NET);
         add_native("tcpLocalPort", { ty_int() },    make_named(std_Result(), { ty_int(),   S }), STD_NET);
+        // Handing a connection to another actor: the socket moves between isolates through a ticket
+        // (see SocketHandOff in net.skn, and the literal rule in infer_struct_lit).
+        add_native("rawHandOff",   { ty_int() },    make_named(std_Result(), { ty_int(),   S }), STD_NET);
+        add_native("rawTake",      { ty_int() },    make_named(std_Result(), { ty_int(),   S }), STD_NET);
         // Hashing -- std::hash (opt-in; the pure-Skarn crc32 + hex helpers live in hash.skn, same module).
         // sha256 is a native (32-bit modular arithmetic is awkward in a 48-bit-Int language) returning the
         // raw 32-byte digest as Bytes; the prelude sha256Hex/sha256HexStr render it.
@@ -1292,6 +1296,73 @@ private:
         add_native("rawRecvNb",    { ty_int(), ty_int() },
                                    make_named(std_Result(), { make_named("Array", { B }), S }), STD_POLL);
         add_native("rawSendNb",    { ty_int(), B },  make_named(std_Result(), { ty_int(),  S }), STD_POLL);
+
+        // Fork-join tasks -- std::task (opt-in). The only GENERIC natives: a task's argument and result
+        // have the types of the function it runs, which one monomorphic signature cannot state. They are
+        // the plumbing under std/task.skn; a program writes `spawn(f, x)` and `t.join()`. What makes the
+        // generic types honest is checked elsewhere: `spawn`'s call site (check_spawn_site: a named
+        // top-level fn, sendable argument and result), and a Task is built nowhere but in std::task
+        // (the struct-literal rule), so a Task[R] always carries the id of a task that returns an R.
+        // rawTaskTake / rawTaskError are ONE native (NATIVE_TASK_TAKE) under two types; rawJoin's Bool
+        // says which one the caller holds.
+        std::string gate = STD_TASK;   // the module the generic natives below are gated to
+        auto add_generic_native = [&](const std::string& name, std::vector<std::string> gnames,
+                                      auto make_params, auto make_ret) {
+            assert(native_id_of(name) >= 0 && "static native name missing from NativeRegistry.h");
+            native_module_[name] = gate;
+            FnSig sig;
+            std::vector<TyPtr> vars;
+            for (const auto& gn : gnames) {
+                TyPtr v = tc_.rigid_var(gn);
+                sig.generics.push_back(GenericInfo{ gn, {}, v->var_id, v });
+                vars.push_back(v);
+            }
+            sig.params = make_params(vars);
+            sig.ret    = make_ret(vars);
+            builtin_fns_.emplace(name, std::move(sig));
+        };
+        auto task_of = [](const TyPtr& r) { return make_named(std_Task(), { r }); };
+        // rawSpawn(f: Fn(A) -> R, arg: A) -> Int   (the task id; std::task wraps it in a Task[R])
+        add_generic_native("rawSpawn", { "A", "R" },
+            [](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ make_fn({ v[0] }, v[1]), v[0] }; },
+            [](const std::vector<TyPtr>&)   { return ty_int(); });
+        add_generic_native("rawJoin", { "R" },
+            [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ task_of(v[0]) }; },
+            [](const std::vector<TyPtr>&)    { return ty_bool(); });
+        add_generic_native("rawTaskTake", { "R" },
+            [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ task_of(v[0]) }; },
+            [](const std::vector<TyPtr>& v)  { return v[0]; });
+        add_generic_native("rawTaskError", { "R" },
+            [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ task_of(v[0]) }; },
+            [S](const std::vector<TyPtr>&)   { return S; });
+
+        // Actors -- std::actor (opt-in), on the same runtime. Typed by the handles, as above: a
+        // Pid[M] / Inbox[M] carries the message type, and the checker validates M where one is MADE
+        // (check_spawn_actor_site, check_main_inbox_site) -- Pid and Inbox literals are std::actor's
+        // alone -- so `send` and the mail readers need no check of their own.
+        gate = STD_ACTOR;
+        auto pid_of   = [](const TyPtr& m) { return make_named(std_Pid(), { m }); };
+        auto inbox_of = [](const TyPtr& m) { return make_named(std_Inbox(), { m }); };
+        add_generic_native("rawSpawnActor", { "A", "R" },
+            [](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ make_fn({ v[0] }, v[1]), v[0] }; },
+            [](const std::vector<TyPtr>&)   { return ty_int(); });
+        add_generic_native("rawSend", { "M" },
+            [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ pid_of(v[0]), v[0] }; },
+            [](const std::vector<TyPtr>&)    { return ty_bool(); });
+        add_generic_native("rawReceive", { "M" },
+            [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ inbox_of(v[0]), ty_int() }; },
+            [](const std::vector<TyPtr>&)    { return ty_int(); });
+        add_generic_native("rawMailMsg", { "M" },
+            [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ inbox_of(v[0]) }; },
+            [](const std::vector<TyPtr>& v)  { return v[0]; });
+        add_generic_native("rawMailFrom", { "M" },
+            [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ inbox_of(v[0]) }; },
+            [](const std::vector<TyPtr>&)    { return ty_int(); });
+        add_generic_native("rawMailReason", { "M" },
+            [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ inbox_of(v[0]) }; },
+            [S](const std::vector<TyPtr>&)   { return S; });
+        add_native("rawMainInbox", {}, ty_int(), STD_ACTOR);
+        add_native("rawSelfId",    {}, ty_int(), STD_ACTOR);
     }
 
     // Is a gated native `name` callable from the module currently being checked? A native NOT in
@@ -3551,6 +3622,13 @@ private:
         }
         const std::string key = mangle_ref(e.name);   // a local shadows; else module-qualify
         if (const FnSig* usig = user_fn(key, &e)) {
+            // `spawn`'s rules (a named task function, sendable types) are checked at its CALL; a
+            // `spawn` passed around as a value would be called where nothing checks them.
+            if ((key == std_spawn() && cur_module_ != STD_TASK) ||
+                ((key == std_spawnActor() || key == std_mainInbox()) && cur_module_ != STD_ACTOR)) {
+                error(e.line, e.col, "'" + short_name(key) + "' can only be called, not used as a value");
+                return ty_error();
+            }
             e.name = key;   // writeback: codegen resolves the fn value by this (mangled) name
             // A generic fn with trait bounds cannot become a first-class `Fn` value
             // -- an `Fn` type has nowhere to record `T: Display`, so the bound would be
@@ -4168,7 +4246,185 @@ private:
         // bool here). Only the check-mode Call path passes `expected`; infer-mode callers pass null.
         if (expected) tc_.subsumes(apply(ret), apply(expected));
         discharge_bounds(sig.generics, m, node.line, node.col, &what);
+        if (is_std_sig(sig, std_spawn(), STD_TASK))                check_spawn_site(args);
+        else if (is_std_sig(sig, std_spawnActor(), STD_ACTOR))     check_spawn_actor_site(args);
+        else if (is_std_sig(sig, std_mainInbox(), STD_ACTOR))      check_main_inbox_site(ret, node);
         return apply(ret);
+    }
+
+    // ----- Tasks and actors: what `spawn`, `spawnActor` and `mainInbox` accept ---------------------
+    // All three are ordinary generic fns in their std module, so every way of calling them -- bare,
+    // piped, module-qualified -- arrives in call_direct_fn, and these rules are checked there, on top of
+    // their types. Inside their own module they are plumbing and unchecked.
+    bool is_std_sig(const FnSig& sig, const std::string& key, const char* owner) const {
+        if (cur_module_ == owner) return false;
+        const auto it = fns_.find(key);
+        return it != fns_.end() && &it->second == &sig;
+    }
+
+    // The function an isolate runs must be NAMED: a top-level fn is a Func immediate that means the
+    // same in every isolate (one program image), while a lambda or a closure is a heap object the value
+    // codec refuses -- and a Fn-typed local could hold either, which only the value tells. Non-generic,
+    // because the types checked afterwards must be the ones it really runs at. Reports and returns null
+    // otherwise.
+    const FnSig* named_isolate_fn(Expr& f, const char* who, const char* what) {
+        const FnSig* fsig = nullptr;
+        if (f.kind == ExprKind::Ident) {
+            const auto& id = static_cast<const IdentExpr&>(f);
+            if (id.qualifier.empty() && !lookup(id.name))
+                if (auto it = fns_.find(id.name); it != fns_.end()) fsig = &it->second;
+        }
+        if (!fsig) {
+            error(f.line, f.col, std::string(who) + " needs the name of a top-level function here, not " +
+                  std::string(f.kind == ExprKind::Lambda ? "a lambda" : "a computed function value") +
+                  " -- " + what + " runs a named function of the program");
+            return nullptr;
+        }
+        if (!fsig->generics.empty()) {
+            error(f.line, f.col, std::string(who) + " cannot start the generic function '" +
+                  display_name(static_cast<const IdentExpr&>(f).name) +
+                  "' -- wrap it in a non-generic function with the types it uses");
+            return nullptr;
+        }
+        return fsig;
+    }
+
+    // spawn(f, x): f named, one parameter; its argument and result must be SENDABLE, since both are
+    // copied between heaps.
+    void check_spawn_site(const std::vector<Expr*>& args) {
+        if (args.size() != 2) return;                     // already reported as an arity error
+        Expr& f = *args[0];
+        const FnSig* fsig = named_isolate_fn(f, "spawn", "a task");
+        if (!fsig) return;
+        const std::string name = display_name(static_cast<const IdentExpr&>(f).name);
+        if (fsig->params.size() != 1) {
+            error(f.line, f.col, "a task function takes exactly one parameter; '" + name + "' takes " +
+                  std::to_string(fsig->params.size()) + " -- pass a tuple or a struct instead");
+            return;
+        }
+        TypeRenderer r;
+        if (const std::string why = send_blocker(fsig->params[0]); !why.empty())
+            error(f.line, f.col, "the argument of '" + name + "' (" + r(apply(fsig->params[0])) +
+                  ") cannot be sent to a task: it contains " + why);
+        if (const std::string why = send_blocker(fsig->ret); !why.empty())
+            error(f.line, f.col, "the result of '" + name + "' (" + r(apply(fsig->ret)) +
+                  ") cannot be sent back from a task: it contains " + why);
+    }
+
+    // spawnActor(f, init): f named, `fn(Inbox[M], I) -> ()` (its type is spawnActor's own and already
+    // unified). What makes the new Pid[M] honest is M: every message sent to it will be copied, so M
+    // must be sendable -- checked HERE, where the Pid is made, which is why `send` needs no check. The
+    // start value I is copied once and must be sendable too.
+    void check_spawn_actor_site(const std::vector<Expr*>& args) {
+        if (args.size() != 2) return;
+        Expr& f = *args[0];
+        const FnSig* fsig = named_isolate_fn(f, "spawnActor", "an actor");
+        if (!fsig) return;
+        const std::string name = display_name(static_cast<const IdentExpr&>(f).name);
+        if (fsig->params.size() != 2) return;             // fails spawnActor's own type, reported there
+        const TyPtr inbox = apply(fsig->params[0]);
+        if (inbox->kind != TyKind::Named || inbox->name != std_Inbox() || inbox->args.size() != 1)
+            return;                                        // ditto
+        TypeRenderer r;
+        if (const std::string why = send_blocker(inbox->args[0]); !why.empty())
+            error(f.line, f.col, "the messages of '" + name + "' (" + r(apply(inbox->args[0])) +
+                  ") cannot be sent to an actor: they contain " + why);
+        if (const std::string why = send_blocker(fsig->params[1]); !why.empty())
+            error(f.line, f.col, "the start value of '" + name + "' (" + r(apply(fsig->params[1])) +
+                  ") cannot be sent to an actor: it contains " + why);
+    }
+
+    // mainInbox(): its message type comes only from the expected type (`let inbox: Inbox[T] =
+    // mainInbox()`), and it must be KNOWN here -- this is where the main program's Pid[M] is fixed --
+    // and sendable.
+    void check_main_inbox_site(const TyPtr& ret, Expr& node) {
+        const TyPtr inbox = apply(ret);
+        if (inbox->kind != TyKind::Named || inbox->args.size() != 1) return;
+        const TyPtr m = apply(inbox->args[0]);
+        if (m->kind == TyKind::Var) {
+            error(node.line, node.col, "the main inbox needs its message type here -- write "
+                  "`let inbox: Inbox[T] = mainInbox()`");
+            return;
+        }
+        TypeRenderer r;
+        if (const std::string why = send_blocker(m); !why.empty())
+            error(node.line, node.col, "the main inbox's messages (" + r(m) +
+                  ") cannot be sent: they contain " + why);
+    }
+
+    // Why a value of type `t` cannot be copied to another task's heap ("" = it can). Sendable is plain
+    // data: the scalars, String, Bytes, and tuples, containers, structs and enums built from sendable
+    // parts. NOT sendable: a function value (a closure is a heap object the codec refuses, and the type
+    // cannot tell one from a named fn), a trait object (its concrete type is hidden, and may be any of
+    // the below), a type parameter (unknown here), and the HANDLES -- a socket or a task is a struct over
+    // an Int that means something only in the heap that created it, which is why they are named.
+    //
+    // Recursive types: a type met again while it is still being examined counts as sendable-so-far
+    // (the greatest fixpoint -- a cycle by itself adds no bad component). Nothing is cached, so the
+    // mutual-recursion mis-cache documented at is_eq cannot happen here; spawn sites are few, and
+    // each walk is bounded by the number of distinct types it meets.
+    std::string send_blocker(const TyPtr& ty) {
+        std::vector<std::string> active;
+        return send_blocker_in(ty, active);
+    }
+
+    std::string send_blocker_in(TyPtr t, std::vector<std::string>& active) {
+        t = apply(t);
+        TypeRenderer r;
+        switch (t->kind) {
+        case TyKind::Error: case TyKind::Never: case TyKind::Unit:
+        case TyKind::Int: case TyKind::Double: case TyKind::Bool: case TyKind::String:
+            return "";
+        case TyKind::Fn:  return "a function value (" + r(t) + ")";
+        case TyKind::Dyn: return "a trait object (" + r(t) + ")";
+        case TyKind::Var: return "a type parameter (" + r(t) + ")";
+        case TyKind::Tuple:
+            for (const auto& e : t->args)
+                if (std::string why = send_blocker_in(e, active); !why.empty()) return why;
+            return "";
+        case TyKind::Named: break;
+        default: return "a value of type " + r(t);
+        }
+        if (t->name == "Bytes") return "";
+        if ((t->name == "Array" || t->name == "Vec" || t->name == "List") && t->args.size() == 1)
+            return send_blocker_in(t->args[0], active);
+        if (t->name == "Map" && t->args.size() == 2) {
+            if (std::string why = send_blocker_in(t->args[0], active); !why.empty()) return why;
+            return send_blocker_in(t->args[1], active);
+        }
+        if (t->name == mangle_name(STD_NET, "TcpConn") || t->name == mangle_name(STD_NET, "TcpListener") ||
+            t->name == mangle_name(STD_POLL, "NbConn") || t->name == mangle_name(STD_POLL, "NbListener"))
+            return "a socket handle (" + r(t) + ")";
+        if (t->name == std_Task()) return "a task handle (" + r(t) + ")";
+        // An Inbox is the RECEIVING end of one actor's mailbox; a copy in another isolate could read
+        // that actor's mail. Its address (Pid) is plain data and may travel.
+        if (t->name == std_Inbox()) return "an actor's inbox (" + r(t) + ")";
+        const std::string key = describe(t);
+        if (std::find(active.begin(), active.end(), key) != active.end()) return "";   // a back-edge
+        active.push_back(key);
+        std::string why;
+        if (auto sit = structs_.find(t->name); sit != structs_.end()) {
+            const StructInfo& si = sit->second;
+            std::unordered_map<uint32_t, TyPtr> m;
+            for (size_t i = 0; i < si.generics.size() && i < t->args.size(); ++i) m[si.generics[i].id] = t->args[i];
+            for (const auto& ft : si.field_types)
+                if (why = send_blocker_in(tc_.substitute(ft, m), active); !why.empty()) break;
+        } else if (auto eit = enums_.find(t->name); eit != enums_.end()) {
+            const EnumInfo& ei = eit->second;
+            std::unordered_map<uint32_t, TyPtr> m;
+            for (size_t i = 0; i < ei.generics.size() && i < t->args.size(); ++i) m[ei.generics[i].id] = t->args[i];
+            for (const auto& vn : ei.variant_names) {
+                auto vit = variants_.find(vn);
+                if (vit == variants_.end() || vit->second.enum_name != t->name) continue;
+                for (const auto& ft : vit->second.field_types)
+                    if (why = send_blocker_in(tc_.substitute(ft, m), active); !why.empty()) break;
+                if (!why.empty()) break;
+            }
+        } else {
+            why = "an opaque type (" + r(t) + ")";
+        }
+        active.pop_back();
+        return why;
     }
 
     // A module-qualified call `mod::name(args)`: `name` is a fn or a (tuple/variant) constructor
@@ -5537,6 +5793,20 @@ private:
             return ty_error();
         }
         const StructInfo& si = it->second;
+        // A Task[R] is built only by `spawn`, inside std::task. Its R is a promise that the task's
+        // function returns an R; a literal elsewhere (`Task { id: t.id }` at another R, or a record
+        // update of one) would break it, and join would hand back a value of the wrong type.
+        if (e.name == std_Task() && cur_module_ != STD_TASK)
+            error(e.line, e.col, "a Task can only be created by `spawn`");
+        // Likewise a Pid[M] promises that actor `id` receives M, and an Inbox is an actor's own; both are
+        // made only inside std::actor (spawnActor, inbox.pid(), mainInbox), where M is checked.
+        if ((e.name == std_Pid() || e.name == std_Inbox()) && cur_module_ != STD_ACTOR)
+            error(e.line, e.col, std::string(e.name == std_Pid() ? "a Pid" : "an Inbox") +
+                  " can only be created by std::actor (spawnActor, inbox.pid(), mainInbox)");
+        // A SocketHandOff is a ticket for a connection in transit: a forged one could take over
+        // somebody else's connection. Only `c.handOff()` makes one.
+        if (e.name == mangle_name(STD_NET, "SocketHandOff") && cur_module_ != STD_NET)
+            error(e.line, e.col, "a SocketHandOff can only be created by `c.handOff()`");
         std::unordered_map<uint32_t, TyPtr> m;
         std::vector<TyPtr> targs;
         for (const auto& g : si.generics) { TyPtr fv = tc_.fresh_var(g.name, g.bounds); m[g.id] = fv; targs.push_back(fv); }
