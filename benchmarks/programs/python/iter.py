@@ -11,16 +11,19 @@ def _gc_cb(phase, info):
     if phase == 'start': _gc_start = time.perf_counter_ns()
     else: _gc_ns += time.perf_counter_ns() - _gc_start
 gc.callbacks.append(_gc_cb)
-gc_before = sum(s['collections'] for s in gc.get_stats())
 
-n = 2_000_000
-t0 = time.perf_counter_ns()
-total = reduce(lambda acc, x: acc + x,
-               map(lambda x: x + 1,
-                   filter(lambda x: x % 2 == 0, range(n))),
-               0)
-wall_ns = time.perf_counter_ns() - t0
+def main():
+    gc_before = sum(s['collections'] for s in gc.get_stats())
+    n = 2_000_000
+    t0 = time.perf_counter_ns()
+    total = reduce(lambda acc, x: acc + x,
+                   map(lambda x: x + 1,
+                       filter(lambda x: x % 2 == 0, range(n))),
+                   0)
+    wall_ns = time.perf_counter_ns() - t0
+    gc_collections = sum(s['collections'] for s in gc.get_stats()) - gc_before
+    print(f"benchmark=iter  n={n}  total={total}  wall_ns={wall_ns}  ns/elem={wall_ns // n}")
+    print(f"gc_collections={gc_collections}  gc_bytes=0  gc_ns={_gc_ns}")
 
-gc_collections = sum(s['collections'] for s in gc.get_stats()) - gc_before
-print(f"benchmark=iter  n={n}  total={total}  wall_ns={wall_ns}  ns/elem={wall_ns // n}")
-print(f"gc_collections={gc_collections}  gc_bytes=0  gc_ns={_gc_ns}")
+if __name__ == "__main__":
+    main()

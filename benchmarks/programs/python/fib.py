@@ -10,16 +10,19 @@ def _gc_cb(phase, info):
     if phase == 'start': _gc_start = time.perf_counter_ns()
     else: _gc_ns += time.perf_counter_ns() - _gc_start
 gc.callbacks.append(_gc_cb)
-gc_before = sum(s['collections'] for s in gc.get_stats())
 
 def fib(k):
     return k if k < 2 else fib(k - 1) + fib(k - 2)
 
-k = 35
-t0 = time.perf_counter_ns()
-r = fib(k)
-wall_ns = time.perf_counter_ns() - t0
+def main():
+    gc_before = sum(s['collections'] for s in gc.get_stats())
+    k = 35
+    t0 = time.perf_counter_ns()
+    r = fib(k)
+    wall_ns = time.perf_counter_ns() - t0
+    gc_collections = sum(s['collections'] for s in gc.get_stats()) - gc_before
+    print(f"benchmark=fib  k={k}  result={r}  wall_ns={wall_ns}")
+    print(f"gc_collections={gc_collections}  gc_bytes=0  gc_ns={_gc_ns}")
 
-gc_collections = sum(s['collections'] for s in gc.get_stats()) - gc_before
-print(f"benchmark=fib  k={k}  result={r}  wall_ns={wall_ns}")
-print(f"gc_collections={gc_collections}  gc_bytes=0  gc_ns={_gc_ns}")
+if __name__ == "__main__":
+    main()

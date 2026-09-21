@@ -152,7 +152,7 @@ def speedup_chart(df: pd.DataFrame, ax: plt.Axes, baseline: str = "cpp") -> None
     ax.set_yticks(y_positions)
     ax.set_yticklabels(benches, fontsize=9)
     ax.set_xscale("log")
-    ax.set_xlabel(f"× slower than {baseline.upper()} (log scale)", fontsize=9)
+    ax.set_xlabel(f"× slower than {baseline.capitalize()} (log scale)", fontsize=9)
     ax.axvline(1, color="#999", linestyle="--", linewidth=0.8)
     ax.legend(fontsize=8)
     ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{v:,.0f}×"))
@@ -198,7 +198,7 @@ def speedup_table(df: pd.DataFrame, ax: plt.Axes, baseline: str = "cpp") -> None
     base_df = df[df["language"] == baseline].set_index("benchmark")
 
     col_labels = ["Benchmark"] + [f"{l.capitalize()} Wall" for l in langs] \
-                               + [f"vs {baseline.upper()}: {l.capitalize()}" for l in langs]
+                               + [f"vs {baseline.capitalize()}: {l.capitalize()}" for l in langs]
     rows = []
     for b in benches:
         row = [b]
@@ -322,10 +322,10 @@ def main():
     rss_chart(df, ax)
     save_or_show(fig, out_dir, "02_peak_rss")
 
-    # 3 — relative slowdown vs C++
-    fig, ax = make_fig(f"Relative Slowdown vs C++  ·  {sub}", figsize=(12, 6))
-    speedup_chart(df, ax)
-    save_or_show(fig, out_dir, "03_slowdown_vs_cpp")
+    # 3 — relative slowdown vs CPython
+    fig, ax = make_fig(f"Relative Slowdown vs CPython  ·  {sub}", figsize=(12, 6))
+    speedup_chart(df, ax, baseline="python")
+    save_or_show(fig, out_dir, "03_slowdown_vs_python")
 
     # 4 — GC overhead
     # NOTE: Python measures only cyclic-collector (refcount frees are invisible);
@@ -335,8 +335,8 @@ def main():
     save_or_show(fig, out_dir, "04_gc_overhead")
 
     # 5 — exact ratio table
-    fig, ax = make_fig(f"Slowdown vs C++ (exact ratios)  ·  {sub}", figsize=(13, 5))
-    speedup_table(df, ax)
+    fig, ax = make_fig(f"Slowdown vs CPython (exact ratios)  ·  {sub}", figsize=(13, 5))
+    speedup_table(df, ax, baseline="python")
     save_or_show(fig, out_dir, "05_slowdown_table")
 
 
