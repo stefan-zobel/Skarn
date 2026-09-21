@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-# Benchmark: filter -> map -> fold (as explicit loop, matching Skarn semantics).
+# Benchmark: filter -> map -> fold (lazy pipeline matching Skarn semantics).
 # n=2_000_000 — identical across Skarn, Python, C++.
+# functools.reduce(map(filter())) mirrors Skarn's fold(map(filter(...))).
+from functools import reduce
 import time, gc
 
 _gc_ns = 0; _gc_start = 0
@@ -13,10 +15,10 @@ gc_before = sum(s['collections'] for s in gc.get_stats())
 
 n = 2_000_000
 t0 = time.perf_counter_ns()
-total = 0
-for x in range(n):
-    if x % 2 == 0:
-        total += x + 1
+total = reduce(lambda acc, x: acc + x,
+               map(lambda x: x + 1,
+                   filter(lambda x: x % 2 == 0, range(n))),
+               0)
 wall_ns = time.perf_counter_ns() - t0
 
 gc_collections = sum(s['collections'] for s in gc.get_stats()) - gc_before

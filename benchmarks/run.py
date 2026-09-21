@@ -54,7 +54,8 @@ def find_vm(override=None):
         return v
     sys.exit(
         f"error: skarnvm not found at {candidate} or in PATH\n"
-        "       Build with: cmake --build build --config Release"
+        "       Build with: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release\n"
+        "                   cmake --build build --target skarnvm"
     )
 
 
@@ -123,7 +124,7 @@ def run_benchmark(cmd: list, name: str, lang: str) -> dict:
         "language":      lang,
         "name":          name,
         "exit_code":     result.returncode,
-        "wall_vm_ns":    vm_metrics.get("wall_ns", 0),
+        "wall_vm_ns":    vm_metrics.get("wall_ns"),
         "wall_total_ns": wall_total_ns,
         "user_ns":       user_ns,
         "sys_ns":        sys_ns,
@@ -353,6 +354,49 @@ def cpu_info() -> str:
     return "unknown"
 
 
+# ── Cross-language checksum verification ─────────────────────────────────────
+
+# Maps benchmark name to the output field whose value must agree across all languages.
+_CHECKSUM_FIELDS: dict[str, str] = {
+    "arith":   "checksum",
+    "fib":     "result",
+    "iter":    "total",
+    "strings": "len",
+    "hashmap": "checksum",
+    "alloc":   "checksum",
+    "sort":    "sorted",
+}
+
+
+def verify_checksums(results: list[dict]) -> bool:
+    """Compare per-benchmark reference values across languages.
+
+    Returns True if every benchmark whose results are all present and successful
+    reports the same value, False if any mismatch is found.
+    """
+    by_bench: dict[str, list[dict]] = {}
+    for r in results:
+        if r["exit_code"] != 0 or r["wall_vm_ns"] is None:
+            continue
+        by_bench.setdefault(r["name"], []).append(r)
+
+    all_ok = True
+    for bench in sorted(by_bench):
+        rows = by_bench[bench]
+        if len(rows) < 2:
+            continue
+        field = _CHECKSUM_FIELDS.get(bench)
+        if not field:
+            continue
+        vals = {r["language"]: r["extra"].get(field) for r in rows}
+        unique = {v for v in vals.values() if v is not None}
+        if len(unique) > 1:
+            detail = ", ".join(f"{lang}={v}" for lang, v in sorted(vals.items()))
+            print(f"  MISMATCH  {bench}.{field}: {detail}")
+            all_ok = False
+    return all_ok
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -418,10 +462,23 @@ def main():
     print_table(results)
     print()
 
+    print("Cross-language checksum verification:")
+    if verify_checksums(results):
+        print("  all checksums agree")
+    print()
+
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.csv).parent.mkdir(parents=True, exist_ok=True)
     save_json(results, Path(args.out))
     save_csv(results, Path(args.csv), meta)
+
+    failed = [r for r in results if r["exit_code"] != 0 or r["wall_vm_ns"] is None]
+    if failed:
+        print(f"\n{len(failed)} benchmark(s) failed or produced no timing output:")
+        for r in failed:
+            print(f"  {r['language']}/{r['name']}  exit={r['exit_code']}"
+                  f"{'  (no wall_ns)' if r['wall_vm_ns'] is None else ''}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

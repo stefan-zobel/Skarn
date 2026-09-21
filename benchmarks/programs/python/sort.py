@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # Benchmark: insertion sort on a list of random integers.
 # n=5_000 — identical across Skarn, Python, C++.
-import time, random, gc
+# Uses the same xorshift32(13, 17, 5) as the C++ program so all three
+# languages sort the same input permutation.
+import time, gc
 
 _gc_ns = 0; _gc_start = 0
 def _gc_cb(phase, info):
@@ -11,9 +13,18 @@ def _gc_cb(phase, info):
 gc.callbacks.append(_gc_cb)
 gc_before = sum(s['collections'] for s in gc.get_stats())
 
-random.seed(42)
+def _xorshift32(s):
+    s ^= (s << 13) & 0xFFFFFFFF
+    s ^= (s >> 17)
+    s ^= (s << 5) & 0xFFFFFFFF
+    return s & 0xFFFFFFFF
+
 n = 5_000
-arr = [random.randint(0, 1_000_000) for _ in range(n)]
+state = 42
+arr = []
+for _ in range(n):
+    state = _xorshift32(state)
+    arr.append(state % 1_000_000)
 
 t0 = time.perf_counter_ns()
 for i in range(1, n):

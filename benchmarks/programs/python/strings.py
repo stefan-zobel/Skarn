@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# Benchmark: string allocation via repeated concatenation (O(n^2) copies).
+# Benchmark: string concatenation pressure (O(n^2) copies).
 # n=10_000 — identical across Skarn, Python, C++.
+# s = s + "x" avoids the refcount-1 in-place realloc fast path, matching Skarn semantics.
 import time, gc
 
 _gc_ns = 0; _gc_start = 0
@@ -15,7 +16,7 @@ n = 10_000
 t0 = time.perf_counter_ns()
 s = ""
 for _ in range(n):
-    s += "x"
+    s = s + "x"
 wall_ns = time.perf_counter_ns() - t0
 
 gc_collections = sum(s2['collections'] for s2 in gc.get_stats()) - gc_before

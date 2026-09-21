@@ -25,7 +25,8 @@ done
 
 if [[ ! -x "$VM" ]]; then
     echo "error: skarnvm not found at: $VM" >&2
-    echo "       Build with: cmake --build build --config Release" >&2
+    echo "       Build with: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release" >&2
+    echo "                   cmake --build build --target skarnvm" >&2
     exit 1
 fi
 

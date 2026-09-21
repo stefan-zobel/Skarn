@@ -68,9 +68,9 @@ def fmt_delta_pct(before, after):
 
 def load(path: str) -> dict:
     data = json.loads(Path(path).read_text())
-    # Support both list and dict formats from run.py
+    # Key on (language, name) so rows from different languages never collide.
     if isinstance(data, list):
-        return {r["name"]: r for r in data}
+        return {(r.get("language", ""), r["name"]): r for r in data}
     return data
 
 
@@ -85,12 +85,14 @@ def main():
     before = load(args.before)
     after  = load(args.after)
 
-    all_names = sorted(set(before) | set(after))
+    all_keys = sorted(set(before) | set(after))
 
     rows = []
-    for name in all_names:
-        b = before.get(name, {})
-        a = after.get(name,  {})
+    for key in all_keys:
+        lang, name = key if isinstance(key, tuple) else ("", key)
+        label = f"{lang}/{name}" if lang else name
+        b = before.get(key, {})
+        a = after.get(key,  {})
         wb = b.get("wall_vm_ns") or 0
         wa = a.get("wall_vm_ns") or 0
         ub = b.get("user_ns") or 0
@@ -98,7 +100,7 @@ def main():
         rb = b.get("rss_bytes") or 0
         ra = a.get("rss_bytes") or 0
         ratio = (wa / wb) if wb else None
-        rows.append((name, wb, wa, ub, ua, rb, ra, ratio))
+        rows.append((label, wb, wa, ub, ua, rb, ra, ratio))
 
     if args.sort == "wall":
         rows.sort(key=lambda r: r[2] or 0, reverse=True)
@@ -107,8 +109,8 @@ def main():
     elif args.sort == "ratio":
         rows.sort(key=lambda r: r[7] or 1.0, reverse=True)
 
-    cols = [18, 11, 11, 9, 9, 9, 9, 8, 9]
-    header = ["Benchmark",
+    cols = [22, 11, 11, 9, 9, 9, 9, 8, 9]
+    header = ["Lang/Benchmark",
               "Wall before", "Wall after",
               "User bef",    "User aft",
               "RSS bef",     "RSS aft",
@@ -116,9 +118,9 @@ def main():
     print("  ".join(h.ljust(w) for h, w in zip(header, cols)))
     print("  ".join("-" * w for w in cols))
 
-    for name, wb, wa, ub, ua, rb, ra, ratio in rows:
+    for label, wb, wa, ub, ua, rb, ra, ratio in rows:
         row = [
-            name,
+            label,
             fmt_ns(wb),
             fmt_ns(wa),
             fmt_ns(ub),

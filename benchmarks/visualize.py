@@ -209,7 +209,7 @@ def speedup_table(df: pd.DataFrame, ax: plt.Axes, baseline: str = "cpp") -> None
             sub = df[(df["language"] == l) & (df["benchmark"] == b)]
             if len(sub) and b in base_df.index:
                 ratio = sub["wall_vm_ns"].values[0] / base_df.loc[b, "wall_vm_ns"]
-                row.append(f"{ratio:,.0f}×")
+                row.append(f"{ratio:.2f}×")
             else:
                 row.append("—")
         rows.append(row)
@@ -328,7 +328,9 @@ def main():
     save_or_show(fig, out_dir, "03_slowdown_vs_cpp")
 
     # 4 — GC overhead
-    fig, ax = make_fig(f"Skarn GC Overhead (% of wall time)  ·  {sub}", figsize=(12, 5))
+    # NOTE: Python measures only cyclic-collector (refcount frees are invisible);
+    # C++ hardcodes 0. Skarn shows real tracing-collector stats. Not directly comparable.
+    fig, ax = make_fig(f"GC Overhead (% of wall time)  ·  {sub}  *Skarn only; see note", figsize=(12, 5))
     gc_chart(df, ax)
     save_or_show(fig, out_dir, "04_gc_overhead")
 

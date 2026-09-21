@@ -1,15 +1,16 @@
 // Benchmark: unordered_map insertion and lookup throughput.
 // n=200_000 — identical across Skarn, Python, C++.
+// No reserve() so all three languages pay the same rehash/growth cost inside the timer.
 #include <cstdio>
 #include <chrono>
 #include <unordered_map>
 
 int main() {
     const int n = 200'000;
-    std::unordered_map<int, long long> m;
-    m.reserve(n);
 
     auto t0 = std::chrono::high_resolution_clock::now();
+
+    std::unordered_map<int, long long> m;
 
     for (int i = 0; i < n; ++i) m[i] = (long long)i * i;
 

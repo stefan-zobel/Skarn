@@ -1,5 +1,6 @@
-// Benchmark: string concatenation pressure (O(n^2) copies via append).
+// Benchmark: string concatenation pressure (O(n^2) copies).
 // n=10_000 — identical across Skarn, Python, C++.
+// s = s + "x" forces a full copy each iteration, matching Python and Skarn semantics.
 #include <cstdio>
 #include <chrono>
 #include <string>
@@ -9,7 +10,7 @@ int main() {
     auto t0 = std::chrono::high_resolution_clock::now();
 
     std::string s;
-    for (int i = 0; i < n; ++i) s += 'x';
+    for (int i = 0; i < n; ++i) s = s + "x";
 
     auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::high_resolution_clock::now() - t0).count();

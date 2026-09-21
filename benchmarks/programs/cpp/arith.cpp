@@ -1,10 +1,12 @@
 // Benchmark: tight integer arithmetic loop (compute-bound).
 // n=10_000_000 — identical across Skarn, Python, C++.
+// volatile read makes n runtime-unknown so -O3 cannot substitute a closed-form sum.
 #include <cstdio>
 #include <chrono>
 
 int main() {
-    const long long n = 10'000'000LL;
+    static volatile long long _n_runtime = 10'000'000LL;
+    const long long n = _n_runtime;
     auto t0 = std::chrono::high_resolution_clock::now();
 
     long long s = 0;
