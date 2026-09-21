@@ -390,8 +390,9 @@ unknown required chunks are rejected.
 
 ## Copying values between heaps
 
-`ValueCodec.h` moves a runtime value from one heap to another, the groundwork for passing messages between
-executions that each own a heap. Nothing in the language uses it yet. `vcodec::encode` writes the value
+`ValueCodec.h` moves a runtime value from one heap to another. It is the channel between executions that
+each own a heap: a task's argument and result and every actor message travel through it (see "Tasks and
+actors"). `vcodec::encode` writes the value
 into a byte buffer without allocating; `vcodec::decode` rebuilds it in the destination heap without looking
 at the source. Going through a buffer, instead of copying heap to heap directly, means a collection in the
 destination can never move a half-copied graph out from under the copier.
