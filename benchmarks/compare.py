@@ -99,7 +99,7 @@ def main():
         ua = a.get("user_ns")
         rb = b.get("rss_bytes")
         ra = a.get("rss_bytes")
-        ratio = (wa / wb) if wb else None
+        ratio = (wa / wb) if (wb and wa) else None
         rows.append((label, wb, wa, ub, ua, rb, ra, ratio))
 
     if args.sort == "wall":

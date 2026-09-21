@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # Benchmark: string concatenation pressure (O(n^2) copies).
 # n=10_000 — identical across Skarn, Python, C++.
-# s = s + "x" avoids the refcount-1 in-place realloc fast path; inside a function
-# CPython may reuse the buffer for s += "x", which would change the O(n^2) cost model.
+# `prev = s; s = prev + "x"` keeps s at refcount > 1 at the concat point, defeating
+# CPython's in-place realloc fast path (which applies to both spellings when inside a
+# function and the left operand is the same variable being assigned).
 import time, gc
 
 _gc_ns = 0; _gc_start = 0
@@ -18,7 +19,8 @@ def main():
     t0 = time.perf_counter_ns()
     s = ""
     for _ in range(n):
-        s = s + "x"
+        prev = s
+        s = prev + "x"
     wall_ns = time.perf_counter_ns() - t0
     gc_collections = sum(s2['collections'] for s2 in gc.get_stats()) - gc_before
     print(f"benchmark=strings  n={n}  len={len(s)}  wall_ns={wall_ns}  ns/iter={wall_ns // n}")

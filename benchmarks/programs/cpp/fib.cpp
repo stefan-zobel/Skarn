@@ -8,7 +8,8 @@ static long long fib(int k) {
 }
 
 int main() {
-    const int k = 35;
+    static volatile int _k_runtime = 35;
+    const int k = _k_runtime;
     auto t0 = std::chrono::high_resolution_clock::now();
 
     long long r = fib(k);

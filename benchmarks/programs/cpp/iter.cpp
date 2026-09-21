@@ -6,14 +6,15 @@
 #include <ranges>
 
 int main() {
-    const long long n = 2'000'000LL;
+    static volatile long long _n_runtime = 2'000'000LL;
+    const long long n = _n_runtime;
     auto t0 = std::chrono::high_resolution_clock::now();
 
     auto rng = std::views::iota(0LL, n)
              | std::views::filter([](long long x) { return x % 2 == 0; })
              | std::views::transform([](long long x) { return x + 1; });
     long long total = 0;
-    for (long long x : rng) total += x;
+    for (long long x : rng) { total += x; asm volatile("" : "+r"(total)); }
 
     auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::high_resolution_clock::now() - t0).count();

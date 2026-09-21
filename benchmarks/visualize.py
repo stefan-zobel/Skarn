@@ -152,10 +152,10 @@ def speedup_chart(df: pd.DataFrame, ax: plt.Axes, baseline: str = "cpp") -> None
     ax.set_yticks(y_positions)
     ax.set_yticklabels(benches, fontsize=9)
     ax.set_xscale("log")
-    ax.set_xlabel(f"× slower than {baseline.capitalize()} (log scale)", fontsize=9)
+    ax.set_xlabel(f"Time relative to {baseline.capitalize()} (log scale)", fontsize=9)
     ax.axvline(1, color="#999", linestyle="--", linewidth=0.8)
     ax.legend(fontsize=8)
-    ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{v:,.0f}×"))
+    ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{v:g}×"))
     ax.grid(axis="x", linestyle="--", alpha=0.4)
     ax.set_axisbelow(True)
 
