@@ -17,3 +17,8 @@ static_compiler/prelude_embed.inc
 
 /build
 /upload
+benchmarks/programs/cpp/bin/
+benchmarks/results/
+benchmarks/.DS_Store
+demo/.DS_Store
+.DS_Store

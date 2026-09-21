@@ -1,0 +1,21 @@
+// Benchmark: tight integer arithmetic loop (compute-bound).
+// n=10_000_000 — identical across Skarn, Python, C++.
+use std::env::*
+
+let n = 10000000
+gcResetStats()
+let t0 = nanoTime()
+let mut s = 0
+let mut i = 0
+while i < n {
+    s = s + i
+    i = i + 1
+}
+let wall_ns = nanoTime() - t0
+let g = gcStats()
+
+println("benchmark=arith  n=" + toString(n) + "  checksum=" + toString(s)
+        + "  wall_ns=" + toString(wall_ns) + "  ns/iter=" + toString(wall_ns / n))
+println("gc_collections=" + toString(toInt(g.collections))
+        + "  gc_bytes=" + toString(toInt(g.bytesAlloced))
+        + "  gc_ns=" + toString(toInt(g.gcNanosTotal)))

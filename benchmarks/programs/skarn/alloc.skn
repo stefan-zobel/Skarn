@@ -1,0 +1,30 @@
+// Benchmark: allocation and GC pressure — short-lived Vec[Int] per iteration.
+// n=50_000, size=100 — identical across Skarn, Python, C++.
+use std::env::*
+
+let n    = 50000
+let size = 100
+gcResetStats()
+let t0 = nanoTime()
+let mut total = 0
+let mut i = 0
+while i < n {
+    let mut v: Vec[Int] = vec()
+    let mut j = 0
+    while j < size {
+        push(v, j)
+        j = j + 1
+    }
+    total = total + v[size - 1]
+    i = i + 1
+}
+let wall_ns = nanoTime() - t0
+let g = gcStats()
+
+let gc_pct = if wall_ns > 0 { 100 * toInt(g.gcNanosTotal) / wall_ns } else { 0 }
+println("benchmark=alloc  n=" + toString(n) + "  size=" + toString(size)
+        + "  checksum=" + toString(total) + "  wall_ns=" + toString(wall_ns)
+        + "  gc_pct=" + toString(gc_pct))
+println("gc_collections=" + toString(toInt(g.collections))
+        + "  gc_bytes=" + toString(toInt(g.bytesAlloced))
+        + "  gc_ns=" + toString(toInt(g.gcNanosTotal)))

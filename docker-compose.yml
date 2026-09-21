@@ -1,0 +1,10 @@
+services:
+  benchmark:
+    build:
+      context: .
+      dockerfile: benchmarks/Dockerfile
+    # Results (JSON, CSV) and charts (PNG) are written here and mirrored to host.
+    volumes:
+      - ./benchmarks/results:/skarn/benchmarks/results
+    # Pass extra flags to run.py via `docker compose run`, e.g.:
+    #   docker compose run benchmark --lang skarn,cpp --filter arith
