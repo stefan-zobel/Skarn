@@ -2327,6 +2327,7 @@ private:
         if (is_eq_trait(trait))       return "'Eq' is a compile-time marker, not usable as a trait object";
         if (trait == std_Hashable())  return "'Hashable' is a compile-time marker, not usable as a trait object";
         if (trait == std_MustUse())   return "'MustUse' is a compile-time marker, not usable as a trait object";
+        if (trait == std_Sendable())  return "'Sendable' is a compile-time marker, not usable as a trait object";
 
         // OS5: a supertrait's methods are reachable through the object, so they must be
         // dispatchable too. (Checked first: it names the real culprit.)
@@ -2425,6 +2426,13 @@ private:
             // Only the four built-in impls in std::core are legitimate, so allow that module and reject
             // every other written impl. (`--no-prelude` user `trait Hashable` mangles to a different
             // name != std::core::Hashable, so the seal correctly no-fires, like is_eq_trait.)
+            // `Sendable` is SEALED and structural (send_blocker): a written impl would let a type holding a
+            // handle or a function pass the check at compile time and fail on the copy at run time.
+            if (im.trait_name == std_Sendable()) {
+                error(im.line, im.col, "cannot implement the built-in 'Sendable' marker: whether a type can "
+                      "be sent is derived from its parts (plain data -- no function value, trait object or handle)");
+                continue;
+            }
             if (im.trait_name == std_Hashable() && im.module != STD_CORE) {
                 error(im.line, im.col, "cannot implement the built-in 'Hashable' marker: it is a "
                       "fixed compiler marker for the permitted map-key types (Int, Double, Bool, "
@@ -2503,6 +2511,10 @@ private:
         for (const auto& b : im.blanket_bounds)
             if (b.trait == std_MustUse()) {
                 error(im.line, im.col, "'MustUse' marks values for a warning; it cannot select a blanket impl");
+                return;
+            } else if (b.trait == std_Sendable()) {
+                // The erasure types are sendable too, so the same dispatch-column problem as for MustUse.
+                error(im.line, im.col, "'Sendable' is checked where values are sent; it cannot select a blanket impl");
                 return;
             }
         auto ins = blanket_impls_.emplace(im.trait_name, BlanketInfo{ im.blanket_bounds, im.line, im.col });
@@ -3524,7 +3536,7 @@ private:
                 bi.trait = b.trait;
                 for (const auto& a : b.args) bi.args.push_back(tc_.substitute(a, m));
                 if (!discharge_parametric_bound(solved, bi, e.line, e.col))
-                    error(e.line, e.col, "type " + describe(solved) + " does not satisfy the bound '" + describe_bound(bi) + "'");
+                    error(e.line, e.col, unsatisfied_bound(solved, bi));
             }
         }
         e.ty = apply(inst);
@@ -3637,9 +3649,10 @@ private:
         if (const FnSig* usig = user_fn(key, &e)) {
             // `spawn`'s rules (a named task function, sendable types) are checked at its CALL; a
             // `spawn` passed around as a value would be called where nothing checks them.
-            if ((key == std_spawn() && cur_module_ != STD_TASK) ||
+            if (((key == std_spawn() || key == std_taskFn()) && cur_module_ != STD_TASK) ||
                 ((key == std_spawnActor() || key == std_spawnActorBounded() || key == std_mainInbox() ||
-                  key == std_newInbox() || key == std_newBoundedInbox() || key == std_ask()) &&
+                  key == std_newInbox() || key == std_newBoundedInbox() || key == std_ask() ||
+                  key == std_actorFn()) &&
                  cur_module_ != STD_ACTOR)) {
                 error(e.line, e.col, "'" + short_name(key) + "' can only be called, not used as a value");
                 return ty_error();
@@ -4261,8 +4274,10 @@ private:
         // bool here). Only the check-mode Call path passes `expected`; infer-mode callers pass null.
         if (expected) tc_.subsumes(apply(ret), apply(expected));
         discharge_bounds(sig.generics, m, node.line, node.col, &what);
-        if (is_std_sig(sig, std_spawn(), STD_TASK))                check_spawn_site(args);
+        if (is_std_sig(sig, std_spawn(), STD_TASK))                check_spawn_site(args, "spawn");
+        else if (is_std_sig(sig, std_taskFn(), STD_TASK))          check_spawn_site(args, "taskFn");
         else if (is_std_sig(sig, std_spawnActor(), STD_ACTOR))     check_spawn_actor_site(args, "spawnActor");
+        else if (is_std_sig(sig, std_actorFn(), STD_ACTOR))        check_spawn_actor_site(args, "actorFn");
         else if (is_std_sig(sig, std_spawnActorBounded(), STD_ACTOR))
             check_spawn_actor_site(args, "spawnActorBounded");
         else if (is_std_sig(sig, std_mainInbox(), STD_ACTOR))
@@ -4313,11 +4328,12 @@ private:
     }
 
     // spawn(f, x): f named, one parameter; its argument and result must be SENDABLE, since both are
-    // copied between heaps.
-    void check_spawn_site(const std::vector<Expr*>& args) {
-        if (args.size() != 2) return;                     // already reported as an arity error
+    // copied between heaps. taskFn(f) has the same rules: they are checked once, where the TaskFn is
+    // made, and hold for every later `t.spawn(x)`.
+    void check_spawn_site(const std::vector<Expr*>& args, const char* who) {
+        if (args.size() != (std::string(who) == "spawn" ? 2u : 1u)) return;   // an arity error, reported
         Expr& f = *args[0];
-        const FnSig* fsig = named_isolate_fn(f, "spawn", "a task");
+        const FnSig* fsig = named_isolate_fn(f, who, "a task");
         if (!fsig) return;
         const std::string name = display_name(static_cast<const IdentExpr&>(f).name);
         if (fsig->params.size() != 1) {
@@ -4338,9 +4354,10 @@ private:
     // unified). What makes the new Pid[M] honest is M: every message sent to it will be copied, so M
     // must be sendable -- checked HERE, where the Pid is made, which is why `send` needs no check. The
     // start value I is copied once and must be sendable too.
-    // spawnActorBounded(f, init, capacity) has the same rules.
+    // spawnActorBounded(f, init, capacity) has the same rules, and so has actorFn(f): checked once where
+    // the ActorFn is made, they hold for every later `a.spawn(init)`.
     void check_spawn_actor_site(const std::vector<Expr*>& args, const char* who) {
-        if (args.size() < 2) return;
+        if (args.empty()) return;
         Expr& f = *args[0];
         const FnSig* fsig = named_isolate_fn(f, who, "an actor");
         if (!fsig) return;
@@ -4365,7 +4382,9 @@ private:
         const TyPtr inbox = apply(ret);
         if (inbox->kind != TyKind::Named || inbox->args.size() != 1) return;
         const TyPtr m = apply(inbox->args[0]);
-        if (m->kind == TyKind::Var) {
+        // An unsolved variable is unknown; a type parameter of the enclosing generic function is known,
+        // and send_blocker accepts it when it carries the bound `Sendable`.
+        if (m->kind == TyKind::Var && !m->rigid) {
             error(node.line, node.col, what + " needs its message type here -- write `" + how + "`");
             return;
         }
@@ -4381,7 +4400,7 @@ private:
         const TyPtr res = apply(ret);
         if (res->kind != TyKind::Named || res->args.size() != 2) return;
         const TyPtr reply = apply(res->args[0]);
-        if (reply->kind == TyKind::Var) {
+        if (reply->kind == TyKind::Var && !reply->rigid) {   // a type parameter goes on to send_blocker
             error(node.line, node.col, "ask needs the reply type here -- it comes from the request's reply "
                   "address (`Pid[T]`) or from an annotation such as `let r: Result[T, AskError] = ask(..)`");
             return;
@@ -4395,7 +4414,7 @@ private:
     // data: the scalars, String, Bytes, and tuples, containers, structs and enums built from sendable
     // parts. NOT sendable: a function value (a closure is a heap object the codec refuses, and the type
     // cannot tell one from a named fn), a trait object (its concrete type is hidden, and may be any of
-    // the below), a type parameter (unknown here), and the HANDLES -- a socket or a task is a struct over
+    // the below), a type parameter without the bound `Sendable` (unknown here), and the HANDLES -- a socket or a task is a struct over
     // an Int that means something only in the heap that created it, which is why they are named.
     //
     // Recursive types: a type met again while it is still being examined counts as sendable-so-far
@@ -4416,7 +4435,12 @@ private:
             return "";
         case TyKind::Fn:  return "a function value (" + r(t) + ")";
         case TyKind::Dyn: return "a trait object (" + r(t) + ")";
-        case TyKind::Var: return "a type parameter (" + r(t) + ")";
+        case TyKind::Var:                                  // sendable only through its bound
+            for (const auto& bd : t->bounds) {
+                if (bd.trait == std_Sendable()) return "";
+                if (supertrait_closure(bd.trait).count(std_Sendable())) return "";
+            }
+            return "a type parameter (" + r(t) + ") without the bound 'Sendable'";
         case TyKind::Tuple:
             for (const auto& e : t->args)
                 if (std::string why = send_blocker_in(e, active); !why.empty()) return why;
@@ -4438,6 +4462,10 @@ private:
         // An Inbox is the RECEIVING end of one actor's mailbox; a copy in another isolate could read
         // that actor's mail. Its address (Pid) is plain data and may travel.
         if (t->name == std_Inbox()) return "an actor's inbox (" + r(t) + ")";
+        // A checked function value holds a function, but only a NAMED one (actorFn / taskFn made it, and a
+        // literal elsewhere is an error), which the codec carries as its Func id. Its message, start and
+        // result types were checked there.
+        if (t->name == std_ActorFn() || t->name == std_TaskFn()) return "";
         const std::string key = describe(t);
         if (std::find(active.begin(), active.end(), key) != active.end()) return "";   // a back-edge
         active.push_back(key);
@@ -4599,6 +4627,9 @@ private:
         // by is_eq (all components Eq). This makes a written `T: Eq` bound discharge structurally
         // and lets any `satisfies_bound(ty, Eq)` query (e.g. a container's element bound) work.
         if (is_eq_trait(b)) return is_eq(ty);
+        // `Sendable` is sealed and structural like `Eq`: send_blocker decides it (a type parameter counts
+        // only through its own bound).
+        if (b == std_Sendable()) return send_blocker(ty).empty();
         // A trait object satisfies its OWN trait and that trait's supertraits -- the exact
         // mirror of the Var branch below (a `dyn A` is "some T: A", so it knows precisely what
         // a `T: A` knows). It may also satisfy a blanket keyed on those, and soundly so: the
@@ -4919,6 +4950,15 @@ private:
         return s;
     }
 
+    // "type X does not satisfy the bound 'B'", and for `Sendable` also WHY (send_blocker's reason), since
+    // the offending part may sit deep inside X.
+    std::string unsatisfied_bound(const TyPtr& solved, const Bound& b) {
+        std::string msg = "type " + describe(solved) + " does not satisfy the bound '" + describe_bound(b) + "'";
+        if (b.trait == std_Sendable())
+            if (const std::string why = send_blocker(solved); !why.empty()) msg += ": it contains " + why;
+        return msg;
+    }
+
     // Find trait `trait`'s type ARGUMENTS as implemented for `selfTy`, writing them to
     // `out`. This is the output-inference heart of parametric traits:
     //   * `selfTy` a type variable carrying the bound -> read its args directly.
@@ -5034,8 +5074,7 @@ private:
                 const bool ok = with_impl_obligations(what, line, col,
                     [&] { return discharge_parametric_bound(solved, bi, line, col); });
                 if (!ok)
-                    error(line, col, "type " + describe(solved) +
-                          " does not satisfy the bound '" + describe_bound(bi) + "'");
+                    error(line, col, unsatisfied_bound(solved, bi));
             }
         }
     }
@@ -5119,8 +5158,7 @@ private:
             }
             if (p.bound.trait.empty()) continue;
             if (!discharge_parametric_bound(solved, p.bound, p.line, p.col)) {
-                const std::string msg = "type " + describe(solved) +
-                                        " does not satisfy the bound '" + describe_bound(p.bound) + "'";
+                const std::string msg = unsatisfied_bound(solved, p.bound);
                 if (unsatisfied_reported.insert(p.module + '\x1f' + msg).second)
                     error(p.line, p.col, msg);
             }
@@ -5846,6 +5884,12 @@ private:
         // somebody else's connection. Only `c.handOff()` makes one.
         if (e.name == mangle_name(STD_NET, "SocketHandOff") && cur_module_ != STD_NET)
             error(e.line, e.col, "a SocketHandOff can only be created by `c.handOff()`");
+        // An ActorFn / a TaskFn is sendable because its function is a named one; a literal could hold a
+        // closure, which cannot cross heaps.
+        if (e.name == std_ActorFn() && cur_module_ != STD_ACTOR)
+            error(e.line, e.col, "an ActorFn can only be created by `actorFn(f)`");
+        if (e.name == std_TaskFn() && cur_module_ != STD_TASK)
+            error(e.line, e.col, "a TaskFn can only be created by `taskFn(f)`");
         std::unordered_map<uint32_t, TyPtr> m;
         std::vector<TyPtr> targs;
         for (const auto& g : si.generics) { TyPtr fv = tc_.fresh_var(g.name, g.bounds); m[g.id] = fv; targs.push_back(fv); }

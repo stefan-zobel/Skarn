@@ -1,0 +1,9 @@
+// CLAIM: `Sendable` is a built-in marker the compiler derives from a type's parts; writing an impl of it is a
+//        compile error, so a type holding a function cannot be declared sendable by hand.
+// GUIDE: 23 (Built-in traits at a glance)
+// EXPECT: fail cannot implement the built-in 'Sendable' marker
+struct Callback { f: fn(Int) -> Int }
+
+impl Sendable for Callback {}
+
+println("unreachable")

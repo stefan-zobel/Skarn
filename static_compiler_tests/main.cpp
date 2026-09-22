@@ -8912,6 +8912,72 @@ void test_std_task() {
         "let t = spawn(sq, 2)\nlet u: Task[String] = Task { id: t.id }\n0", "can only be created by `spawn`"));
     check_true("task_no_task_record_update", check_has_p(U + SQ +
         "let t = spawn(sq, 2)\nlet u = Task { ..t }\n0", "can only be created by `spawn`"));
+
+    // ---- taskFn(f): a checked task function as a value, for generic code ----
+    const std::string PARMAP =
+        "fn parMap[A, R](t: TaskFn[A, R], xs: Vec[A]) -> Vec[Result[R, String]] {\n"
+        "  let mut ts: Vec[Task[R]] = vec()\n"
+        "  for x in xs { push(ts, t.spawn(x)) }\n"
+        "  let mut out: Vec[Result[R, String]] = vec()\n"
+        "  for t2 in ts { push(out, t2.join()) }\n"
+        "  out\n"
+        "}\n";
+    check_int_p("task_fn_generic_par_map", U + SQ + UNWRAP + PARMAP +
+        "let mut xs: Vec[Int] = vec()\npush(xs, 1)\npush(xs, 2)\npush(xs, 3)\n"
+        "let mut s = 0\nfor r in parMap(taskFn(sq), xs) { s = s + got(r) }\ns", 14);
+    // A TaskFn is sendable (its function is a named one): it can be the argument of a task.
+    check_int_p("task_fn_travels", U + SQ + UNWRAP +
+        "fn run(t: TaskFn[Int, Int]) -> Int { got(t.spawn(6).join()) }\n"
+        "got(spawn(run, taskFn(sq)).join())", 36);
+    check_true("task_fn_rejects_lambda", check_has_p(U +
+        "let t = taskFn(fn(x: Int) -> Int { x })\n0", "taskFn needs the name of a top-level function here, not a lambda"));
+    check_true("task_fn_rejects_fn_param", check_has_p(U +
+        "fn wrap(g: fn(Int) -> Int) -> TaskFn[Int, Int] { taskFn(g) }\n0", "not a computed function value"));
+    check_true("task_fn_rejects_generic_fn", check_has_p(U +
+        "fn ident[T](x: T) -> T { x }\nlet t = taskFn(ident)\n0", "generic function 'ident'"));
+    check_true("task_fn_checks_sendable", check_has_p(U +
+        "fn mk(n: Int) -> fn(Int) -> Int { fn(x: Int) -> Int { x + n } }\nlet t = taskFn(mk)\n0",
+        "cannot be sent back from a task"));
+    check_true("task_fn_not_a_value", check_has_p(U + "let f = taskFn\n0", "can only be called"));
+    check_true("task_fn_no_literal", check_has_p(U +
+        "let t = TaskFn { f: fn(x: Int) -> Int { x } }\n0", "a TaskFn can only be created by `taskFn(f)`"));
+
+    // ---- the Sendable marker (std::core) ----
+    const std::string NEED = "fn need[T: Sendable](x: T) -> Int { 1 }\n";
+    check_int_p("sendable_plain_data_ok", NEED +
+        "struct P { a: Int, b: Vec[String] }\n"
+        "enum Tree { Leaf, Node(Tree, Int, Tree) }\n"
+        "let m: Map[String, (Int, Bool)] = #{}\n"
+        "need(1) + need(P { a: 1, b: vec() }) + need(Tree::Leaf) + need(m) + need(bytes())", 5);
+    check_true("sendable_rejects_fn_with_reason", check_has_p(NEED +
+        "struct H { f: fn(Int) -> Int }\nneed(H { f: fn(x: Int) -> Int { x } })",
+        "does not satisfy the bound 'std::core::Sendable': it contains a function value"));
+    check_true("sendable_rejects_socket", check_has_p("use std::net::*\n" + NEED +
+        "fn f(c: TcpConn) -> Int { need(c) }\n0", "it contains a socket handle"));
+    check_true("sendable_rejects_task", check_has_p(U + SQ + NEED + "need(spawn(sq, 1))", "it contains a task handle"));
+    check_true("sendable_rejects_dyn_value", check_has_p(NEED +
+        "trait Shape { fn area(self) -> Int }\nfn f(s: dyn Shape) -> Int { need(s) }\n0", "it contains a trait object"));
+    // A type fixed only AFTER the call (the deferred-generic-arguments path).
+    check_true("sendable_checked_on_late_type", check_has_p(
+        "fn mk[T: Sendable]() -> Vec[T] { vec() }\nlet v = mk()\nlet w: Vec[fn(Int) -> Int] = v\n0",
+        "does not satisfy the bound 'std::core::Sendable'"));
+    // A type parameter is sendable only through its own bound.
+    check_true("sendable_param_needs_bound", check_has_p(NEED +
+        "fn outer[T](x: T) -> Int { need(x) }\n0", "a type parameter (T) without the bound 'Sendable'"));
+    check_true("sendable_param_with_bound_ok", !p_fails(NEED +
+        "fn outer[T: Sendable](x: T) -> Int { need(x) }\nouter(3)"));
+    check_true("sendable_through_supertrait_ok", !p_fails(NEED +
+        "trait Msg: Sendable {}\nfn outer[T: Msg](x: T) -> Int { need(x) }\n0"));
+    check_true("sendable_mutual_recursion", check_has_p(NEED +
+        "struct A { b: Option[B] }\nstruct B { a: Option[A], f: fn(Int) -> Int }\nneed(A { b: None })",
+        "it contains a function value"));
+    check_true("sendable_is_sealed", check_has_p(
+        "struct X { a: Int }\nimpl Sendable for X {}\n0", "cannot implement the built-in 'Sendable' marker"));
+    check_true("sendable_no_dyn", check_has_p("fn g(d: dyn Sendable) -> Int { 1 }\n0",
+        "'Sendable' is a compile-time marker"));
+    check_true("sendable_no_blanket", check_has_p(
+        "trait Show { fn show(self) -> Int }\nimpl[T: Sendable] Show for T { fn show(self) -> Int { 1 } }\n0",
+        "cannot select a blanket impl"));
 }
 
 // =============================================================================
@@ -9208,6 +9274,73 @@ void test_std_actor() {
     check_true("actor_ask_reply_sendable", check_has_p(U +
         "fn a(i: Inbox[Int], x: Int) -> () {}\nlet p = spawnActor(a, 0)\n"
         "let r: Result[fn(Int) -> Int, AskError] = ask(p, fn(me) { 1 }, 10)\n0", "the reply (fn(Int) -> Int) cannot be sent"));
+
+    // ---- generic helpers: a type parameter bounded `Sendable` at the checked sites ----
+    check_str("actor_generic_reply_inbox", cg_run_native(U + ECHO +
+        "fn replyInbox[R: Sendable]() -> Inbox[R] { newInbox() }\n"
+        "let rx: Inbox[Int] = replyInbox()\n"
+        "send(spawnActor(echo, 0), Ask { n: 4, replyTo: rx.pid() })\n"
+        "match rx.receive() { Mail::Msg(v) => println(v), _ => println(\"?\") }\n"), "8\n");
+    check_str("actor_generic_ask", cg_run_native(U + COUNTER +
+        "fn askOr[M, R: Sendable](p: Pid[M], make: fn(Pid[R]) -> M, dflt: R) -> R {\n"
+        "  match ask(p, make, 5000) { Ok(r) => r, Err(_) => dflt }\n"
+        "}\n"
+        "let c = spawnActor(counter, 3)\n"
+        "println(askOr(c, fn(me) { Query::Total(me) }, -1))\n"), "3\n");
+    check_true("actor_generic_inbox_needs_bound", check_has_p(U +
+        "fn replyInbox[R]() -> Inbox[R] { newInbox() }\n0", "a type parameter (R) without the bound 'Sendable'"));
+    check_true("actor_generic_ask_needs_bound", check_has_p(U +
+        "fn askIt[M, R](p: Pid[M], make: fn(Pid[R]) -> M) -> Int { match ask(p, make, 10) { Ok(_) => 1, Err(_) => 0 } }\n0",
+        "a type parameter (R) without the bound 'Sendable'"));
+
+    // ---- actorFn(f): a checked actor function as a value ----
+    const std::string ECHO_F =
+        "fn echoTimes(inbox: Inbox[Ask], factor: Int) -> () {\n"
+        "  for a in inbox.messages() { send(a.replyTo, a.n * factor) }\n"
+        "}\n";
+    const std::string ASK_S = "struct Ask { n: Int, replyTo: Pid[Int] }\n";
+    // A generic pool: the function arrives as a parameter, which spawnActor could not take.
+    check_str("actor_fn_generic_pool", cg_run_native(U + ASK_S + ECHO_F + GET +
+        "fn pool[M, I](a: ActorFn[M, I], init: I, n: Int) -> Vec[Pid[M]] {\n"
+        "  let mut ps: Vec[Pid[M]] = vec()\n"
+        "  let mut i = 0\n"
+        "  while i < n { push(ps, a.spawn(init))\n i += 1 }\n"
+        "  ps\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "for p in pool(actorFn(echoTimes), 3, 4) { send(p, Ask { n: 2, replyTo: me.pid() }) }\n"
+        "let mut sum = 0\nlet mut k = 0\n"
+        "while k < 4 { sum += got(me.receive())\n k += 1 }\n"
+        "println(sum)\n"), "24\n");
+    // A child spec (function + start value) is plain data: it travels to an actor, which starts it.
+    check_str("actor_fn_child_spec_travels", cg_run_native(U + ASK_S + ECHO_F +
+        "struct Child[M, I] { a: ActorFn[M, I], init: I }\n"
+        "fn starter(inbox: Inbox[Child[Ask, Int]], boss: Pid[Pid[Ask]]) -> () {\n"
+        "  for c in inbox.messages() { send(boss, c.a.spawnBounded(c.init, 4)) }\n"
+        "}\n"
+        "let me: Inbox[Pid[Ask]] = mainInbox()\n"
+        "send(spawnActor(starter, me.pid()), Child { a: actorFn(echoTimes), init: 10 })\n"
+        "let child = match me.receive() { Mail::Msg(p) => p, _ => panic(\"no child\") }\n"
+        "match ask(child, fn(r) { Ask { n: 5, replyTo: r } }, 5000) { Ok(v) => println(v), Err(e) => println(e) }\n"),
+        "50\n");
+    check_true("actor_fn_rejects_lambda", check_has_p(U +
+        "let a = actorFn(fn(i: Inbox[Int], u: Int) -> () {})\n0", "actorFn needs the name of a top-level function here, not a lambda"));
+    check_true("actor_fn_rejects_fn_param", check_has_p(U +
+        "fn wrap(g: fn(Inbox[Int], Int) -> ()) -> ActorFn[Int, Int] { actorFn(g) }\n0", "not a computed function value"));
+    check_true("actor_fn_rejects_generic_fn", check_has_p(U +
+        "fn gen[T](i: Inbox[T], u: Int) -> () {}\nlet a = actorFn(gen)\n0", "generic function 'gen'"));
+    check_true("actor_fn_checks_messages", check_has_p(U +
+        "fn f(inbox: Inbox[fn(Int) -> Int], unused: Int) -> () {}\nlet a = actorFn(f)\n0", "messages of 'f'"));
+    check_true("actor_fn_checks_start_value", check_has_p(U +
+        "fn f(inbox: Inbox[Int], g: fn(Int) -> Int) -> () {}\nlet a = actorFn(f)\n0", "start value of 'f'"));
+    check_true("actor_fn_not_a_value", check_has_p(U + "let f = actorFn\n0", "can only be called"));
+    check_true("actor_fn_no_literal", check_has_p(U +
+        "fn f(inbox: Inbox[Int], unused: Int) -> () {}\nlet a = ActorFn { f: f }\n0",
+        "an ActorFn can only be created by `actorFn(f)`"));
+    check_true("actor_fn_no_record_update", check_has_p(U +
+        "fn f(inbox: Inbox[Int], unused: Int) -> () {}\nlet a = actorFn(f)\n"
+        "let b = ActorFn { f: fn(i: Inbox[Int], u: Int) -> () {}, ..a }\n0",
+        "an ActorFn can only be created by `actorFn(f)`"));
 }
 
 // =============================================================================
@@ -11369,6 +11502,22 @@ void test_differential() {
         "let b = spawn(tally, v)\npush(v, 6)\n"
         "let c = spawn(outer, 3)\n"
         "println(c.join())\nprintln(b.join())\nprintln(a.join())\nprintln(len(v))\n",
+        /*with_prelude=*/true);
+    // The same through taskFn: a generic parallel map, and a TaskFn handed to a task that starts it.
+    check_same("diff_task_fn",
+        "use std::task::*\n"
+        "fn sq(n: Int) -> Int { println(\"sq \" + n)\n n * n }\n"
+        "fn parMap[A, R](t: TaskFn[A, R], xs: Vec[A]) -> Vec[Result[R, String]] {\n"
+        "  let mut ts: Vec[Task[R]] = vec()\n"
+        "  for x in xs { push(ts, t.spawn(x)) }\n"
+        "  let mut out: Vec[Result[R, String]] = vec()\n"
+        "  for t2 in ts { push(out, t2.join()) }\n"
+        "  out\n"
+        "}\n"
+        "fn run(t: TaskFn[Int, Int]) -> Int { match t.spawn(6).join() { Ok(v) => v, Err(_) => -1 } }\n"
+        "let mut xs: Vec[Int] = vec()\npush(xs, 3)\npush(xs, 1)\npush(xs, 2)\n"
+        "println(parMap(taskFn(sq), xs))\n"
+        "println(spawn(run, taskFn(sq)).join())\n",
         /*with_prelude=*/true);
     check_same("diff_eq_cycles",
         "struct Node { v: Int, next: Option[Node] }\n"

@@ -508,6 +508,7 @@ inline std::string std_Iterable()     { return mangle_name(STD_ITER, "Iterable")
 inline std::string std_Eq()           { return mangle_name(STD_CORE, "Eq"); }        // the sealed structural-== marker
 inline std::string std_Hashable()     { return mangle_name(STD_CORE, "Hashable"); }  // the map-key marker
 inline std::string std_MustUse()      { return mangle_name(STD_CORE, "MustUse"); }   // the open must-use marker
+inline std::string std_Sendable()     { return mangle_name(STD_CORE, "Sendable"); }  // the sealed can-be-sent marker
 inline std::string std_ProcessOutput(){ return mangle_name(STD_PROCESS, "ProcessOutput"); }
 inline std::string std_Char()          { return mangle_name(STD_STRING, "Char"); }
 inline std::string std_codePointToStr(){ return mangle_name(STD_STRING, "codePointToStr"); }
@@ -521,6 +522,11 @@ inline std::string std_newBoundedInbox() { return mangle_name(STD_ACTOR, "newBou
 inline std::string std_ask()          { return mangle_name(STD_ACTOR, "ask"); }
 inline std::string std_Pid()          { return mangle_name(STD_ACTOR, "Pid"); }
 inline std::string std_Inbox()        { return mangle_name(STD_ACTOR, "Inbox"); }
+// The checked function values: made only by `actorFn(f)` / `taskFn(f)` with a named function.
+inline std::string std_ActorFn()      { return mangle_name(STD_ACTOR, "ActorFn"); }
+inline std::string std_actorFn()      { return mangle_name(STD_ACTOR, "actorFn"); }
+inline std::string std_TaskFn()       { return mangle_name(STD_TASK, "TaskFn"); }
+inline std::string std_taskFn()       { return mangle_name(STD_TASK, "taskFn"); }
 
 // ----- debug rendering ------------------------------------------------------
 

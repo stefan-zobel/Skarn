@@ -3789,6 +3789,35 @@ use std::task::*
 println(spawn(fn(x: Int) -> Int { x * 2 }, 21).join())   // error: spawn needs the name of a top-level function
 ```
 
+**Passing a task function around.** Because `spawn` needs the *name*, a helper cannot call it on a function
+it received as a parameter. `taskFn(f)` is the way out: it checks the named function once, like `spawn`
+would, and returns a `TaskFn[A, R]` that can be passed around; `t.spawn(x)` starts a task from it. A generic
+parallel map:
+
+```rust
+use std::task::*
+
+fn square(n: Int) -> Int { n * n }
+
+fn parMap[A, R](t: TaskFn[A, R], xs: Vec[A]) -> Vec[Result[R, String]] {
+  let mut tasks: Vec[Task[R]] = vec()
+  for x in xs { push(tasks, t.spawn(x)) }      // all start at once
+  let mut out: Vec[Result[R, String]] = vec()
+  for task in tasks { push(out, task.join()) }
+  out
+}
+
+let mut xs: Vec[Int] = vec()
+push(xs, 3)
+push(xs, 4)
+println(parMap(taskFn(square), xs))           // => [Ok(9), Ok(16)]
+```
+
+A helper that works on values of a type parameter and hands them to another heap needs to know that they
+are plain data. The bound **`T: Sendable`** says so. `Sendable` is a built-in marker like `Eq`: the compiler
+decides it from a type's parts, and you never implement it. A function passed to `taskFn` is still checked
+with its concrete types, so `parMap` above needs no bound.
+
 What a task prints appears when it is **joined**, in join order, so the output does not depend on which
 task happened to run first. A task nobody joins is still waited for when the program ends; what it
 printed is dropped.
@@ -3914,6 +3943,56 @@ while i <= 100 {
 
 Two actors that each wait to send into the other's full mailbox wait forever; nothing detects that, so keep
 the messages of a bounded pair flowing in one direction.
+
+**Generic helpers.** `actorFn(f)` is the actor counterpart of `taskFn`. It checks `f` once, like
+`spawnActor` would, and returns an `ActorFn[M, I]`; `a.spawn(init)` and `a.spawnBounded(init, n)` start
+actors from it. An `ActorFn` is plain data, so it can travel in a message as well: a supervisor can be sent
+a child's function and start value and start the child itself. A helper that makes an inbox for a type
+parameter needs the bound `Sendable`:
+
+```rust
+use std::actor::*
+
+struct Ask { n: Int, replyTo: Pid[Int] }
+
+fn times(inbox: Inbox[Ask], factor: Int) -> () {
+  for a in inbox.messages() { send(a.replyTo, a.n * factor) }
+}
+
+// Start n actors that run the same function.
+fn pool[M, I](a: ActorFn[M, I], init: I, n: Int) -> Vec[Pid[M]] {
+  let mut pids: Vec[Pid[M]] = vec()
+  let mut i = 0
+  while i < n {
+    push(pids, a.spawn(init))
+    i = i + 1
+  }
+  pids
+}
+
+// An inbox for replies of any sendable type.
+fn replyInbox[R: Sendable]() -> Inbox[R] { newInbox() }
+
+let rx: Inbox[Int] = replyInbox()
+for p in pool(actorFn(times), 10, 3) { send(p, Ask { n: 2, replyTo: rx.pid() }) }
+let mut sum = 0
+let mut k = 0
+while k < 3 {
+  match rx.receive() {
+    Mail::Msg(v) => { sum = sum + v },
+    _ => {},
+  }
+  k = k + 1
+}
+println(sum)                              // => 60
+```
+
+Without the bound, `replyInbox` is rejected: the compiler cannot know that every `R` will be plain data.
+
+```rust fail
+use std::actor::*
+fn replyInbox[R]() -> Inbox[R] { newInbox() }   // error: a new inbox's messages (R) cannot be sent
+```
 
 Actors print a line at a time into the program's output, so lines from different actors never mix, but
 their order depends on scheduling. When the program ends, every actor gets `Stop` and the program waits for
@@ -4239,12 +4318,14 @@ fine — each element is converted at the point you add it.)
 
 ### Built-in traits at a glance
 
-Five traits are built into the standard library. Four split **2 + 2** — two are sealed, two are ordinary, and
-the split is *reasoned*, not arbitrary; the fifth, **`MustUse`**, is an open marker for a warning (see
-[Advisory warnings](#advisory-warnings)). **Two are sealed compile-time markers** you never implement (the
+Six traits are built into the standard library. Five split **3 + 2** — three are sealed, two are ordinary, and
+the split is *reasoned*, not arbitrary; the sixth, **`MustUse`**, is an open marker for a warning (see
+[Advisory warnings](#advisory-warnings)). **Three are sealed compile-time markers** you never implement (the
 checker decides membership and discharges the bound statically, no dispatch): **`Eq`** — sealed because equality
-is **structural by construction**, so there is nothing to implement — and **`Hashable`** — sealed because a heap
-object's **pointer bits are not stable under the moving GC**, so only the primitive-backed types can be keys.
+is **structural by construction**, so there is nothing to implement — **`Hashable`** — sealed because a heap
+object's **pointer bits are not stable under the moving GC**, so only the primitive-backed types can be keys —
+and **`Sendable`** — sealed because whether a value can be copied into another task's or actor's heap follows
+from its parts, and a wrong claim would fail on the copy.
 **The other two are ordinary dispatched traits you *can* implement** for your own types: **`Ord`** (built-in
 impls for `Int`/`Double`/`String`; add your own with `impl Ord` — the one exception is the erasure types) and
 **`Clone`**.
@@ -4253,12 +4334,13 @@ impls for `Int`/`Double`/`String`; add your own with `impl Ord` — the one exce
 |-------|---------------|---------|----------------|----------|
 | `Eq` | `==` / `!=` (see [§5](#5-operators)) | derived structurally: any type whose components are all `Eq` (immediates + `String` + erasure types are the leaves; a function-carrying type is **not** `Eq`) | no (auto-derived) | no |
 | `Hashable` | map keys / set elements (see [§14](#14-collections)) | `Int`, `Double`, `Bool`, `String`, and erasure types that wrap one of those (`Char`, integer-backed `enum`s, `transparent` newtypes over these) | no (fixed marker) | no |
+| `Sendable` | what may be copied to another task or actor, in generic code (see [§20](#20-modules), "Running functions in parallel") | derived structurally: plain data — scalars, `String`, `Bytes`, and collections, tuples, structs and enums of those; **not** a function value, a `dyn` value, a socket, a `Task` or an `Inbox` | no (auto-derived) | no |
 | `Ord` | `sort` / `sorted` / `min` / `max` (ring, `std::iter`) and `minOf` / `maxOf` / `clamp` (opt-in `std::math` — needs `use std::math`); see [§19](#19-iterators) | `Int` / `Double` / `String` built in; **user types may `impl Ord`** (write `fn lessThan`). The one exception is **erasure types** (`Char` / `transparent` newtypes / integer-backed `enum`s) — a method trait can't dispatch on them; a `Char` compares with `<` but is not `Ord` | **yes** (like `Clone`; erasure types excepted) | no |
 | `Clone` | `clone(x)` (see [§14](#14-collections)) | built-in for the containers; **user-extensible** — write `impl Clone for MyType` | **yes** | no (returns `Self`) |
 | `MustUse` | the unused-value warning (see [Advisory warnings](#advisory-warnings)) | none built in; **any type the program owns**, erasure types included — write `impl MustUse for MyType {}` | **yes** (empty impl) | no |
 
-The three markers (`Eq`, `Hashable`, `MustUse`) cost nothing at run time; `==` on a leaf is a single instruction
-and on a composite a structural walk. None of the five is usable as `dyn T`, but for two different reasons: the
+The four markers (`Eq`, `Hashable`, `Sendable`, `MustUse`) cost nothing at run time; `==` on a leaf is a single
+instruction and on a composite a structural walk. None of the six is usable as `dyn T`, but for two different reasons: the
 markers are **compile-time only** — there is nothing to dispatch, so a `dyn` of them is meaningless and
 rejected; `Ord` and `Clone` fail **object safety** (`Ord` takes `Self` as a second parameter, `Clone` returns
 `Self` — see [§17](#17-trait-objects-dyn-trait)).
@@ -4693,6 +4775,8 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 |----------|---------|
 | `spawn(f, x)` | start `f(x)` on its own thread → `Task[R]` (free). `f` must be a named, non-generic top-level function with one parameter; its parameter and result types must be plain data — no function values, `dyn` values, sockets or tasks |
 | `t.join()` | wait for the task → `Result[R, String]`: `Ok(result)`, or `Err(message)` if it faulted. Once per task; what the task printed appears here |
+| `taskFn(f)` / `tf.spawn(x)` | `f` as a value that generic code can take and start tasks from → `TaskFn[A, R]`, checked as `spawn` would check `f` / start `f(x)` → `Task[R]` (free). A `TaskFn` can itself be sent |
+| `T: Sendable` | the bound that lets generic code copy values of `T` to another task or actor (a built-in marker, in `std::core`; never implemented by hand) |
 
 **Actors** *(all `std::actor` — `use std::actor::*`; one thread and one heap per actor, every message copied)*
 
@@ -4710,6 +4794,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `inbox.close()` | close an inbox made with `newInbox`: later sends answer `false`, what it holds is dropped. A main inbox cannot be closed |
 | `spawnActorBounded(f, init, n)` | as `spawnActor`, but its mailbox holds at most `n` messages; a `send` to it waits while it is full (free) |
 | `trySend(p, m)` | send without ever waiting → `SendResult`: `Sent`, `Full` (nothing was queued) or `Gone` (free) |
+| `actorFn(f)` / `a.spawn(init)` / `a.spawnBounded(init, n)` | `f` as a value that generic code can take and start actors from → `ActorFn[M, I]`, checked as `spawnActor` would check `f` / start an actor → `Pid[M]` (free). An `ActorFn` can itself be sent |
 
 **Regex** *(all `std::regex` — `use std::regex::*`; byte-level, linear-time Pike VM; no backrefs/lookaround. Note the names: matching anywhere is `search`, not `find`, and rewriting is `replaceRe`, not `replace` — those two belong to `std::iter` / `std::string`)*
 

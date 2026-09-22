@@ -196,8 +196,9 @@ branch types (in `if`, `match`, or the `break` values of a `loop`) is exact.
   - Built-in functions and natives can only be called, never used as values.
 - **`dyn Trait`** values are the plain values themselves: no box, no vtable. A method may appear in a `dyn`
   type only if it takes `self` and does not mention `Self` in another parameter.
-- **Sealed marker traits.** `Eq` and `Hashable` are derived by the compiler and cannot be implemented by
-  users; see "Language semantics" below. The third marker, `MustUse`, is open; see "Warnings and diagnostics".
+- **Sealed marker traits.** `Eq`, `Hashable` and `Sendable` are derived by the compiler and cannot be
+  implemented by users; see "Language semantics" below and, for `Sendable`, "Fork-join tasks". The fourth
+  marker, `MustUse`, is open; see "Warnings and diagnostics".
 
 Higher-kinded types, higher-rank polymorphism and `where` clauses beyond a parameter's own bounds are not
 part of the language.
@@ -305,14 +306,27 @@ copied. The checker therefore adds these rules at every call of `spawn`:
   checked here must be the ones the task actually runs with.
 - **The parameter type and the result type must be sendable.** Sendable means plain data: numbers, `Bool`,
   `String`, `Bytes`, and tuples, collections, structs and enums built only from sendable parts. It excludes
-  function values, trait objects, type parameters, and handles — a socket (`TcpConn`, `TcpListener`,
-  `NbConn`, `NbListener`) or a `Task`. A handle is a struct over an integer that is meaningful only in the
-  heap that created it. The check walks recursive types, treating a type met again as sendable so far, and
-  caches nothing. A disallowed component behind a mutual recursion is therefore still found.
+  function values, trait objects, type parameters without the bound `Sendable`, and handles — a socket
+  (`TcpConn`, `TcpListener`, `NbConn`, `NbListener`), a `Task` or an actor's `Inbox`. A handle is a struct
+  over an integer that is meaningful only in the heap that created it. The check walks recursive types,
+  treating a type met again as sendable so far, and caches nothing. A disallowed component behind a mutual
+  recursion is therefore still found.
 - **`spawn` can only be called**, never used as a value, since a value would be called where none of this is
   checked.
 - **A `Task` is built only by `spawn`.** A struct literal or record update of `Task` outside `std::task` is
   an error. Otherwise a `Task[String]` could be made from the id of a task that returns an `Int`.
+
+Two additions let generic code work with tasks and actors:
+- **`Sendable` is a sealed marker trait** in `std::core` that names exactly the sendable types. Like `Eq`, it
+  has no impls: the compiler decides it from a type's parts, and a written `impl Sendable` is an error. A
+  type parameter is sendable when it carries the bound, so `fn replyInbox[R: Sendable]() -> Inbox[R]`
+  compiles and the checks happen where the helper is called, with the concrete type. A failed bound names the
+  part that is not sendable. `dyn Sendable` does not exist, and `Sendable` cannot select a blanket impl,
+  since erased newtypes are sendable and would dispatch as their underlying primitive.
+- **`taskFn(f)` makes a checked function value**, a `TaskFn[A, R]`, under the rules of `spawn`; `t.spawn(x)`
+  then starts a task. A generic helper cannot call `spawn` on a function it received as a parameter, since
+  the parameter might hold a closure. It can take a `TaskFn` instead. A `TaskFn` literal outside `std::task`
+  is an error, so its function is always a named one, and a `TaskFn` is itself sendable.
 
 The four natives underneath are generic, and they take the `Task` itself, so a task's result type comes from
 its handle. `rawTaskTake` and `rawTaskError` are one native under two types, and `rawJoin`'s `Bool` says which
@@ -351,8 +365,14 @@ A `Pid[M]` promises that the actor it names receives `M`. The checker keeps that
   waits for the reply and closes the inbox. Its reply type `R` is fixed by the `Pid[R]` the request carries
   (or by an annotation) and must be known at the call and sendable, because `R` is the message type of the
   inbox it makes.
+- **`actorFn(f)`** makes an `ActorFn[M, I]` under the rules of `spawnActor`. `a.spawn(init)` and
+  `a.spawnBounded(init, n)` then start actors from code that received the function as a value — a worker
+  pool, or a supervisor that is sent a child's function and start value and starts it. An `ActorFn` is
+  sendable, because only `actorFn` makes one.
+- **Inside a generic function**, the message type of a new inbox and the reply type of `ask` may be a type
+  parameter bounded `Sendable`.
 - **These functions can only be called**, never used as values, so no call escapes the rules above.
-- **`Pid` and `Inbox` literals are an error outside `std::actor`.**
+- **`Pid`, `Inbox` and `ActorFn` literals are an error outside `std::actor`.**
 
 A request that wants an answer does not need a selective receive: the answer goes to an inbox of its own,
 with its own type. A bounded inbox provides back-pressure — `send` waits while it is full, `trySend` reports

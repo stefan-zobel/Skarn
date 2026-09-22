@@ -41,6 +41,10 @@
 // of its receiver instead of filling its memory; `trySend` never waits and reports Full instead.
 // Exit reports and Stop always get through. Two actors that each wait to send to the other's full
 // inbox wait forever -- the runtime does not detect that.
+//
+// GENERIC CODE. `actorFn(f)` checks `f` once, as `spawnActor` would, and returns an `ActorFn` that a
+// pool or a supervisor can take as a value, send in a message, and start with `a.spawn(init)`. Inside
+// a generic function, a new inbox or `ask` may use a type parameter bounded `Sendable` (std::core).
 
 // An actor's address. Only `spawnActor` and `inbox.pid()` make one.
 pub struct Pid[M] { id: Int }
@@ -80,6 +84,26 @@ pub fn mainInbox[M]() -> Inbox[M] { Inbox { id: rawMainInbox() } }
 // waits while it is full.
 pub fn spawnActorBounded[M, I](f: fn(Inbox[M], I) -> (), init: I, capacity: Int) -> Pid[M] {
   Pid { id: rawSpawnActorBounded(_actorMain, ActorStart { f: f, init: init }, capacity) }
+}
+
+// An actor function as a VALUE that can start actors later, pass through generic code and travel in a
+// message -- what a worker pool or a supervisor that restarts its children needs. Only `actorFn(f)`
+// makes one, from a named top-level function, and checks it there as `spawnActor` would.
+pub struct ActorFn[M, I] { f: fn(Inbox[M], I) -> () }
+
+// The checked value of `f`.
+pub fn actorFn[M, I](f: fn(Inbox[M], I) -> ()) -> ActorFn[M, I] { ActorFn { f: f } }
+
+impl[M, I] ActorFn[M, I] {
+  // Start an actor running this function with the start value `init`.
+  fn spawn(self, init: I) -> Pid[M] {
+    Pid { id: rawSpawnActor(_actorMain, ActorStart { f: self.f, init: init }) }
+  }
+
+  // Start one whose inbox holds at most `capacity` messages.
+  fn spawnBounded(self, init: I, capacity: Int) -> Pid[M] {
+    Pid { id: rawSpawnActorBounded(_actorMain, ActorStart { f: self.f, init: init }, capacity) }
+  }
 }
 
 // What `trySend` reports: the message was queued, the inbox is full (nothing was queued), or the

@@ -1,0 +1,45 @@
+// CLAIM: an `ActorFn` lets generic code start actors -- a pool starts several from one value -- and it is
+//        plain data, so a child spec (function + start value) can be sent to an actor that starts it.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: ok pool 60 child 50
+use std::actor::*
+
+struct Ask { n: Int, replyTo: Pid[Int] }
+
+fn times(inbox: Inbox[Ask], factor: Int) -> () {
+  for a in inbox.messages() { send(a.replyTo, a.n * factor) }
+}
+
+fn pool[M, I](a: ActorFn[M, I], init: I, n: Int) -> Vec[Pid[M]] {
+  let mut pids: Vec[Pid[M]] = vec()
+  let mut i = 0
+  while i < n {
+    push(pids, a.spawn(init))
+    i = i + 1
+  }
+  pids
+}
+
+// A child spec travels in a message; the starter starts it and reports the new address.
+struct Child[M, I] { a: ActorFn[M, I], init: I }
+
+fn starter(inbox: Inbox[Child[Ask, Int]], boss: Pid[Pid[Ask]]) -> () {
+  for c in inbox.messages() { send(boss, c.a.spawn(c.init)) }
+}
+
+let rx: Inbox[Int] = newInbox()
+for p in pool(actorFn(times), 10, 3) { send(p, Ask { n: 2, replyTo: rx.pid() }) }
+let mut sum = 0
+let mut k = 0
+while k < 3 {
+  match rx.receive() { Mail::Msg(v) => { sum = sum + v }, _ => {} }
+  k = k + 1
+}
+
+let me: Inbox[Pid[Ask]] = mainInbox()
+send(spawnActor(starter, me.pid()), Child { a: actorFn(times), init: 10 })
+let child = match me.receive() { Mail::Msg(p) => p, _ => panic("no child") }
+match ask(child, fn(r) { Ask { n: 5, replyTo: r } }, 5000) {
+  Ok(v) => println("pool ${sum} child ${v}"),
+  Err(e) => println(e),
+}
