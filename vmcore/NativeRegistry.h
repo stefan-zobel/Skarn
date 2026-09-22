@@ -133,7 +133,11 @@ enum NativeId : uint16_t {
     NATIVE_SPAWN_INTO  = 76,    // rawSpawnInto(slot, fn, arg) -> Int (the actor id; the slot must be free)
     NATIVE_RELEASE_SLOT = 77,   // rawReleaseSlot(slot)    -> ()   (stops an actor in it; later sends false)
     NATIVE_STOP_ACTOR  = 78,    // rawStopActor(pid)       -> Bool (Stop into each of its inboxes)
-    NATIVE_COUNT       = 79,
+    // Monitors: be told when an actor ends, in an inbox of one's own -- for an actor that did not start
+    // it, and for a normal end, neither of which the starter's own report covers.
+    NATIVE_MONITOR     = 79,    // rawMonitor(pid, inbox)  -> Bool (false: it had already ended, and the
+                                //   report -- exactly one per monitor -- was delivered at once)
+    NATIVE_COUNT       = 80,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -225,6 +229,7 @@ inline int native_id_of(const std::string& name) {
     if (name == "rawSpawnInto") return NATIVE_SPAWN_INTO;
     if (name == "rawReleaseSlot") return NATIVE_RELEASE_SLOT;
     if (name == "rawStopActor") return NATIVE_STOP_ACTOR;
+    if (name == "rawMonitor") return NATIVE_MONITOR;
     return -1;
 }
 
@@ -282,6 +287,7 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_MAIL_FROM: case NATIVE_MAIL_REASON: case NATIVE_MAIN_INBOX: case NATIVE_SELF_ID:
         case NATIVE_NEW_INBOX: case NATIVE_CLOSE_INBOX: case NATIVE_TRY_SEND: case NATIVE_ACTOR_SPAWN_BOUNDED:
         case NATIVE_NEW_SLOT: case NATIVE_SPAWN_INTO: case NATIVE_RELEASE_SLOT: case NATIVE_STOP_ACTOR:
+        case NATIVE_MONITOR:
         case NATIVE_READ_ALL_STDIN: return NRET_PLAIN;
         default:                 return NRET_RESULT;
     }
@@ -309,6 +315,7 @@ inline int native_arity(int id) {
         case NATIVE_SEND:
         case NATIVE_RECEIVE:
         case NATIVE_TRY_SEND:
+        case NATIVE_MONITOR:
         case NATIVE_RUN_PROCESS: return 2;
         case NATIVE_ACTOR_SPAWN_BOUNDED:
         case NATIVE_SPAWN_INTO:

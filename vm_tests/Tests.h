@@ -3306,6 +3306,34 @@ inline void task_fns(Assembler& as) {
     as.R6(OpCode::PANIC, 0, 1, 0);
     as.J(OpCode::RET);
 
+    // acrashon(_): waits for one message, then faults -- a crash the test can time.
+    as.label("acrashon");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_str(6, "boom on demand");
+    as.R6(OpCode::PANIC, 0, 6, 0);
+    as.J(OpCode::RET);
+
+    // awatch(pid): monitors the actor its ARGUMENT addresses -- an actor it did not start -- and sends
+    // the address from the report to the main program, so the test can check who it was told about.
+    as.label("awatch");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.R6(OpCode::MOV, 2, 0, 0);
+    as.R6(OpCode::MOV, 3, 1, 0);
+    as.call_native_id(4, 5, 2, 2, NATIVE_MONITOR);
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(6, 5, 2, 2, NATIVE_RECEIVE);
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.call_native_id(6, 5, 2, 1, NATIVE_MAIL_FROM);
+    as.load_const(2, 0);
+    as.R6(OpCode::MOV, 3, 6, 0);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
     // aslot(inbox_id): like aecho, but it receives on the inbox its ARGUMENT names -- the slot it was
     // started into, whose id is not its own (rawSpawnInto). Doubles each message to the main program.
     as.label("aslot");
@@ -3503,6 +3531,8 @@ inline void declare_task_fns(Assembler& as) {
     as.declare_fn("aecho",  8, 1);
     as.declare_fn("acrash", 2, 1);
     as.declare_fn("aslot",  8, 1);
+    as.declare_fn("acrashon", 8, 1);
+    as.declare_fn("awatch", 8, 1);
     as.declare_fn("astop",  8, 1);
     as.declare_fn("aconn",  8, 1);
     as.declare_fn("areply", 8, 1);
@@ -4249,6 +4279,92 @@ inline void test_actor_stop_actor() {
                                  r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
         std::cout << std::format("  a stranger's address: false: {}\n", stop_ok ? "PASS" : "FAIL");
         check(alive_ok && stop_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A MONITOR is told when an actor ends, in an inbox of the watcher's own: a crash with its message, and
+// a normal end with "normal" -- which the starter's own report does not cover. It does not replace that
+// report; both arrive.
+inline void test_actor_monitor() {
+    using namespace forkjoin;
+    std::cout << "=== actor_monitor ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(43, 0);  as.call_native_id(11, 42, 43, 1, NATIVE_NEW_INBOX);   // r11 = the watch inbox
+        as.load_const(41, 0);  spawn_actor(as, 12, "acrashon");
+        call2(as, 13, NATIVE_MONITOR, 12, 11);                                        // still running: true
+        send_int(as, 14, 12, 1);                                                      // now it faults
+        as.load_const(43, -1); call2(as, 15, NATIVE_RECEIVE, 11, 43);                 // the monitor's report
+        call1(as, 16, NATIVE_MAIL_FROM, 11);
+        call1(as, 17, NATIVE_MAIL_REASON, 11);
+        receive_main(as, 18, 10000);                                                  // the starter's own
+        mail_read(as, 19, NATIVE_MAIL_FROM);
+        // A normal end: stopActor on a monitored actor reports "normal" -- and only to the monitor.
+        as.load_const(41, 0);  spawn_actor(as, 20, "aecho");
+        call2(as, 21, NATIVE_MONITOR, 20, 11);
+        call1(as, 22, NATIVE_STOP_ACTOR, 20);
+        as.load_const(43, -1); call2(as, 23, NATIVE_RECEIVE, 11, 43);
+        call1(as, 24, NATIVE_MAIL_FROM, 11);
+        call1(as, 25, NATIVE_MAIL_REASON, 11);
+        receive_main(as, 26, 50);                                                     // nothing for the starter
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        auto same   = [&](int a, int b) { return r.regs[a].isInt() && r.regs[b].isInt() &&
+                                                 r.regs[a].asSigned48() == r.regs[b].asSigned48(); };
+        const bool crash_ok  = r.fault.empty() && r.regs[13].isBool() && r.regs[13].asBool() &&
+                               is_int(15, 2) && same(16, 12) &&
+                               str_of(r.regs[17]).find("boom on demand") != std::string::npos;
+        const bool both_ok   = r.fault.empty() && is_int(18, 2) && same(19, 12);
+        const bool normal_ok = r.fault.empty() && r.regs[21].isBool() && r.regs[21].asBool() &&
+                               is_int(23, 2) && same(24, 20) && str_of(r.regs[25]) == "normal";
+        const bool quiet_ok  = r.fault.empty() && is_int(26, 0);
+        std::cout << std::format("  a crash reaches the monitor:      {}{}\n", crash_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  ... and the starter as well:      {}\n", both_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  a normal end reports \"normal\":    {}  (\"{}\")\n", normal_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[25]));
+        std::cout << std::format("  ... and is NOT sent to the starter: {}\n", quiet_ok ? "PASS" : "FAIL");
+        check(crash_ok && both_ok && normal_ok && quiet_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// An actor that did NOT start another one can watch it -- which the starter's report cannot do -- and a
+// monitor on an actor that has already ended reports at once, so a monitor always ends in one report.
+inline void test_actor_monitor_others() {
+    using namespace forkjoin;
+    std::cout << "=== actor_monitor_others ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(41, 0);  spawn_actor(as, 11, "aecho");        // the actor being watched
+        as.R6(OpCode::MOV, 41, 11, 0);  spawn_actor(as, 12, "awatch");
+        call1(as, 13, NATIVE_STOP_ACTOR, 11);
+        receive_main(as, 14, 10000);  mail_read(as, 15, NATIVE_MAIL_MSG);   // the watcher's word
+        // An actor that has already ended: false, and the report comes at once.
+        as.load_const(43, 0);  as.call_native_id(16, 42, 43, 1, NATIVE_NEW_INBOX);
+        as.load_const(41, 0);  spawn_actor(as, 17, "acrash");
+        receive_main(as, 18, 10000);                                        // its crash, so it is over
+        call2(as, 19, NATIVE_MONITOR, 17, 16);
+        as.load_const(43, 0); call2(as, 20, NATIVE_RECEIVE, 16, 43);
+        call1(as, 21, NATIVE_MAIL_REASON, 16);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool watcher_ok = r.fault.empty() && is_int(14, 1) && r.regs[15].isInt() && r.regs[11].isInt() &&
+                                r.regs[15].asSigned48() == r.regs[11].asSigned48();
+        const bool gone_ok    = r.fault.empty() && r.regs[19].isBool() && !r.regs[19].asBool() &&
+                                is_int(20, 2) && str_of(r.regs[21]) == "gone";
+        std::cout << std::format("  a non-starter is told of the end: {}{}\n", watcher_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  already ended: false, report now: {}  (\"{}\")\n", gone_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[21]));
+        check(watcher_ok && gone_ok);
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 

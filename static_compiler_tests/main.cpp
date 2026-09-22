@@ -9342,6 +9342,71 @@ void test_std_actor() {
         "let b = ActorFn { f: fn(i: Inbox[Int], u: Int) -> () {}, ..a }\n0",
         "an ActorFn can only be created by `actorFn(f)`"));
 
+    // ---- monitor(p, rx): being told that an actor has ended ----
+    const std::string SERVICE =
+        "struct Req { n: Int, replyTo: Pid[Int] }\n"
+        "fn service(inbox: Inbox[Req], unused: Int) -> () {\n"
+        "  for r in inbox.messages() {\n"
+        "    if r.n == 0 { panic(\"service died\") }\n"
+        "    send(r.replyTo, r.n)\n"
+        "  }\n"
+        "}\n"
+        "fn why(m: Mail[Int]) -> String {\n"
+        "  match m {\n"
+        "    Mail::Exited(_, reason) => { let k = indexOf(reason, \" at line \")\n"
+        "      if k < 0 { reason } else { slice(reason, 0, k) } },\n"
+        "    _ => \"?\"\n"
+        "  }\n"
+        "}\n";
+    // A crash ends an `ask` at once, with the reason -- where it used to sit out the whole timeout --
+    // and the monitor set by hand is told as well.
+    check_str("monitor_ask_reports_crash", cg_run_native(U + SERVICE +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let s = spawnActor(service, 0)\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "println(monitor(s, rx))\n"
+        "match ask(s, fn(r) { Req { n: 0, replyTo: r } }, 60000) {\n"
+        "  Ok(v) => println(v),\n"
+        "  Err(AskError::Crashed(reason)) => { let k = indexOf(reason, \" at line \")\n"
+        "    println(\"crashed: ${if k < 0 { reason } else { slice(reason, 0, k) }}\") },\n"
+        "  Err(e) => println(e),\n"
+        "}\n"
+        "println(why(rx.receive()))\n"), "true\ncrashed: service died\nservice died\n");
+    // A normal end is reported to the monitor -- and to nobody else.
+    check_str("monitor_reports_normal_end", cg_run_native(U + SERVICE +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let s = spawnActor(service, 0)\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "println(monitor(s, rx))\n"
+        "println(stopActor(s))\n"
+        "println(why(rx.receive()))\n"
+        "match me.receiveTimeout(50) { None => println(\"the starter hears nothing\"), _ => println(\"?\") }\n"),
+        "true\ntrue\nnormal\nthe starter hears nothing\n");
+    // An actor that has already ended: false, and the one report comes at once.
+    check_str("monitor_already_ended", cg_run_native(U + SERVICE +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let s = spawnActor(service, 0)\n"
+        "send(s, Req { n: 0, replyTo: me.pid() })\n"
+        "match me.receive() { Mail::Exited(_, _) => {}, _ => println(\"?\") }\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "println(monitor(s, rx))\n"
+        "println(why(rx.receive()))\n"), "false\ngone\n");
+    // A monitor reports once: the actor started into the same slot afterwards is not watched.
+    check_str("monitor_does_not_follow_a_slot", cg_run_native(U + SERVICE +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let at: Slot[Req] = newSlot()\n"
+        "let first = at.spawn(actorFn(service), 0)\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "println(monitor(at.pid(), rx))\n"
+        "send(at.pid(), Req { n: 0, replyTo: me.pid() })\n"
+        "println(why(rx.receive()))\n"
+        "match me.receive() { Mail::Exited(_, _) => {}, _ => println(\"?\") }\n"
+        "let second = at.spawn(actorFn(service), 0)\n"
+        "send(at.pid(), Req { n: 0, replyTo: me.pid() })\n"
+        "match me.receive() { Mail::Exited(_, _) => println(\"the starter hears the second one\"), _ => println(\"?\") }\n"
+        "match rx.receiveTimeout(50) { None => println(\"the monitor does not\"), _ => println(\"?\") }\n"),
+        "true\nservice died\nthe starter hears the second one\nthe monitor does not\n");
+
     // ---- Slot[M]: an address that outlives its actor ----
     const std::string WORKER =
         "fn worker(inbox: Inbox[Ask], factor: Int) -> () {\n"
@@ -10264,7 +10329,9 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // The slot four (ids 75-78: rawNewSlot / rawSpawnInto / rawReleaseSlot / rawStopActor) are NOT listed
 // for the same reason: they are about an address a restarted actor keeps, so what they do depends on
 // when an actor crashed and what was on its way. Pinned by the actor_slot_* tests in vm_tests.
-static_assert(NATIVE_COUNT == 79,
+// rawMonitor (id 79) is NOT listed either: it reports when another isolate ends, which no sequential
+// model has. Pinned by the actor_monitor_* tests in vm_tests.
+static_assert(NATIVE_COUNT == 80,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 

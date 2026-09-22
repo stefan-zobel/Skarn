@@ -364,7 +364,12 @@ A `Pid[M]` promises that the actor it names receives `M`. The checker keeps that
 - **`ask(pid, make, timeoutMs) -> Result[R, AskError]`** makes a reply inbox, sends `make(replyAddress)`,
   waits for the reply and closes the inbox. Its reply type `R` is fixed by the `Pid[R]` the request carries
   (or by an annotation) and must be known at the call and sendable, because `R` is the message type of the
-  inbox it makes.
+  inbox it makes. It also monitors the receiver, so `AskError` has a `Crashed(reason)` beside `Gone`,
+  `Timeout` and `Stopped`: a crash ends the wait at once instead of after the timeout.
+- **`monitor(p, rx) -> Bool`** asks to be told when the actor at `p` ends: exactly one
+  `Mail::Exited(id, reason)` arrives in the caller's own inbox `rx`, for a crash, for a normal end
+  (`"normal"`), or at once if it had already ended (`"gone"`, and the call answers `false`). It watches
+  that actor, not the address. It needs no rule of its own — it creates neither an isolate nor an address.
 - **`actorFn(f)`** makes an `ActorFn[M, I]` under the rules of `spawnActor`. `a.spawn(init)` and
   `a.spawnBounded(init, n)` then start actors from code that received the function as a value — a worker
   pool, or a supervisor that is sent a child's function and start value and starts it. An `ActorFn` is

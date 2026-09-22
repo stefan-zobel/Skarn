@@ -54,6 +54,12 @@
 // `s.release()` ends the address for good (and tells an actor still running in it to stop).
 // `stopActor(p)` tells any actor to end -- it ends when it next receives, so an actor that never
 // receives cannot be stopped this way.
+//
+// WATCHING ANOTHER ACTOR. A crash is reported to the STARTER only, and a normal end to nobody. Whoever
+// else wants to know sets a monitor: `monitor(p, rx)` puts one `Exited(id, reason)` into the inbox `rx`
+// when that actor ends -- for a crash, for a normal end ("normal"), and at once if it had already ended
+// ("gone"). `ask` uses this itself, which is why it answers `Crashed` instead of waiting out its timeout
+// when the actor it asked dies.
 
 // An actor's address. Only `spawnActor` and `inbox.pid()` make one.
 pub struct Pid[M] { id: Int }
@@ -177,13 +183,23 @@ pub fn newBoundedInbox[M](capacity: Int) -> Inbox[M] {
   Inbox { id: rawNewInbox(capacity) }
 }
 
-// Why an `ask` got no reply: the receiver no longer runs, no reply came in time, or the program is
-// ending.
-pub enum AskError { Gone, Timeout, Stopped }
+// Be told when the actor at `p` ends: an `Exited(id, reason)` arrives in `rx`, one of YOUR inboxes. It
+// watches that one actor and reports exactly once -- an actor started into the same slot afterwards is
+// not watched, so monitor again if you want to go on watching. The reason is "normal" if it returned,
+// "gone" if it had already ended when the monitor was set (the report then comes at once), and otherwise
+// the message of the fault that ended it. False means it was no longer running.
+pub fn monitor[M, R](p: Pid[M], rx: Inbox[R]) -> Bool { rawMonitor(p, rx) }
+
+// Why an `ask` got no reply: the receiver no longer runs, it crashed while we waited (with the message
+// of its fault), no reply came in time, or the program is ending.
+pub enum AskError { Gone, Timeout, Stopped, Crashed(String) }
 
 // Request and reply. `make` builds the request from the address to reply to; the reply is awaited
 // on an inbox of its own for at most `timeoutMs` (the wait for room in a full receiver comes on
 // top), and that inbox is closed again whatever happens, so a late reply is dropped.
+//
+// It also MONITORS the receiver on that same inbox, so a crash ends the wait at once, with the reason,
+// instead of sitting out the whole timeout.
 //
 //     let r = ask(counter, fn(me) { Query::Total(me) }, 1000)
 pub fn ask[M, R](p: Pid[M], make: fn(Pid[R]) -> M, timeoutMs: Int) -> Result[R, AskError] {
@@ -191,9 +207,11 @@ pub fn ask[M, R](p: Pid[M], make: fn(Pid[R]) -> M, timeoutMs: Int) -> Result[R, 
   let result = if !send(p, make(rx.pid())) {
     Err(AskError::Gone)
   } else {
+    let _watching = monitor(p, rx)
     match rx.receiveTimeout(timeoutMs) {
       Some(Mail::Msg(reply)) => Ok(reply),
-      Some(_) => Err(AskError::Stopped),
+      Some(Mail::Exited(_, why)) => Err(AskError::Crashed(why)),
+      Some(Mail::Stop) => Err(AskError::Stopped),
       None => Err(AskError::Timeout)
     }
   }

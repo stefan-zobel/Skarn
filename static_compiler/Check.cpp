@@ -1391,6 +1391,11 @@ private:
         add_generic_native("rawStopActor", { "M" },
             [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ pid_of(v[0]) }; },
             [](const std::vector<TyPtr>&)    { return ty_bool(); });
+        // A monitor reports as a Mail::Exited, which every Inbox[R] carries, so the watched actor's
+        // message type and the watcher's are unrelated.
+        add_generic_native("rawMonitor", { "M", "R" },
+            [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ pid_of(v[0]), inbox_of(v[1]) }; },
+            [](const std::vector<TyPtr>&)    { return ty_bool(); });
     }
 
     // Is a gated native `name` callable from the module currently being checked? A native NOT in

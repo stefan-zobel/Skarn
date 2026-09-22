@@ -1,0 +1,19 @@
+// CLAIM: a monitor tells an actor that did NOT start another one that it has ended -- the starter's own
+//        crash report cannot do that -- and it arrives in the inbox the watcher named.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: ok watching true, told about it true
+use std::actor::*
+
+fn fragile(inbox: Inbox[Int], unused: Int) -> () {
+  for n in inbox.messages() { if n == 0 { panic("fragile gave up") } }
+}
+
+let f = spawnActor(fragile, 0)
+let watch: Inbox[Int] = newInbox()
+let watching = monitor(f, watch)
+send(f, 0)
+let told = match watch.receive() {
+  Mail::Exited(who, _) => who == f.actorId(),
+  _ => false,
+}
+println("watching ${watching}, told about it ${told}")

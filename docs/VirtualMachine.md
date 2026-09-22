@@ -441,6 +441,12 @@ and stacks, sharing the program with its starter read-only. Values cross between
     end of an actor closes all of its inboxes.
   - `rawStopActor(pid)` tells an actor to end: `Stop` goes into every inbox it owns, so it stops wherever
     it waits. An actor that never receives cannot be stopped this way, and there is no kill.
+  - `rawMonitor(pid, inbox)` asks to be told when that actor ends. Exactly one report follows, into an
+    inbox of the caller's own, as the same mail a crash report uses: the address plus a reason — the
+    fault message, `"normal"` when the actor returned, or `"gone"` when it had already ended, in which
+    case the report comes at once and the call answers false. It watches that one actor, not the address,
+    so an actor started into the same slot afterwards is not watched. The automatic report to the starter
+    is unaffected and stays crash-only.
 - `rawTaskInput()` and `rawSelfId()` are internal: an isolate reads its argument and its own id with them.
 
 **An address that outlives its actor.** A restarted actor is a new actor, so anyone holding the old

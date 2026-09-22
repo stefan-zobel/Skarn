@@ -332,6 +332,10 @@ struct Isolate {
     bool                     actor   = false;
     std::shared_ptr<Mailbox> mailbox;           // actors only: the main inbox
     int64_t                  mailbox_id = 0;    // its id: the actor's own, or a slot's (rawSpawnInto)
+    // Who asked to be told when this actor ends (rawMonitor): the inboxes the reports go into, and
+    // whether the end has already happened. Both are guarded by World::m, like the registries.
+    std::vector<int64_t>     watchers;
+    bool                     ended = false;
     std::thread              thread;
     std::mutex               join_m;            // one joiner at a time: the starter, or the world
     bool                     thread_joined = false;
@@ -2290,15 +2294,30 @@ static void run_isolate(World* world, std::shared_ptr<Isolate> iso, uint16_t fn_
     }
     actor_buf.flush_partial();
     world->close_mailboxes_of(iso->id);   // the main inbox and every extra one (a slot is vacated)
-    // The report names the ADDRESS, which for an actor in a slot outlives it -- so a supervisor's
-    // comparison survives a restart. It goes to the starter's main inbox, found through its record:
-    // its id is not its inbox's when the starter itself lives in a slot.
+    // Every report names the ADDRESS, which for an actor in a slot outlives it -- so a supervisor's
+    // comparison survives a restart.
+    const std::string reason = faulted ? std::move(fault) : std::string("normal");
+    // The STARTER is told of a crash only, and unconditionally: that is the v1 contract every existing
+    // program is written against. Its main inbox is found through its record, since its id is not its
+    // inbox's when the starter itself lives in a slot.
     if (faulted) {
         std::shared_ptr<Mailbox> box;
         if (iso->starter == 0) box = world->mailbox_of(0);
         else if (auto st = world->find(iso->starter)) box = st->mailbox;
-        if (box) box->put(Mail{ MAIL_EXITED, {}, iso->mailbox_id, std::move(fault) });
+        if (box) box->put(Mail{ MAIL_EXITED, {}, iso->mailbox_id, reason });
     }
+    // MONITORS are told of every end, a normal one included ("normal"). Taking the list and marking the
+    // end under one lock is what makes "exactly one report per monitor" hold: a monitor set from here on
+    // finds `ended` and reports at once instead of waiting for an end that has already happened.
+    std::vector<int64_t> watchers;
+    {
+        std::lock_guard<std::mutex> lk(world->m);
+        iso->ended = true;
+        watchers.swap(iso->watchers);
+    }
+    for (const int64_t box_id : watchers)
+        if (auto box = world->mailbox_of(box_id))
+            box->put(Mail{ MAIL_EXITED, {}, iso->mailbox_id, reason });
 }
 
 // The id inside a handle: a bare Int, or Skarn's one-field `Task[R]` / `Pid[M]` / `Inbox[M]`
@@ -2545,7 +2564,6 @@ static Value native_stop_actor(Value* args, uint8_t nargs, Context* ctx) {
     for (auto& b : local->world->mailboxes_of(owner)) b->put(Mail{ MAIL_STOP, {}, 0, {} });
     return Value::fromBool(true);
 }
-
 // rawMainInbox() -> Int. Gives the ROOT a mailbox, so it can receive replies and crash reports.
 // ONCE: the Inbox it becomes fixes the message type, and a second one of another type could read
 // the same queue as something else.
@@ -2619,6 +2637,41 @@ static Value native_close_inbox(Value* args, uint8_t nargs, Context* ctx) {
     local->world->close_mailbox(id);
     std::erase_if(local->inboxes, [id](const auto& e) { return e.first == id; });
     return Value::fromNil();
+}
+
+// rawMonitor(pid, inbox) -> Bool. Be told when the actor at `pid` ends: MAIL_EXITED with its ADDRESS and
+// the reason ("normal", or the fault message) goes into `inbox`, which must be one of the caller's own.
+// It watches THAT actor, not the address, and reports EXACTLY ONCE -- an actor started into the same slot
+// afterwards is not watched. The Bool says whether it was still running; if it had already ended, the
+// report is delivered at once with the reason "gone", so the caller's receive loop is the same either way.
+static Value native_monitor(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world) raise_located(ctx, "monitor: this execution has no world");
+    if (nargs < 2) raise_located(ctx, "monitor: needs an address and an inbox to report into");
+    Mailbox&      into     = own_mailbox(args[1], ctx, "monitor");
+    const int64_t inbox_id = handle_id(args[1]).asSigned48();
+    const Value   id       = handle_id(args[0]);
+    if (!id.isInt()) raise_located(ctx, "monitor: not an actor address");
+    const int64_t target   = id.asSigned48();
+    World*        world    = local->world;
+    bool          watching = false;
+    {
+        // Under the world's lock, so an actor that ends in between is not missed: run_isolate marks
+        // `ended` and takes the list under the same lock.
+        std::lock_guard<std::mutex> lk(world->m);
+        const auto box = world->mailboxes.find(target);
+        if (box != world->mailboxes.end()) {
+            int64_t owner;
+            { std::lock_guard<std::mutex> box_lk(box->second->m); owner = box->second->owner; }
+            const auto iso = owner > 0 ? world->isolates.find(owner) : world->isolates.end();
+            if (iso != world->isolates.end() && !iso->second->ended) {
+                iso->second->watchers.push_back(inbox_id);
+                watching = true;
+            }
+        }
+    }
+    if (!watching) into.put(Mail{ MAIL_EXITED, {}, target, "gone" });
+    return Value::fromBool(watching);
 }
 
 // The message of a send, encoded HERE, in the sender's heap -- before any waiting, so a sender
@@ -2842,5 +2895,6 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_SPAWN_INTO]   = native_spawn_into;
     t[NATIVE_RELEASE_SLOT] = native_release_slot;
     t[NATIVE_STOP_ACTOR]   = native_stop_actor;
+    t[NATIVE_MONITOR]      = native_monitor;
     return t;
 }

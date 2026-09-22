@@ -3911,13 +3911,49 @@ fn squarer(inbox: Inbox[Query], unused: Int) -> () {
 let s = spawnActor(squarer, 0)
 match ask(s, fn(me) { Query::Square(7, me) }, 1000) {
   Ok(n)  => println(n),                   // => 49
-  Err(e) => println(e),                   // Gone, Timeout or Stopped
+  Err(e) => println(e),                   // Gone, Timeout, Stopped or Crashed(reason)
 }
 ```
 
 An actor may make more inboxes of its own with `newInbox()` — each with its own address and message type,
 annotated like `mainInbox()` — and `inbox.close()` one it no longer needs; the end of an actor closes all of
 its inboxes.
+
+**Watching another actor.** A crash is reported to the actor that *started* the crashed one, and a normal
+end is reported to nobody. Anyone else who needs to know sets a **monitor**: `monitor(p, rx)` promises
+exactly one `Mail::Exited(id, reason)` in your own inbox `rx` when that actor ends. The reason is the fault
+message if it crashed, `"normal"` if it returned, and `"gone"` if it had already ended — in which case the
+report arrives at once and the call answers `false`. A monitor watches *that actor*, not the address, so
+after a restart in a slot you monitor again if you want to keep watching. `ask` sets one itself, which is
+why it answers `Crashed` immediately instead of waiting out its timeout when the actor it asked dies.
+
+```rust
+use std::actor::*
+
+enum Query { Square(Int, Pid[Int]) }
+
+fn squarer(inbox: Inbox[Query], unused: Int) -> () {
+  for q in inbox.messages() {
+    match q {
+      Query::Square(n, replyTo) => { if n < 0 { panic("a negative square is beyond me") }
+        send(replyTo, n * n) },
+    }
+  }
+}
+
+let s = spawnActor(squarer, 0)
+let watch: Inbox[Int] = newInbox()
+println(monitor(s, watch))                  // => true
+match ask(s, fn(me) { Query::Square(-1, me) }, 60000) {
+  Ok(n) => println(n),
+  Err(AskError::Crashed(_)) => println("the service crashed"),   // => the service crashed
+  Err(e) => println(e),
+}
+match watch.receive() {
+  Mail::Exited(_, _) => println("the monitor was told too"),     // => the monitor was told too
+  _ => println("?"),
+}
+```
 
 **Back-pressure.** A mailbox grows as long as messages come in faster than its actor reads them.
 `spawnActorBounded(f, init, n)` starts an actor whose mailbox holds at most `n` messages: a `send` to it then
@@ -4898,7 +4934,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `inbox.receive()` | wait for the next mail → `Mail[M]`: `Mail::Msg(m)`, `Mail::Exited(id, reason)` (an actor this one started has crashed), or `Mail::Stop` (the program is ending) |
 | `inbox.receiveTimeout(ms)` | as `receive`, but `None` after `ms` milliseconds → `Option[Mail[M]]` |
 | `inbox.pid()` / `p.actorId()` | this actor's address, to hand out → `Pid[M]` / an actor's id, to compare with the one in `Exited` → `ActorId` |
-| `ask(p, make, ms)` | request and reply: sends `make(replyAddress)` to `p`, waits at most `ms` milliseconds for the answer on an inbox of its own → `Result[R, AskError]` (`Gone`, `Timeout`, `Stopped`) (free). The reply type `R` comes from the `Pid[R]` in the request, and must be plain data |
+| `ask(p, make, ms)` | request and reply: sends `make(replyAddress)` to `p`, waits at most `ms` milliseconds for the answer on an inbox of its own → `Result[R, AskError]` (`Gone`, `Timeout`, `Stopped`, `Crashed(reason)`) (free). It monitors the receiver, so a crash ends the wait at once instead of after `ms`. The reply type `R` comes from the `Pid[R]` in the request, and must be plain data |
 | `newInbox()` / `newBoundedInbox(n)` | a further inbox of this actor (or of the main program), with its own address → `Inbox[M]` (free; annotate it: `let rx: Inbox[T] = newInbox()`; the bounded one holds at most `n` messages) |
 | `inbox.close()` | close an inbox made with `newInbox`: later sends answer `false`, what it holds is dropped. A main inbox cannot be closed |
 | `spawnActorBounded(f, init, n)` | as `spawnActor`, but its mailbox holds at most `n` messages; a `send` to it waits while it is full (free) |
@@ -4907,6 +4943,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `newSlot()` / `newBoundedSlot(n)` | an address that outlives the actors started into it → `Slot[M]` (free; annotate it: `let s: Slot[T] = newSlot()`; the bounded one holds at most `n` messages) |
 | `s.pid()` / `s.spawn(a, init)` / `s.release()` | the address to hand out → `Pid[M]` / start an actor at it → `ActorId` (an error if one is running there) / end the address: later sends answer `false`, an actor still there is told to stop |
 | `stopActor(p)` | tell the actor at `p` to end → `Bool`: `false` if it no longer runs. It stops when it next receives; an actor that never receives cannot be stopped |
+| `monitor(p, rx)` | be told when the actor at `p` ends → `Bool`: `false` if it had already ended. Exactly ONE `Mail::Exited(id, reason)` follows, in your own inbox `rx`; the reason is `"normal"`, `"gone"`, or the fault message. It watches that actor, not the address |
 
 **Supervision** *(all `std::supervisor` — `use std::supervisor::*`; builds on `std::actor`)*
 
