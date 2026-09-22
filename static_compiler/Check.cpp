@@ -4289,6 +4289,14 @@ private:
             for (Expr* a : args) infer(*a);
             return apply(ret);
         }
+        // `actorFn(f)` / `taskFn(f)` take ONE argument, so nothing beside it can fix their type
+        // parameters -- only the expected type can (`let a: ActorFn[Int, Int] = actorFn(echo)`), and the
+        // argument needs them fixed to be checked at all when `f` is generic. So they pin BEFORE the
+        // argument, where every other call pins after it (below). Narrowly these two: pinning early in
+        // general would report a return-type mismatch as an argument error.
+        const bool pin_first = expected && (is_std_sig(sig, std_actorFn(), STD_ACTOR) ||
+                                            is_std_sig(sig, std_taskFn(), STD_TASK));
+        if (pin_first) tc_.subsumes(apply(ret), apply(expected));
         check_args_two_pass(args, params, &sig.origin);
         for (size_t i = 0; i < args.size() && i < sig.params_mut.size(); ++i)
             if (sig.params_mut[i]) require_mut_arg(args[i], "a `mut` parameter");
@@ -4332,9 +4340,16 @@ private:
 
     // The function an isolate runs must be NAMED: a top-level fn is a Func immediate that means the
     // same in every isolate (one program image), while a lambda or a closure is a heap object the value
-    // codec refuses -- and a Fn-typed local could hold either, which only the value tells. Non-generic,
-    // because the types checked afterwards must be the ones it really runs at. Reports and returns null
-    // otherwise.
+    // codec refuses -- and a Fn-typed local could hold either, which only the value tells.
+    //
+    // A GENERIC one is allowed, because types are erased: a generic function has ONE compiled body and
+    // therefore one id, which is exactly what travels. What the callers must not do is read its types off
+    // the DECLARATION, where a type parameter is still abstract -- they read the INSTANTIATED type of this
+    // expression instead (isolate_fn_type below). A type parameter nothing at the call determines is
+    // refused further on: a bounded one by check_bounded_fn_value, an unbounded one by send_blocker,
+    // which cannot prove an unconstrained type sendable.
+    //
+    // Reports and returns null otherwise.
     const FnSig* named_isolate_fn(Expr& f, const char* who, const char* what) {
         const FnSig* fsig = nullptr;
         if (f.kind == ExprKind::Ident) {
@@ -4348,13 +4363,25 @@ private:
                   " -- " + what + " runs a named function of the program");
             return nullptr;
         }
-        if (!fsig->generics.empty()) {
-            error(f.line, f.col, std::string(who) + " cannot start the generic function '" +
-                  display_name(static_cast<const IdentExpr&>(f).name) +
-                  "' -- wrap it in a non-generic function with the types it uses");
-            return nullptr;
-        }
         return fsig;
+    }
+
+    // The type `f` really runs at: the instantiation this call unified, not the declaration. Null when
+    // the expression did not end up with a function type (an error was reported there), so a caller that
+    // needs the types can simply stop.
+    const TyPtr isolate_fn_type(const Expr& f) {
+        if (!f.ty) return nullptr;
+        TyPtr t = apply(f.ty);
+        return t->kind == TyKind::Fn ? t : nullptr;
+    }
+
+    // What to SHOW for a type one of the rules below refused. Normally the instantiated type, which is
+    // what it really runs at -- but if that is still an unsolved variable, the call fixed nothing about
+    // it, and the variable carries whatever name unification happened to keep (spawnActor's own `M` or
+    // `I`, say). The declared type is then the one the reader wrote.
+    TyPtr shown_ty(const TyPtr& inst, const TyPtr& declared) {
+        const TyPtr t = apply(inst);
+        return t->kind == TyKind::Var ? apply(declared) : t;
     }
 
     // spawn(f, x): f named, one parameter; its argument and result must be SENDABLE, since both are
@@ -4371,12 +4398,16 @@ private:
                   std::to_string(fsig->params.size()) + " -- pass a tuple or a struct instead");
             return;
         }
+        const TyPtr ft = isolate_fn_type(f);               // the types it really runs at
+        if (!ft || ft->args.size() != 1) return;           // reported where the type was built
         TypeRenderer r;
-        if (const std::string why = send_blocker(fsig->params[0]); !why.empty())
-            error(f.line, f.col, "the argument of '" + name + "' (" + r(apply(fsig->params[0])) +
+        const TyPtr arg = shown_ty(ft->args[0], fsig->params[0]);
+        const TyPtr res = shown_ty(ft->ret, fsig->ret);
+        if (const std::string why = send_blocker(arg); !why.empty())
+            error(f.line, f.col, "the argument of '" + name + "' (" + r(arg) +
                   ") cannot be sent to a task: it contains " + why);
-        if (const std::string why = send_blocker(fsig->ret); !why.empty())
-            error(f.line, f.col, "the result of '" + name + "' (" + r(apply(fsig->ret)) +
+        if (const std::string why = send_blocker(res); !why.empty())
+            error(f.line, f.col, "the result of '" + name + "' (" + r(res) +
                   ") cannot be sent back from a task: it contains " + why);
     }
 
@@ -4393,15 +4424,23 @@ private:
         if (!fsig) return;
         const std::string name = display_name(static_cast<const IdentExpr&>(f).name);
         if (fsig->params.size() != 2) return;             // fails spawnActor's own type, reported there
-        const TyPtr inbox = apply(fsig->params[0]);
+        const TyPtr ft = isolate_fn_type(f);               // the types it really runs at
+        if (!ft || ft->args.size() != 2) return;           // ditto
+        const TyPtr inbox = apply(ft->args[0]);
         if (inbox->kind != TyKind::Named || inbox->name != std_Inbox() || inbox->args.size() != 1)
             return;                                        // ditto
+        // The message type as the writer of `f` spelled it, for a diagnostic the call left unsolved.
+        const TyPtr decl_inbox = apply(fsig->params[0]);
+        const TyPtr decl_msg = decl_inbox->kind == TyKind::Named && decl_inbox->name == std_Inbox() &&
+                               decl_inbox->args.size() == 1 ? decl_inbox->args[0] : inbox->args[0];
         TypeRenderer r;
-        if (const std::string why = send_blocker(inbox->args[0]); !why.empty())
-            error(f.line, f.col, "the messages of '" + name + "' (" + r(apply(inbox->args[0])) +
+        const TyPtr msg = shown_ty(inbox->args[0], decl_msg);
+        const TyPtr init = shown_ty(ft->args[1], fsig->params[1]);
+        if (const std::string why = send_blocker(msg); !why.empty())
+            error(f.line, f.col, "the messages of '" + name + "' (" + r(msg) +
                   ") cannot be sent to an actor: they contain " + why);
-        if (const std::string why = send_blocker(fsig->params[1]); !why.empty())
-            error(f.line, f.col, "the start value of '" + name + "' (" + r(apply(fsig->params[1])) +
+        if (const std::string why = send_blocker(init); !why.empty())
+            error(f.line, f.col, "the start value of '" + name + "' (" + r(init) +
                   ") cannot be sent to an actor: it contains " + why);
     }
 
@@ -4632,9 +4671,29 @@ private:
             check_expr(*args[i], params[i], lbl ? &*lbl : nullptr);
         };
         for (size_t i = 0; i < args.size(); ++i)
-            if (args[i]->kind != ExprKind::Lambda) check_one(i);
+            if (!needs_the_other_args(*args[i])) check_one(i);
         for (size_t i = 0; i < args.size(); ++i)
-            if (args[i]->kind == ExprKind::Lambda) check_one(i);
+            if (needs_the_other_args(*args[i])) check_one(i);
+    }
+
+    // Does this argument's EXPECTED type have to be solved before it can be checked? Two kinds do, and
+    // for the same reason -- a callee's type parameter is usually fixed by a plainer argument beside
+    // them:
+    //   * a LAMBDA, whose own parameter types come from the expected type;
+    //   * the NAME of a generic top-level function used as a value, whose type parameters have to be
+    //     determined by the expected type (see check_bounded_fn_value). `spawnActor(echo, 7)` is the
+    //     case that needs it: `7` is what fixes the message and start types of a generic `echo`.
+    // Both are therefore checked in the second pass, after everything that can fix those types.
+    bool needs_the_other_args(const Expr& e) {
+        if (e.kind == ExprKind::Lambda) return true;
+        if (e.kind != ExprKind::Ident) return false;
+        const auto& id = static_cast<const IdentExpr&>(e);
+        if (!id.qualifier.empty() || lookup(id.name)) return false;   // a local binding, not a fn name
+        // By the NAME THIS MODULE SEES: `fns_` is keyed by the mangled name, and the ident still carries
+        // the written one here -- check_expr rewrites it only when it checks it, which is the very thing
+        // being ordered.
+        const auto it = fns_.find(mangle_ref(id.name));
+        return it != fns_.end() && !it->second.generics.empty();
     }
 
     // Does `ty` satisfy trait bound `b`? A concrete type: an impl exists. A type

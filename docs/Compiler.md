@@ -300,10 +300,12 @@ ordinary generic function in `std/task.skn`; the VM side is described under "Tas
 [VirtualMachine.md](VirtualMachine.md). Because a task works on its own heap, its argument and result are
 copied. The checker therefore adds these rules at every call of `spawn`:
 
-- **`f` must name a top-level function** that is not generic and takes one parameter. A lambda, a closure
-  or a function-typed variable is rejected: a closure is a heap object that cannot be copied, and a
-  `fn(A) -> R` type does not say whether a value is one. A generic function is rejected because the types
-  checked here must be the ones the task actually runs with.
+- **`f` must name a top-level function** taking one parameter. A lambda, a closure or a function-typed
+  variable is rejected: a closure is a heap object that cannot be copied, and a `fn(A) -> R` type does not
+  say whether a value is one. A **generic** function is accepted where the call determines its type
+  parameters — types are erased, so one compiled body serves every use and the id that travels is that
+  body's, and the rules below are then checked against the types it really runs at. What nothing at the
+  call determines stays rejected: an undetermined type cannot be proven sendable.
 - **The parameter type and the result type must be sendable.** Sendable means plain data: numbers, `Bool`,
   `String`, `Bytes`, and tuples, collections, structs and enums built only from sendable parts. It excludes
   function values, trait objects, type parameters without the bound `Sendable`, and handles — a socket
@@ -351,10 +353,16 @@ start value.
 
 A `Pid[M]` promises that the actor it names receives `M`. The checker keeps that promise where a `Pid` is
 **made**, so `send` needs no check of its own:
-- **`spawnActor(f, init)`:** `f` must name a non-generic top-level function
-  `fn(Inbox[M], I) -> ()`, for the same reasons as a task's function. The message type `M` and the start
-  value `I` must be sendable. Every message is copied, so a message may carry a `Pid` (it is plain data)
-  but not an `Inbox`, the receiving end of one actor's mailbox.
+- **`spawnActor(f, init)`:** `f` must name a top-level function `fn(Inbox[M], I) -> ()`, for the same
+  reasons as a task's function, and a generic one is accepted on the same terms — the start value is
+  usually what fixes its type parameter. The message type `M` and the start value `I` must be sendable.
+  Every message is copied, so a message may carry a `Pid` (it is plain data) but not an `Inbox`, the
+  receiving end of one actor's mailbox.
+- **A generic actor body, and a generic starter over it.** Because one erased body serves every use,
+  `fn relay[T: Sendable](inbox: Inbox[T], boss: Pid[T])` can be started at several message types, and
+  `fn start[T: Sendable](boss: Pid[T]) -> Pid[T] { spawnActor(relay, boss) }` can be written: inside it
+  `T` is abstract and sendable through its bound alone, the same rule a new inbox already follows. What
+  stays fixed is the address: one `Pid` still carries one message type.
 - **`mainInbox()`** gives the main program an inbox. Its message type comes only from an annotation
   (`let inbox: Inbox[T] = mainInbox()`); it must be known at the call and sendable.
 - **`newInbox()` / `newBoundedInbox(n)`** give an actor or the main program a further inbox, with the same

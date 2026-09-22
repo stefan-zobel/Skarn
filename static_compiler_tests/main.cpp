@@ -2415,13 +2415,13 @@ void test_check_bounded_fn_values() {
     check_true("unannotated_still_rejected",
         check_has(std::string(DISP) + "fn g() -> String { let f = describe\n \"x\" }",
             "first-class value"));
-    // Documented safe limitation: a combinator with the fn parameter BEFORE the element
-    // parameter leaves `A` unsolved when `describe` is checked -> over-rejected.
-    check_true("reversed_order_rejected",
-        check_has(std::string(DISP) +
+    // A combinator with the fn parameter BEFORE the element parameter used to leave `A` unsolved when
+    // `describe` was checked, and over-rejected. It no longer does: the name of a generic function is
+    // checked in the SECOND argument pass, like a lambda, so `5` has fixed `A` by then.
+    check_true("reversed_order_now_solved",
+        check_errc(std::string(DISP) +
             "fn ap2[A, B](f: fn(A) -> B, x: A) -> B { f(x) }\n"
-            "fn g() -> String { ap2(describe, 5) }",
-            "is not determined by the expected type"));
+            "fn g() -> String { ap2(describe, 5) }") == 0);
 }
 
 // ---- typechecker: parametric traits + bounds with OUTPUT inference ----------
@@ -8887,8 +8887,17 @@ void test_std_task() {
         "let t = spawn(fn(x: Int) -> Int { x }, 1)\n0", "not a lambda"));
     check_true("task_rejects_fn_value", check_has_p(U + SQ +
         "let g = sq\nlet t = spawn(g, 1)\n0", "not a computed function value"));
-    check_true("task_rejects_generic_fn", check_has_p(U +
-        "fn ident[T](x: T) -> T { x }\nlet t = spawn(ident, 1)\n0", "generic function 'ident'"));
+    // A generic function IS allowed where the call determines its type parameters: types are erased, so
+    // one body serves every use and the id that travels is that body's. Here `1` fixes T.
+    check_str("task_generic_fn_determined_ok", cg_run_native(U +
+        "fn ident[T](x: T) -> T { x }\n"
+        "let t = spawn(ident, 1)\n"
+        "println(match t.join() { Ok(v) => v, Err(_) => 0 })\n"), "1\n");
+    // Nothing fixes T, so it cannot be proven sendable -- the soundness guard, in the type parameter's
+    // own name.
+    check_true("task_rejects_undetermined_generic_fn", check_has_p(U +
+        "fn ident[T](x: T) -> T { x }\nlet t = taskFn(ident)\n0",
+        "a type parameter (T) without the bound 'Sendable'"));
     // Two parameters already fail spawn's own type (fn(A) -> R); that is the first error reported.
     check_true("task_rejects_two_params", check_has_p(U +
         "fn add(a: Int, b: Int) -> Int { a + b }\nlet t = spawn(add, 1)\n0", "found fn(Int, Int) -> Int"));
@@ -8939,8 +8948,10 @@ void test_std_task() {
         "let t = taskFn(fn(x: Int) -> Int { x })\n0", "taskFn needs the name of a top-level function here, not a lambda"));
     check_true("task_fn_rejects_fn_param", check_has_p(U +
         "fn wrap(g: fn(Int) -> Int) -> TaskFn[Int, Int] { taskFn(g) }\n0", "not a computed function value"));
-    check_true("task_fn_rejects_generic_fn", check_has_p(U +
-        "fn ident[T](x: T) -> T { x }\nlet t = taskFn(ident)\n0", "generic function 'ident'"));
+    // taskFn has ONE argument, so nothing at the call fixes T: refused, in T's own name.
+    check_true("task_fn_rejects_undetermined_generic_fn", check_has_p(U +
+        "fn ident[T](x: T) -> T { x }\nlet t = taskFn(ident)\n0",
+        "a type parameter (T) without the bound 'Sendable'"));
     check_true("task_fn_checks_sendable", check_has_p(U +
         "fn mk(n: Int) -> fn(Int) -> Int { fn(x: Int) -> Int { x + n } }\nlet t = taskFn(mk)\n0",
         "cannot be sent back from a task"));
@@ -9333,8 +9344,10 @@ void test_std_actor() {
         "let a = actorFn(fn(i: Inbox[Int], u: Int) -> () {})\n0", "actorFn needs the name of a top-level function here, not a lambda"));
     check_true("actor_fn_rejects_fn_param", check_has_p(U +
         "fn wrap(g: fn(Inbox[Int], Int) -> ()) -> ActorFn[Int, Int] { actorFn(g) }\n0", "not a computed function value"));
-    check_true("actor_fn_rejects_generic_fn", check_has_p(U +
-        "fn gen[T](i: Inbox[T], u: Int) -> () {}\nlet a = actorFn(gen)\n0", "generic function 'gen'"));
+    // actorFn has ONE argument, so nothing at the call fixes T: refused, in T's own name.
+    check_true("actor_fn_rejects_undetermined_generic_fn", check_has_p(U +
+        "fn gen[T](i: Inbox[T], u: Int) -> () {}\nlet a = actorFn(gen)\n0",
+        "a type parameter (T) without the bound 'Sendable'"));
     check_true("actor_fn_checks_messages", check_has_p(U +
         "fn f(inbox: Inbox[fn(Int) -> Int], unused: Int) -> () {}\nlet a = actorFn(f)\n0", "messages of 'f'"));
     check_true("actor_fn_checks_start_value", check_has_p(U +
@@ -9412,6 +9425,63 @@ void test_std_actor() {
         "match me.receive() { Mail::Exited(_, _) => println(\"the starter hears the second one\"), _ => println(\"?\") }\n"
         "match rx.receiveTimeout(50) { None => println(\"the monitor does not\"), _ => println(\"?\") }\n"),
         "true\nservice died\nthe starter hears the second one\nthe monitor does not\n");
+
+    // ---- a GENERIC actor body, and a generic starter over it ----
+    // Types are erased, so one body serves every use and the id that travels is that body's. The body
+    // below is reachable ONLY through spawnActor -- never called directly -- so this also pins that the
+    // tree-shaker keeps a generic function reached as a value, and that it lowers.
+    const std::string GENERIC =
+        "fn relay[T: Sendable](inbox: Inbox[T], boss: Pid[T]) -> () {\n"
+        "  for m in inbox.messages() { send(boss, m) }\n"
+        "}\n"
+        "fn start[T: Sendable](boss: Pid[T]) -> Pid[T] { spawnActor(relay, boss) }\n";
+    // One erased body, two message types -- and the generic STARTER is what could not be written before.
+    check_str("actor_generic_body_and_starter", cg_run_native(U + GENERIC +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let sx: Inbox[String] = newInbox()\n"
+        "let ints = start(me.pid())\n"
+        "let strs = start(sx.pid())\n"
+        "send(ints, 21)\n"
+        "match me.receive() { Mail::Msg(n) => println(\"int: ${n}\"), _ => println(\"?\") }\n"
+        "send(strs, \"hi\")\n"
+        "match sx.receive() { Mail::Msg(s) => println(\"str: ${s}\"), _ => println(\"?\") }\n"),
+        "int: 21\nstr: hi\n");
+    // The start value is what fixes T at a direct spawn.
+    check_str("actor_generic_body_determined_by_init", cg_run_native(U +
+        "fn once[T: Sendable](inbox: Inbox[T], first: T) -> () { send(inbox.pid(), first) }\n"
+        "fn watcher(inbox: Inbox[Int], unused: Int) -> () {}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "let p = spawnActor(once, 7)\n"
+        "println(monitor(p, rx))\n"
+        "match rx.receive() { Mail::Exited(_, why) => println(why), _ => println(\"?\") }\n"),
+        "true\nnormal\n");
+    // An UNBOUNDED type parameter works too, where the call determines it: the sendability of the type
+    // it is solved to is what the rule needs, not a bound.
+    check_str("actor_generic_unbounded_determined_ok", cg_run_native(U +
+        "fn once[T](inbox: Inbox[T], first: T) -> () { send(inbox.pid(), first) }\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "let p = spawnActor(once, 7)\n"
+        "println(monitor(p, rx))\n"
+        "match rx.receive() { Mail::Exited(_, why) => println(why), _ => println(\"?\") }\n"),
+        "true\nnormal\n");
+    // actorFn takes one argument, so the EXPECTED type is the only thing that can fix T.
+    check_str("actor_fn_generic_with_annotation", cg_run_native(U +
+        "fn once[T: Sendable](inbox: Inbox[T], first: T) -> () { send(inbox.pid(), first) }\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let a: ActorFn[Int, Int] = actorFn(once)\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "let p = a.spawn(7)\n"
+        "println(monitor(p, rx))\n"
+        "match rx.receive() { Mail::Exited(_, why) => println(why), _ => println(\"?\") }\n"),
+        "true\nnormal\n");
+    // What a determined type parameter does NOT excuse: a message type that is not sendable.
+    check_true("actor_generic_still_checks_sendable", check_has_p(U +
+        "fn once[T](inbox: Inbox[T], first: T) -> () {}\n"
+        "fn mk() -> fn(Int) -> Int { fn(x: Int) -> Int { x } }\n"
+        "let p = spawnActor(once, mk())\n0",
+        "cannot be sent to an actor"));
 
     // ---- stopRequested(): an actor whose loop is its own work ends itself ----
     // It never receives, so stopActor's message would never be read -- it ASKS instead.

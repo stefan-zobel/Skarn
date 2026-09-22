@@ -3780,7 +3780,8 @@ what it takes:
 
 - **`f` must be a named top-level function** with one parameter (pass a struct or a tuple for more). A
   lambda cannot travel to another heap, and neither can a function-typed variable, because it might hold
-  one.
+  one. A **generic** function is fine wherever the call fixes its type parameters — one compiled body
+  serves every use, so there is nothing else to travel.
 - **The argument and the result must be plain data**: numbers, strings, bytes, and collections, tuples,
   structs and enums made of those. A function value, a `dyn` trait object, a socket or another `Task`
   inside them is a compile error.
@@ -3980,6 +3981,41 @@ while i <= 100 {
 
 Two actors that each wait to send into the other's full mailbox wait forever; nothing detects that, so keep
 the messages of a bounded pair flowing in one direction.
+
+**A generic actor body.** The function an actor runs may itself be generic, wherever the call fixes its
+type parameters — types are erased, so one compiled body serves every message type. That also lets you
+write a generic *starter*, where `T` is abstract and sendable through its bound alone:
+
+```rust
+use std::actor::*
+
+// One body, any sendable message type.
+fn relay[T: Sendable](inbox: Inbox[T], boss: Pid[T]) -> () {
+  for m in inbox.messages() { send(boss, m) }
+}
+
+fn start[T: Sendable](boss: Pid[T]) -> Pid[T] { spawnActor(relay, boss) }
+
+let me: Inbox[Int] = mainInbox()
+let sx: Inbox[String] = newInbox()
+let ints = start(me.pid())
+let strs = start(sx.pid())
+send(ints, 21)
+match me.receive() {
+  Mail::Msg(n) => println(n),          // => 21
+  _ => {},
+}
+send(strs, "hi")
+match sx.receive() {
+  Mail::Msg(s) => println(s),          // => hi
+  _ => {},
+}
+```
+
+What the call must fix is the type parameter: `spawnActor(relay, boss)` learns it from `boss`. Where
+nothing does — `actorFn(relay)` standing alone — annotate the result (`let a: ActorFn[Int, Int] =
+actorFn(relay)`), because a type nobody determines cannot be shown to be sendable. The address stays
+monomorphic either way: one `Pid` carries one message type.
 
 **Generic helpers.** `actorFn(f)` is the actor counterpart of `taskFn`. It checks `f` once, like
 `spawnActor` would, and returns an `ActorFn[M, I]`; `a.spawn(init)` and `a.spawnBounded(init, n)` start
@@ -5029,6 +5065,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `spawnActorBounded(f, init, n)` | as `spawnActor`, but its mailbox holds at most `n` messages; a `send` to it waits while it is full (free) |
 | `trySend(p, m)` | send without ever waiting → `SendResult`: `Sent`, `Full` (nothing was queued) or `Gone` (free) |
 | `actorFn(f)` / `a.spawn(init)` / `a.spawnBounded(init, n)` | `f` as a value that generic code can take and start actors from → `ActorFn[M, I]`, checked as `spawnActor` would check `f` / start an actor → `Pid[M]` (free). An `ActorFn` can itself be sent |
+| a GENERIC `f` | allowed wherever the call fixes its type parameters (one erased body serves every use). `spawnActor(relay, boss)` learns them from `boss`; `actorFn(relay)` alone needs an annotation |
 | `newSlot()` / `newBoundedSlot(n)` | an address that outlives the actors started into it → `Slot[M]` (free; annotate it: `let s: Slot[T] = newSlot()`; the bounded one holds at most `n` messages) |
 | `s.pid()` / `s.spawn(a, init)` / `s.release()` | the address to hand out → `Pid[M]` / start an actor at it → `ActorId` (an error if one is running there) / end the address: later sends answer `false`, an actor still there is told to stop |
 | `stopActor(p)` | tell the actor at `p` to end → `Bool`: `false` if it no longer runs. It stops when it next receives; an actor that never receives cannot be stopped |

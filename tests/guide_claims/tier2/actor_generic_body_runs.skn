@@ -1,0 +1,29 @@
+// CLAIM: a GENERIC function can be an actor's body where the call determines its type parameters -- one
+//        erased body serves every message type, and a generic starter can be written over it.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: ok int: 21, str: hi
+use std::actor::*
+
+// Reachable only through spawnActor: it is never called directly.
+fn relay[T: Sendable](inbox: Inbox[T], boss: Pid[T]) -> () {
+  for m in inbox.messages() { send(boss, m) }
+}
+
+// The generic starter: `T` here is abstract, sendable through its bound alone.
+fn start[T: Sendable](boss: Pid[T]) -> Pid[T] { spawnActor(relay, boss) }
+
+let me: Inbox[Int] = mainInbox()
+let sx: Inbox[String] = newInbox()
+let ints = start(me.pid())
+let strs = start(sx.pid())
+send(ints, 21)
+let a = match me.receive() {
+  Mail::Msg(n) => "int: ${n}",
+  _ => "?",
+}
+send(strs, "hi")
+let b = match sx.receive() {
+  Mail::Msg(s) => "str: ${s}",
+  _ => "?",
+}
+println("${a}, ${b}")
