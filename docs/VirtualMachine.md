@@ -436,7 +436,18 @@ and stacks, sharing the program with its starter read-only. Values cross between
     report that an actor this isolate started has faulted, or `Stop`. `rawMailMsg`, `rawMailFrom` and
     `rawMailReason` read it.
   - The main program gets a mailbox of its own through `rawMainInbox()`, once.
+  - `rawNewInbox(capacity)` gives an actor or the main program a further inbox with an address of its own,
+    typically for a reply; `rawCloseInbox(inbox)` closes one again, and later sends to it answer false. The
+    end of an actor closes all of its inboxes.
 - `rawTaskInput()` and `rawSelfId()` are internal: an isolate reads its argument and its own id with them.
+
+**Back-pressure.** An inbox may be **bounded** — `rawSpawnActorBounded(fn, arg, capacity)` starts an actor
+whose mailbox holds at most `capacity` messages, and `rawNewInbox` takes a capacity too (0 = unbounded).
+A `rawSend` to a full inbox waits until the receiver has taken a message, so a fast sender is slowed to its
+receiver's pace instead of filling memory; `rawTrySend` never waits and reports "full" instead. Crash
+reports and `Stop` always get through. A waiting sender is released with false when the receiver ends or
+when the world ends, so a full inbox cannot hold up the end of the program. Two actors waiting to send to
+each other's full inbox wait forever; the runtime does not detect that.
 
 Everything started under one call of `execute()` forms a **world**. Addresses are unique within it, so an
 actor's address can be sent inside a message. When that call returns, the world sends every actor `Stop`

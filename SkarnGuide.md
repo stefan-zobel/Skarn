@@ -3485,7 +3485,7 @@ the filesystem, and one without `use std::process` cannot start a program.
 | `std::net` | blocking TCP (IPv4 + IPv6) and a minimal HTTP/1.0 `httpGet` — one connection at a time per thread, and a connection can be handed to an actor; **plaintext only** (no TLS, so `http://` not `https://`) |
 | `std::poll` | non-blocking sockets and readiness polling — many connections from one thread, with the loop written by the program; builds on `std::net` |
 | `std::task` | fork-join parallelism — `spawn` runs a function on its own thread and heap, `join` waits for its result; the argument and result are **copied**, nothing else is shared |
-| `std::actor` | actors — long-lived functions on their own threads with a mailbox; `spawnActor`, `send`, `inbox.messages()`; every message is **copied**, a crash is reported to the actor's starter |
+| `std::actor` | actors — long-lived functions on their own threads with a mailbox; `spawnActor`, `send`, `inbox.messages()`, `ask`, bounded mailboxes; every message is **copied**, a crash is reported to the actor's starter |
 | `std::regex` | linear-time byte-level regular expressions (Thompson NFA / Pike VM) — no catastrophic backtracking, and therefore **no** backreferences or lookaround |
 
 This table says only what each module is *for*. **Every function of every module, with its signature, is listed
@@ -3804,8 +3804,9 @@ crash that stays with the actor that crashed and is reported instead of spreadin
   subjects than to Erlang's untyped ones.
 - **Every actor is an operating-system thread.** Erlang's lightweight processes run on a scheduler of their
   own. Thousands of actors are fine; millions are not.
-- **There is no selective receive, and no links or supervisors.** A crash is reported to the actor that
-  started the crashed one, and nothing is restarted.
+- **There is no selective receive, and no links or supervisors.** A reply goes to an inbox of its own
+  instead (see `ask` below). A crash is reported to the actor that started the crashed one, and nothing is
+  restarted.
 
 `spawnActor(f, init)` starts `f(inbox, init)` on a thread of its own and returns the actor's **address**, a
 `Pid[M]`. `send(pid, m)` puts a copy of `m` into its mailbox. The actor reads its mail with
@@ -3857,6 +3858,62 @@ use std::actor::*
 fn keeper(inbox: Inbox[Inbox[Int]], unused: Int) -> () {}
 let k = spawnActor(keeper, 0)   // error: cannot be sent to an actor
 ```
+
+**Asking for an answer.** The counter above answers into the main program's mailbox, so its answer arrives
+among whatever else comes in, and the answer's type has to be the mailbox's type. `ask` makes a separate
+inbox for the one answer instead: it sends a request built around that inbox's address, waits for the reply
+at most the given milliseconds, and closes the inbox again. The reply type comes from the address the
+request carries:
+
+```rust
+use std::actor::*
+
+enum Query { Square(Int, Pid[Int]) }
+
+fn squarer(inbox: Inbox[Query], unused: Int) -> () {
+  for q in inbox.messages() {
+    match q {
+      Query::Square(n, replyTo) => { send(replyTo, n * n) },
+    }
+  }
+}
+
+let s = spawnActor(squarer, 0)
+match ask(s, fn(me) { Query::Square(7, me) }, 1000) {
+  Ok(n)  => println(n),                   // => 49
+  Err(e) => println(e),                   // Gone, Timeout or Stopped
+}
+```
+
+An actor may make more inboxes of its own with `newInbox()` — each with its own address and message type,
+annotated like `mainInbox()` — and `inbox.close()` one it no longer needs; the end of an actor closes all of
+its inboxes.
+
+**Back-pressure.** A mailbox grows as long as messages come in faster than its actor reads them.
+`spawnActorBounded(f, init, n)` starts an actor whose mailbox holds at most `n` messages: a `send` to it then
+**waits** until the actor has taken one, so the sender slows down to the actor's pace instead of filling
+memory. `trySend(p, m)` never waits; it returns `SendResult::Sent`, `Full` or `Gone`. Crash reports and `Stop`
+always get through a full mailbox.
+
+```rust
+use std::actor::*
+
+fn adder(inbox: Inbox[Int], unused: Int) -> () {
+  let mut sum = 0
+  for n in inbox.messages() { sum = sum + n }
+  println(sum)                            // => 5050
+}
+
+let a = spawnActorBounded(adder, 0, 10)  // at most 10 messages wait for it
+let mut i = 1
+while i <= 100 {
+  send(a, i)                             // waits whenever the mailbox is full
+  i = i + 1
+}
+```
+
+Two actors that each wait to send into the other's full mailbox wait forever; nothing detects that, so keep
+the messages of a bounded pair flowing in one direction.
 
 Actors print a line at a time into the program's output, so lines from different actors never mix, but
 their order depends on scheduling. When the program ends, every actor gets `Stop` and the program waits for
@@ -4648,6 +4705,11 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `inbox.receive()` | wait for the next mail → `Mail[M]`: `Mail::Msg(m)`, `Mail::Exited(id, reason)` (an actor this one started has crashed), or `Mail::Stop` (the program is ending) |
 | `inbox.receiveTimeout(ms)` | as `receive`, but `None` after `ms` milliseconds → `Option[Mail[M]]` |
 | `inbox.pid()` / `p.actorId()` | this actor's address, to hand out → `Pid[M]` / an actor's id, to compare with the one in `Exited` → `ActorId` |
+| `ask(p, make, ms)` | request and reply: sends `make(replyAddress)` to `p`, waits at most `ms` milliseconds for the answer on an inbox of its own → `Result[R, AskError]` (`Gone`, `Timeout`, `Stopped`) (free). The reply type `R` comes from the `Pid[R]` in the request, and must be plain data |
+| `newInbox()` / `newBoundedInbox(n)` | a further inbox of this actor (or of the main program), with its own address → `Inbox[M]` (free; annotate it: `let rx: Inbox[T] = newInbox()`; the bounded one holds at most `n` messages) |
+| `inbox.close()` | close an inbox made with `newInbox`: later sends answer `false`, what it holds is dropped. A main inbox cannot be closed |
+| `spawnActorBounded(f, init, n)` | as `spawnActor`, but its mailbox holds at most `n` messages; a `send` to it waits while it is full (free) |
+| `trySend(p, m)` | send without ever waiting → `SendResult`: `Sent`, `Full` (nothing was queued) or `Gone` (free) |
 
 **Regex** *(all `std::regex` — `use std::regex::*`; byte-level, linear-time Pike VM; no backrefs/lookaround. Note the names: matching anywhere is `search`, not `find`, and rewriting is `replaceRe`, not `replace` — those two belong to `std::iter` / `std::string`)*
 

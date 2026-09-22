@@ -515,6 +515,10 @@ inline std::string std_Task()         { return mangle_name(STD_TASK, "Task"); } 
 inline std::string std_spawn()        { return mangle_name(STD_TASK, "spawn"); }      // its one constructor
 inline std::string std_spawnActor()   { return mangle_name(STD_ACTOR, "spawnActor"); }
 inline std::string std_mainInbox()    { return mangle_name(STD_ACTOR, "mainInbox"); }
+inline std::string std_spawnActorBounded() { return mangle_name(STD_ACTOR, "spawnActorBounded"); }
+inline std::string std_newInbox()     { return mangle_name(STD_ACTOR, "newInbox"); }
+inline std::string std_newBoundedInbox() { return mangle_name(STD_ACTOR, "newBoundedInbox"); }
+inline std::string std_ask()          { return mangle_name(STD_ACTOR, "ask"); }
 inline std::string std_Pid()          { return mangle_name(STD_ACTOR, "Pid"); }
 inline std::string std_Inbox()        { return mangle_name(STD_ACTOR, "Inbox"); }
 

@@ -3347,6 +3347,126 @@ inline void task_fns(Assembler& as) {
     as.R6(OpCode::PRINTLN, 7, 6, 0);
     as.load_const(0, 0);
     as.J(OpCode::RET);
+
+    // Extra and bounded inboxes (same frame layout as above, plus r8 = gate inbox, r9 = the next
+    // expected message, r10 = sum):
+    //   areply(_)  -> every message is an inbox address; answers 7 there. Ends at Stop.
+    //   agate(n)   -> makes an extra inbox (the GATE), sends its id to the main program, and waits on
+    //                 it. Then:
+    //                 * n > 0 (after "go"): consumes messages 1..n from its main inbox, checking their
+    //                   order, sends the sum to the main program (-1 if out of order), waits for Stop;
+    //                 * n = 0 (the gate got Stop): drains its main inbox until Stop, printing "A stopped"
+    //                   -- or "A no stop" if two seconds pass without it.
+    //   aflood(p)  -> sends 1 to the main program, then 5 to p (blocking if p's inbox is full), prints
+    //                 "B done" once the send returns (whatever it answered), waits for Stop.
+    as.label("areply");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.label("areply_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BEQ_INT, 4, 7, "areply_done");
+    as.load_const(7, 1);
+    as.B (OpCode::BNE_INT, 4, 7, "areply_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.call_native_id(6, 5, 2, 1, NATIVE_MAIL_MSG);
+    as.R6(OpCode::MOV, 2, 6, 0);
+    as.load_const(3, 7);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.J(OpCode::J, "areply_loop");
+    as.label("areply_done");
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
+    as.label("agate");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.load_const(2, 0);
+    as.call_native_id(8, 5, 2, 1, NATIVE_NEW_INBOX);           // r8 = the gate
+    as.load_const(2, 0);
+    as.R6(OpCode::MOV, 3, 8, 0);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);                // tell the main program
+    as.R6(OpCode::MOV, 2, 8, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);             // "go", or Stop
+    as.load_const(7, 0);
+    as.B (OpCode::BEQ_INT, 0, 7, "agate_drain");
+    as.load_const(9, 1);
+    as.load_const(10, 0);
+    as.label("agate_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BEQ_INT, 4, 7, "agate_bad");
+    as.load_const(7, 1);
+    as.B (OpCode::BNE_INT, 4, 7, "agate_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.call_native_id(6, 5, 2, 1, NATIVE_MAIL_MSG);
+    as.B (OpCode::BNE_INT, 6, 9, "agate_bad");
+    as.R6(OpCode::ADD_INT, 10, 10, 6);
+    as.load_const(7, 1);
+    as.R6(OpCode::ADD_INT, 9, 9, 7);
+    as.B (OpCode::BNE_INT, 6, 0, "agate_loop");
+    as.label("agate_report");
+    as.load_const(2, 0);
+    as.R6(OpCode::MOV, 3, 10, 0);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.label("agate_wait");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BNE_INT, 4, 7, "agate_wait");
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+    as.label("agate_bad");
+    as.load_const(10, -1);
+    as.J(OpCode::J, "agate_report");
+    as.label("agate_drain");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, 2000);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BEQ_INT, 4, 7, "agate_stopped");
+    as.load_const(7, 0);
+    as.B (OpCode::BEQ_INT, 4, 7, "agate_nostop");
+    as.J(OpCode::J, "agate_drain");
+    as.label("agate_stopped");
+    as.load_str(6, "A stopped");
+    as.R6(OpCode::PRINTLN, 7, 6, 0);
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+    as.label("agate_nostop");
+    as.load_str(6, "A no stop");
+    as.R6(OpCode::PRINTLN, 7, 6, 0);
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
+    as.label("aflood");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.load_const(2, 0);
+    as.load_const(3, 1);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);                // hello
+    as.R6(OpCode::MOV, 2, 0, 0);
+    as.load_const(3, 5);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);                // may block
+    as.load_str(6, "B done");                                  // past the send, whatever it answered
+    as.R6(OpCode::PRINTLN, 7, 6, 0);
+    as.label("aflood_wait");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BNE_INT, 4, 7, "aflood_wait");
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
+    // tinbox(_): a TASK asking for an inbox (refused: tasks have no mail).
+    as.label("tinbox");
+    as.load_const(1, 0);
+    as.call_native_id(2, 3, 1, 1, NATIVE_NEW_INBOX);
+    as.J(OpCode::RET);
 }
 
 inline void declare_task_fns(Assembler& as) {
@@ -3361,6 +3481,17 @@ inline void declare_task_fns(Assembler& as) {
     as.declare_fn("acrash", 2, 1);
     as.declare_fn("astop",  8, 1);
     as.declare_fn("aconn",  8, 1);
+    as.declare_fn("areply", 8, 1);
+    as.declare_fn("agate",  12, 1);
+    as.declare_fn("aflood", 8, 1);
+    as.declare_fn("tinbox", 4, 1);
+}
+
+// id -> r[rd]: spawnActorBounded fn(arg, capacity), where arg is already in r44.
+inline void spawn_actor_bounded(Assembler& as, uint8_t rd, const char* fn, int64_t capacity) {
+    as.LOAD_FN(43, as.func_id(fn));
+    as.load_const(45, capacity);
+    as.call_native_id(rd, 42, 43, 3, NATIVE_ACTOR_SPAWN_BOUNDED);
 }
 
 // r[rd] = native(r[ra]) / native(r[ra], r[rb]), through the argument scratch r40 / r41.
@@ -3823,7 +3954,169 @@ inline void test_actor_misuse() {
             Heap heap;
             ok &= expect("receiving on another actor's inbox", run(as, heap), "belongs to another actor");
         }
+        {   // a negative capacity
+            Assembler as; declare_task_fns(as); as.label("main");
+            as.load_const(20, -1); call1(as, 21, NATIVE_NEW_INBOX, 20);
+            Heap heap;
+            ok &= expect("an inbox of capacity -1", run(as, heap), "capacity must be 0");
+        }
+        {   // receiving on an inbox after closing it
+            Assembler as; declare_task_fns(as); as.label("main");
+            as.load_const(20, 0); call1(as, 21, NATIVE_NEW_INBOX, 20);
+            call1(as, 22, NATIVE_CLOSE_INBOX, 21);
+            as.load_const(20, 0); call2(as, 23, NATIVE_RECEIVE, 21, 20);
+            Heap heap;
+            ok &= expect("receiving on a closed inbox", run(as, heap), "inbox is closed");
+        }
+        {   // the main inbox ends with its owner
+            Assembler as; declare_task_fns(as); as.label("main");
+            main_inbox(as, 10); as.load_const(20, 0); call1(as, 21, NATIVE_CLOSE_INBOX, 20);
+            Heap heap;
+            ok &= expect("closing the main inbox", run(as, heap), "main inbox cannot be closed");
+        }
+        {   // a send to one's own full inbox would wait forever
+            Assembler as; declare_task_fns(as); as.label("main");
+            as.load_const(20, 1); call1(as, 21, NATIVE_NEW_INBOX, 20);
+            call2(as, 22, NATIVE_SEND, 21, 20);
+            call2(as, 23, NATIVE_SEND, 21, 20);
+            Heap heap;
+            ok &= expect("a send to one's own full inbox", run(as, heap), "own inbox is full");
+        }
+        {   // a bounded actor needs room for at least one message
+            Assembler as; declare_task_fns(as); as.label("main");
+            as.load_const(44, 0); spawn_actor_bounded(as, 11, "astop", 0);
+            Heap heap;
+            ok &= expect("a bounded actor of capacity 0", run(as, heap), "at least 1");
+        }
+        {   // a task has no mail, so it cannot make an inbox: its join reports the fault
+            Assembler as; declare_task_fns(as); as.label("main");
+            as.load_const(41, 0); spawn(as, 10, "tinbox"); join(as, 10, 20, 30);
+            Heap heap;
+            const Run r = run(as, heap);
+            const bool t_ok = r.fault.empty() && r.regs[20].isBool() && !r.regs[20].asBool() &&
+                              str_of(r.regs[30]).find("only an actor or the main program") != std::string::npos;
+            std::cout << std::format("  {:<36} {}{}\n", "an inbox made in a task", t_ok ? "PASS" : "FAIL",
+                                     t_ok ? "" : "  (got: \"" + (r.fault.empty() ? str_of(r.regs[30]) : r.fault) + "\")");
+            ok &= t_ok;
+        }
         check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A second inbox: a request carries its address, and the reply arrives there -- not in the main inbox.
+// After closing it, a send answers false and trySend "gone".
+inline void test_actor_extra_inbox_reply() {
+    using namespace forkjoin;
+    std::cout << "=== actor_extra_inbox_reply ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(20, 0);  call1(as, 21, NATIVE_NEW_INBOX, 20);            // r21 = the reply inbox
+        as.load_const(41, 0);  spawn_actor(as, 11, "areply");
+        call2(as, 12, NATIVE_SEND, 11, 21);                                     // "answer at r21"
+        as.load_const(22, -1); call2(as, 13, NATIVE_RECEIVE, 21, 22);
+        call1(as, 14, NATIVE_MAIL_MSG, 21);
+        receive_main(as, 15, 0);                                                // the main inbox: empty
+        call1(as, 16, NATIVE_CLOSE_INBOX, 21);
+        call2(as, 17, NATIVE_SEND, 21, 20);
+        call2(as, 18, NATIVE_TRY_SEND, 21, 20);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool id_ok    = r.fault.empty() && r.regs[21].isInt() && r.regs[11].isInt() &&
+                              r.regs[21].asSigned48() > 0 && r.regs[21].asSigned48() != r.regs[11].asSigned48();
+        const bool reply_ok = r.fault.empty() && is_int(13, 1) && is_int(14, 7) && is_int(15, 0);
+        const bool close_ok = r.fault.empty() && r.regs[17].isBool() && !r.regs[17].asBool() && is_int(18, 2);
+        std::cout << std::format("  a new inbox has its own id:          {}{}\n", id_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  the reply arrives there, not in main: {}\n", reply_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  closed: send false, trySend gone:    {}\n", close_ok ? "PASS" : "FAIL");
+        check(id_ok && reply_ok && close_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// Back-pressure. A bounded actor (capacity 3) that is not yet reading: trySend fills it and then
+// answers "full". After "go" (through the actor's own extra inbox), 36 more blocking sends follow
+// while it reads; it checks that all 40 arrive in order. Then a bounded actor that has crashed
+// answers trySend with "gone".
+inline void test_actor_bounded_backpressure() {
+    using namespace forkjoin;
+    constexpr int N = 40;
+    std::cout << "=== actor_bounded_backpressure ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(44, N);  spawn_actor_bounded(as, 11, "agate", 3);
+        receive_main(as, 13, 10000);  mail_read(as, 14, NATIVE_MAIL_MSG);      // r14 = its gate
+        for (int i = 1; i <= 4; ++i) {                                          // r21..r24
+            as.load_const(20, i);
+            call2(as, static_cast<uint8_t>(20 + i), NATIVE_TRY_SEND, 11, 20);
+        }
+        as.load_const(20, 0);  call2(as, 25, NATIVE_SEND, 14, 20);              // go
+        as.R6(OpCode::MOV, 26, 25, 0);                                          // the go send: true
+        for (int i = 4; i <= N; ++i) {                                          // r26 = AND of the sends
+            as.load_const(20, i);
+            call2(as, 27, NATIVE_SEND, 11, 20);
+            as.R6(OpCode::AND_BOOL, 26, 26, 27);
+        }
+        receive_main(as, 28, 10000);  mail_read(as, 29, NATIVE_MAIL_MSG);      // the sum
+        as.load_const(44, 0);  spawn_actor_bounded(as, 30, "acrash", 1);
+        receive_main(as, 31, 10000);                                            // its exit report
+        as.load_const(20, 1);  call2(as, 32, NATIVE_TRY_SEND, 30, 20);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool full_ok = r.fault.empty() && is_int(21, 0) && is_int(22, 0) && is_int(23, 0) && is_int(24, 1);
+        const bool flow_ok = r.fault.empty() && r.regs[26].isBool() && r.regs[26].asBool() &&
+                             is_int(28, 1) && is_int(29, int64_t{N} * (N + 1) / 2);
+        const bool gone_ok = r.fault.empty() && is_int(31, 2) && is_int(32, 2);
+        std::cout << std::format("  capacity 3: three sent, the fourth full: {}{}\n", full_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  {} messages through, in order (sum {}): {}\n", N, int64_t{N} * (N + 1) / 2,
+                                 flow_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  trySend to a crashed actor -> gone:     {}\n", gone_ok ? "PASS" : "FAIL");
+        check(full_ok && flow_ok && gone_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// The end of the program with back-pressure in flight. Actor A (capacity 1) is full and waits on its
+// extra GATE inbox; actor B is blocked sending to A. The world's end must (1) wake A on the gate,
+// (2) get Stop into A's FULL main inbox (A drains it and prints "A stopped"; without Stop it would
+// print "A no stop" after two seconds), and (3) let B's send go -- false, or true if A's drain made
+// room first; either way B prints "B done" and the program ends.
+inline void test_actor_bounded_shutdown() {
+    using namespace forkjoin;
+    std::cout << "=== actor_bounded_shutdown ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(44, 0);  spawn_actor_bounded(as, 11, "agate", 1);
+        receive_main(as, 13, 10000);                                            // A is at its gate
+        as.load_const(20, 1);  call2(as, 21, NATIVE_TRY_SEND, 11, 20);          // sent
+        call2(as, 22, NATIVE_TRY_SEND, 11, 20);                                 // full
+        as.R6(OpCode::MOV, 41, 11, 0);  spawn_actor(as, 12, "aflood");
+        receive_main(as, 23, 10000);                                            // B's hello
+        receive_main(as, 24, 100);                                              // give B time to block
+        Heap heap;
+        const auto t0 = std::chrono::steady_clock::now();
+        const Run r = run(as, heap);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool setup_ok = r.fault.empty() && is_int(21, 0) && is_int(22, 1) && is_int(23, 1);
+        const bool a_ok     = r.printed.find("A stopped") != std::string::npos;
+        const bool b_ok     = r.printed.find("B done") != std::string::npos;
+        std::cout << std::format("  A full, B blocked on it:            {}{}\n", setup_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  Stop reached A through a full inbox: {}\n", a_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  B's send was let go, the end came:   {}  ({:.0f} ms, \"{}\")\n", b_ok ? "PASS" : "FAIL",
+                                 ms, r.printed);
+        check(setup_ok && a_ok && b_ok);
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 

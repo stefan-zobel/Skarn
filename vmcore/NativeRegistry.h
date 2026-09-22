@@ -121,7 +121,12 @@ enum NativeId : uint16_t {
     // between NetRegistries through a world-wide ticket; the sender's descriptor goes stale.
     NATIVE_HAND_OFF    = 69,    // rawHandOff(sock)        -> Int    | String (a ticket)
     NATIVE_TAKE        = 70,    // rawTake(ticket)         -> Int    | String (a descriptor in THIS isolate; once)
-    NATIVE_COUNT       = 71,
+    // Stage 3 of the actor work: extra inboxes per isolate, and bounded inboxes with back-pressure.
+    NATIVE_NEW_INBOX   = 71,    // rawNewInbox(capacity)   -> Int  (a new inbox of THIS isolate; 0 = unbounded)
+    NATIVE_CLOSE_INBOX = 72,    // rawCloseInbox(inbox)    -> ()   (later sends answer false)
+    NATIVE_TRY_SEND    = 73,    // rawTrySend(pid, msg)    -> Int  (0 sent, 1 full, 2 gone; never waits)
+    NATIVE_ACTOR_SPAWN_BOUNDED = 74, // rawSpawnActorBounded(fn, arg, capacity) -> Int (the actor id)
+    NATIVE_COUNT       = 75,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -205,6 +210,10 @@ inline int native_id_of(const std::string& name) {
     if (name == "rawSelfId")  return NATIVE_SELF_ID;
     if (name == "rawHandOff") return NATIVE_HAND_OFF;
     if (name == "rawTake")    return NATIVE_TAKE;
+    if (name == "rawNewInbox") return NATIVE_NEW_INBOX;
+    if (name == "rawCloseInbox") return NATIVE_CLOSE_INBOX;
+    if (name == "rawTrySend") return NATIVE_TRY_SEND;
+    if (name == "rawSpawnActorBounded") return NATIVE_ACTOR_SPAWN_BOUNDED;
     return -1;
 }
 
@@ -260,6 +269,7 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_TASK_INPUT:
         case NATIVE_ACTOR_SPAWN: case NATIVE_SEND: case NATIVE_RECEIVE: case NATIVE_MAIL_MSG:
         case NATIVE_MAIL_FROM: case NATIVE_MAIL_REASON: case NATIVE_MAIN_INBOX: case NATIVE_SELF_ID:
+        case NATIVE_NEW_INBOX: case NATIVE_CLOSE_INBOX: case NATIVE_TRY_SEND: case NATIVE_ACTOR_SPAWN_BOUNDED:
         case NATIVE_READ_ALL_STDIN: return NRET_PLAIN;
         default:                 return NRET_RESULT;
     }
@@ -286,7 +296,9 @@ inline int native_arity(int id) {
         case NATIVE_ACTOR_SPAWN:
         case NATIVE_SEND:
         case NATIVE_RECEIVE:
+        case NATIVE_TRY_SEND:
         case NATIVE_RUN_PROCESS: return 2;
+        case NATIVE_ACTOR_SPAWN_BOUNDED:
         case NATIVE_POLL:        return 3;
         case NATIVE_READ_FILE:
         case NATIVE_GET_ENV:
@@ -315,6 +327,8 @@ inline int native_arity(int id) {
         case NATIVE_MAIL_REASON:
         case NATIVE_HAND_OFF:
         case NATIVE_TAKE:
+        case NATIVE_NEW_INBOX:
+        case NATIVE_CLOSE_INBOX:
         case NATIVE_SHA256:
         case NATIVE_F64_TO_BYTES: return 1;
         case NATIVE_NANO_TIME:

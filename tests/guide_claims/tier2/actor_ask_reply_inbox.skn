@@ -1,0 +1,25 @@
+// CLAIM: `ask` waits for the answer on an inbox of its own, so the main inbox's other mail is neither
+//        taken for the answer nor lost; the reply type comes from the address the request carries.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: ok reply 49 then 99
+use std::actor::*
+
+struct Req { n: Int, boss: Pid[Int], replyTo: Pid[Int] }
+
+fn squarer(inbox: Inbox[Req], unused: Int) -> () {
+  for r in inbox.messages() {
+    send(r.boss, 99)                  // first something for the main inbox ...
+    send(r.replyTo, r.n * r.n)        // ... then the answer
+  }
+}
+
+let me: Inbox[Int] = mainInbox()
+let s = spawnActor(squarer, 0)
+match ask(s, fn(rt) { Req { n: 7, boss: me.pid(), replyTo: rt } }, 5000) {
+  Ok(v) => print("reply ${v}"),
+  Err(e) => print("${e}"),
+}
+match me.receive() {
+  Mail::Msg(v) => print(" then ${v}"),
+  _ => print(" nothing"),
+}

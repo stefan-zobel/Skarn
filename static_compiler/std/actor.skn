@@ -27,6 +27,20 @@
 //     fn echo(inbox: Inbox[Ask], unused: Int) -> () {
 //       for ask in inbox.messages() { send(ask.replyTo, ask.n * 2) }
 //     }
+//
+// MORE THAN ONE INBOX. An actor (or the main program) may make further inboxes with `newInbox()`,
+// each with its own message type and address -- typically one per request whose reply it waits
+// for, so the reply neither mixes with nor waits behind the rest of its mail. `ask(p, make, ms)`
+// is exactly that: it makes a reply inbox, sends `make(replyAddress)`, waits at most `ms` and
+// closes the inbox again. Close an inbox you made yourself with `inbox.close()` when you are done;
+// the end of the actor closes all of them.
+//
+// BACK-PRESSURE. An inbox may be BOUNDED: `spawnActorBounded(f, init, n)` starts an actor whose main
+// inbox holds at most n messages, and `newBoundedInbox(n)` makes such an extra inbox. A `send` to a
+// full inbox WAITS until the receiver has taken a message, so a fast sender is slowed to the pace
+// of its receiver instead of filling its memory; `trySend` never waits and reports Full instead.
+// Exit reports and Stop always get through. Two actors that each wait to send to the other's full
+// inbox wait forever -- the runtime does not detect that.
 
 // An actor's address. Only `spawnActor` and `inbox.pid()` make one.
 pub struct Pid[M] { id: Int }
@@ -62,6 +76,56 @@ pub fn send[M](p: Pid[M], m: M) -> Bool { rawSend(p, m) }
 // The main program's own inbox. Once per program.
 pub fn mainInbox[M]() -> Inbox[M] { Inbox { id: rawMainInbox() } }
 
+// Start `f(inbox, init)` as an actor whose inbox holds at most `capacity` messages: a `send` to it
+// waits while it is full.
+pub fn spawnActorBounded[M, I](f: fn(Inbox[M], I) -> (), init: I, capacity: Int) -> Pid[M] {
+  Pid { id: rawSpawnActorBounded(_actorMain, ActorStart { f: f, init: init }, capacity) }
+}
+
+// What `trySend` reports: the message was queued, the inbox is full (nothing was queued), or the
+// receiver no longer runs.
+pub enum SendResult { Sent, Full, Gone }
+
+// Send `m` to `p` without ever waiting.
+pub fn trySend[M](p: Pid[M], m: M) -> SendResult {
+  let r = rawTrySend(p, m)
+  if r == 0 { SendResult::Sent } else if r == 1 { SendResult::Full } else { SendResult::Gone }
+}
+
+// A further inbox of this actor (or of the main program), with its own message type and address.
+// Annotate it: `let rx: Inbox[Reply] = newInbox()`.
+pub fn newInbox[M]() -> Inbox[M] { Inbox { id: rawNewInbox(0) } }
+
+// A further inbox that holds at most `capacity` messages.
+pub fn newBoundedInbox[M](capacity: Int) -> Inbox[M] {
+  if capacity < 1 { panic("newBoundedInbox: the capacity must be at least 1") }
+  Inbox { id: rawNewInbox(capacity) }
+}
+
+// Why an `ask` got no reply: the receiver no longer runs, no reply came in time, or the program is
+// ending.
+pub enum AskError { Gone, Timeout, Stopped }
+
+// Request and reply. `make` builds the request from the address to reply to; the reply is awaited
+// on an inbox of its own for at most `timeoutMs` (the wait for room in a full receiver comes on
+// top), and that inbox is closed again whatever happens, so a late reply is dropped.
+//
+//     let r = ask(counter, fn(me) { Query::Total(me) }, 1000)
+pub fn ask[M, R](p: Pid[M], make: fn(Pid[R]) -> M, timeoutMs: Int) -> Result[R, AskError] {
+  let rx: Inbox[R] = newInbox()
+  let result = if !send(p, make(rx.pid())) {
+    Err(AskError::Gone)
+  } else {
+    match rx.receiveTimeout(timeoutMs) {
+      Some(Mail::Msg(reply)) => Ok(reply),
+      Some(_) => Err(AskError::Stopped),
+      None => Err(AskError::Timeout)
+    }
+  }
+  rx.close()
+  result
+}
+
 impl[M] Pid[M] {
   // This actor's id, to compare with the one in an exit report.
   fn actorId(self) -> ActorId { ActorId { id: self.id } }
@@ -79,6 +143,10 @@ impl[M] Inbox[M] {
 
   // The address of the actor this inbox belongs to -- to hand out, e.g. inside a message.
   fn pid(self) -> Pid[M] { Pid { id: self.id } }
+
+  // Close an inbox made with `newInbox`: later sends to it answer false (trySend: Gone), and what
+  // it still holds is dropped. The main inbox cannot be closed; it ends with its actor.
+  fn close(self) -> () { rawCloseInbox(self) }
 
   // The messages, one by one, as a lazy iterator that ends at Stop -- so an actor's whole loop can be
   // `for m in inbox.messages() { .. }`. Exit reports are SKIPPED; an actor that needs them (because it

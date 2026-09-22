@@ -210,6 +210,11 @@ struct NetRegistry {
 //
 // Nothing is shared between two heaps: every value crosses as a value-codec buffer, encoded in
 // the sender's heap and decoded in the receiver's.
+//
+// An actor may own more than one INBOX: its main one, whose id is the actor's, and extra ones it
+// makes (rawNewInbox), each with its own world-wide id -- typically one per request whose reply it
+// waits for. Only the owner receives from an inbox; the end of the owner closes them all. Any inbox
+// may be BOUNDED: then a send to it waits while it is full (back-pressure).
 // =============================================================================
 
 // One message in a mailbox. MAIL_EXITED reports that an actor this isolate started has FAULTED
@@ -223,16 +228,30 @@ struct Mail {
     std::string          reason;       // MAIL_EXITED: its fault message
 };
 
-// An actor's (or the root's) queue. Unbounded in v1. `dead` is set when its owner has ended, and
-// from then on a send is refused (the sender learns it from rawSend's Bool). `stop_seen`: after an
-// actor has received Stop once, every further receive answers Stop again, so any loop ends.
+// One inbox's queue: an actor's main inbox (its id is the actor's), the root's (id 0), or an extra
+// inbox an actor or the root made with rawNewInbox. Only its OWNER receives from it.
+//   * `dead` is set when the inbox is closed -- by rawCloseInbox or because its owner ended -- and
+//     from then on a send is refused (the sender learns it from rawSend's Bool).
+//   * `capacity` bounds the MESSAGES in the queue (0 = unbounded). Exit reports and Stop are
+//     system mail and always enter, so a full inbox can still be stopped and told of a crash. A send
+//     to a full inbox waits on `space` until a receive makes room, the inbox dies, or the world ends
+//     (`released`) -- the last so that no sender blocked here can hold up the world's final join.
+//   * `stop_seen`: once Stop has been received, every further receive answers Stop again, so any
+//     loop ends.
 struct Mailbox {
+    enum Offer { SENT, FULL, GONE };
     std::mutex              m;
-    std::condition_variable cv;
+    std::condition_variable cv;                  // a receiver waits for mail
+    std::condition_variable space;               // a sender waits for room (bounded inboxes only)
     std::deque<Mail>        q;
+    int64_t                 owner     = 0;       // the isolate that receives from it
+    size_t                  capacity  = 0;       // messages; 0 = unbounded
+    size_t                  messages  = 0;       // MAIL_MSG entries in q
     bool                    dead      = false;
+    bool                    released  = false;   // the world is ending: a full inbox refuses
     bool                    stopped   = false;   // Stop has been queued
     bool                    stop_seen = false;   // ... and received
+    // System mail (MAIL_EXITED, MAIL_STOP): never waits, ignores the capacity.
     bool put(Mail&& mail) {
         {
             std::lock_guard<std::mutex> lk(m);
@@ -243,6 +262,35 @@ struct Mailbox {
         cv.notify_one();
         return true;
     }
+    // A message. `wait`: block while the inbox is full (rawSend); otherwise answer FULL (rawTrySend).
+    Offer offer(Mail&& mail, bool wait) {
+        {
+            std::unique_lock<std::mutex> lk(m);
+            if (capacity != 0 && wait)
+                space.wait(lk, [&] { return dead || released || messages < capacity; });
+            if (dead) return GONE;
+            if (capacity != 0 && messages >= capacity) return wait ? GONE : FULL;
+            q.push_back(std::move(mail));
+            ++messages;
+        }
+        cv.notify_one();
+        return SENT;
+    }
+    // Closing: refuse every later send, drop what is queued, and wake anyone waiting on either side.
+    void close() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            dead = true;
+            q.clear();
+            messages = 0;
+        }
+        cv.notify_all();
+        space.notify_all();
+    }
+    void release() {
+        { std::lock_guard<std::mutex> lk(m); released = true; }
+        space.notify_all();
+    }
 };
 
 // One task or actor. The fields below `joined` belong to a TASK: written by its thread, read by
@@ -251,7 +299,7 @@ struct Isolate {
     int64_t                  id      = 0;
     int64_t                  starter = 0;       // the isolate that started it (0 = the root)
     bool                     actor   = false;
-    std::shared_ptr<Mailbox> mailbox;           // actors only
+    std::shared_ptr<Mailbox> mailbox;           // actors only: the main inbox (its id is the actor's)
     std::thread              thread;
     std::mutex               join_m;            // one joiner at a time: the starter, or the world
     bool                     thread_joined = false;
@@ -303,6 +351,10 @@ struct World {
     std::unordered_map<int64_t, std::shared_ptr<Isolate>> isolates;
     int64_t                   next_id  = 1;       // 0 is the root
     std::shared_ptr<Mailbox>  main_mailbox = std::make_shared<Mailbox>();
+    // Every open inbox by id: the root's (0), each actor's main inbox (under the actor's id) and the
+    // extra ones (ids from the same counter as the isolates, so one id names one thing). A closed
+    // inbox leaves this map, so a send to it finds nothing.
+    std::unordered_map<int64_t, std::shared_ptr<Mailbox>> mailboxes{ { 0, main_mailbox } };
     bool                      main_inbox_taken = false;
     bool                      stopping = false;
     // Sockets in transit between isolates (rawHandOff -> rawTake): ticket -> OS socket. A socket here
@@ -315,13 +367,43 @@ struct World {
         auto it = isolates.find(id);
         return it == isolates.end() ? nullptr : it->second;
     }
-    // The mailbox an id addresses: the root's (id 0) or an actor's; null for anything else.
+    // The open inbox an id addresses; null for anything else (a task, a closed inbox, a stranger).
     std::shared_ptr<Mailbox> mailbox_of(int64_t id) {
-        if (id == 0) return main_mailbox;
-        auto iso = find(id);
-        return iso && iso->actor ? iso->mailbox : nullptr;
+        std::lock_guard<std::mutex> lk(m);
+        auto it = mailboxes.find(id);
+        return it == mailboxes.end() ? nullptr : it->second;
     }
-    // The end of the world: Stop to every actor, then join every thread -- repeatedly, because an
+    // Registers a new inbox for `owner` under `id`. Caller holds `m`. An actor's inbox made while
+    // the world ends gets Stop at once, like an actor born then.
+    void add_mailbox_locked(int64_t id, const std::shared_ptr<Mailbox>& box) {
+        mailboxes.emplace(id, box);
+        if (stopping && box->owner != 0) { box->put(Mail{ MAIL_STOP, {}, 0, {} }); box->release(); }
+    }
+    // Closes one inbox, or every inbox an isolate owns (its end).
+    void close_mailbox(int64_t id) {
+        std::shared_ptr<Mailbox> box;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            auto it = mailboxes.find(id);
+            if (it == mailboxes.end()) return;
+            box = it->second;
+            mailboxes.erase(it);
+        }
+        box->close();
+    }
+    void close_mailboxes_of(int64_t owner) {
+        std::vector<std::shared_ptr<Mailbox>> boxes;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            for (auto it = mailboxes.begin(); it != mailboxes.end();) {
+                if (it->second->owner == owner) { boxes.push_back(it->second); it = mailboxes.erase(it); }
+                else ++it;
+            }
+        }
+        for (auto& b : boxes) b->close();
+    }
+    // The end of the world: Stop into every actor's inboxes (an actor may be waiting on any of them),
+    // release every sender blocked on a full inbox, then join every thread -- repeatedly, because an
     // actor may still start others while it winds down (those get Stop at birth, see spawn).
     ~World() {
         // The root's own partial line was written BEFORE anything the actors print while they stop;
@@ -330,8 +412,10 @@ struct World {
         {
             std::lock_guard<std::mutex> lk(m);
             stopping = true;
-            for (auto& [id, iso] : isolates)
-                if (iso->actor) iso->mailbox->put(Mail{ MAIL_STOP, {}, 0, {} });
+            for (auto& [id, box] : mailboxes) {
+                if (box->owner != 0) box->put(Mail{ MAIL_STOP, {}, 0, {} });
+                box->release();
+            }
         }
         for (;;) {
             std::shared_ptr<Isolate> next;
@@ -343,10 +427,7 @@ struct World {
             if (!next) break;
             next->join_thread();
         }
-        {
-            std::lock_guard<std::mutex> lk(main_mailbox->m);
-            main_mailbox->dead = true;
-        }
+        close_mailboxes_of(0);   // the root's own inboxes: every actor has ended, nobody sends
         // Every isolate has ended, so nobody can take these any more.
         for (auto& [ticket, s] : handoffs) sock_close(s);
     }
@@ -388,14 +469,21 @@ int LineForwardBuf::sync() {
     return 0;
 }
 
-// This execution's place in its world (VM::isolate). The root has id 0 and gets a mailbox only
-// through rawMainInbox; an actor has its own; a task has none. `current` is the mail rawReceive
-// took last, which rawMailMsg / rawMailFrom / rawMailReason then read.
+// This execution's place in its world (VM::isolate). The root has id 0 and gets its main inbox only
+// through rawMainInbox; an actor has its own from the start; a task has none and may make none.
+// `inboxes` are the open inboxes this isolate owns, by id -- a copy of its entries in the world's
+// map, so a receive finds its queue without taking the world's lock (usually one or two entries).
+// `current` is the mail rawReceive took last, which rawMailMsg / rawMailFrom / rawMailReason read.
 struct IsolateLocal {
     World*                   world = nullptr;
     int64_t                  id    = 0;
-    std::shared_ptr<Mailbox> mailbox;
+    bool                     actor = false;
+    std::vector<std::pair<int64_t, std::shared_ptr<Mailbox>>> inboxes;
     Mail                     current;
+    Mailbox* inbox(int64_t box_id) const {
+        for (const auto& [i, b] : inboxes) if (i == box_id) return b.get();
+        return nullptr;
+    }
 };
 
 // =============================================================================
@@ -473,7 +561,8 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
     if (task) {
         local.world        = task->world;
         local.id           = task->isolate->id;
-        local.mailbox      = task->isolate->mailbox;
+        local.actor        = task->isolate->actor;
+        if (task->isolate->mailbox) local.inboxes.emplace_back(local.id, task->isolate->mailbox);
         vm.task_input      = task->input;
         vm.task_input_size = task->input_size;
         vm.task_entry_pc   = task->entry_pc;
@@ -2068,8 +2157,10 @@ static Value native_sha256(Value* args, uint8_t nargs, Context* ctx) {
 
 // =============================================================================
 // Isolate natives -- tasks (rawSpawn / rawJoin / rawTaskTake), actors (rawSpawnActor / rawSend /
-// rawReceive / rawMailMsg / rawMailFrom / rawMailReason / rawMainInbox), and for both rawTaskInput
-// and rawSelfId. The runtime they share (World, Isolate, Mailbox) is described above execute().
+// rawReceive / rawMailMsg / rawMailFrom / rawMailReason / rawMainInbox), their extra and bounded
+// inboxes (rawNewInbox / rawCloseInbox / rawTrySend / rawSpawnActorBounded), and for both
+// rawTaskInput and rawSelfId. The runtime they share (World, Isolate, Mailbox) is described above
+// execute().
 //
 // HOW AN ISOLATE STARTS AT A FUNCTION. execute() normally begins at instruction 0, the top-level
 // code. An isolate instead gets the world's code with a short ENTRY STUB appended -- appending
@@ -2108,9 +2199,10 @@ static std::vector<uint32_t> task_code(const std::vector<uint32_t>& program, uin
 //   * A TASK buffers its output and hands it over at join; on success its result is encoded
 //     straight after execute() returns (encode() allocates nothing, so the heap cannot collect
 //     between HALT and the copy).
-//   * An ACTOR writes its output a line at a time to the root's stream. When it ends its mailbox is
-//     marked dead FIRST, so a sender told about the crash can no longer reach it; then, if it
-//     FAULTED, its starter gets MAIL_EXITED (v1 reports crashes only).
+//   * An ACTOR writes its output a line at a time to the root's stream. When it ends all its inboxes
+//     are closed FIRST, so a sender told about the crash can no longer reach it (and a sender blocked
+//     on a full inbox of it is let go); then, if it FAULTED, its starter gets MAIL_EXITED (v1 reports
+//     crashes only).
 static void run_isolate(World* world, std::shared_ptr<Isolate> iso, uint16_t fn_id) {
     std::ostringstream task_out;
     LineForwardBuf     actor_buf(world, /*always_lines=*/true);
@@ -2150,11 +2242,7 @@ static void run_isolate(World* world, std::shared_ptr<Isolate> iso, uint16_t fn_
         return;
     }
     actor_buf.flush_partial();
-    {
-        std::lock_guard<std::mutex> lk(iso->mailbox->m);
-        iso->mailbox->dead = true;
-        iso->mailbox->q.clear();
-    }
+    world->close_mailboxes_of(iso->id);   // the main inbox and every extra one
     if (faulted)
         if (auto box = world->mailbox_of(iso->starter))
             box->put(Mail{ MAIL_EXITED, {}, iso->id, std::move(fault) });
@@ -2178,7 +2266,8 @@ static Value handle_id(Value v) {
 // therefore registers the new record before the world can be done with it; the next pass of the
 // world's join loop finds it. Registering first would let that loop see a record whose `thread` is
 // still being assigned. Nothing else needs the record before spawn returns its id.
-static int64_t start_isolate(Value* args, uint8_t nargs, Context* ctx, bool actor, const char* who) {
+static int64_t start_isolate(Value* args, uint8_t nargs, Context* ctx, bool actor, const char* who,
+                             size_t capacity = 0) {
     VM* vm = ctx->vm;
     IsolateLocal* local = vm->isolate;
     if (!local || !local->world)
@@ -2199,22 +2288,26 @@ static int64_t start_isolate(Value* args, uint8_t nargs, Context* ctx, bool acto
     }
     if (actor) {
         iso->mailbox = std::make_shared<Mailbox>();
+        iso->mailbox->capacity = capacity;
         world->actors_started.store(true, std::memory_order_release);
     }
     {
+        // The main inbox is registered together with the id, before the thread exists: the actor may
+        // receive at once, and a world ending from now on finds it (born while the world ends: Stop
+        // at once, in add_mailbox_locked).
         std::lock_guard<std::mutex> lk(world->m);
         iso->id = world->next_id++;
+        if (actor) { iso->mailbox->owner = iso->id; world->add_mailbox_locked(iso->id, iso->mailbox); }
     }
     try {
         iso->thread = std::thread(run_isolate, world, iso, static_cast<uint16_t>(fn_id));
     } catch (const std::system_error& e) {
+        if (actor) world->close_mailbox(iso->id);
         raise_located(ctx, (std::string(who) + ": could not start a thread: " + e.what()).c_str());
     }
     {
         std::lock_guard<std::mutex> lk(world->m);
         world->isolates.emplace(iso->id, iso);
-        if (actor && world->stopping)          // born while the world ends: stop at once
-            iso->mailbox->put(Mail{ MAIL_STOP, {}, 0, {} });
     }
     return iso->id;
 }
@@ -2302,6 +2395,16 @@ static Value native_actor_spawn(Value* args, uint8_t nargs, Context* ctx) {
     return Value::fromSigned48(start_isolate(args, nargs, ctx, /*actor=*/true, "spawnActor"));
 }
 
+// rawSpawnActorBounded(fn, arg, capacity) -> Int: an actor whose main inbox holds at most
+// `capacity` messages; a send to it waits while it is full (back-pressure).
+static Value native_actor_spawn_bounded(Value* args, uint8_t nargs, Context* ctx) {
+    const Value cap = nargs >= 3 ? args[2] : Value::fromNil();
+    if (!cap.isInt() || cap.asSigned48() < 1)
+        raise_located(ctx, "spawnActorBounded: the capacity must be at least 1");
+    return Value::fromSigned48(start_isolate(args, 2, ctx, /*actor=*/true, "spawnActorBounded",
+                                             static_cast<size_t>(cap.asSigned48())));
+}
+
 // rawMainInbox() -> Int. Gives the ROOT a mailbox, so it can receive replies and crash reports.
 // ONCE: the Inbox it becomes fixes the message type, and a second one of another type could read
 // the same queue as something else.
@@ -2315,38 +2418,116 @@ static Value native_main_inbox(Value*, uint8_t, Context* ctx) {
             raise_located(ctx, "mainInbox: the main inbox was already taken");
         local->world->main_inbox_taken = true;
     }
-    local->mailbox = local->world->main_mailbox;
+    local->inboxes.emplace_back(0, local->world->main_mailbox);
     return Value::fromSigned48(0);
 }
 
-// rawSend(pid, msg) -> Bool. The message is encoded HERE, in the sender's heap. False when the
-// addressee no longer runs (or never was an actor); the message is then dropped, as in Erlang.
-static Value native_send(Value* args, uint8_t nargs, Context* ctx) {
+// rawNewInbox(capacity) -> Int, the id of a new inbox THIS isolate owns: a second address, typically
+// for replies, so that they neither mix with nor wait behind the main inbox's mail. Capacity 0 =
+// unbounded. For actors and the root; a task has no mail at all. The inbox lives until rawCloseInbox
+// or the end of its owner.
+static Value native_new_inbox(Value* args, uint8_t nargs, Context* ctx) {
     IsolateLocal* local = ctx->vm->isolate;
-    const Value   id    = handle_id(nargs >= 1 ? args[0] : Value::fromNil());
-    if (!local || !local->world || !id.isInt() || nargs < 2)
-        raise_located(ctx, "send: not an actor address");
-    Mail mail;
-    mail.kind = MAIL_MSG;
-    try {
-        mail.buf = vcodec::encode(args[1]);
-    } catch (const vcodec::ValueCodecError& e) {
-        raise_located(ctx, (std::string("send: the message cannot be sent: ") + e.what()).c_str());
+    if (!local || !local->world || (local->id != 0 && !local->actor))
+        raise_located(ctx, "newInbox: only an actor or the main program can have an inbox");
+    const Value cap = nargs >= 1 ? args[0] : Value::fromNil();
+    if (!cap.isInt() || cap.asSigned48() < 0)
+        raise_located(ctx, "newInbox: the capacity must be 0 (unbounded) or more");
+    auto box = std::make_shared<Mailbox>();
+    box->owner    = local->id;
+    box->capacity = static_cast<size_t>(cap.asSigned48());
+    int64_t id;
+    {
+        std::lock_guard<std::mutex> lk(local->world->m);
+        id = local->world->next_id++;
+        local->world->add_mailbox_locked(id, box);
     }
-    auto box = local->world->mailbox_of(id.asSigned48());
-    return Value::fromBool(box && box->put(std::move(mail)));
+    local->inboxes.emplace_back(id, std::move(box));
+    return Value::fromSigned48(id);
 }
 
-// This isolate's mailbox, checked against the inbox the program names. An Inbox cannot be sent,
-// so a mismatch means a forged one.
+// This isolate's inbox that `inbox` names. An Inbox cannot be sent, so an inbox of another isolate
+// means a forged one; one that is not open any more was closed.
 static Mailbox& own_mailbox(Value inbox, Context* ctx, const char* who) {
     IsolateLocal* local = ctx->vm->isolate;
     const Value   id    = handle_id(inbox);
-    if (!local || !local->mailbox)
-        raise_located(ctx, (std::string(who) + ": this execution has no inbox (mainInbox first?)").c_str());
-    if (!id.isInt() || id.asSigned48() != local->id)
-        raise_located(ctx, (std::string(who) + ": this inbox belongs to another actor").c_str());
-    return *local->mailbox;
+    // Not an open inbox of ours. A task has none at all, and the root none at 0 before mainInbox;
+    // an open one of someone else is a forged Inbox; anything else was closed (the closing isolate
+    // keeps no record of it -- an actor making an inbox per request would grow it without end).
+    const bool has_mail = local && local->world && (local->actor || local->id == 0);
+    if (has_mail && id.isInt()) {
+        const int64_t i = id.asSigned48();
+        if (Mailbox* box = local->inbox(i)) return *box;
+        if (auto box = local->world->mailbox_of(i); box && box->owner != local->id)
+            raise_located(ctx, (std::string(who) + ": this inbox belongs to another actor").c_str());
+        if (!(i == 0 && local->id == 0))
+            raise_located(ctx, (std::string(who) + ": this inbox is closed").c_str());
+    }
+    raise_located(ctx, (std::string(who) + ": this execution has no inbox (mainInbox first?)").c_str());
+}
+
+// rawCloseInbox(inbox) -> (). Closes an extra inbox of this isolate: later sends to it answer false
+// and whatever is queued is dropped -- a late reply nobody waits for any more cannot pile up. The
+// MAIN inbox cannot be closed: exit reports and Stop arrive there, and it ends with its owner.
+static Value native_close_inbox(Value* args, uint8_t nargs, Context* ctx) {
+    (void)own_mailbox(nargs >= 1 ? args[0] : Value::fromNil(), ctx, "close");
+    IsolateLocal* local = ctx->vm->isolate;
+    const int64_t id    = handle_id(args[0]).asSigned48();
+    if (id == local->id)
+        raise_located(ctx, "close: the main inbox cannot be closed (it ends with its owner)");
+    local->world->close_mailbox(id);
+    std::erase_if(local->inboxes, [id](const auto& e) { return e.first == id; });
+    return Value::fromNil();
+}
+
+// The message of a send, encoded HERE, in the sender's heap -- before any waiting, so a sender
+// blocked on a full inbox holds no heap object.
+static Mail encode_message(Value* args, uint8_t nargs, Context* ctx, const char* who) {
+    Mail mail;
+    mail.kind = MAIL_MSG;
+    try {
+        mail.buf = vcodec::encode(nargs >= 2 ? args[1] : Value::fromNil());
+    } catch (const vcodec::ValueCodecError& e) {
+        raise_located(ctx, (std::string(who) + ": the message cannot be sent: " + e.what()).c_str());
+    }
+    return mail;
+}
+static std::shared_ptr<Mailbox> addressee(Value* args, uint8_t nargs, Context* ctx, const char* who) {
+    IsolateLocal* local = ctx->vm->isolate;
+    const Value   id    = handle_id(nargs >= 1 ? args[0] : Value::fromNil());
+    if (!local || !local->world || !id.isInt() || nargs < 2)
+        raise_located(ctx, (std::string(who) + ": not an actor address").c_str());
+    return local->world->mailbox_of(id.asSigned48());
+}
+
+// rawSend(pid, msg) -> Bool. False when the addressee no longer runs, its inbox was closed, or the
+// program is ending while the inbox is full; the message is then dropped, as in Erlang. To a FULL
+// bounded inbox it waits until there is room (back-pressure). Waiting on one's own full inbox could
+// never end -- only this isolate empties it -- so that is a located fault instead.
+static Value native_send(Value* args, uint8_t nargs, Context* ctx) {
+    auto box  = addressee(args, nargs, ctx, "send");
+    Mail mail = encode_message(args, nargs, ctx, "send");
+    if (!box) return Value::fromBool(false);
+    if (box->capacity != 0 && box->owner == ctx->vm->isolate->id) {
+        if (box->offer(std::move(mail), /*wait=*/false) == Mailbox::FULL)
+            raise_located(ctx, "send: this actor's own inbox is full, and waiting for room would never end");
+        return Value::fromBool(true);   // SENT (GONE is impossible: the owner is running)
+    }
+    return Value::fromBool(box->offer(std::move(mail), /*wait=*/true) == Mailbox::SENT);
+}
+
+// rawTrySend(pid, msg) -> Int: 0 sent, 1 the inbox is full (nothing was queued), 2 the addressee is
+// gone. Never waits.
+static Value native_try_send(Value* args, uint8_t nargs, Context* ctx) {
+    auto box  = addressee(args, nargs, ctx, "trySend");
+    Mail mail = encode_message(args, nargs, ctx, "trySend");
+    if (!box) return Value::fromSigned48(2);
+    switch (box->offer(std::move(mail), /*wait=*/false)) {
+        case Mailbox::SENT: return Value::fromSigned48(0);
+        case Mailbox::FULL: return Value::fromSigned48(1);
+        case Mailbox::GONE: return Value::fromSigned48(2);
+    }
+    return Value::fromSigned48(2);
 }
 
 // rawReceive(inbox, timeoutMs) -> Int: MAIL_NONE (the timeout passed), MAIL_MSG, MAIL_EXITED or
@@ -2368,6 +2549,10 @@ static Value native_receive(Value* args, uint8_t nargs, Context* ctx) {
     local->current = std::move(box.q.front());
     box.q.pop_front();
     if (local->current.kind == MAIL_STOP) box.stop_seen = true;
+    if (local->current.kind == MAIL_MSG) {
+        --box.messages;
+        if (box.capacity != 0) { lk.unlock(); box.space.notify_one(); }   // room for one sender
+    }
     return Value::fromSigned48(local->current.kind);
 }
 
@@ -2508,5 +2693,9 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_SELF_ID]      = native_self_id;
     t[NATIVE_HAND_OFF]     = native_hand_off;
     t[NATIVE_TAKE]         = native_take;
+    t[NATIVE_NEW_INBOX]    = native_new_inbox;
+    t[NATIVE_CLOSE_INBOX]  = native_close_inbox;
+    t[NATIVE_TRY_SEND]     = native_try_send;
+    t[NATIVE_ACTOR_SPAWN_BOUNDED] = native_actor_spawn_bounded;
     return t;
 }

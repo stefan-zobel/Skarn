@@ -1363,6 +1363,19 @@ private:
             [S](const std::vector<TyPtr>&)   { return S; });
         add_native("rawMainInbox", {}, ty_int(), STD_ACTOR);
         add_native("rawSelfId",    {}, ty_int(), STD_ACTOR);
+        // Extra and bounded inboxes. rawNewInbox returns the bare id (std::actor wraps it in the
+        // Inbox[M] the checker validated at the newInbox call); rawTrySend answers 0 / 1 / 2.
+        add_native("rawNewInbox",  { ty_int() }, ty_int(), STD_ACTOR);
+        add_generic_native("rawCloseInbox", { "M" },
+            [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ inbox_of(v[0]) }; },
+            [](const std::vector<TyPtr>&)    { return ty_unit(); });
+        add_generic_native("rawTrySend", { "M" },
+            [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ pid_of(v[0]), v[0] }; },
+            [](const std::vector<TyPtr>&)    { return ty_int(); });
+        add_generic_native("rawSpawnActorBounded", { "A", "R" },
+            [](const std::vector<TyPtr>& v) {
+                return std::vector<TyPtr>{ make_fn({ v[0] }, v[1]), v[0], ty_int() }; },
+            [](const std::vector<TyPtr>&)   { return ty_int(); });
     }
 
     // Is a gated native `name` callable from the module currently being checked? A native NOT in
@@ -3625,7 +3638,9 @@ private:
             // `spawn`'s rules (a named task function, sendable types) are checked at its CALL; a
             // `spawn` passed around as a value would be called where nothing checks them.
             if ((key == std_spawn() && cur_module_ != STD_TASK) ||
-                ((key == std_spawnActor() || key == std_mainInbox()) && cur_module_ != STD_ACTOR)) {
+                ((key == std_spawnActor() || key == std_spawnActorBounded() || key == std_mainInbox() ||
+                  key == std_newInbox() || key == std_newBoundedInbox() || key == std_ask()) &&
+                 cur_module_ != STD_ACTOR)) {
                 error(e.line, e.col, "'" + short_name(key) + "' can only be called, not used as a value");
                 return ty_error();
             }
@@ -4247,15 +4262,23 @@ private:
         if (expected) tc_.subsumes(apply(ret), apply(expected));
         discharge_bounds(sig.generics, m, node.line, node.col, &what);
         if (is_std_sig(sig, std_spawn(), STD_TASK))                check_spawn_site(args);
-        else if (is_std_sig(sig, std_spawnActor(), STD_ACTOR))     check_spawn_actor_site(args);
-        else if (is_std_sig(sig, std_mainInbox(), STD_ACTOR))      check_main_inbox_site(ret, node);
+        else if (is_std_sig(sig, std_spawnActor(), STD_ACTOR))     check_spawn_actor_site(args, "spawnActor");
+        else if (is_std_sig(sig, std_spawnActorBounded(), STD_ACTOR))
+            check_spawn_actor_site(args, "spawnActorBounded");
+        else if (is_std_sig(sig, std_mainInbox(), STD_ACTOR))
+            check_new_inbox_site(ret, node, "the main inbox", "let inbox: Inbox[T] = mainInbox()");
+        else if (is_std_sig(sig, std_newInbox(), STD_ACTOR))
+            check_new_inbox_site(ret, node, "a new inbox", "let rx: Inbox[T] = newInbox()");
+        else if (is_std_sig(sig, std_newBoundedInbox(), STD_ACTOR))
+            check_new_inbox_site(ret, node, "a new inbox", "let rx: Inbox[T] = newBoundedInbox(n)");
+        else if (is_std_sig(sig, std_ask(), STD_ACTOR))            check_ask_site(ret, node);
         return apply(ret);
     }
 
-    // ----- Tasks and actors: what `spawn`, `spawnActor` and `mainInbox` accept ---------------------
-    // All three are ordinary generic fns in their std module, so every way of calling them -- bare,
-    // piped, module-qualified -- arrives in call_direct_fn, and these rules are checked there, on top of
-    // their types. Inside their own module they are plumbing and unchecked.
+    // ----- Tasks and actors: what `spawn`, `spawnActor`, the inbox makers and `ask` accept ----------
+    // All are ordinary generic fns in their std module, so every way of calling them -- bare, piped,
+    // module-qualified -- arrives in call_direct_fn, and these rules are checked there, on top of their
+    // types. Inside their own module they are plumbing and unchecked.
     bool is_std_sig(const FnSig& sig, const std::string& key, const char* owner) const {
         if (cur_module_ == owner) return false;
         const auto it = fns_.find(key);
@@ -4315,10 +4338,11 @@ private:
     // unified). What makes the new Pid[M] honest is M: every message sent to it will be copied, so M
     // must be sendable -- checked HERE, where the Pid is made, which is why `send` needs no check. The
     // start value I is copied once and must be sendable too.
-    void check_spawn_actor_site(const std::vector<Expr*>& args) {
-        if (args.size() != 2) return;
+    // spawnActorBounded(f, init, capacity) has the same rules.
+    void check_spawn_actor_site(const std::vector<Expr*>& args, const char* who) {
+        if (args.size() < 2) return;
         Expr& f = *args[0];
-        const FnSig* fsig = named_isolate_fn(f, "spawnActor", "an actor");
+        const FnSig* fsig = named_isolate_fn(f, who, "an actor");
         if (!fsig) return;
         const std::string name = display_name(static_cast<const IdentExpr&>(f).name);
         if (fsig->params.size() != 2) return;             // fails spawnActor's own type, reported there
@@ -4334,22 +4358,37 @@ private:
                   ") cannot be sent to an actor: it contains " + why);
     }
 
-    // mainInbox(): its message type comes only from the expected type (`let inbox: Inbox[T] =
-    // mainInbox()`), and it must be KNOWN here -- this is where the main program's Pid[M] is fixed --
-    // and sendable.
-    void check_main_inbox_site(const TyPtr& ret, Expr& node) {
+    // mainInbox() / newInbox() / newBoundedInbox(n): the message type comes only from the expected
+    // type (`let inbox: Inbox[T] = mainInbox()`), and it must be KNOWN here -- this is where the inbox's
+    // Pid[M] is fixed -- and sendable.
+    void check_new_inbox_site(const TyPtr& ret, Expr& node, const std::string& what, const char* how) {
         const TyPtr inbox = apply(ret);
         if (inbox->kind != TyKind::Named || inbox->args.size() != 1) return;
         const TyPtr m = apply(inbox->args[0]);
         if (m->kind == TyKind::Var) {
-            error(node.line, node.col, "the main inbox needs its message type here -- write "
-                  "`let inbox: Inbox[T] = mainInbox()`");
+            error(node.line, node.col, what + " needs its message type here -- write `" + how + "`");
             return;
         }
         TypeRenderer r;
         if (const std::string why = send_blocker(m); !why.empty())
-            error(node.line, node.col, "the main inbox's messages (" + r(m) +
-                  ") cannot be sent: they contain " + why);
+            error(node.line, node.col, what + "'s messages (" + r(m) + ") cannot be sent: they contain " + why);
+    }
+
+    // ask(p, make, timeoutMs) -> Result[R, AskError]: the reply type R is the message type of the reply
+    // inbox ask makes, so it gets the same rule -- known here, and sendable. It is fixed by `make`'s
+    // `Pid[R]` (typically through the request's reply field) or by the expected type.
+    void check_ask_site(const TyPtr& ret, Expr& node) {
+        const TyPtr res = apply(ret);
+        if (res->kind != TyKind::Named || res->args.size() != 2) return;
+        const TyPtr reply = apply(res->args[0]);
+        if (reply->kind == TyKind::Var) {
+            error(node.line, node.col, "ask needs the reply type here -- it comes from the request's reply "
+                  "address (`Pid[T]`) or from an annotation such as `let r: Result[T, AskError] = ask(..)`");
+            return;
+        }
+        TypeRenderer r;
+        if (const std::string why = send_blocker(reply); !why.empty())
+            error(node.line, node.col, "the reply (" + r(reply) + ") cannot be sent: it contains " + why);
     }
 
     // Why a value of type `t` cannot be copied to another task's heap ("" = it can). Sendable is plain
@@ -5799,10 +5838,10 @@ private:
         if (e.name == std_Task() && cur_module_ != STD_TASK)
             error(e.line, e.col, "a Task can only be created by `spawn`");
         // Likewise a Pid[M] promises that actor `id` receives M, and an Inbox is an actor's own; both are
-        // made only inside std::actor (spawnActor, inbox.pid(), mainInbox), where M is checked.
+        // made only inside std::actor (spawnActor, inbox.pid(), mainInbox, newInbox), where M is checked.
         if ((e.name == std_Pid() || e.name == std_Inbox()) && cur_module_ != STD_ACTOR)
             error(e.line, e.col, std::string(e.name == std_Pid() ? "a Pid" : "an Inbox") +
-                  " can only be created by std::actor (spawnActor, inbox.pid(), mainInbox)");
+                  " can only be created by std::actor (spawnActor, inbox.pid(), mainInbox, newInbox)");
         // A SocketHandOff is a ticket for a connection in transit: a forged one could take over
         // somebody else's connection. Only `c.handOff()` makes one.
         if (e.name == mangle_name(STD_NET, "SocketHandOff") && cur_module_ != STD_NET)

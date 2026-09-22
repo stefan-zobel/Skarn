@@ -343,8 +343,21 @@ A `Pid[M]` promises that the actor it names receives `M`. The checker keeps that
   but not an `Inbox`, the receiving end of one actor's mailbox.
 - **`mainInbox()`** gives the main program an inbox. Its message type comes only from an annotation
   (`let inbox: Inbox[T] = mainInbox()`); it must be known at the call and sendable.
-- **`spawnActor` and `mainInbox` can only be called**, never used as values.
+- **`newInbox()` / `newBoundedInbox(n)`** give an actor or the main program a further inbox, with the same
+  rule as `mainInbox`: an annotated, sendable message type.
+- **`spawnActorBounded(f, init, n)`** starts an actor whose inbox holds at most `n` messages, with the rules
+  of `spawnActor`.
+- **`ask(pid, make, timeoutMs) -> Result[R, AskError]`** makes a reply inbox, sends `make(replyAddress)`,
+  waits for the reply and closes the inbox. Its reply type `R` is fixed by the `Pid[R]` the request carries
+  (or by an annotation) and must be known at the call and sendable, because `R` is the message type of the
+  inbox it makes.
+- **These functions can only be called**, never used as values, so no call escapes the rules above.
 - **`Pid` and `Inbox` literals are an error outside `std::actor`.**
+
+A request that wants an answer does not need a selective receive: the answer goes to an inbox of its own,
+with its own type. A bounded inbox provides back-pressure — `send` waits while it is full, `trySend` reports
+`Full` instead — and exit reports and `Stop` always get through. None of this needs a checker rule beyond
+the ones above; the waiting is the runtime's.
 
 A connection cannot be a message: `TcpConn` stays unsendable, since its descriptor means something only in
 the actor that opened it. `std::net` moves it in two steps instead. `c.handOff()` detaches the connection

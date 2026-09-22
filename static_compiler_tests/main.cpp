@@ -9116,6 +9116,98 @@ void test_std_actor() {
         "let p: Pid[String] = Pid { id: 0 }\n0", "a Pid can only be created by std::actor"));
     check_true("actor_no_inbox_literal", check_has_p(U +
         "let i: Inbox[Int] = Inbox { id: 0 }\n0", "an Inbox can only be created by std::actor"));
+
+    // ---- extra inboxes, ask, and bounded inboxes (back-pressure) ----
+    const std::string COUNTER =
+        "enum Query { Add(Int), Total(Pid[Int]) }\n"
+        "fn counter(inbox: Inbox[Query], start: Int) -> () {\n"
+        "  let mut total = start\n"
+        "  for q in inbox.messages() {\n"
+        "    match q { Query::Add(n) => { total += n }, Query::Total(p) => { send(p, total) } }\n"
+        "  }\n"
+        "}\n";
+    // The reply goes to an inbox of its own; the reply type (Int) comes from the request's Pid[Int].
+    check_str("actor_ask_round_trip", cg_run_native(U + COUNTER +
+        "let c = spawnActor(counter, 10)\n"
+        "send(c, Query::Add(5))\nsend(c, Query::Add(7))\n"
+        "match ask(c, fn(me) { Query::Total(me) }, 5000) { Ok(t) => println(t), Err(e) => println(e) }\n"),
+        "22\n");
+    // The main inbox's own mail neither answers an ask nor is lost by one: the actor first sends 99 to
+    // the main program, then replies to the ask.
+    check_str("actor_ask_beside_main_inbox", cg_run_native(U + GET +
+        "struct Req { boss: Pid[Int], replyTo: Pid[String] }\n"
+        "fn both(inbox: Inbox[Req], unused: Int) -> () {\n"
+        "  for r in inbox.messages() { send(r.boss, 99)\n send(r.replyTo, \"reply\") }\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let b = spawnActor(both, 0)\n"
+        "match ask(b, fn(rt) { Req { boss: me.pid(), replyTo: rt } }, 5000) {\n"
+        "  Ok(s) => println(s), Err(e) => println(e) }\n"
+        "println(got(me.receive()))\n"), "reply\n99\n");
+    check_str("actor_ask_timeout", cg_run_native(U +
+        "fn deaf(inbox: Inbox[Pid[Int]], unused: Int) -> () { for p in inbox.messages() {} }\n"
+        "let d = spawnActor(deaf, 0)\n"
+        "match ask(d, fn(me) { me }, 20) { Ok(t) => println(t), Err(e) => println(e) }\n"), "Timeout\n");
+    check_str("actor_ask_gone", cg_run_native(U +
+        "fn crasher(inbox: Inbox[Pid[Int]], unused: Int) -> () { panic(\"boom\") }\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let x = spawnActor(crasher, 0)\n"
+        "match me.receive() { Mail::Exited(_, _) => {}, _ => println(\"?\") }\n"
+        "match ask(x, fn(r) { r }, 1000) { Ok(t) => println(t), Err(e) => println(e) }\n"), "Gone\n");
+    // An extra inbox of the main program: bounded to one message, and closed.
+    check_str("actor_bounded_extra_inbox", cg_run_native(U +
+        "let rx: Inbox[Int] = newBoundedInbox(1)\n"
+        "println(\"${trySend(rx.pid(), 1)} ${trySend(rx.pid(), 2)}\")\n"
+        "match rx.receive() { Mail::Msg(v) => println(v), _ => println(\"?\") }\n"
+        "println(trySend(rx.pid(), 3))\n"
+        "rx.close()\n"
+        "println(\"${send(rx.pid(), 4)} ${trySend(rx.pid(), 5)}\")\n"), "Sent Full\n1\nSent\nfalse Gone\n");
+    // Back-pressure: a bounded actor (capacity 2) that has not started reading is full after two
+    // messages. After "go" (through its own extra inbox) ten more blocking sends follow while it reads.
+    check_str("actor_bounded_back_pressure", cg_run_native(U +
+        "fn gated(inbox: Inbox[Int], boss: Pid[Pid[Int]]) -> () {\n"
+        "  let gate: Inbox[Int] = newInbox()\n"
+        "  send(boss, gate.pid())\n"
+        "  match gate.receive() { _ => {} }\n"
+        "  let mut sum = 0\n"
+        "  let mut n = 0\n"
+        "  for v in inbox.messages() { sum += v\n n += 1\n if n == 12 { println(\"sum ${sum}\") } }\n"
+        "}\n"
+        "let me: Inbox[Pid[Int]] = mainInbox()\n"
+        "let g = spawnActorBounded(gated, me.pid(), 2)\n"
+        "let gate = match me.receive() { Mail::Msg(p) => p, _ => panic(\"no gate\") }\n"
+        "println(\"${trySend(g, 1)} ${trySend(g, 2)} ${trySend(g, 3)}\")\n"
+        "send(gate, 0)\n"
+        "let mut i = 3\n"
+        "while i <= 12 { send(g, i)\n i += 1 }\n"), "Sent Sent Full\nsum 78\n");
+    auto faults_with = [&](const std::string& src, const char* needle) {
+        try { (void)cg_run_native(src); return false; }
+        catch (const std::exception& e) { return std::string(e.what()).find(needle) != std::string::npos; }
+    };
+    check_true("actor_main_inbox_cannot_close", faults_with(U +
+        "let me: Inbox[Int] = mainInbox()\nme.close()\n", "main inbox cannot be closed"));
+    check_true("actor_bounded_inbox_needs_room", faults_with(U +
+        "let rx: Inbox[Int] = newBoundedInbox(0)\n", "at least 1"));
+    check_true("actor_own_full_inbox_faults", faults_with(U +
+        "let rx: Inbox[Int] = newBoundedInbox(1)\nsend(rx.pid(), 1)\nsend(rx.pid(), 2)\n", "own inbox is full"));
+
+    check_true("actor_new_inbox_needs_type", check_has_p(U + "let rx = newInbox()\n0", "a new inbox needs its message type"));
+    check_true("actor_new_inbox_sendable", check_has_p(U +
+        "let rx: Inbox[fn(Int) -> Int] = newBoundedInbox(2)\n0", "a new inbox's messages"));
+    check_true("actor_new_inbox_not_a_value", check_has_p(U + "let f = newInbox\n0", "can only be called"));
+    check_true("actor_ask_not_a_value", check_has_p(U + "let f = ask\n0", "can only be called"));
+    check_true("actor_bounded_spawn_not_a_value", check_has_p(U + "let f = spawnActorBounded\n0", "can only be called"));
+    check_true("actor_bounded_spawn_rejects_lambda", check_has_p(U +
+        "let p = spawnActorBounded(fn(i: Inbox[Int], u: Int) -> () {}, 0, 2)\n0", "not a lambda"));
+    check_true("actor_bounded_spawn_sendable", check_has_p(U +
+        "fn f(inbox: Inbox[fn(Int) -> Int], unused: Int) -> () {}\nlet p = spawnActorBounded(f, 0, 2)\n0",
+        "messages of 'f'"));
+    check_true("actor_ask_needs_reply_type", check_has_p(U +
+        "fn a(i: Inbox[Int], x: Int) -> () {}\nlet p = spawnActor(a, 0)\nlet r = ask(p, fn(me) { 1 }, 10)\n0",
+        "ask needs the reply type"));
+    check_true("actor_ask_reply_sendable", check_has_p(U +
+        "fn a(i: Inbox[Int], x: Int) -> () {}\nlet p = spawnActor(a, 0)\n"
+        "let r: Result[fn(Int) -> Int, AskError] = ask(p, fn(me) { 1 }, 10)\n0", "the reply (fn(Int) -> Int) cannot be sent"));
 }
 
 // =============================================================================
@@ -9815,7 +9907,10 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // program. Their behaviour is pinned by the actor_* tests in vm_tests.
 // The hand-off two (ids 69-70: rawHandOff / rawTake) move a live socket between isolates -- side effects
 // on the OS, like every socket native -- and are pinned by actor_socket_hand_off in both suites.
-static_assert(NATIVE_COUNT == 71,
+// The inbox four (ids 71-74: rawNewInbox / rawCloseInbox / rawTrySend / rawSpawnActorBounded) are NOT
+// listed for the actor eight's reason: whether a bounded inbox is full, or a reply has arrived, depends
+// on how the actors interleave. Pinned by the actor_* tests in vm_tests.
+static_assert(NATIVE_COUNT == 75,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 

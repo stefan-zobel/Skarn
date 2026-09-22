@@ -11,11 +11,15 @@
 // the program checks itself and `panic`s otherwise. Then it prints both timings.
 //
 // Run:   static_vmrun demo/actors/wordcount.skn [file] [--counters=N] [--lines=N] [--batch=N]
+//                                               [--capacity=N]
 //   file          count the words of this file instead of a generated text
 //   --counters=N  counter actors (default 4)
 //   --lines=N     lines of generated text (default 40000; ignored with a file)
 //   --batch=N     lines per message (default 250). 1 sends every line on its own, which shows what
 //                 a message costs: every message is copied into the receiver's heap.
+//   --capacity=N  let each counter's mailbox hold at most N messages (default: no limit). A send to
+//                 a full mailbox waits, so the reader cannot run ahead of the counters and fill the
+//                 memory with messages nobody has read yet: back-pressure.
 
 use std::actor::*
 use std::cli::*
@@ -94,12 +98,18 @@ fn countSequentially(lines: Vec[String]) -> Vec[Entry] {
     topWords(counts, 10)
 }
 
-fn countWithActors(lines: Vec[String], counters: Int, batchSize: Int, me: Inbox[Vec[Entry]]) -> Vec[Entry] {
+fn countWithActors(lines: Vec[String], counters: Int, batchSize: Int, capacity: Int,
+                   me: Inbox[Vec[Entry]]) -> Vec[Entry] {
     let coll = spawnActor(collector, CollectorSetup { expect: counters, replyTo: me.pid() })
     let mut workers: Vec[Pid[Work]] = vec()
     let mut k = 0
     while k < counters {
-        push(workers, spawnActor(counter, coll))
+        let w = if capacity > 0 {
+            spawnActorBounded(counter, coll, capacity)
+        } else {
+            spawnActor(counter, coll)
+        }
+        push(workers, w)
         k = k + 1
     }
     // Deal the lines out in batches, round robin.
@@ -175,6 +185,10 @@ fn same(a: Vec[Entry], b: Vec[Entry]) -> Bool { a == b }
 let opts     = CliArgs::parse(args())
 let counters = intOpt(opts, "counters", 4)
 let batch    = intOpt(opts, "batch", 250)
+let capacity = match parseInt(opts.getOptOr("capacity", "0")) {
+    Ok(v) => if v < 0 { 0 } else { v },
+    Err(_) => panic("--capacity needs a whole number"),
+}
 let text     = match opts.positionalAt(0) {
     Some(path) => fileLines(path),
     None => generate(intOpt(opts, "lines", 40000)),
@@ -184,10 +198,11 @@ let me: Inbox[Vec[Entry]] = mainInbox()
 let t0  = nanoTime()
 let seq = countSequentially(text)
 let t1  = nanoTime()
-let par = countWithActors(text, counters, batch, me)
+let par = countWithActors(text, counters, batch, capacity, me)
 let t2  = nanoTime()
 
-println("${len(text)} lines, ${counters} counters, ${batch} lines per message")
+let limit = if capacity > 0 { ", at most ${capacity} waiting per counter" } else { "" }
+println("${len(text)} lines, ${counters} counters, ${batch} lines per message${limit}")
 println("")
 for e in par { println("  ${e.word:<10} ${e.count}") }
 println("")
