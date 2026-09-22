@@ -2745,6 +2745,9 @@ void test_import_matrix() {
         // that an erased enum travels the import forms like any other item. A fixed variant, not
         // currentOs(), so the cell means the same on every platform.
         { "std_int_enum","std::process", "Os",           "currentOs",    "match Os::Windows { Os::Windows => 7, _ => 0 }", 7 },
+        // std::poll is the one module that `use`s another (std::net). This row pins that its own
+        // items still travel every import form -- and, via the `_other` cell, that a const does too.
+        { "std_poll",    "std::poll",    "READABLE",     "WRITABLE",     "READABLE | 6", 7 },
     };
     for (const auto& r : std_rows) {
         const std::string id = std::string("imx_") + r.id;
@@ -4578,6 +4581,24 @@ void test_tree_shake_prelude() {
     try_bool("shake_sh_keeps_current_os", [&] {
         return has_fn(svc::compile("use std::process::*\nlet r = sh(\"echo\")\n 0",
                                    svc::builtin_prelude()), "currentOs");
+    });
+
+    // (7) std::poll is the 16th prelude module and the first one reachable only through another
+    // (it `use`s std::net). Unlike `Os`, its enums CARRY payloads, so they are real struct types and
+    // `has_struct` can see them -- a program that never opens a socket must keep none of it.
+    try_bool("shake_default_drops_poll", [&] {
+        const svc::Module m = svc::compile("42", svc::builtin_prelude());
+        return !has_struct(m, "WouldBlock") && !has_fn(m, "rawPoll");
+    });
+    // ... and one that runs a loop keeps the enum it matches on.
+    try_bool("shake_poll_keeps_received", [&] {
+        return has_struct(svc::compile(
+            "use std::net::*\nuse std::poll::*\n"
+            "fn f() -> Result[Int, String] {\n"
+            "  let c = nonBlockingConn(connect(\"127.0.0.1\", 1)?)?\n"
+            "  match c.recv(8)? { Received::Data(b) => Ok(len(b)), _ => Ok(0) }\n"
+            "}\n"
+            "let r = f()\n0", svc::builtin_prelude()), "WouldBlock");
     });
 }
 
@@ -8566,6 +8587,538 @@ void test_std_net() {
 }
 
 // =============================================================================
+// std::poll -- non-blocking I/O + readiness (rawSetNonBlocking/rawPoll/rawAcceptNb/rawRecvNb/
+// rawSendNb; NativeRegistry ids 52-56). Like std::net these are side-effecting and OS-timed, so they
+// are excluded from the differential and verified by single-thread LOOPBACK instead -- which works
+// here for the same reason it works there, and better: one thread can now drive a server AND several
+// clients, because nothing blocks.
+//
+// What these tests are really for is the three-way distinction the module exists to make. Before this
+// round a socket could only say "bytes" or "error", and an empty read meant EOF; "nothing yet" had
+// nowhere to go. So the assertions below deliberately separate WouldBlock from Closed on the same
+// socket, in the same program, a few lines apart.
+// =============================================================================
+void test_std_poll() {
+    std::cout << "[codegen: std::poll]\n";
+    auto p_fails = [](const std::string& s) {
+        try { svc::compile(s.c_str(), svc::builtin_prelude()); return false; }
+        catch (const svc::CheckFailure&) { return true; }
+        catch (...) { return false; }
+    };
+    // Gating: the raw natives are out of scope without `use std::poll`, exactly like the tcp* ones.
+    check_true("poll_gate_rejects", p_fails("let r = rawPoll(vec(), vec(), 0)\n0"));
+    check_true("poll_gate_ok",     !p_fails("use std::poll::*\nlet r = rawPoll(vec(), vec(), 0)\n0"));
+    // std::poll does NOT re-export std::net: taking the event loop must not silently hand out the
+    // blocking API too (the wrappers `use` it, but a `use` is not transitive).
+    check_true("poll_does_not_reexport_net", p_fails("use std::poll::*\nlet l = listen(0)\n0"));
+
+    // The assertion that was impossible before: a listener with nobody waiting REPORTS that, instead
+    // of blocking the program or failing. Port from the OS (tcpListen(0)), never hardcoded.
+    check_str("poll_accept_would_block",
+        cg_run_native("use std::net::*\nuse std::poll::*\n"
+                      "fn probe() -> Result[String, String] {\n"
+                      "  let srv = nonBlocking(listen(0)?)?\n"
+                      "  let out = match srv.accept()? {\n"
+                      "    Accepted::Conn(_)    => \"connected\",\n"
+                      "    Accepted::WouldBlock => \"would-block\"\n"
+                      "  }\n"
+                      "  srv.close()?\n"
+                      "  Ok(out)\n"
+                      "}\n"
+                      "match probe() { Ok(s) => println(s), Err(e) => println(\"ERR: \" + e) }\n"),
+        "would-block\n");
+
+    // THE distinction, on one socket: nothing sent yet -> WouldBlock; peer closed -> Closed. If these
+    // two ever collapse into the same answer a server can no longer tell a quiet connection from a
+    // dead one, which is the defect this module was built to remove.
+    const std::string three =
+        "use std::net::*\nuse std::poll::*\n"
+        "fn probe() -> Result[String, String] {\n"
+        "  let lst = listen(0)?\n"
+        "  let port = lst.localPort()?\n"
+        "  let srv = nonBlocking(lst)?\n"
+        "  let cli = nonBlockingConn(connect(\"127.0.0.1\", port)?)?\n"
+        "  let mut fds: Vec[Int] = vec()\n"
+        "  let mut want: Vec[Int] = vec()\n"
+        "  push(fds, srv.fd)  push(want, READABLE)\n"
+        "  poll(fds, want, 2000)?\n"
+        "  let con = match srv.accept()? {\n"
+        "    Accepted::Conn(c)    => c,\n"
+        "    Accepted::WouldBlock => return Err(\"no connection after poll said readable\")\n"
+        "  }\n"
+        "  let quiet = match con.recv(64)? {\n"
+        "    Received::Data(_)    => \"data\",\n"
+        "    Received::WouldBlock => \"would-block\",\n"
+        "    Received::Closed     => \"closed\"\n"
+        "  }\n"
+        "  cli.close()?\n"
+        "  let mut f2: Vec[Int] = vec()\n"
+        "  let mut w2: Vec[Int] = vec()\n"
+        "  push(f2, con.fd)  push(w2, READABLE)\n"
+        "  poll(f2, w2, 2000)?\n"
+        "  let dead = match con.recv(64)? {\n"
+        "    Received::Data(_)    => \"data\",\n"
+        "    Received::WouldBlock => \"would-block\",\n"
+        "    Received::Closed     => \"closed\"\n"
+        "  }\n"
+        "  con.close()?\n"
+        "  srv.close()?\n"
+        "  Ok(quiet + \" then \" + dead)\n"
+        "}\n"
+        "match probe() { Ok(s) => println(s), Err(e) => println(\"ERR: \" + e) }\n";
+    check_str("poll_would_block_is_not_closed", cg_run_native(three), "would-block then closed\n");
+
+    // send reports a COUNT, not success/failure, and the loop that drains the remainder terminates.
+    // (A forced SHORT write needs a full kernel buffer and is timing-dependent, so what is pinned is
+    // the contract the caller depends on: the count is what went out, and looping on it transfers all.)
+    check_str("poll_send_returns_count",
+        cg_run_native("use std::net::*\nuse std::poll::*\n"
+                      "fn probe() -> Result[Bool, String] {\n"
+                      "  let lst = listen(0)?\n"
+                      "  let port = lst.localPort()?\n"
+                      "  let srv = nonBlocking(lst)?\n"
+                      "  let cli = nonBlockingConn(connect(\"127.0.0.1\", port)?)?\n"
+                      "  let n = cli.sendStr(\"0123456789\")?\n"
+                      "  cli.close()?\n"
+                      "  srv.close()?\n"
+                      "  Ok(n > 0 && n <= 10)\n"
+                      "}\n"
+                      "match probe() { Ok(b) => println(b), Err(e) => println(\"ERR: \" + e) }\n"),
+        "true\n");
+
+    // poll must WAIT. These four exist because the first version of the two "no interest" guards
+    // asserted only that no error came back -- which a call returning instantly satisfies just as
+    // well as a correct one. They were green against a live defect (an empty interest set skipped the
+    // syscall AND discarded the timeout, turning such a round into a 100 % CPU spin), so they pinned
+    // it instead of catching it. A guard that only checks "did not fail" pins whatever behaviour
+    // happens to exist.
+    //
+    // The assertion is a LOWER bound on elapsed time. An upper bound would be flaky on a loaded
+    // machine; a lower bound is not reachable by a call that returned at once, which is the whole
+    // defect. Time is read with nanoTime() inside the program, so nothing here depends on the harness.
+    const std::string waits_prefix =
+        "use std::net::*\nuse std::poll::*\nuse std::env::*\n"
+        "fn probe() -> Result[Bool, String] {\n"
+        "  let srv = nonBlocking(listen(0)?)?\n"
+        "  let mut fds: Vec[Int] = vec()\n"
+        "  let mut want: Vec[Int] = vec()\n"
+        "  push(fds, srv.fd)\n";
+    const std::string waits_suffix =
+        "  let t0 = nanoTime()\n"
+        "  let mut i = 0\n"
+        "  while i < 4 { poll(fds, want, 200)?  i = i + 1 }\n"
+        "  let ms = (nanoTime() - t0) / 1000000\n"
+        "  srv.close()?\n"
+        "  Ok(ms >= 400)\n"
+        "}\n"
+        "match probe() { Ok(b) => println(b), Err(e) => println(\"ERR: \" + e) }\n";
+
+    // (a) An all-zero interest set waits out the timeout. WSAPoll cannot express the set at all, so
+    // rawPoll emulates what POSIX poll() does with it rather than adopting Winsock's limitation.
+    check_str("poll_zero_interest_waits",
+        cg_run_native(waits_prefix + "  push(want, 0)\n" + waits_suffix), "true\n");
+
+    // (b) The NORMAL path waits too -- the case the original round never pinned at all, which is how
+    // a future "skip the syscall when nothing can be ready" change could regress it unseen.
+    check_str("poll_readable_waits",
+        cg_run_native(waits_prefix + "  push(want, READABLE)\n" + waits_suffix), "true\n");
+
+    // (c) An empty socket set is the degenerate case, and is also the portable-sleep idiom.
+    check_str("poll_empty_set_waits",
+        cg_run_native("use std::poll::*\nuse std::env::*\n"
+                      "fn probe() -> Result[Bool, String] {\n"
+                      "  let t0 = nanoTime()\n"
+                      "  let mut i = 0\n"
+                      "  while i < 4 { poll(vec(), vec(), 200)?  i = i + 1 }\n"
+                      "  Ok((nanoTime() - t0) / 1000000 >= 400)\n"
+                      "}\n"
+                      "match probe() { Ok(b) => println(b), Err(e) => println(\"ERR: \" + e) }\n"),
+        "true\n");
+
+    // (d) ... but "wait indefinitely" with nothing to wait ON is a guaranteed hang, so it is refused
+    // rather than freezing the VM indistinguishably from a crash. A deliberate departure from POSIX,
+    // where poll(NULL, 0, -1) blocks forever.
+    check_str("poll_negative_timeout_no_interest_errs",
+        cg_run_native("use std::poll::*\n"
+                      "match poll(vec(), vec(), -1) {\n"
+                      "  Ok(r)  => println(\"unexpectedly ok \" + toString(len(r))),\n"
+                      "  Err(e) => println(e)\n"
+                      "}\n"),
+        "rawPoll: a negative timeout with no interest would wait forever\n");
+
+    // A zero timeout still means "return at once" -- the one case that must NOT wait.
+    check_str("poll_zero_timeout_returns_at_once",
+        cg_run_native("use std::poll::*\nuse std::env::*\n"
+                      "fn probe() -> Result[Bool, String] {\n"
+                      "  let t0 = nanoTime()\n"
+                      "  let mut i = 0\n"
+                      "  while i < 20 { poll(vec(), vec(), 0)?  i = i + 1 }\n"
+                      "  Ok((nanoTime() - t0) / 1000000 < 100)\n"
+                      "}\n"
+                      "match probe() { Ok(b) => println(b), Err(e) => println(\"ERR: \" + e) }\n"),
+        "true\n");
+
+    // The claim of the whole round, in one program: ONE thread, ONE loop, TWO clients served without
+    // either waiting for the other. The two arrive in whatever order the OS reports them, so the
+    // result is sorted -- asserting an arrival ORDER would be asserting a race.
+    const std::string loop_prog =
+        "use std::net::*\nuse std::poll::*\n"
+        "fn serve() -> Result[String, String] {\n"
+        "  let lst = listen(0)?\n"
+        "  let port = lst.localPort()?\n"
+        "  let srv = nonBlocking(lst)?\n"
+        "  let a = nonBlockingConn(connect(\"127.0.0.1\", port)?)?\n"
+        "  let b = nonBlockingConn(connect(\"127.0.0.1\", port)?)?\n"
+        "  a.sendStr(\"alpha\")?\n"
+        "  b.sendStr(\"beta\")?\n"
+        "  let mut conns: Vec[NbConn] = vec()\n"
+        "  let mut got: Vec[String] = vec()\n"
+        "  let mut spins = 0\n"
+        "  while len(got) < 2 && spins < 400 {\n"
+        "    let mut fds: Vec[Int] = vec()\n"
+        "    let mut want: Vec[Int] = vec()\n"
+        "    push(fds, srv.fd)  push(want, READABLE)\n"
+        "    for c in conns { push(fds, c.fd)  push(want, READABLE) }\n"
+        "    let live = len(conns)\n"
+        "    let r = poll(fds, want, 50)?\n"
+        "    if (r[0] & READABLE) != 0 {\n"
+        "      if let Accepted::Conn(c) = srv.accept()? { push(conns, c) }\n"
+        "    }\n"
+        "    let mut i = 0\n"
+        "    while i < live {\n"
+        "      if (r[i + 1] & READABLE) != 0 {\n"
+        "        if let Received::Data(bs) = conns[i].recv(256)? { push(got, fromBytes(bs)) }\n"
+        "      }\n"
+        "      i = i + 1\n"
+        "    }\n"
+        "    spins = spins + 1\n"
+        "  }\n"
+        "  for c in conns { c.close()? }\n"
+        "  a.close()?\n"
+        "  b.close()?\n"
+        "  srv.close()?\n"
+        "  let mut out = \"\"\n"
+        "  for s in sorted(got) { out = out + s + \" \" }\n"
+        "  Ok(trim(out))\n"
+        "}\n"
+        "match serve() { Ok(s) => println(s), Err(e) => println(\"ERR: \" + e) }\n";
+    check_str("poll_two_clients_one_loop", cg_run_native(loop_prog), "alpha beta\n");
+}
+
+// =============================================================================
+// std::task -- fork-join tasks (spawn / Task.join over the rawSpawn / rawJoin / rawTaskTake natives,
+// NativeRegistry ids 57-60). Three things are locked here:
+//   * the RUN-TIME contract as a program sees it: results come back, a fault is an Err, the
+//     argument is a COPY taken at spawn (a later change in the parent does not reach the task, a
+//     change in the task does not reach the parent), output appears in join order, tasks nest;
+//   * the CHECKER rules at the spawn site: a named, non-generic, one-parameter top-level function,
+//     a sendable argument and result -- no function value, trait object, socket or task handle,
+//     also behind a mutually recursive type -- `spawn` not usable as a value, and no Task built
+//     outside std::task;
+//   * the oracle agreeing (diff_task_*), which models a task by running it at join.
+// The VM half (threads, registry, faults) is pinned by the task_* tests in vm_tests.
+// =============================================================================
+void test_std_task() {
+    std::cout << "[codegen: std::task]\n";
+    auto p_fails = [](const std::string& s) {
+        try { svc::compile(s.c_str(), svc::builtin_prelude()); return false; }
+        catch (const svc::CheckFailure&) { return true; }
+        catch (...) { return false; }
+    };
+    const std::string U  = "use std::task::*\n";
+    const std::string SQ = "fn sq(n: Int) -> Int { n * n }\n";
+    const std::string UNWRAP = "fn got(r: Result[Int, String]) -> Int { match r { Ok(v) => v, Err(_) => -1 } }\n";
+
+    // Gating: spawn is std::task's, reached by `use` like any item.
+    check_true("task_gate_rejects", p_fails(SQ + "let t = spawn(sq, 2)\n0"));
+    check_true("task_gate_ok",     !p_fails(U + SQ + "let t = spawn(sq, 2)\n0"));
+
+    // ---- run time ----
+    check_int_p("task_basic", U + SQ + UNWRAP + "got(spawn(sq, 7).join())", 49);
+    check_int_p("task_two_in_parallel", U + UNWRAP +
+        "struct Range { lo: Int, hi: Int }\n"
+        "fn sumRange(r: Range) -> Int {\n"
+        "  let mut s = 0\n  let mut i = r.lo\n"
+        "  while i <= r.hi { s = s + i\n i = i + 1 }\n  s\n}\n"
+        "let a = spawn(sumRange, Range { lo: 1, hi: 50000 })\n"
+        "let b = spawn(sumRange, Range { lo: 50001, hi: 100000 })\n"
+        "got(a.join()) + got(b.join())", 5000050000);
+    // A String result is Ok, not Err: the natives' "a String means failure" protocol does NOT apply.
+    check_int_p("task_string_result_is_ok", U +
+        "fn greet(n: Int) -> String { \"n=\" + n }\n"
+        "match spawn(greet, 5).join() { Ok(s) => len(s), Err(_) => -1 }", 3);
+    check_int_p("task_heap_result", U +
+        "fn words(n: Int) -> Vec[String] {\n"
+        "  let mut v: Vec[String] = vec()\n  let mut i = 0\n"
+        "  while i < n { push(v, \"w\" + i)\n i = i + 1 }\n  v\n}\n"
+        "match spawn(words, 4).join() { Ok(v) => len(v) * 10 + len(v[3]), Err(_) => -1 }", 42);
+    check_int_p("task_fault_is_err", U +
+        "fn boom(n: Int) -> Int { if n > 0 { panic(\"boom\") } else { n } }\n"
+        "match spawn(boom, 1).join() { Ok(_) => 0, Err(m) => 1 }", 1);
+    // The argument is a copy taken AT SPAWN: the parent's later push does not reach the task ...
+    check_int_p("task_arg_copied_at_spawn", U + UNWRAP +
+        "fn size(v: Vec[Int]) -> Int { len(v) }\n"
+        "let mut v: Vec[Int] = vec()\npush(v, 1)\npush(v, 2)\n"
+        "let t = spawn(size, v)\npush(v, 3)\n"
+        "got(t.join()) * 10 + len(v)", 23);
+    // ... and the task's own changes do not reach the parent.
+    check_int_p("task_changes_stay_in_task", U + UNWRAP +
+        "fn grow(v: Vec[Int]) -> Int { let mut w = v\n push(w, 9)\n push(w, 9)\n len(w) }\n"
+        "let mut v: Vec[Int] = vec()\npush(v, 1)\n"
+        "got(spawn(grow, v).join()) * 10 + len(v)", 31);
+    // A task can start tasks of its own (a second level of execute()).
+    check_int_p("task_nested", U + SQ + UNWRAP +
+        "fn outer(n: Int) -> Int { got(spawn(sq, n).join()) + 1 }\n"
+        "got(spawn(outer, 5).join())", 26);
+    // Output appears when a task is JOINED, in join order -- not in the order the tasks ran.
+    check_str("task_output_in_join_order", cg_run_native(U +
+        "fn say(s: String) -> Int { println(s)\n len(s) }\n"
+        "let a = spawn(say, \"first\")\nlet b = spawn(say, \"second\")\n"
+        "let rb = b.join()\nlet ra = a.join()\nprintln(\"done\")\n"), "second\nfirst\ndone\n");
+
+    // ---- the checker, at the spawn site ----
+    check_true("task_rejects_lambda", check_has_p(U +
+        "let t = spawn(fn(x: Int) -> Int { x }, 1)\n0", "not a lambda"));
+    check_true("task_rejects_fn_value", check_has_p(U + SQ +
+        "let g = sq\nlet t = spawn(g, 1)\n0", "not a computed function value"));
+    check_true("task_rejects_generic_fn", check_has_p(U +
+        "fn ident[T](x: T) -> T { x }\nlet t = spawn(ident, 1)\n0", "generic function 'ident'"));
+    // Two parameters already fail spawn's own type (fn(A) -> R); that is the first error reported.
+    check_true("task_rejects_two_params", check_has_p(U +
+        "fn add(a: Int, b: Int) -> Int { a + b }\nlet t = spawn(add, 1)\n0", "found fn(Int, Int) -> Int"));
+    check_true("task_rejects_fn_in_arg", check_has_p(U +
+        "struct H { f: fn(Int) -> Int }\nfn go(h: H) -> Int { 1 }\n"
+        "let t = spawn(go, H { f: fn(x: Int) -> Int { x } })\n0", "contains a function value"));
+    check_true("task_rejects_dyn_result", check_has_p(U +
+        "trait Shape { fn area(self) -> Int }\nstruct Sq { s: Int }\n"
+        "impl Shape for Sq { fn area(self) -> Int { self.s } }\n"
+        "fn mk(n: Int) -> dyn Shape { Sq { s: n } }\nlet t = spawn(mk, 1)\n0", "contains a trait object"));
+    check_true("task_rejects_socket", check_has_p(U + "use std::net::*\n"
+        "fn go(c: TcpConn) -> Int { 1 }\n"
+        "fn f() -> Result[Int, String] { let c = connect(\"localhost\", 1)?\n let t = spawn(go, c)\n Ok(0) }\n0",
+        "contains a socket handle"));
+    check_true("task_rejects_task_handle", check_has_p(U + SQ +
+        "fn go(t: Task[Int]) -> Int { 1 }\nlet t = spawn(go, spawn(sq, 2))\n0", "contains a task handle"));
+    // The handle sits behind a MUTUAL recursion -- the shape is_eq may mis-cache; this walk does not.
+    check_true("task_rejects_through_mutual_recursion", check_has_p(U +
+        "struct A { b: Option[B] }\nstruct B { a: Option[A], f: fn(Int) -> Int }\n"
+        "fn go(a: A) -> Int { 1 }\nlet t = spawn(go, A { b: None })\n0", "contains a function value"));
+    check_true("task_recursive_type_ok", !p_fails(U +
+        "enum Tree { Leaf, Node(Tree, Int, Tree) }\n"
+        "fn total(t: Tree) -> Int { match t { Tree::Leaf => 0, Tree::Node(l, v, r) => total(l) + v + total(r) } }\n"
+        "let t = spawn(total, Tree::Node(Tree::Leaf, 3, Tree::Leaf))\n0"));
+    check_true("task_spawn_not_a_value", check_has_p(U + "let s = spawn\n0", "can only be called"));
+    check_true("task_no_task_literal", check_has_p(U + SQ +
+        "let t = spawn(sq, 2)\nlet u: Task[String] = Task { id: t.id }\n0", "can only be created by `spawn`"));
+    check_true("task_no_task_record_update", check_has_p(U + SQ +
+        "let t = spawn(sq, 2)\nlet u = Task { ..t }\n0", "can only be created by `spawn`"));
+}
+
+// =============================================================================
+// std::actor -- actors over rawSpawnActor / rawSend / rawReceive / ... (NativeRegistry ids 61-68).
+// The oracle does NOT model actors (free interleaving, see RefEval's Unsupported site), so every
+// runtime case here is written to have ONE possible output whatever the schedule: a single sender
+// per mailbox (a mailbox is FIFO), or a result that does not depend on arrival order (a sum).
+// The checker half locks the rules at the points where a Pid[M] is MADE: spawnActor's function is
+// named, its messages and start value are sendable, mainInbox's message type is annotated and
+// sendable, neither can be used as a value, and Pid / Inbox literals exist only in std::actor.
+// The VM half (mailboxes, stop, crash reports, many actors) is pinned by vm_tests' actor_* tests.
+// =============================================================================
+void test_std_actor() {
+    std::cout << "[codegen: std::actor]\n";
+    auto p_fails = [](const std::string& s) {
+        try { svc::compile(s.c_str(), svc::builtin_prelude()); return false; }
+        catch (const svc::CheckFailure&) { return true; }
+        catch (...) { return false; }
+    };
+    const std::string U = "use std::actor::*\n";
+    // An echo actor that answers to the address inside each message: the reply-to pattern, which
+    // needs a Pid to travel inside a message.
+    const std::string ECHO =
+        "struct Ask { n: Int, replyTo: Pid[Int] }\n"
+        "fn echo(inbox: Inbox[Ask], unused: Int) -> () {\n"
+        "  loop {\n"
+        "    match inbox.receive() {\n"
+        "      Mail::Msg(ask) => { let ok = send(ask.replyTo, ask.n * 2) },\n"
+        "      Mail::Exited(_, _) => {},\n"
+        "      Mail::Stop => { return },\n"
+        "    }\n"
+        "  }\n"
+        "}\n";
+    const std::string GET = "fn got(m: Mail[Int]) -> Int { match m { Mail::Msg(v) => v, _ => -1 } }\n";
+
+    check_true("actor_gate_rejects", p_fails("fn f(i: Int) -> Int { i }\nlet p = spawnActor(f, 0)\n0"));
+
+    // ---- run time (one possible output each) ----
+    check_str("actor_echo_reply_to", cg_run_native(U + ECHO + GET +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let e = spawnActor(echo, 0)\n"
+        "let s1 = send(e, Ask { n: 21, replyTo: me.pid() })\n"
+        "println(got(me.receive()))\n"), "42\n");
+    check_str("actor_state_kept", cg_run_native(U + GET +
+        "enum Cmd { Add(Int), Get(Pid[Int]) }\n"
+        "fn counter(inbox: Inbox[Cmd], start: Int) -> () {\n"
+        "  let mut total = start\n"
+        "  loop {\n"
+        "    match inbox.receive() {\n"
+        "      Mail::Msg(Cmd::Add(k)) => { total = total + k },\n"
+        "      Mail::Msg(Cmd::Get(p)) => { let ok = send(p, total) },\n"
+        "      Mail::Exited(_, _) => {},\n"
+        "      Mail::Stop => { println(\"stops at \" + total)\n return },\n"
+        "    }\n"
+        "  }\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let c = spawnActor(counter, 100)\n"
+        "let s1 = send(c, Cmd::Add(5))\nlet s2 = send(c, Cmd::Add(7))\nlet s3 = send(c, Cmd::Get(me.pid()))\n"
+        "println(got(me.receive()))\n"), "112\nstops at 112\n");
+    // Three stages, each the only sender of the next: FIFO end to end.
+    check_str("actor_pipeline", cg_run_native(U + GET +
+        "fn twice(inbox: Inbox[Int], next: Pid[Int]) -> () {\n"
+        "  loop { match inbox.receive() { Mail::Msg(v) => { let ok = send(next, v * 2) }, Mail::Stop => { return }, _ => {} } }\n"
+        "}\n"
+        "fn plusOne(inbox: Inbox[Int], next: Pid[Int]) -> () {\n"
+        "  loop { match inbox.receive() { Mail::Msg(v) => { let ok = send(next, v + 1) }, Mail::Stop => { return }, _ => {} } }\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let b = spawnActor(plusOne, me.pid())\n"
+        "let a = spawnActor(twice, b)\n"
+        "let mut i = 1\n"
+        "while i <= 5 { let ok = send(a, i)\n i = i + 1 }\n"
+        "let mut out = \"\"\n"
+        "i = 0\n"
+        "while i < 5 { out = out + got(me.receive()) + \" \"\n i = i + 1 }\n"
+        "println(out)\n"), "3 5 7 9 11 \n");
+    check_str("actor_crash_reported", cg_run_native(U +
+        "fn crasher(inbox: Inbox[Int], unused: Int) -> () { panic(\"boom\") }\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let x = spawnActor(crasher, 0)\n"
+        "match me.receive() {\n"
+        "  Mail::Exited(id, why) => println(\"exited \" + (id == x.actorId()) + \" \" + startsWith(why, \"boom\")),\n"
+        "  _ => println(\"?\"),\n"
+        "}\n"
+        "println(\"send afterwards: \" + send(x, 1))\n"), "exited true true\nsend afterwards: false\n");
+    check_str("actor_receive_timeout", cg_run_native(U +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "match me.receiveTimeout(10) { None => println(\"nothing\"), Some(_) => println(\"?\") }\n"),
+        "nothing\n");
+    // Many actors; the replies arrive in any order, but their sum is fixed.
+    check_str("actor_many", cg_run_native(U + ECHO + GET +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let mut i = 1\n"
+        "while i <= 100 { let ok = send(spawnActor(echo, 0), Ask { n: i, replyTo: me.pid() })\n i = i + 1 }\n"
+        "let mut sum = 0\n"
+        "i = 0\n"
+        "while i < 100 { sum = sum + got(me.receive())\n i = i + 1 }\n"
+        "println(sum)\n"), "10100\n");
+
+    // inbox.messages(): the actor's whole loop is a `for`, which ends at Stop (the line after it runs
+    // when the program ends) ...
+    check_str("actor_messages_ends_at_stop", cg_run_native(U + GET +
+        "struct Ask { n: Int, replyTo: Pid[Int] }\n"
+        "fn echo(inbox: Inbox[Ask], unused: Int) -> () {\n"
+        "  for ask in inbox.messages() { send(ask.replyTo, ask.n * 2) }\n"
+        "  println(\"echo done\")\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "send(spawnActor(echo, 0), Ask { n: 21, replyTo: me.pid() })\n"
+        "println(got(me.receive()))\n"), "42\necho done\n");
+    // ... and which skips exit reports: this actor starts one that crashes, and still answers.
+    check_str("actor_messages_skips_exit_reports", cg_run_native(U + GET +
+        "fn crasher(inbox: Inbox[Int], unused: Int) -> () { panic(\"boom\") }\n"
+        "fn relay(inbox: Inbox[Pid[Int]], unused: Int) -> () {\n"
+        "  let c = spawnActor(crasher, 0)\n"
+        "  for p in inbox.messages() { send(p, 7) }\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let r = spawnActor(relay, 0)\n"
+        "send(r, me.pid())\n"
+        "send(r, me.pid())\n"
+        "println(got(me.receive()) + got(me.receive()))\n"), "14\n");
+
+    // ---- handing a connection to an actor (std::net: c.handOff() / h.take()) ----
+    // Over loopback, port from the OS. The worker answers on the moved connection; the root's old
+    // TcpConn is dead afterwards, and a ticket is taken once.
+    const std::string NET = "use std::net::*\n" + U;
+    const std::string GREETER =
+        "fn greeter(inbox: Inbox[SocketHandOff], unused: Int) -> () {\n"
+        "  for h in inbox.messages() {\n"
+        "    match h.take() {\n"
+        "      Ok(mut c) => {\n"
+        "        match c.recvLine() { Ok(Some(line)) => { let _ = c.sendStr(\"got \" + line + \"\\n\") }, _ => {} }\n"
+        "        let _ = c.close()\n"
+        "      },\n"
+        "      Err(e) => println(\"take failed: \" + e),\n"
+        "    }\n"
+        "  }\n"
+        "}\n";
+    check_str("actor_socket_hand_off", cg_run_native(NET + GREETER +
+        "fn run() -> Result[(), String] {\n"
+        "  let srv = listen(0)?\n"
+        "  let port = srv.localPort()?\n"
+        "  let g = spawnActor(greeter, 0)\n"
+        "  let mut client = connect(\"127.0.0.1\", port)?\n"
+        "  client.sendStr(\"world\\n\")?\n"
+        "  let conn = srv.accept()?\n"
+        "  let ticket = conn.handOff()?\n"
+        "  send(g, ticket)\n"
+        "  match client.recvLine()? { Some(l) => println(l), None => println(\"EOF\") }\n"
+        "  match conn.sendStr(\"x\") { Ok(_) => println(\"stale send worked\"), Err(e) => println(e) }\n"
+        "  match ticket.take() { Ok(_) => println(\"second take worked\"), Err(e) => println(e) }\n"
+        "  Ok(())\n"
+        "}\n"
+        "match run() { Ok(_) => {}, Err(e) => println(\"error: \" + e) }\n"),
+        "got world\ntcpSend: socket was handed to another actor\ntake: this connection was already taken\n");
+    // Bytes the sender already read past a line boundary travel with the connection: the client sends
+    // two lines at once, the root reads the first (the second is now in its buffer), hands off, and the
+    // worker's recvLine must still see the second.
+    check_str("actor_socket_hand_off_keeps_buffer", cg_run_native(NET + GREETER +
+        "fn run() -> Result[(), String] {\n"
+        "  let srv = listen(0)?\n"
+        "  let port = srv.localPort()?\n"
+        "  let g = spawnActor(greeter, 0)\n"
+        "  let mut client = connect(\"127.0.0.1\", port)?\n"
+        "  client.sendStr(\"one\\ntwo\\n\")?\n"
+        "  let mut conn = srv.accept()?\n"
+        "  match conn.recvLine()? { Some(l) => println(\"root read \" + l), None => println(\"EOF\") }\n"
+        "  send(g, conn.handOff()?)\n"
+        "  match client.recvLine()? { Some(l) => println(l), None => println(\"EOF\") }\n"
+        "  Ok(())\n"
+        "}\n"
+        "match run() { Ok(_) => {}, Err(e) => println(\"error: \" + e) }\n"),
+        "root read one\ngot two\n");
+    check_true("actor_no_hand_off_literal", check_has_p(NET +
+        "let h = SocketHandOff { token: 1, buf: bytes() }\n0", "can only be created by `c.handOff()`"));
+    check_true("actor_rejects_conn_in_message", check_has_p(NET +
+        "fn f(inbox: Inbox[TcpConn], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0", "a socket handle"));
+    check_true("actor_hand_off_in_message_ok", !p_fails(NET +
+        "fn f(inbox: Inbox[SocketHandOff], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0"));
+
+    // ---- the checker, where a Pid[M] is made ----
+    check_true("actor_rejects_lambda", check_has_p(U +
+        "let p = spawnActor(fn(i: Inbox[Int], u: Int) -> () {}, 0)\n0", "not a lambda"));
+    check_true("actor_rejects_fn_message", check_has_p(U +
+        "fn f(inbox: Inbox[fn(Int) -> Int], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0",
+        "messages of 'f'"));
+    check_true("actor_rejects_fn_start_value", check_has_p(U +
+        "fn f(inbox: Inbox[Int], g: fn(Int) -> Int) -> () {}\nlet p = spawnActor(f, fn(x: Int) -> Int { x })\n0",
+        "start value of 'f'"));
+    check_true("actor_rejects_inbox_in_message", check_has_p(U +
+        "fn f(inbox: Inbox[Inbox[Int]], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0", "an actor's inbox"));
+    check_true("actor_pid_in_message_ok", !p_fails(U +
+        "fn f(inbox: Inbox[Pid[Int]], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0"));
+    check_true("actor_spawn_not_a_value", check_has_p(U + "let s = spawnActor\n0", "can only be called"));
+    check_true("actor_main_inbox_not_a_value", check_has_p(U + "let s = mainInbox\n0", "can only be called"));
+    check_true("actor_main_inbox_needs_type", check_has_p(U + "let me = mainInbox()\n0", "needs its message type"));
+    check_true("actor_main_inbox_sendable", check_has_p(U +
+        "let me: Inbox[fn(Int) -> Int] = mainInbox()\n0", "main inbox's messages"));
+    check_true("actor_no_pid_literal", check_has_p(U +
+        "let p: Pid[String] = Pid { id: 0 }\n0", "a Pid can only be created by std::actor"));
+    check_true("actor_no_inbox_literal", check_has_p(U +
+        "let i: Inbox[Int] = Inbox { id: 0 }\n0", "an Inbox can only be created by std::actor"));
+}
+
+// =============================================================================
 // std::regex -- the opt-in byte-level Pike-VM regex engine, pure prelude (compile / isMatch /
 // find / findFrom first). A `use std::regex::*` prefix + gate pair, then KAT triples. isMatch cases use
 // check_bool_p; find cases encode start*1000+end as an Int (-1 = no match); plus check_same diffs.
@@ -9246,7 +9799,23 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // `tcpLocalPort` (id 50) is deliberately NOT differentiable: the port it reports is chosen by the OS.
 // `rawOsId` (id 51) IS differentiable: it answers the same on every run of one machine, and the oracle
 // mirrors it with the same #ifdef -- so a disagreement about the platform is a test failure, not a skip.
-static_assert(NATIVE_COUNT == 52,
+// The std::poll five (ids 52-56) are NOT differentiable, and no fixture could make them so: each one
+// touches a live socket, and four of them answer from the kernel's momentary state -- whether a peer
+// has connected, whether bytes have arrived, how much buffer space happens to be free. Two runs of the
+// SAME implementation need not agree, so two implementations certainly need not. They are exercised by
+// the std::poll loopback tests instead, which is where their real behaviour is pinned.
+// The fork-join four (ids 57-60: rawSpawn / rawJoin / rawTaskTake / rawTaskInput) are NOT listed
+// either, and not because they are nondeterministic -- a join's answer is fixed by the program. They
+// are runtime plumbing no Skarn source names: a program writes `spawn` / `join`, and it is THOSE the
+// oracle has to model (sequentially: run the function at join). Their VM behaviour is pinned by the
+// task_* tests in vm_tests.
+// The actor eight (ids 61-68: rawSpawnActor / rawSend / rawReceive / rawMailMsg / rawMailFrom /
+// rawMailReason / rawMainInbox / rawSelfId) are NOT listed, and here the reason IS nondeterminism: two
+// actors interleave freely, so which message a blocking receive gets first is not fixed by the
+// program. Their behaviour is pinned by the actor_* tests in vm_tests.
+// The hand-off two (ids 69-70: rawHandOff / rawTake) move a live socket between isolates -- side effects
+// on the OS, like every socket native -- and are pinned by actor_socket_hand_off in both suites.
+static_assert(NATIVE_COUNT == 71,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 
@@ -10687,6 +11256,25 @@ void test_differential() {
     check_same("diff_struct_double",   "struct P { x: Double }\n let n = 3\n P { x: n }");
     check_same("diff_struct_mut",      "struct P { x: Int }\n let mut p = P { x: 1 }\n p.x = 42\n p.x");
     // `==` on CYCLIC values, VM against the oracle: equal cycles, a difference behind a cycle.
+    // Fork-join, against the oracle's sequential model (a task runs at join, on a copy taken at spawn):
+    // results, a heap result, the copy semantics in both directions, nesting and join-order output.
+    check_same("diff_task_fork_join",
+        "use std::task::*\n"
+        "struct Range { lo: Int, hi: Int }\n"
+        "fn sumRange(r: Range) -> Int {\n"
+        "  let mut s = 0\n  let mut i = r.lo\n"
+        "  while i <= r.hi { s = s + i\n i = i + 1 }\n  s\n}\n"
+        "fn tally(v: Vec[Int]) -> Vec[String] {\n"
+        "  let mut out: Vec[String] = vec()\n"
+        "  for x in v { push(out, \"#\" + x) }\n  push(out, \"n=\" + len(v))\n  out\n}\n"
+        "fn sq(n: Int) -> Int { println(\"sq \" + n)\n n * n }\n"
+        "fn outer(n: Int) -> Int { match spawn(sq, n).join() { Ok(v) => v + 1, Err(_) => -1 } }\n"
+        "let a = spawn(sumRange, Range { lo: 1, hi: 300 })\n"
+        "let mut v: Vec[Int] = vec()\npush(v, 4)\npush(v, 5)\n"
+        "let b = spawn(tally, v)\npush(v, 6)\n"
+        "let c = spawn(outer, 3)\n"
+        "println(c.join())\nprintln(b.join())\nprintln(a.join())\nprintln(len(v))\n",
+        /*with_prelude=*/true);
     check_same("diff_eq_cycles",
         "struct Node { v: Int, next: Option[Node] }\n"
         "struct W { x: Int, n: Node }\n"
@@ -11230,6 +11818,9 @@ int main(int argc, char** argv) {
     test_std_cli();
     test_std_hash();
     test_std_net();
+    test_std_poll();
+    test_std_task();
+    test_std_actor();
     test_interpolation();
     test_format();
     test_string_iter();

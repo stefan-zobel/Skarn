@@ -1,0 +1,200 @@
+// Word count with actors: a reader, N counters and a collector, talking only by messages.
+//
+//   main (reader) --Work::Lines--> counter 1..N --partial counts--> collector --top 10--> main
+//
+// The main program splits the text into BATCHES of lines and deals them out to the counters in
+// turn. Each counter keeps its own Map of counts; nothing is shared, so nothing is locked. When a
+// counter is told to finish, it sends its whole Map to the collector, which merges the N partial
+// results and answers the main program with the ten most frequent words.
+//
+// The same count is also done sequentially, on the main thread, and the two results must agree --
+// the program checks itself and `panic`s otherwise. Then it prints both timings.
+//
+// Run:   static_vmrun demo/actors/wordcount.skn [file] [--counters=N] [--lines=N] [--batch=N]
+//   file          count the words of this file instead of a generated text
+//   --counters=N  counter actors (default 4)
+//   --lines=N     lines of generated text (default 40000; ignored with a file)
+//   --batch=N     lines per message (default 250). 1 sends every line on its own, which shows what
+//                 a message costs: every message is copied into the receiver's heap.
+
+use std::actor::*
+use std::cli::*
+use std::env::*
+use std::io::*
+use std::random::*
+
+// What the reader sends a counter.
+enum Work { Lines(Vec[String]), Finish }
+
+// A word and how often it occurs.
+struct Entry { word: String, count: Int }
+
+// ---------------------------------------------------------------- counting (shared by both ways)
+
+// Add the words of `line` to `counts`, lower-cased.
+fn countLine(mut counts: Map[String, Int], line: String) -> () {
+    for w in words(line) {
+        let k = toLower(w)
+        counts[k] = getOr(counts, k, 0) + 1
+    }
+}
+
+// The `n` most frequent words, most frequent first; ties by the word, so the order is fixed.
+fn topWords(counts: Map[String, Int], n: Int) -> Vec[Entry] {
+    let mut all: Vec[Entry] = vec()
+    for (w, c) in counts { push(all, Entry { word: w, count: c }) }
+    let ordered = sortBy(all, fn(a: Entry, b: Entry) -> Bool {
+        a.count > b.count || (a.count == b.count && a.word < b.word)
+    })
+    let mut top: Vec[Entry] = vec()
+    let mut i = 0
+    while i < n && i < len(ordered) {
+        push(top, ordered[i])
+        i = i + 1
+    }
+    top
+}
+
+// ---------------------------------------------------------------- the actors
+
+// A counter: count every batch it gets, and on Finish hand its counts to the collector.
+fn counter(inbox: Inbox[Work], collector: Pid[Map[String, Int]]) -> () {
+    let mut counts: Map[String, Int] = #{}
+    for work in inbox.messages() {
+        match work {
+            Work::Lines(batch) => { for line in batch { countLine(counts, line) } },
+            Work::Finish => {
+                send(collector, counts)
+                return
+            },
+        }
+    }
+}
+
+// What the collector needs to know: how many partial results to wait for, and where the answer goes.
+struct CollectorSetup { expect: Int, replyTo: Pid[Vec[Entry]] }
+
+// The collector: merge `expect` partial counts, then send the top ten to `replyTo`.
+fn collector(inbox: Inbox[Map[String, Int]], setup: CollectorSetup) -> () {
+    let mut total: Map[String, Int] = #{}
+    let mut got = 0
+    for part in inbox.messages() {
+        for (w, c) in part { total[w] = getOr(total, w, 0) + c }
+        got = got + 1
+        if got == setup.expect { break }
+    }
+    send(setup.replyTo, topWords(total, 10))
+}
+
+// ---------------------------------------------------------------- the two ways to count
+
+fn countSequentially(lines: Vec[String]) -> Vec[Entry] {
+    let mut counts: Map[String, Int] = #{}
+    for line in lines { countLine(counts, line) }
+    topWords(counts, 10)
+}
+
+fn countWithActors(lines: Vec[String], counters: Int, batchSize: Int, me: Inbox[Vec[Entry]]) -> Vec[Entry] {
+    let coll = spawnActor(collector, CollectorSetup { expect: counters, replyTo: me.pid() })
+    let mut workers: Vec[Pid[Work]] = vec()
+    let mut k = 0
+    while k < counters {
+        push(workers, spawnActor(counter, coll))
+        k = k + 1
+    }
+    // Deal the lines out in batches, round robin.
+    let mut next = 0
+    let mut batch: Vec[String] = vec()
+    for line in lines {
+        push(batch, line)
+        if len(batch) == batchSize {
+            send(workers[next], Work::Lines(batch))
+            batch = vec()
+            next = (next + 1) % counters
+        }
+    }
+    if len(batch) > 0 { send(workers[next], Work::Lines(batch)) }
+    for w in workers { send(w, Work::Finish) }
+    match me.receive() {
+        Mail::Msg(top) => top,
+        Mail::Exited(_, why) => panic("an actor failed: ${why}"),
+        Mail::Stop => panic("stopped before the result arrived"),
+    }
+}
+
+// ---------------------------------------------------------------- input
+
+// The vocabulary of the generated text. (A function rather than a `const`: a const array holds
+// numbers and booleans only.)
+fn vocabulary() -> Vec[String] {
+    collect(words("the actor sends a message to another one and nothing is shared between them " +
+                  "every value crosses as copy so there no lock heap thread mailbox waits for next work"))
+}
+
+// A deterministic text: `n` lines of 12 words drawn from the vocabulary with a fixed seed. The draw
+// is skewed (the first words are likelier), so the counts differ and the top ten mean something.
+fn generate(n: Int) -> Vec[String] {
+    let vocab = vocabulary()
+    let mut rng = Rng::fromSeed(20260921)
+    let mut out: Vec[String] = vec()
+    let mut i = 0
+    while i < n {
+        let mut line = ""
+        let mut j = 0
+        while j < 12 {
+            let a = rng.nextInt(0, len(vocab))
+            let b = rng.nextInt(0, len(vocab))
+            let pick = if a < b { a } else { b }
+            line = if j == 0 { vocab[pick] } else { line + " " + vocab[pick] }
+            j = j + 1
+        }
+        push(out, line)
+        i = i + 1
+    }
+    out
+}
+
+fn fileLines(path: String) -> Vec[String] {
+    match readFile(path) {
+        Ok(b) => collect(lines(fromBytes(b))),
+        Err(e) => panic("could not read ${path}: ${e}"),
+    }
+}
+
+fn intOpt(opts: CliArgs, name: String, dflt: Int) -> Int {
+    match parseInt(opts.getOptOr(name, toString(dflt))) {
+        Ok(v) => if v < 1 { 1 } else { v },
+        Err(_) => panic("--${name} needs a whole number"),
+    }
+}
+
+fn same(a: Vec[Entry], b: Vec[Entry]) -> Bool { a == b }
+
+// ---------------------------------------------------------------- driver
+
+let opts     = CliArgs::parse(args())
+let counters = intOpt(opts, "counters", 4)
+let batch    = intOpt(opts, "batch", 250)
+let text     = match opts.positionalAt(0) {
+    Some(path) => fileLines(path),
+    None => generate(intOpt(opts, "lines", 40000)),
+}
+let me: Inbox[Vec[Entry]] = mainInbox()
+
+let t0  = nanoTime()
+let seq = countSequentially(text)
+let t1  = nanoTime()
+let par = countWithActors(text, counters, batch, me)
+let t2  = nanoTime()
+
+println("${len(text)} lines, ${counters} counters, ${batch} lines per message")
+println("")
+for e in par { println("  ${e.word:<10} ${e.count}") }
+println("")
+println("sequential  ${(t1 - t0) / 1000000} ms")
+println("actors      ${(t2 - t1) / 1000000} ms")
+if same(seq, par) {
+    println("results agree")
+} else {
+    panic("the actors counted differently from the sequential count")
+}

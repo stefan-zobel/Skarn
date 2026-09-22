@@ -194,9 +194,9 @@ enum class OpCode : uint8_t {
                            // types, so it is unreachable from well-typed source). Uses an explicit worklist (NOT
                            // native C++ recursion), so a deep-but-finite value -- a long cons list, a deep tree --
                            // compares correctly and never overflows the native stack; a CYCLIC value (buildable
-                           // only via a `mut` field) exhausts the work budget and raises a located "stack
-                           // overflow" fault (the accepted D2 behavior -- never a silent wrong answer). Read-only:
-                           // NO allocation, no GC safepoint, but CAN trap (cycle / closure). `!=` = EQ_DEEP then
+                           // only via a `mut` field) is ANSWERED co-inductively -- equal when both unfold alike --
+                           // and every compare terminates. Read-only:
+                           // NO allocation, no GC safepoint, but CAN trap (closure). `!=` = EQ_DEEP then
                            // NOT_BOOL. The STATIC front end emits it for a composite `==`/`!=`; a leaf `==` keeps
                            // the cheaper EQ/NE fast path. See "Equality" in docs/Compiler.md.
     MOV_TAKE        = 119, // rd = ra, then ra = Undefined -- a MOVE that leaves the source EMPTY (r6; rb

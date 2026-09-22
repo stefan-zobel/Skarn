@@ -38,6 +38,7 @@ x64\Release\static_vmrun.exe demo\json.skn
 | `file_io.skn` | `std::io`: writes, reads and removes a file in the current directory |
 | `net_echo.skn` | `std::net`: a TCP echo over the loopback interface |
 | `http_get.skn` | `std::net`: an HTTP GET to example.com; needs a network connection |
+| `poll_server.skn` | `std::poll`: an HTTP server and two clients on ONE thread, driven by one readiness loop |
 | `gc_stats.skn` | `gcResetStats` / `gcStats`: measuring garbage-collector activity from Skarn |
 
 ## Larger programs
@@ -46,7 +47,9 @@ x64\Release\static_vmrun.exe demo\json.skn
 |---|---|
 | `json_parser.skn` | a recursive-descent JSON parser written from scratch |
 | `aes256.skn` | AES-256 with table-driven and byte-oriented paths, checked against the FIPS-197 and NIST test vectors (not constant-time; not for real use) |
-| [`raytracer/`](raytracer/README.md) | a path tracer spread over several modules that writes a BMP; `--preview` renders in about two seconds |
+| [`raytracer/`](raytracer/README.md) | a path tracer spread over several modules that writes a BMP; `--preview` renders in about two seconds, `--threads=N` renders on N tasks |
+| [`actors/`](actors/README.md) | actors: a word count by a reader, N counter actors and a collector, checked against a sequential count |
+| [`actor_server/`](actor_server/README.md) | an HTTP server whose acceptor hands each connection to one of N worker actors, and a load generator on tasks |
 
 ## Benchmark
 

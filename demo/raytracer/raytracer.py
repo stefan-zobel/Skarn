@@ -4,10 +4,11 @@ README.md, and the only self-checking part of it.
     python demo/raytracer/raytracer.py [--preview]
 
 FIDELITY IS THE POINT, AND IT IS CHECKABLE -- which is what makes this comparison worth more than the
-loop microbenchmarks in demo/bench/bench.py. The Skarn renderer is deterministic (one seed, one sequential
-random stream, no threads) and pins its output's CRC-32. This port reproduces the same generator
-(xoshiro128** with the same SplitMix32 seeding), draws random numbers in the same ORDER, and writes
-the same BMP, then checks the CRC itself and exits non-zero on a mismatch. A matching CRC proves the
+loop microbenchmarks in demo/bench/bench.py. The Skarn renderer is deterministic (one seed, one random
+stream per row, the same image on any number of threads) and pins its output's CRC-32. This port
+reproduces the same generator (xoshiro128** with the same SplitMix32 seeding, row y seeded with SEED + y),
+draws random numbers in the same ORDER within each row, and writes the same BMP, then checks the CRC
+itself and exits non-zero on a mismatch. It renders sequentially. A matching CRC proves the
 two programs performed the SAME computation, so the timings compare the languages rather than two
 different pictures. Nothing else here is guarded, so if it drifts it will say so.
 
@@ -36,8 +37,8 @@ MAX_DEPTH = 12
 SEED = 20260728
 T_MAX = 1000000000.0
 
-CRC_PREVIEW = 796770691
-CRC_FULL = 3519314400
+CRC_PREVIEW = 3886897764
+CRC_FULL = 3340800133
 
 # ---------------------------------------------------------------- Rng (std/random.skn)
 
@@ -384,7 +385,7 @@ def ray_color(r, world, depth, rng):
     return Vec3(1.0, 1.0, 1.0).scale(1.0 - t).add(Vec3(0.5, 0.7, 1.0).scale(t))
 
 
-def render(width, height, samples, cam, world, rng):
+def render(width, height, samples, cam, world):
     img = Canvas(width, height)
     # DIVISION, not multiplication by a precomputed reciprocal: a/b and a*(1/b) are not bit-identical,
     # and the Skarn source divides. Getting this "optimisation" wrong would move the image.
@@ -392,6 +393,8 @@ def render(width, height, samples, cam, world, rng):
     fh = float(height - 1)
     inv_s = 1.0 / float(samples)          # this one IS a reciprocal in the Skarn source
     for y in range(height):
+        rng = Rng.from_seed(SEED + y)       # one stream per row, as main.skn -- the image must not
+                                            # depend on how rows are split among tasks
         for x in range(width):
             acc = zero3()
             for _ in range(samples):
@@ -424,10 +427,9 @@ def main():
     world = build_scene()
     cam = Camera(zero3(), Vec3(0.0, 0.0, -1.0), Vec3(0.0, 1.0, 0.0),
                  90.0, float(width) / float(height))
-    rng = Rng.from_seed(SEED)
 
     t0 = time.perf_counter()
-    img = render(width, height, samples, cam, world, rng)
+    img = render(width, height, samples, cam, world)
     elapsed = time.perf_counter() - t0
 
     data = img.to_bmp()

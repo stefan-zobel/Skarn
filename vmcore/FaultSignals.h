@@ -23,21 +23,31 @@
 //   __except body (may throw)        the sigsetjmp(...) != 0 arm    run_switch
 //   unwind to the __try frame        siglongjmp                     the handler
 //
-// WHY THE RENDEZVOUS IS A GLOBAL ATOMIC AND NOT thread_local. TLS is the reflex answer
-// and it is the wrong one on the target platform. Darwin has no local-exec TLS model:
-// every thread_local access goes through a TLV descriptor, and a thread's FIRST access
-// calls malloc to allocate its TLV block. A faulting pipe-drainer thread (rawRun spawns
-// two) would therefore call malloc *inside a SIGSEGV handler* -- against, quite possibly,
-// the very malloc lock the faulting thread is holding. A std::atomic<Landing*> load is a
-// single instruction with no descriptor and no allocation.
+// WHY THE RENDEZVOUS IS A LOOKUP TABLE AND NOT thread_local. TLS is the reflex answer and
+// it is the wrong one on the target platform. Darwin has no local-exec TLS model: every
+// thread_local access goes through a TLV descriptor, and a thread's FIRST access calls
+// malloc to allocate its TLV block. A faulting pipe-drainer thread (rawRun spawns two)
+// would therefore call malloc *inside a SIGSEGV handler* -- against, quite possibly, the
+// very malloc lock the faulting thread is holding. So the handler has to find its frame
+// without touching TLS, and an array of atomics scanned by thread id does exactly that:
+// lock-free loads and integer compares, no descriptor, no allocation. See ThreadSlotTable.h,
+// which is kept free of POSIX declarations so the Windows build can still test it.
+//
+// WHY A TABLE AND NOT ONE SLOT. A single global slot admits exactly one thread inside
+// execute() at a time. It used to REFUSE to arm on a second thread, which meant every VM
+// instance but the first silently lost fault classification -- a guard-page hit there
+// became a raw process kill instead of a located error. Keying the rendezvous by thread id
+// lifts that limit and is what lets several VM instances run at once. Nesting is unchanged:
+// `Landing::prev` still chains a thread's enclosing windows, because nesting was always a
+// per-thread property; the table simply holds each thread's INNERMOST window.
 //
 // This is also a far smaller re-introduction of global state than it looks. vmcore.cpp's
 // comment above `VM vm;` records that per-execution state was deliberately moved OUT of
 // TLS hooks and into Context. That decision stands untouched: VM, VM_Resources and
-// Context remain stack locals in execute(). What is global here is one POINTER to a frame
-// that provably lives exactly as long as the armed window -- and a handler has no
-// argument channel, so a rendezvous slot is not a design preference, it is the minimum
-// the mechanism requires.
+// Context remain stack locals in execute(). What is global here is a table of POINTERS to
+// frames that each provably live exactly as long as their armed window -- and a handler has
+// no argument channel, so a rendezvous is not a design preference, it is the minimum the
+// mechanism requires.
 // =============================================================================
 
 #include <atomic>
@@ -49,6 +59,7 @@
 #include <cstdlib>      // getenv
 #include <pthread.h>
 #include <sys/mman.h>
+#include "ThreadSlotTable.h"   // the per-thread rendezvous; signal-safe lookup, no TLS
 
 #if defined(__APPLE__) && defined(__aarch64__)
 #  include <sys/ucontext.h>
@@ -58,7 +69,8 @@ namespace vm_signals {
 
 // -----------------------------------------------------------------------------
 // The rendezvous between run_switch and the fault handler. ONE of these lives in each
-// run_switch frame; only the pointer to the innermost is global.
+// run_switch frame; what is global is a table holding, per thread, the pointer to that
+// thread's innermost frame.
 // -----------------------------------------------------------------------------
 struct Landing {
     sigjmp_buf jb;                        // sigsetjmp(jb, /*savemask=*/1)
@@ -70,9 +82,23 @@ struct Landing {
     bool                  armed    = false;     // normal-context bookkeeping only
 };
 
-inline std::atomic<Landing*> g_landing{nullptr};
-static_assert(std::atomic<Landing*>::is_always_lock_free,
-              "the rendezvous load must be lock-free: it runs inside a signal handler");
+// Bounds how many VM instances may hold an armed window AT ONCE. Sized for isolates,
+// which scale with CORE count -- serving many connections from ONE instance is what the
+// readiness event loop is for. Beyond it, `store` refuses and that thread runs without
+// fault classification, exactly as every second thread used to: degraded, never wrong.
+inline constexpr unsigned MAX_ARMED_THREADS = 64;
+
+inline ThreadSlotTable<Landing, MAX_ARMED_THREADS> g_landings;
+
+// The thread identity used as the table key. pthread_t is a pointer on Darwin and an
+// integer on other POSIX targets; both convert to uintptr_t, and the conversion is a
+// cast, not a call -- pthread_equal is NOT on the async-signal-safe list, which is why
+// this file has always compared thread identity by value rather than through it.
+// The table reserves key 0 for "slot free"; no POSIX implementation hands a running
+// thread a null pthread_t, so a live thread can never collide with it.
+[[nodiscard]] inline uintptr_t self_key() noexcept {
+    return reinterpret_cast<uintptr_t>(reinterpret_cast<void*>(pthread_self()));
+}
 
 // The dispositions we displaced, so an unrelated fault can be handed back to whatever
 // was there before (usually SIG_DFL, but possibly a debugger or an embedder's handler).
@@ -86,26 +112,32 @@ inline struct sigaction g_old_bus  {};
 // -----------------------------------------------------------------------------
 inline void retract(Landing& L) noexcept {
     if (L.armed) {
+        // Normal context, so an assert is legal here (it would not be in the handler).
+        // A window must be retracted by the thread that armed it: retracting from
+        // another thread would publish this frame's `prev` into a stranger's slot.
+        assert((void*)L.owner == (void*)pthread_self() &&
+               "fault window retracted on a different thread than it was armed on");
         L.armed = false;
-        g_landing.store(L.prev, std::memory_order_release);
+        // Restoring prev (rather than clearing) is what unwinds a nested execute(); when
+        // prev is null this releases the thread's slot for reuse.
+        g_landings.store(self_key(), L.prev);
     }
 }
 
 struct Arm {
     Landing& L;
     explicit Arm(Landing& l) noexcept : L(l) {
+        const uintptr_t self = self_key();
         L.owner = pthread_self();
-        L.prev  = g_landing.load(std::memory_order_relaxed);
-        // Two threads inside execute() at once is not a supported configuration. If it
-        // ever happens, refuse to arm rather than risk a cross-thread longjmp: the run
-        // then simply gets no fault classification, exactly like before this header.
-        if (L.prev && (void*)L.prev->owner != (void*)L.owner) {
-            assert(false && "concurrent execute() on two threads is not supported");
-            L.armed = false;
-            return;
-        }
-        L.armed = true;
-        g_landing.store(&L, std::memory_order_release);
+        // `prev` is THIS thread's enclosing window, so the whole nesting chain stays
+        // per-thread exactly as before -- the table only replaces "the one global slot"
+        // with "this thread's slot". A second thread no longer collides with the first.
+        L.prev  = g_landings.load(self);
+        // The only way to fail is an exhausted table (more than MAX_ARMED_THREADS armed
+        // at once). Then this run gets no fault classification, which is the same
+        // degradation every non-first thread used to get -- never a cross-thread longjmp.
+        L.armed = g_landings.store(self, &L);
+        assert(L.armed && "fault-rendezvous table exhausted: raise MAX_ARMED_THREADS");
     }
     ~Arm() { retract(L); }
     Arm(const Arm&)            = delete;
@@ -118,9 +150,13 @@ struct Arm {
 // ASYNC-SIGNAL-SAFETY -- the complete inventory of what runs below, because the next
 // person to touch this will be tempted to "improve" it:
 //
-//   std::atomic<Landing*>::load   not a call; one lock-free load (static_assert above)
+//   ThreadSlotTable::load         not a call in any meaningful sense: it inlines to a
+//                                 bounded scan of lock-free atomic loads and integer
+//                                 compares (static_asserts in ThreadSlotTable.h). No
+//                                 allocation, no lock, no TLS -- which is the whole
+//                                 reason the rendezvous is a table and not thread_local.
 //   pthread_self()                on the POSIX async-signal-safe list
-//   (void*) compare of pthread_t  not a call. Deliberately NOT pthread_equal, which is
+//   uintptr_t cast of pthread_t   not a call. Deliberately NOT pthread_equal, which is
 //                                 NOT on the list.
 //   reads of si_addr / __esr      plain loads from kernel-provided structs
 //   stores into *L                plain aligned stores to a frame this thread owns; the
@@ -155,13 +191,16 @@ inline void chain_to_previous(int signo) noexcept {
 }
 
 extern "C" inline void fault_handler(int signo, siginfo_t* info, void* uctx) {
-    Landing* L = g_landing.load(std::memory_order_acquire);
+    // Look up THIS thread's armed window. The lookup is keyed by thread id, so the
+    // "is it ours?" test that used to be a separate owner comparison is now the lookup
+    // itself: a thread with no armed window simply has no slot.
+    Landing* L = g_landings.load(self_key());
 
     // Not our thread, or the VM is not dispatching. Hand it back. This check is
     // load-bearing, not hygiene: rawRun's two drainer threads are alive precisely while
-    // the VM thread sits in run_switch with the window armed, and a longjmp from a
-    // drainer would set that thread's SP into ANOTHER thread's stack.
-    if (!L || (void*)L->owner != (void*)pthread_self()) {
+    // a VM thread sits in run_switch with its window armed, and a longjmp from a drainer
+    // would set that thread's SP into ANOTHER thread's stack.
+    if (!L) {
         chain_to_previous(signo);
         return;
     }
@@ -257,14 +296,14 @@ inline bool install_once() noexcept {
     sa.sa_sigaction = &fault_handler;
     sigemptyset(&sa.sa_mask);
     // SA_NODEFER is deliberately NOT set. The delivered signal stays blocked inside the
-    // handler, so a fault WITHIN the handler (a corrupt g_landing, say) is force-delivered
+    // handler, so a fault WITHIN the handler (a corrupt rendezvous table, say) is force-delivered
     // with the default disposition and kills the process immediately instead of recursing.
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
 
     // BOTH signals, and SIGBUS is not optional on Darwin: KERN_INVALID_ADDRESS maps to
     // SIGSEGV but KERN_PROTECTION_FAILURE maps to SIGBUS -- and VM_Resources reserves with
     // mmap(PROT_NONE), so a guard-page hit (the case this whole mechanism exists for)
-    // arrives as SIGBUS there and as SIGSEGV on Linux.
+    // arrives as SIGBUS there and as SIGSEGV on other POSIX systems.
     sigaction(SIGSEGV, &sa, &g_old_segv);
     sigaction(SIGBUS,  &sa, &g_old_bus);
     return true;

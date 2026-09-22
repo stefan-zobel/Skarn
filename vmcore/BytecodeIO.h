@@ -48,6 +48,7 @@
 #include <vector>
 #include <stdexcept>
 
+#include "ByteIO.h"
 #include "Value.h"
 #include "StructType.h"
 #include "FunctionTable.h"
@@ -123,15 +124,14 @@ inline uint32_t crc32(const uint8_t* data, size_t n) {
 // ----- little-endian write primitives ----------------------------------------
 namespace detail {
 
-inline void put_u8 (std::vector<uint8_t>& o, uint8_t v)  { o.push_back(v); }
-inline void put_u16(std::vector<uint8_t>& o, uint16_t v) { o.push_back(uint8_t(v)); o.push_back(uint8_t(v >> 8)); }
-inline void put_u32(std::vector<uint8_t>& o, uint32_t v) {
-    o.push_back(uint8_t(v)); o.push_back(uint8_t(v >> 8));
-    o.push_back(uint8_t(v >> 16)); o.push_back(uint8_t(v >> 24));
-}
-inline void put_u64(std::vector<uint8_t>& o, uint64_t v) {
-    for (int i = 0; i < 8; ++i) o.push_back(uint8_t(v >> (8 * i)));
-}
+// The byte primitives themselves live in ByteIO.h, shared with the other container in
+// vmcore that packs into a byte buffer (ValueCodec.h). Pulled in by name so every call
+// site below reads exactly as it did when they were defined here.
+using byteio::put_u8;
+using byteio::put_u16;
+using byteio::put_u32;
+using byteio::put_u64;
+
 inline void put_str(std::vector<uint8_t>& o, const std::string& s) {
     put_u32(o, uint32_t(s.size()));
     o.insert(o.end(), s.begin(), s.end());
@@ -145,35 +145,11 @@ inline void emit_chunk(std::vector<uint8_t>& o, const char tag[4], uint8_t cflag
 }
 
 // ----- little-endian read cursor (bounds-checked) ----------------------------
-struct Reader {
-    const uint8_t* p;
-    size_t         n;
-    size_t         pos = 0;
-
-    void need(size_t k) const {
-        if (pos + k > n) throw BytecodeError("bytecode: unexpected end of data");
-    }
-    uint8_t  u8()  { need(1); return p[pos++]; }
-    uint16_t u16() { need(2); uint16_t v = uint16_t(p[pos]) | uint16_t(uint16_t(p[pos + 1]) << 8); pos += 2; return v; }
-    uint32_t u32() {
-        need(4);
-        uint32_t v = uint32_t(p[pos]) | (uint32_t(p[pos + 1]) << 8)
-                   | (uint32_t(p[pos + 2]) << 16) | (uint32_t(p[pos + 3]) << 24);
-        pos += 4; return v;
-    }
-    uint64_t u64() {
-        need(8);
-        uint64_t v = 0;
-        for (int i = 0; i < 8; ++i) v |= uint64_t(p[pos + i]) << (8 * i);
-        pos += 8; return v;
-    }
-    std::string str() {
-        uint32_t len = u32();
-        need(len);
-        std::string s(reinterpret_cast<const char*>(p + pos), len);
-        pos += len; return s;
-    }
-};
+// Also from ByteIO.h; the cursor is parameterized on its failure channel, so SKBC keeps
+// raising BytecodeError with its own message. EOD_MSG is what a short read says --
+// passed at construction because the shared cursor carries no container's vocabulary.
+using Reader = byteio::ReaderT<BytecodeError>;
+inline constexpr const char* EOD_MSG = "bytecode: unexpected end of data";
 
 inline bool tag_eq(const char t[4], const char (&lit)[5]) {
     return std::memcmp(t, lit, 4) == 0;
@@ -300,7 +276,7 @@ inline ModuleImage deserialize(const uint8_t* data, size_t size) {
     if (crc32(data, size - FOOTER_SIZE) != stored)
         throw BytecodeError("bytecode: CRC mismatch (corrupt image)");
 
-    Reader r{ data, size };
+    Reader r{ data, size, detail::EOD_MSG };
 
     // header
     r.need(4);
@@ -330,7 +306,7 @@ inline ModuleImage deserialize(const uint8_t* data, size_t size) {
         const uint32_t len    = r.u32();
         r.need(len);
         // sub-cursor bounded to this chunk so a lying length can't over-read
-        Reader pr{ r.p + r.pos, len };
+        Reader pr{ r.p + r.pos, len, detail::EOD_MSG };
         r.pos += len;
 
         if (tag_eq(tag, "CODE")) {

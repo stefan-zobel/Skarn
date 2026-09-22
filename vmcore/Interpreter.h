@@ -77,7 +77,11 @@
 #include <cstdio>
 
 namespace vm_prof {
-    inline uint64_t op_counts[256]{};
+    // thread_local, so several VM instances on several threads each count their OWN dispatches
+    // instead of racing one shared array (an unsynchronized read-modify-write per instruction).
+    // dump_op_counts() runs at the end of execute(), i.e. on the counting thread, so each instance
+    // reports its own histogram. A single-threaded run is unaffected.
+    inline thread_local uint64_t op_counts[256]{};
 
     // Dump non-zero buckets to stderr, descending, with each opcode's share.
     // stderr, not the VM's `out` sink, so a profiled run's stdout still matches
@@ -436,6 +440,11 @@ static void raise_located(Context* ctx, const char* what) {
     size_t total_callers = 0;
     for (ReturnFrame* f = ctx->ret_stack_ptr; f > ctx->ret_stack_base; ) {
         --f;
+        // A fork-join task's outermost caller is its entry stub, appended after the program: not
+        // code anyone wrote, and it has no line and no function of its own. Leave it out.
+        if (vm->task_entry_pc && vm->code_base &&
+            f->old_ip >= vm->code_base + 4 * static_cast<size_t>(vm->task_entry_pc))
+            continue;
         ++total_callers;
         if (frames.size() <= TRACE_CAP) {         // collect [0] + up to TRACE_CAP callers
             const uint8_t* call_ip = f->old_ip;
@@ -724,10 +733,14 @@ static void raise_access_violation(const Context* ctx, uintptr_t fault_addr, boo
 // back into run_switch's __try scope and reinstate exactly the cost the split removes.
 SKARN_NOINLINE static void run_switch_loop(Context* ctx) {
     const uint8_t* ip     = ctx->ip;
-    // The bytecode base (entry = instruction 0). CALL_INDIRECT jumps to an ABSOLUTE
+    // The bytecode base (instruction 0). CALL_INDIRECT jumps to an ABSOLUTE
     // code position (code_base + 4 * code_offset) recovered from the function table,
-    // unlike the relative offset a static CALL/J carries.
-    const uint8_t* const code_base = ctx->ip;
+    // unlike the relative offset a static CALL/J carries. Taken from VM::code_base, NOT
+    // from the entry ip: a fork-join task enters at a stub appended AFTER the program, so
+    // its first ip is not instruction 0. (Hand-built test contexts set no code_base; they
+    // always enter at instruction 0.) Read once per run, off the dispatch path.
+    const uint8_t* const code_base =
+        (ctx->vm && ctx->vm->code_base) ? ctx->vm->code_base : ctx->ip;
     Value*         window = ctx->window_ptr;
     ReturnFrame*   rsp    = ctx->ret_stack_ptr;
     uint8_t*       fsp    = ctx->frame_size_ptr;

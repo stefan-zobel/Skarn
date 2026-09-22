@@ -24,7 +24,13 @@ vMachine is a register-based bytecode interpreter in C++20. Its design choices:
   allocation, no fragmentation, and collection cost proportional to the live data.
 - **Index-addressed globals, heap strings and string interning.**
 
-The VM is single-threaded. It runs on **Windows x64 with MSVC** and on **macOS arm64 with Clang**; both
+A Skarn program shares no memory between threads. It can run functions in parallel as tasks and actors
+(see "Tasks and actors"). Each is a separate VM instance on its own thread, with its own heap, and values
+cross between them only as copies: an argument, a result or a message. There is no `async` and no shared
+mutable state, and each collector stops only its own heap. In general, several VM instances may run at the
+same time on separate threads, each with its own heap, interner and streams, sharing only the read-only
+image.
+It runs on **Windows x64 with MSVC** and on **macOS arm64 with Clang**; both
 build the whole project and pass every suite. A small platform layer (`vmcore/Platform.h`) is what the rest
 of the runtime sees:
 
@@ -35,7 +41,10 @@ of the runtime sees:
   wrapped around the dispatch loop: a structured-exception frame on Windows, and a signal handler on POSIX
   that records the faulting address and jumps to a landing point set with `sigsetjmp`. Both SIGSEGV and
   SIGBUS are installed there, because a `PROT_NONE` guard page is reported as SIGBUS on macOS and as SIGSEGV
-  on Linux.
+  elsewhere. The landing point is per thread on both platforms: structured exceptions are per thread
+  inherently, and the POSIX handler finds its landing point through a lock-free table keyed by thread id.
+  It is a table rather than thread-local storage because on macOS a thread's first thread-local access
+  allocates, which a signal handler must never do.
 - **The instruction encoding** uses bit-fields, whose layout the C++ standard leaves to the implementation.
   The two supported toolchains lay them out the same way; a bytecode file carries a sentinel so that a
   reader which does not is rejected rather than misled (see "Bytecode container format").
@@ -67,6 +76,8 @@ compiler, the driver and the test programs include its headers and link it.
 | `NativeRegistry.h`, `Natives.h` | the native-function registry |
 | `Fault.h` | `VmFault`, the structured runtime error |
 | `BytecodeIO.h` | the `.skbc` bytecode file format |
+| `ValueCodec.h` | copying a runtime value from one heap to another through a byte buffer |
+| `ByteIO.h` | the little-endian byte primitives both formats above share |
 | `Assembler.h`, `Disassembler.h` | building and printing bytecode |
 | `Execute.h` | the public entry point `execute()` |
 
@@ -236,6 +247,18 @@ returned string means `Err(message)` and anything else means `Ok(value)`; for an
 means `None`. The VM never needs to know the `Result` and `Option` types. `CALL_NATIVE` is a GC safepoint,
 so a native copies its argument bytes out before it allocates.
 
+That leaves two channels, which is a limit worth knowing when a native has a third thing to say. The
+non-blocking socket natives are the case in point: "would block" is neither a value nor an error, so each
+one carries it inside its success value — a negative descriptor, an empty array, a zero count — and the
+standard library turns that into an ordinary enum before a program sees it. Picking a carrier the type
+system can already describe keeps this out of the compiler; a heterogeneous array would need a special
+case in code generation, as the process-spawning native does.
+
+The socket natives work on small integer descriptors into a per-execution table, never on raw OS handles,
+and close whatever is still open when the execution ends. `tcpConnect` gives up after 10 seconds: on POSIX
+through a non-blocking connect and `select()`, on Windows through a blocking connect bounded by `TCP_MAXRT`,
+because there the `select()` wait can add one timer tick (about 15 ms) even on loopback.
+
 **Adding a native:**
 
 1. Append a `NativeId` and extend `native_id_of`, `native_return_of` and `native_arity`.
@@ -365,6 +388,87 @@ instead of misreading it.
 is rejected. `CONTAINER_FORMAT_VERSION` versions the file structure. Unknown optional chunks are skipped;
 unknown required chunks are rejected.
 
+## Copying values between heaps
+
+`ValueCodec.h` moves a runtime value from one heap to another. It is the channel between executions that
+each own a heap: a task's argument and result and every actor message travel through it (see "Tasks and
+actors"). `vcodec::encode` writes the value
+into a byte buffer without allocating; `vcodec::decode` rebuilds it in the destination heap without looking
+at the source. Going through a buffer, instead of copying heap to heap directly, means a collection in the
+destination can never move a half-copied graph out from under the copier.
+
+- Every heap object is written once and referred to by index, so shared parts stay shared and cyclic
+  values are copied correctly.
+- Each slot is stored as its value type plus payload and rebuilt through the normal constructors, never
+  as raw bits, so a decoded value can never turn into a pointer.
+- The rebuild keeps every object it has created registered as a collector root, so it stays correct even
+  when the destination heap collects while the graph is being built.
+- Maps are copied without rehashing: their keys hash by content (strings) or by their bits (numbers and
+  booleans), and neither changes when the value moves to another heap.
+- Closures and raw function pointers are refused. A function value that is only an index into the shared
+  program travels like a number.
+- Copied strings are not interned in the destination. Nothing depends on that: the VM compares strings,
+  and looks up string map keys, by content everywhere.
+- The decoder checks every object against the program: a struct's type and field count, and the size,
+  backing and counts of every vector, byte buffer and map. A buffer that describes an object the VM could not
+  have built is rejected, so a bad buffer can yield a wrong value but never a malformed object.
+
+The codec cannot tell a native handle, such as a socket, from any other struct holding an integer. Keeping
+handles out of a message is the type checker's job, not the codec's.
+
+This format carries no magic number, version or checksum: it never outlives the process that wrote it.
+For the same reason it writes struct type ids and function ids as plain numbers, so a buffer can only be
+decoded by an execution running the same program.
+
+## Tasks and actors
+
+A task or an actor is an **isolate**: a function that runs on its own thread, with its own heap, interner
+and stacks, sharing the program with its starter read-only. Values cross between isolates only as copies.
+- A **task** runs a function once and hands back one value.
+  - `rawSpawn(fn, arg)` copies the argument out of the starter's heap, starts the task, and returns a task
+    id.
+  - `rawJoin(id)` waits for it and reports whether it returned a value.
+  - `rawTaskTake(id)` copies that value into the starter's heap, or returns the task's fault message.
+- An **actor** runs a function that loops on a **mailbox** until it is told to stop.
+  - `rawSpawnActor(fn, arg)` starts one and returns its address.
+  - `rawSend(pid, msg)` copies a message into its mailbox, and answers false once the actor has ended.
+  - `rawReceive(inbox, ms)` waits for the next mail, with an optional timeout. The mail is a message, a
+    report that an actor this isolate started has faulted, or `Stop`. `rawMailMsg`, `rawMailFrom` and
+    `rawMailReason` read it.
+  - The main program gets a mailbox of its own through `rawMainInbox()`, once.
+- `rawTaskInput()` and `rawSelfId()` are internal: an isolate reads its argument and its own id with them.
+
+Everything started under one call of `execute()` forms a **world**. Addresses are unique within it, so an
+actor's address can be sent inside a message. When that call returns, the world sends every actor `Stop`
+and waits for every isolate to end, so no isolate outlives the program it runs. Nothing can be cancelled.
+
+`execute()` publishes the tables it was given as a `ProgramImage`, and every isolate of a world runs the
+image of the call that created the world. An isolate does not start at instruction 0. Its code is the
+program followed by a short entry stub, which reads the argument, calls the function through the ordinary
+calling convention, and halts. Appending the stub leaves every function's address unchanged.
+
+- **Failures are values.** A task that faults does not stop its starter: `rawJoin` returns false and the
+  message is available as a string. An actor that faults is reported to the isolate that started it,
+  through its mailbox.
+- **Output.** A task's output is collected and written out when the task is joined, in join order, so it
+  does not depend on scheduling. An actor writes to the main program's output stream a line at a time, so
+  lines from different actors never mix. Isolates read an empty standard input.
+- **Memory.** An isolate starts small — 64 KiB of register stack and 1024 return frames, and an actor's heap
+  at 64 KiB — and grows like any other execution. Hundreds of actors are therefore affordable.
+
+**Handing a connection to another isolate.** A socket is a descriptor into the socket table of ONE
+execution, so it cannot travel inside a message. It changes owner through the world instead:
+- `rawHandOff(fd)` takes the socket out of the caller's table (without closing it), parks it in the world
+  under a fresh ticket, and returns the ticket.
+- `rawTake(ticket)` moves it into the caller's table and returns a new descriptor. A ticket can be taken
+  once; a ticket nobody takes is closed when the world ends.
+
+A descriptor is a table slot plus a generation, and the generation advances whenever a slot's socket is
+closed or handed off. A descriptor kept after either is therefore refused — with the message "socket was
+handed to another actor" after a hand-off — and never reaches a later connection that reuses the slot. The
+ticket itself is a plain integer; that a program cannot forge one is a rule of the language (see "Actors" in
+[Compiler.md](Compiler.md)). Only connections move; listeners stay with the isolate that opened them.
+
 ## Embedding the VM
 
 A compiler's entire contract with the VM is the instruction set plus the `Assembler` that emits it. It never
@@ -382,7 +486,12 @@ has a default, so small hand-built programs pass only what they use:
 - the native table, the program arguments, and the output and input streams.
 
 The caller owns the heap, the globals and the interner and passes them in. There is no global or
-thread-local interpreter state, so executions are independent.
+thread-local interpreter state, so executions are independent — including at the same time on different
+threads. Each concurrent execution needs its own heap, globals, interner, program arguments and output and
+input streams; the constant pool, struct types, function table, trait table and native table are read-only
+and may be shared. The two stream parameters default to the process-wide standard output and input, which
+two concurrent executions must not both take, or they will interleave their output and compete for the
+same input.
 
 ## Dispatch
 

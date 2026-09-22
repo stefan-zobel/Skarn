@@ -8,6 +8,10 @@
 #include <cmath>
 #include <filesystem>   // temp-dir round-trip for test_native_dirops (listDir / mkdir)
 #include <fstream>      // std::ofstream -- seed the temp dir in test_native_dirops
+#include <thread>       // the concurrency probes: several execute() instances at once
+#include <atomic>       // ditto -- the ThreadSlotTable unit test's cross-thread flags
+#include <chrono>       // test_rooted_pool_release times one pool release
+#include <optional>     // ... and holds the pool in an optional so reset() is the destructor
 #include "Assembler.h"
 #include "Disassembler.h"
 #include "VM_Resources.h"
@@ -23,6 +27,8 @@
 #include "TypeUniverse.h"   // BuiltinTid / BUILTIN_COUNT / TRAIT_METHOD_NONE (trait dispatch)
 #include "NativeRegistry.h" // NativeId ids (nanoTime / millisTime -> test_native_time)
 #include "Natives.h"        // build_native_table() -- the real native registry
+#include "ThreadSlotTable.h"// the per-thread fault rendezvous -> test_thread_slot_table
+#include "ValueCodec.h"     // value graph <-> byte buffer -> test_value_codec_*
 
 // =============================================================================
 // Minimal test harness -- lets the suite FAIL THE BUILD (non-zero exit code).
@@ -2497,6 +2503,1361 @@ inline void test_fault_probe() {
     std::cout << std::format("  recovered twice in a row:            {}\n",
                              again_ok ? "PASS" : "FAIL");
     check(stack_ok && wild_ok && again_ok);
+}
+
+// =============================================================================
+// value-codec tests -- a value graph out of one heap and back into another.
+//
+// THE ORACLE, AND WHY IT IS NOT HAND-WRITTEN. Correctness here means "the rebuilt graph
+// is structurally the original", and the temptation is to write that comparison next to
+// the codec. That is exactly the differential that cannot fail: a walker written from
+// the same understanding as the encoder agrees with it about anything both got wrong.
+// So the oracle is the interpreter's OWN EQ_DEEP worker, reached through vcodec::deep_eq
+// -- the same code a Skarn `==` runs. It compares across two heaps because it only
+// dereferences pointers and never allocates, so neither graph can move under it.
+//
+// WHERE THE ORACLE CANNOT SEE A DIFFERENCE: the graph's shape. EQ_DEEP answers on a
+// cyclic value, but co-inductively -- two values are equal when they unfold alike -- so
+// equality would hold just as well if the codec had duplicated a shared subgraph or
+// unrolled a cycle into a longer ring, and those are precisely the bugs worth catching.
+// Cycles and sharing are therefore checked by POINTER IDENTITY in the rebuilt graph.
+// =============================================================================
+
+inline void test_value_codec_roundtrip() {
+    std::cout << "=== value_codec_roundtrip (immediates, string, array, struct) ===\n";
+    try {
+        Heap      src(64 * 1024);
+        GcTestCtx t(&src, 16);
+        Context   sctx = t.context();
+
+        // --- build: an Array[4] holding a String, a struct, a Double and Nil ----------
+        // Every allocation is a safepoint, so each already-built object is re-fetched
+        // through the rooted register it was published into (invariant #7).
+        GcObject* arr = src.alloc_slots_gc(GcObject::KIND_ARRAY, 4, &sctx);
+        t.win[0] = Value::fromPtr(arr->slots());
+        GcObject* str = src.alloc_string_gc("hello codec", &sctx);
+        GcObject::from_slots(t.win[0].asPtr())->slots()[0] = Value::fromPtr(str->bytes());
+        GcObject* obj = src.alloc_object_gc(/*type_id*/ 7, 2, &sctx);
+        obj->slots()[0] = Value::fromSigned48(-12345);
+        obj->slots()[1] = Value::fromBool(true);
+        Value* a = GcObject::from_slots(t.win[0].asPtr())->slots();
+        a[1] = Value::fromPtr(obj->slots());
+        a[2] = Value::fromDouble(3.5);
+        a[3] = Value::fromNil();
+
+        // decode() checks every struct against the image's type table, so the test needs
+        // one in which id 7 has the two fields the object was built with.
+        std::vector<StructType> types(8, StructType{ 0, "", {} });
+        types[7] = StructType{ 2, "Pair", { "a", "b" } };
+
+        const auto      buf = vcodec::encode(t.win[0]);
+        Heap            dst(64 * 1024);
+        RootedValuePool pool;
+        const Value     rebuilt = vcodec::decode(buf.data(), buf.size(), dst, nullptr, pool,
+                                                 types.data(), types.size());
+
+        const bool eq_ok = vcodec::deep_eq(t.win[0], rebuilt, &sctx);
+        // It must be a COPY: a codec that handed back the source pointer would satisfy
+        // every equality check ever written for it.
+        const bool moved_ok = rebuilt.asPtr() != t.win[0].asPtr();
+        // The struct's nominal identity has to survive, or the rebuilt value is a
+        // different type wearing the same fields.
+        GcObject*  r_arr  = GcObject::from_slots(rebuilt.asPtr());
+        GcObject*  r_obj  = GcObject::from_slots(r_arr->slots()[1].asPtr());
+        const bool tid_ok = r_obj->object_type_id() == 7;
+
+        std::cout << std::format("  deep_eq / distinct storage / type id: {} {} {}\n",
+                                 eq_ok ? "PASS" : "FAIL", moved_ok ? "PASS" : "FAIL",
+                                 tid_ok ? "PASS" : "FAIL");
+        check(eq_ok && moved_ok && tid_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_value_codec_containers -- Vec, Map and Bytes, built by the REAL opcodes.
+//
+// These three are the header/backing pairs, and hand-assembling one in a test would
+// bake this test's idea of their layout into the guard. So the program is built and run
+// by the VM, and only the finished value is handed to the codec.
+//
+// The Map is deliberately STRING-keyed. Its backing is copied slot for slot with no
+// rehash, which is only sound because a string key hashes by CONTENT (a pointer move
+// does not change the hash) and every other permitted key hashes by its bits. If that
+// ever stopped holding, a rebuilt map would still compare equal element-wise but would
+// no longer FIND its keys -- so the test looks the key up through the map itself.
+// =============================================================================
+// A test-only native: encode the argument and rebuild it in the SAME heap, so a running
+// program can then use the copy through the ordinary opcodes.
+//
+// Order matters and is the whole safety argument: encode() first, while nothing
+// allocates and the source graph therefore cannot move; only then decode(), whose
+// allocations may collect. The real Context is passed on, so those collections forward
+// the running program's registers instead of reclaiming them. The pool dies at the end
+// of the call, after which the value is held by the register CALL_NATIVE writes it to --
+// and nothing allocates in between.
+inline Value native_codec_roundtrip(Value* args, uint8_t nargs, Context* ctx) {
+    if (nargs < 1) return Value::fromNil();
+    const auto      buf = vcodec::encode(args[0]);
+    RootedValuePool pool;
+    return vcodec::decode(buf.data(), buf.size(), *ctx->vm->heap, ctx, pool,
+                          ctx->vm->struct_types, ctx->vm->struct_type_count);
+}
+
+inline void test_value_codec_containers() {
+    std::cout << "=== value_codec_containers (Vec / Map[String] / Bytes, in-VM) ===\n";
+    try {
+        Assembler as;
+        as.label("main");
+        as.VEC_NEW(0);                                        // r0 = []
+        as.load_const(1, 42);      as.VEC_PUSH(0, 1);
+        as.load_str(1, "in-vec");  as.VEC_PUSH(0, 1);
+        as.MAP_NEW(2);                                        // r2 = #{}
+        as.load_str(3, "alpha"); as.load_const(4, 1); as.MAP_SET(2, 3, 4);
+        as.load_str(3, "beta");  as.load_const(4, 2); as.MAP_SET(2, 3, 4);
+        as.VEC_PUSH(0, 2);                                    // the vec holds the map
+        as.load_str(5, "some bytes"); as.BYTES_FROM_STR(6, 5);
+        as.VEC_PUSH(0, 6);                                    // ... and the bytes
+
+        as.call_native_id(/*rd*/8, /*id_reg*/7, /*first_arg*/0, /*nargs*/1, /*id*/0);  // r8 = copy
+        as.R6(OpCode::EQ_DEEP, 9, 0, 8);                      // r9 = (original == copy)
+        // Look a STRING KEY up through the REBUILT map. The backing is copied slot for
+        // slot with no rehash, which is sound only because a string key hashes by
+        // content; if that ever stopped holding, the bytes would still compare equal but
+        // the lookup would miss -- so this is the check that would actually notice.
+        as.load_const(10, 2); as.ARRAY_GET(11, 8, 10);        // r11 = copy[2] (the map; ARRAY_GET indexes a Vec too)
+        as.load_str(12, "beta"); as.MAP_GET(13, 11, 12);      // r13 = copy_map["beta"]
+        as.J(OpCode::HALT);
+
+        Heap                    heap(64 * 1024);
+        StringInterner          interner;
+        const auto              slits = as.string_literals();
+        std::vector<NativeFunc> ntab  = { native_codec_roundtrip };
+        auto res = execute(as.assemble(), &heap, nullptr, &interner, 16, nullptr, nullptr,
+                           &slits, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                           nullptr, nullptr, nullptr, &ntab);
+        auto* regs = res.get_reg_base();
+
+        const bool copy_ok   = regs[8].isPtr() && regs[8].asPtr() != regs[0].asPtr();
+        const bool eq_ok     = regs[9].isBool() && regs[9].asBool();
+        const bool lookup_ok = regs[13].isInt() && regs[13].asSigned48() == 2;
+
+        std::cout << std::format("  distinct copy / EQ_DEEP says equal: {} {}\n",
+                                 copy_ok ? "PASS" : "FAIL", eq_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  string key still found in the copy: {}\n",
+                                 lookup_ok ? "PASS" : "FAIL");
+        check(copy_ok && eq_ok && lookup_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_value_codec_strings_not_interned -- a received string meets an INTERNED literal.
+//
+// decode() rebuilds a string as a fresh, NOT interned object in the destination heap. That
+// is sound only because nothing in the VM compares strings by identity: EQ/NE/LT fall back
+// to a content compare, EQ_DEEP compares string leaves by content, and a map hashes and
+// matches a string key by content. So the copy is run through every one of those against
+// the interned literal of the same text. The test first proves the premise -- the literal
+// IS the interner's object and the copy is NOT -- or every comparison below would pass by
+// pointer identity and prove nothing.
+// =============================================================================
+inline void test_value_codec_strings_not_interned() {
+    std::cout << "=== value_codec_strings_not_interned (copy vs interned literal) ===\n";
+    try {
+        Assembler as;
+        as.label("main");
+        as.load_str(0, "payload");                            // r0 = the interned literal
+        as.call_native_id(/*rd*/1, /*id_reg*/2, /*first_arg*/0, /*nargs*/1, /*id*/0);  // r1 = copy
+        as.R6(OpCode::EQ, 3, 1, 0);                           // r3 = copy == literal
+        as.R6(OpCode::NE, 4, 1, 0);                           // r4 = copy != literal
+        as.R6(OpCode::LT, 5, 1, 0);                           // r5 = copy <  literal
+        as.R6(OpCode::LT, 6, 0, 1);                           // r6 = literal < copy
+        as.VEC_NEW(7); as.VEC_PUSH(7, 0);                     // r7 = [literal]
+        as.VEC_NEW(8); as.VEC_PUSH(8, 1);                     // r8 = [copy]
+        as.R6(OpCode::EQ_DEEP, 9, 7, 8);                      // r9 = [literal] == [copy]
+        as.MAP_NEW(10); as.load_const(11, 5); as.MAP_SET(10, 0, 11);
+        as.MAP_GET(12, 10, 1);                                // r12 = {literal: 5}[copy]
+        as.MAP_NEW(13); as.load_const(11, 6); as.MAP_SET(13, 1, 11);
+        as.MAP_GET(14, 13, 0);                                // r14 = {copy: 6}[literal]
+        as.J(OpCode::HALT);
+
+        Heap                    heap(64 * 1024);
+        StringInterner          interner;
+        const auto              slits = as.string_literals();
+        std::vector<NativeFunc> ntab  = { native_codec_roundtrip };
+        auto res = execute(as.assemble(), &heap, nullptr, &interner, 16, nullptr, nullptr,
+                           &slits, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                           nullptr, nullptr, nullptr, &ntab);
+        auto* regs = res.get_reg_base();
+
+        const Value interned  = interner.find("payload");
+        const bool  premise   = interned.isPtr() && regs[0].isPtr() && regs[1].isPtr() &&
+                                regs[0].asPtr() == interned.asPtr() &&
+                                regs[1].asPtr() != regs[0].asPtr();
+        const bool  cmp_ok    = regs[3].isBool() && regs[3].asBool() &&
+                                regs[4].isBool() && !regs[4].asBool() &&
+                                regs[5].isBool() && !regs[5].asBool() &&
+                                regs[6].isBool() && !regs[6].asBool();
+        const bool  deep_ok   = regs[9].isBool() && regs[9].asBool();
+        const bool  map_ok    = regs[12].isInt() && regs[12].asSigned48() == 5 &&
+                                regs[14].isInt() && regs[14].asSigned48() == 6;
+
+        std::cout << std::format("  literal interned, copy distinct:     {}\n", premise ? "PASS" : "FAIL");
+        std::cout << std::format("  EQ / NE / LT both ways by content:   {}\n", cmp_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  EQ_DEEP on a string leaf:            {}\n", deep_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  map key found in both directions:    {}\n", map_ok ? "PASS" : "FAIL");
+        check(premise && cmp_ok && deep_ok && map_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_value_codec_sharing_and_cycles -- the two properties the node table exists for.
+//
+// Both are checked by POINTER IDENTITY, not by equality, and that is the point: a codec
+// that duplicated a shared subgraph would still compare equal everywhere, and so would one
+// that unrolled a cycle into a longer ring (EQ_DEEP compares cyclic values by how they unfold).
+// =============================================================================
+inline void test_value_codec_sharing_and_cycles() {
+    std::cout << "=== value_codec_sharing_and_cycles ===\n";
+    try {
+        // ---- sharing: a diamond. Two slots of the parent point at ONE child. --------
+        bool share_ok = false;
+        {
+            Heap      src(64 * 1024);
+            GcTestCtx t(&src, 16);
+            Context   sctx = t.context();
+            GcObject* parent = src.alloc_slots_gc(GcObject::KIND_ARRAY, 2, &sctx);
+            t.win[0] = Value::fromPtr(parent->slots());
+            GcObject* child = src.alloc_string_gc("shared", &sctx);
+            Value*    p = GcObject::from_slots(t.win[0].asPtr())->slots();
+            p[0] = Value::fromPtr(child->bytes());
+            p[1] = p[0];                                   // the SAME object twice
+
+            const auto      buf = vcodec::encode(t.win[0]);
+            Heap            dst(64 * 1024);
+            RootedValuePool pool;
+            const Value     rebuilt = vcodec::decode(buf.data(), buf.size(), dst, nullptr, pool, nullptr, 0);
+            Value*          q = GcObject::from_slots(rebuilt.asPtr())->slots();
+            share_ok = q[0].isPtr() && q[0].asPtr() == q[1].asPtr();
+        }
+        // Reported here, not at the end: a throw in the cycle block below would otherwise
+        // swallow this result too, and then a failure tells you nothing about which half
+        // broke. (Found by falsifying this very test.)
+        std::cout << std::format("  shared child stays ONE object: {}\n", share_ok ? "PASS" : "FAIL");
+
+        // ---- a cycle: an object whose field points back at itself -------------------
+        bool cycle_ok = false;
+        {
+            Heap      src(64 * 1024);
+            GcTestCtx t(&src, 16);
+            Context   sctx = t.context();
+            GcObject* node = src.alloc_slots_gc(GcObject::KIND_ARRAY, 2, &sctx);
+            t.win[0] = Value::fromPtr(node->slots());
+            Value*    n = GcObject::from_slots(t.win[0].asPtr())->slots();
+            n[0] = Value::fromSigned48(99);
+            n[1] = t.win[0];                               // self-reference
+
+            const auto      buf = vcodec::encode(t.win[0]);   // must TERMINATE
+            Heap            dst(64 * 1024);
+            RootedValuePool pool;
+            const Value     rebuilt = vcodec::decode(buf.data(), buf.size(), dst, nullptr, pool, nullptr, 0);
+            Value*          m = GcObject::from_slots(rebuilt.asPtr())->slots();
+            // The ring must close onto the REBUILT object, not onto the source.
+            cycle_ok = m[0].isInt() && m[0].asSigned48() == 99 &&
+                       m[1].isPtr() && m[1].asPtr() == rebuilt.asPtr();
+        }
+
+        std::cout << std::format("  cycle terminates and closes:   {}\n", cycle_ok ? "PASS" : "FAIL");
+        check(share_ok && cycle_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_value_codec_refusals -- what must NOT travel, and what a bad buffer must do.
+// =============================================================================
+inline void test_value_codec_refusals() {
+    std::cout << "=== value_codec_refusals ===\n";
+    try {
+        Heap      src(64 * 1024);
+        GcTestCtx t(&src, 16);
+        Context   sctx = t.context();
+
+        // A closure: its captures are arbitrary and its function id belongs to one image.
+        GcObject* clo = src.alloc_closure_gc(/*fn_id*/ 3, 1, &sctx);
+        t.win[0] = Value::fromPtr(clo->slots());
+        GcObject::from_slots(t.win[0].asPtr())->slots()[0] = Value::fromSigned48(1);
+        bool closure_refused = false;
+        try { (void)vcodec::encode(t.win[0]); }
+        catch (const vcodec::ValueCodecError&) { closure_refused = true; }
+
+        // A closure nested inside an otherwise fine graph must be refused just as hard.
+        GcObject* arr = src.alloc_slots_gc(GcObject::KIND_ARRAY, 1, &sctx);
+        t.win[1] = Value::fromPtr(arr->slots());
+        GcObject::from_slots(t.win[1].asPtr())->slots()[0] = t.win[0];
+        bool nested_refused = false;
+        try { (void)vcodec::encode(t.win[1]); }
+        catch (const vcodec::ValueCodecError&) { nested_refused = true; }
+
+        // A Func IMMEDIATE is NOT a closure -- an id into the shared image, so it travels.
+        t.win[2] = Value::fromFunc(11);
+        bool func_ok = false;
+        {
+            const auto      buf = vcodec::encode(t.win[2]);
+            Heap            dst(16 * 1024);
+            RootedValuePool pool;
+            const Value     v = vcodec::decode(buf.data(), buf.size(), dst, nullptr, pool, nullptr, 0);
+            func_ok = v.isFunc() && v.asFuncId() == 11;
+        }
+
+        // A truncated buffer must raise, not read past its end.
+        bool truncated_refused = false;
+        {
+            auto buf = vcodec::encode(Value::fromSigned48(7));
+            buf.resize(buf.size() - 1);
+            Heap            dst(16 * 1024);
+            RootedValuePool pool;
+            try { (void)vcodec::decode(buf.data(), buf.size(), dst, nullptr, pool, nullptr, 0); }
+            catch (const vcodec::ValueCodecError&) { truncated_refused = true; }
+        }
+
+        std::cout << std::format("  closure / nested closure refused: {} {}\n",
+                                 closure_refused ? "PASS" : "FAIL", nested_refused ? "PASS" : "FAIL");
+        std::cout << std::format("  Func immediate travels:           {}\n", func_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  truncated buffer raises:          {}\n",
+                                 truncated_refused ? "PASS" : "FAIL");
+        check(closure_refused && nested_refused && func_ok && truncated_refused);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_value_codec_malformed -- decode() refuses every object the VM could not have built.
+//
+// The buffers are written by hand, byte by byte, because encode() cannot produce a bad
+// one. A hand-built VALID buffer comes first: if it were refused, every refusal below
+// could be the builder's fault rather than the check's. Each bad buffer must fail with
+// ITS OWN message, so a check that fires for the wrong reason does not count.
+// =============================================================================
+namespace codec_malformed {
+struct Buf {
+    std::vector<uint8_t> o;
+    explicit Buf(uint32_t nodes) { byteio::put_u32(o, nodes); }
+    Buf& node(uint8_t kind, uint32_t n) { byteio::put_u8(o, kind); byteio::put_u32(o, n); return *this; }
+    Buf& object(uint32_t n, uint16_t tid) { node(GcObject::KIND_OBJECT, n); byteio::put_u16(o, tid); return *this; }
+    Buf& string(std::string_view s) {
+        node(GcObject::KIND_STRING, static_cast<uint32_t>(s.size()));
+        o.insert(o.end(), s.begin(), s.end());
+        return *this;
+    }
+    Buf& tag(Value::Type t) { byteio::put_u8(o, static_cast<uint8_t>(t)); return *this; }
+    Buf& ptr(uint32_t idx) { tag(Value::Type::Pointer); byteio::put_u32(o, idx); return *this; }
+    Buf& num(int64_t v) { tag(Value::Type::Integer); byteio::put_u64(o, static_cast<uint64_t>(v)); return *this; }
+    Buf& undef() { return tag(Value::Type::Undef); }
+};
+
+// "" -> the buffer must decode; otherwise it must raise a ValueCodecError containing `want`.
+inline bool expect(const char* label, const Buf& b, const char* want,
+                   const std::vector<StructType>& types) {
+    Heap            dst(16 * 1024);
+    RootedValuePool pool;
+    std::string     got;
+    try { (void)vcodec::decode(b.o.data(), b.o.size(), dst, nullptr, pool, types.data(), types.size()); }
+    catch (const vcodec::ValueCodecError& e) { got = e.what(); }
+    const bool ok = *want ? got.find(want) != std::string::npos : got.empty();
+    std::cout << std::format("  {:<34} {}{}\n", label, ok ? "PASS" : "FAIL",
+                             ok ? "" : std::format("  (got: \"{}\")", got));
+    return ok;
+}
+} // namespace codec_malformed
+
+inline void test_value_codec_malformed() {
+    using namespace codec_malformed;
+    constexpr uint8_t ARR = GcObject::KIND_ARRAY, VEC = GcObject::KIND_VEC,
+                      MAP = GcObject::KIND_MAP,   BYT = GcObject::KIND_BYTES;
+    std::cout << "=== value_codec_malformed (hand-built bad buffers) ===\n";
+    try {
+        std::vector<StructType> types(8, StructType{ 0, "", {} });
+        types[7] = StructType{ 2, "Pair", { "a", "b" } };
+        bool ok = true;
+
+        // Control: a Vec of one Int over a 2-slot backing, and a struct of type 7.
+        ok &= expect("valid Vec (control)",
+                     Buf(2).node(VEC, 2).node(ARR, 2).ptr(1).num(1).num(5).undef().ptr(0), "", types);
+        ok &= expect("valid struct (control)",
+                     Buf(1).object(2, 7).num(1).num(2).ptr(0), "", types);
+
+        ok &= expect("struct type id outside the image",
+                     Buf(1).object(2, 9).num(1).num(2).ptr(0), "not in this image", types);
+        ok &= expect("struct with the wrong field count",
+                     Buf(1).object(3, 7).num(1).num(2).num(3).ptr(0), "does not match its type", types);
+        ok &= expect("Vec header with 3 slots",
+                     Buf(1).node(VEC, 3).undef().num(0).num(0).ptr(0), "wrong size", types);
+        ok &= expect("Vec backed by a string",
+                     Buf(2).node(VEC, 2).string("xy").ptr(1).num(0).ptr(0), "wrong kind", types);
+        ok &= expect("Vec count beyond capacity",
+                     Buf(2).node(VEC, 2).node(ARR, 2).ptr(1).num(3).num(1).num(2).ptr(0),
+                     "vector count out of range", types);
+        ok &= expect("Bytes count beyond capacity",
+                     Buf(2).node(BYT, 2).string("ab").ptr(1).num(3).ptr(0),
+                     "byte buffer count out of range", types);
+        // Two Vecs over ONE backing: a push through either would show up in the other.
+        ok &= expect("backing shared by two Vecs",
+                     Buf(4).node(ARR, 2).node(VEC, 2).node(VEC, 2).node(ARR, 2)
+                           .ptr(1).ptr(2)                    // root array -> both Vecs
+                           .ptr(3).num(0).ptr(3).num(0)      // both Vecs -> node 3
+                           .undef().undef().ptr(0),
+                     "backing is shared", types);
+        ok &= expect("Map backing not a power of two",
+                     Buf(2).node(MAP, 3).node(ARR, 6).ptr(1).num(0).num(0)
+                           .undef().undef().undef().undef().undef().undef().ptr(0),
+                     "power-of-two", types);
+        // One pair, and it is taken: a probe for an absent key would never stop.
+        ok &= expect("Map with no empty slot",
+                     Buf(2).node(MAP, 3).node(ARR, 2).ptr(1).num(1).num(1).num(10).num(20).ptr(0),
+                     "no empty slot", types);
+        ok &= expect("Map count disagrees with its keys",
+                     Buf(2).node(MAP, 3).node(ARR, 4).ptr(1).num(1).num(1)
+                           .undef().undef().undef().undef().ptr(0),
+                     "disagree with its keys", types);
+        ok &= expect("Map key that is an array",
+                     Buf(3).node(MAP, 3).node(ARR, 4).node(ARR, 0).ptr(1).num(1).num(1)
+                           .ptr(2).num(1).undef().undef().ptr(0),
+                     "neither a string nor an immediate", types);
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_rooted_pool_release -- a pool unregisters exactly its own slots, in linear time.
+//
+// Releasing a pool used to call remove_root once per slot, each a linear search plus an
+// erase that shifts the rest: ~0.5 s for a 100 k-node decode, 80x the decode itself. Two
+// things are checked. EXACTNESS: roots registered before and after the pool survive, and
+// they are the ones that remain (removing each by hand must succeed, one at a time).
+// SPEED: releasing 200 k slots must stay far below what the quadratic version needed.
+// The bound is loose on purpose -- 200 ms, against seconds for the old code even in
+// Release -- so the test does not become a timing flake on a busy machine.
+// =============================================================================
+inline void test_rooted_pool_release() {
+    std::cout << "=== rooted_pool_release (exact, and linear) ===\n";
+    try {
+        Heap  heap(64 * 1024);
+        Value before = Value::fromNil(), after = Value::fromNil();
+        heap.add_root(&before);
+
+        std::optional<RootedValuePool> pool;
+        pool.emplace();
+        pool->heap = &heap;
+        pool->slots.resize(200000);
+        for (Value& s : pool->slots) heap.add_root(&s);
+        heap.add_root(&after);                         // registered AFTER the pool's block
+        const auto t0 = std::chrono::steady_clock::now();
+        pool.reset();                                  // the destructor, timed
+        const double release_ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0).count();
+
+        const bool count_ok = heap.root_count() == 2;
+        heap.remove_root(&before);
+        const bool before_ok = heap.root_count() == 1;
+        heap.remove_root(&after);
+        const bool after_ok = heap.root_count() == 0;
+        const bool fast_ok  = release_ms < 200.0;
+
+        std::cout << std::format("  only the pool's roots removed: {} {} {}\n", count_ok ? "PASS" : "FAIL",
+                                 before_ok ? "PASS" : "FAIL", after_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  200 k slots released in {:.2f} ms (< 200): {}\n",
+                                 release_ms, fast_ok ? "PASS" : "FAIL");
+        check(count_ok && before_ok && after_ok && fast_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_value_codec_collects -- the rebuild pass must survive collections MID-REBUILD.
+//
+// This is the test the rooted pool exists for. The destination heap starts far too
+// small for the graph, so the allocation loop collects repeatedly while half the nodes
+// are built and not yet wired. Every one of them is held only by its pool slot, and the
+// collector rewrites those slots in place -- which is also why the patch pass reads its
+// referents out of the pool rather than out of a saved pointer.
+//
+// Falsifier: swap the pool for a plain std::vector<GcObject*> and this goes wrong.
+// =============================================================================
+inline void test_value_codec_collects() {
+    std::cout << "=== value_codec_collects (rebuild across collections) ===\n";
+    try {
+        Heap      src(256 * 1024);
+        GcTestCtx t(&src, 16);
+        Context   sctx = t.context();
+
+        constexpr int N = 400;
+        GcObject* spine = src.alloc_slots_gc(GcObject::KIND_ARRAY, N, &sctx);
+        t.win[0] = Value::fromPtr(spine->slots());
+        for (int i = 0; i < N; ++i) {
+            // Each string is its own object, so the graph is N+1 nodes wide.
+            GcObject* s = src.alloc_string_gc(std::format("node-{}", i), &sctx);
+            GcObject::from_slots(t.win[0].asPtr())->slots()[i] = Value::fromPtr(s->bytes());
+        }
+
+        const auto buf = vcodec::encode(t.win[0]);
+
+        Heap            dst(1024);            // deliberately tiny -> forced to collect/grow
+        RootedValuePool pool;
+        const Value     rebuilt = vcodec::decode(buf.data(), buf.size(), dst, nullptr, pool, nullptr, 0);
+
+        const bool collected = dst.stats().collections > 0;
+        const bool eq_ok     = vcodec::deep_eq(t.win[0], rebuilt, &sctx);
+        std::cout << std::format("  destination really collected ({}x): {}\n",
+                                 dst.stats().collections, collected ? "PASS" : "FAIL");
+        std::cout << std::format("  graph still intact afterwards:      {}\n", eq_ok ? "PASS" : "FAIL");
+        check(collected && eq_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_thread_slot_table -- the data structure behind the POSIX fault rendezvous.
+//
+// WHY IT IS TESTED HERE, ON A PLATFORM THAT DOES NOT USE IT. ThreadSlotTable is
+// consumed only by FaultSignals.h, which is compiled only on POSIX -- so on Windows
+// the production use is unreachable. The table itself is deliberately free of any
+// POSIX declaration precisely so it can still be COMPILED and EXERCISED here: it is
+// the part with invariants that can be got wrong (claim/release ordering, capacity
+// exhaustion, one slot per thread), and the part that is cheap to test. What stays
+// untestable on Windows is only the wiring into the signal handler.
+//
+// The `load` path is the one that runs in signal context, so the properties that
+// matter are: a thread reads back exactly what IT stored, an unknown thread reads
+// nullptr (which the handler treats as "not ours" and chains onward), and a full
+// table REFUSES rather than corrupting -- degraded classification, never a wrong
+// landing frame.
+// =============================================================================
+inline void test_thread_slot_table() {
+    std::cout << "=== thread_slot_table ===\n";
+    int a = 1, b = 2, c = 3;
+
+    // --- single thread: claim, nest, release -----------------------------------
+    ThreadSlotTable<int, 4> t;
+    const bool empty_ok = t.load(7) == nullptr;              // nothing stored yet
+    t.store(7, &a);
+    const bool claim_ok = t.load(7) == &a;
+    t.store(7, &b);                                          // re-arm (the nesting case)
+    const bool nest_ok = t.load(7) == &b && t.load(8) == nullptr;
+    t.store(7, &a);                                          // retract to the enclosing frame
+    const bool unnest_ok = t.load(7) == &a;
+    t.store(7, nullptr);                                     // release
+    const bool release_ok = t.load(7) == nullptr;
+    const bool reclaim_ok = t.store(9, &c) && t.load(9) == &c;   // slot reusable afterwards
+    t.store(9, nullptr);
+
+    // --- capacity: the last store must FAIL, not overwrite a stranger's slot ----
+    ThreadSlotTable<int, 4> full;
+    bool fill_ok = true;
+    for (uintptr_t i = 1; i <= 4; ++i) fill_ok = fill_ok && full.store(i, &a);
+    const bool overflow_ok = !full.store(5, &b) && full.load(5) == nullptr;
+    bool intact_ok = true;                                    // the four holders are untouched
+    for (uintptr_t i = 1; i <= 4; ++i) intact_ok = intact_ok && full.load(i) == &a;
+
+    // --- several threads at once: each must only ever see its OWN value ---------
+    // The real contention is claiming a free slot; each thread then hammers its own
+    // entry so a slot stolen or aliased by another thread shows up as a mismatch.
+    constexpr unsigned NT = 4;
+    ThreadSlotTable<int, NT> shared;
+    std::atomic<bool>        race_ok{ true };
+    std::vector<std::thread> workers;
+    std::vector<int>         values(NT);
+    for (unsigned i = 0; i < NT; ++i) values[i] = static_cast<int>(100 + i);
+    for (unsigned i = 0; i < NT; ++i) {
+        workers.emplace_back([&shared, &race_ok, &values, i] {
+            const uintptr_t tid = static_cast<uintptr_t>(i) + 1;   // 0 means FREE
+            for (int round = 0; round < 2000; ++round) {
+                if (!shared.store(tid, &values[i])) { race_ok = false; return; }
+                if (shared.load(tid) != &values[i]) { race_ok = false; return; }
+                shared.store(tid, nullptr);
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+
+    std::cout << std::format("  empty / claim / nest / unnest:  {} {} {} {}\n",
+                             empty_ok ? "PASS" : "FAIL", claim_ok ? "PASS" : "FAIL",
+                             nest_ok ? "PASS" : "FAIL", unnest_ok ? "PASS" : "FAIL");
+    std::cout << std::format("  release / slot reusable:        {} {}\n",
+                             release_ok ? "PASS" : "FAIL", reclaim_ok ? "PASS" : "FAIL");
+    std::cout << std::format("  full table refuses, holders ok: {} {}\n",
+                             overflow_ok ? "PASS" : "FAIL", intact_ok ? "PASS" : "FAIL");
+    std::cout << std::format("  {} threads, 2000 rounds each:     {}\n",
+                             NT, race_ok.load() ? "PASS" : "FAIL");
+    check(empty_ok && claim_ok && nest_ok && unnest_ok && release_ok && reclaim_ok &&
+          fill_ok && overflow_ok && intact_ok && race_ok.load());
+}
+
+// =============================================================================
+// test_concurrent_execute -- several execute() instances running AT THE SAME TIME,
+// each with its own Heap, StringInterner and output stream, over ONE shared image.
+//
+// This is the claim the whole `concurrent-execute` work exists to establish, turned
+// into a test: the per-instance state really is per-instance, and the read-only image
+// really is shareable. Everything the interpreter mutates is reached through
+// ctx->vm->..., so if that were not so, this is where it shows.
+//
+// WHY THE PROGRAM ALLOCATES. A loop that only adds would prove nothing about the
+// heaps: it never collects, so two instances sharing one Heap would still agree. The
+// body runs TO_STRING per iteration, which allocates a throwaway string, and each
+// instance starts from a deliberately small semispace -- so every instance drives its
+// OWN collector through many cycles while the others are mid-flight. The test asserts
+// that collections actually happened, because a run that never collected would make
+// the whole thing vacuous.
+//
+// HOW TO FALSIFY IT (and it must be falsified before it is believed): give every
+// worker the SAME Heap and StringInterner instead of its own locals. The sums must
+// then go wrong or the run must fault -- a probe that passes either way would be
+// pinning nothing.
+// =============================================================================
+struct ChurnImage {
+    static constexpr uint8_t FRAME = 4;          // r0 count, r1 acc, r2 temp, r3 alloc scratch
+    static constexpr int16_t N     = 2000;
+    static constexpr int64_t WANT  = int64_t(N) * (int64_t(N) + 1) / 2;
+
+    std::vector<uint32_t>    bytecode;
+    std::vector<std::string> string_literals;
+
+    ChurnImage() {
+        Assembler as;
+        as.func("churn", FRAME);
+        as.label("main");
+        as.C2(OpCode::LOAD_CONST, FRAME + 0, N);   // args for the call slide by FRAME
+        as.C2(OpCode::LOAD_CONST, FRAME + 1, 0);
+        as.CALL("churn");
+        as.load_str(1, "done");                    // r1/r2 are in the TOP frame
+        as.R6(OpCode::PRINTLN, 2, 1, 0);           // -> this instance's own `out`
+        as.J(OpCode::HALT);
+        as.label("churn");
+        as.C2(OpCode::LOAD_CONST, 2, 0);
+        as.B (OpCode::BEQ_INT, 0, 2, "churn_base");
+        as.R6(OpCode::TO_STRING, 3, 0, 0);         // allocate garbage -> drive the collector
+        as.R6(OpCode::ADD_INT, 2, 1, 0);
+        as.C2(OpCode::DECR, 0);
+        as.R6(OpCode::MOV, 1, 2, 0);
+        as.TCO_CALL("churn");
+        as.label("churn_base");
+        as.R6(OpCode::MOV, 0, 1, 0);
+        as.J(OpCode::RET);
+        bytecode        = as.assemble();
+        string_literals = as.string_literals();
+    }
+};
+
+struct ChurnResult {
+    int64_t     sum         = -1;
+    std::string text;
+    uint64_t    collections = 0;
+    bool        threw       = false;
+    std::string what;
+};
+
+// One instance. Every piece of mutable VM state here is a LOCAL: that is the contract
+// under test. Only `img` is shared, and it is const.
+inline void churn_run(const ChurnImage& img, ChurnResult& out) {
+    try {
+        Heap               heap(8 * 1024);   // small semispace -> frequent collections
+        StringInterner     interner;
+        std::ostringstream os;
+        auto res = execute(img.bytecode, &heap, nullptr, &interner, ChurnImage::FRAME,
+                           nullptr, nullptr, &img.string_literals, nullptr, nullptr, &os);
+        out.sum         = res.get_reg_base()[ChurnImage::FRAME].asSigned48();
+        out.text        = os.str();
+        out.collections = heap.stats().collections;
+    } catch (const std::exception& e) {
+        out.threw = true;
+        out.what  = e.what();
+    }
+}
+
+inline void test_concurrent_execute() {
+    std::cout << "=== concurrent_execute (4 instances, one shared image) ===\n";
+    const ChurnImage img;
+
+    ChurnResult base;                          // the single-threaded reference
+    churn_run(img, base);
+    const bool base_ok = !base.threw && base.sum == ChurnImage::WANT && base.text == "done\n";
+    std::cout << std::format("  baseline: sum={} printed-once={} collections={} -> {}\n",
+                             base.sum, base.text == "done\n", base.collections,
+                             base_ok ? "PASS" : "FAIL");
+
+    constexpr unsigned NT = 4;
+    std::vector<ChurnResult> results(NT);
+    std::vector<std::thread> workers;
+    for (unsigned i = 0; i < NT; ++i)
+        workers.emplace_back([&img, &results, i] { churn_run(img, results[i]); });
+    for (auto& w : workers) w.join();
+
+    bool all_ok = base_ok;
+    for (unsigned i = 0; i < NT; ++i) {
+        const ChurnResult& r = results[i];
+        // Each instance must compute the right answer, print into ITS OWN stream exactly
+        // once (a shared sink would give one thread two lines and another none), and have
+        // really run its own collector.
+        const bool ok = !r.threw && r.sum == ChurnImage::WANT && r.text == "done\n" &&
+                        r.collections > 0;
+        all_ok = all_ok && ok;
+        if (r.threw)
+            std::cout << std::format("  instance {}: threw: {}\n", i, r.what);
+        else
+            std::cout << std::format("  instance {}: sum={} printed-once={} collections={} -> {}\n",
+                                     i, r.sum, r.text == "done\n", r.collections,
+                                     ok ? "PASS" : "FAIL");
+    }
+    check(all_ok);
+}
+
+// =============================================================================
+// fork-join tasks -- rawSpawn / rawJoin / rawTaskTake, driven by hand-assembled programs.
+//
+// Every program below shares ONE set of task functions (task_fns), appended after its main
+// code, so each task runs a second execute() over the very image the parent runs -- the real
+// arrangement. The parent's results are checked through its registers after HALT. The top
+// frame is TF = 48, so every register the tests use for a heap value lies inside the scanned
+// frame; r40..r43 are the scratch registers for native-call arguments.
+// =============================================================================
+namespace forkjoin {
+constexpr uint8_t TF = 48;
+
+// The task functions (all arity 1):
+//   tsum(n)   -> 1 + 2 + ... + n, allocating a garbage string per step so the TASK heap collects
+//   tfail(x)  -> PANIC "boom"
+//   techo(x)  -> x
+//   tshape(x) -> a Vec [x, "from-task"] built in the task heap
+//   ttalk(x)  -> prints "child", returns x
+inline void task_fns(Assembler& as) {
+    as.label("tsum");
+    as.C2(OpCode::LOAD_CONST, 1, 0);
+    as.TCO_CALL("tsum_loop");
+    as.label("tsum_loop");                       // (n = r0, acc = r1)
+    as.C2(OpCode::LOAD_CONST, 2, 0);
+    as.B (OpCode::BEQ_INT, 0, 2, "tsum_done");
+    as.R6(OpCode::TO_STRING, 3, 0, 0);           // garbage -> the task heap collects
+    as.R6(OpCode::ADD_INT, 1, 1, 0);
+    as.C2(OpCode::DECR, 0);
+    as.TCO_CALL("tsum_loop");
+    as.label("tsum_done");
+    as.R6(OpCode::MOV, 0, 1, 0);
+    as.J(OpCode::RET);
+
+    as.label("tfail");
+    as.load_str(1, "boom");
+    as.R6(OpCode::PANIC, 0, 1, 0);
+    as.J(OpCode::RET);
+
+    as.label("techo");
+    as.J(OpCode::RET);
+
+    as.label("tshape");
+    as.VEC_NEW(1);
+    as.VEC_PUSH(1, 0);
+    as.load_str(2, "from-task");
+    as.VEC_PUSH(1, 2);
+    as.R6(OpCode::MOV, 0, 1, 0);
+    as.J(OpCode::RET);
+
+    as.label("ttalk");
+    as.load_str(1, "child");
+    as.R6(OpCode::PRINTLN, 2, 1, 0);
+    as.J(OpCode::RET);
+
+    // tdeep(n) = 0 if n == 0, else 1 + tdeep(n - 1): a real (non-tail) CALL chain n deep.
+    as.label("tdeep");
+    as.load_const(1, 0);
+    as.B (OpCode::BEQ_INT, 0, 1, "tdeep_base");
+    as.R6(OpCode::MOV, 3, 0, 0);
+    as.C2(OpCode::DECR, 3);
+    as.CALL("tdeep");
+    as.load_const(1, 1);
+    as.R6(OpCode::ADD_INT, 0, 3, 1);
+    as.J(OpCode::RET);
+    as.label("tdeep_base");
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
+    // The actor functions (all take one ignored start value; frame: r1 = own id, r2/r3 = native
+    // arguments, r4 = mail kind, r5 = native-id scratch, r6 = message, r7 = temp):
+    //   aecho(_)  -> for every message n, sends 2n to the MAIN program (address 0); ends at Stop
+    //   acrash(_) -> PANIC "boom" at once
+    //   astop(_)  -> ignores messages; at Stop prints "stopped" and ends
+    as.label("aecho");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.label("aecho_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BEQ_INT, 4, 7, "aecho_done");
+    as.load_const(7, 1);
+    as.B (OpCode::BNE_INT, 4, 7, "aecho_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.call_native_id(6, 5, 2, 1, NATIVE_MAIL_MSG);
+    as.R6(OpCode::ADD_INT, 6, 6, 6);
+    as.load_const(2, 0);
+    as.R6(OpCode::MOV, 3, 6, 0);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.J(OpCode::J, "aecho_loop");
+    as.label("aecho_done");
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
+    as.label("acrash");
+    as.load_str(1, "boom");
+    as.R6(OpCode::PANIC, 0, 1, 0);
+    as.J(OpCode::RET);
+
+    // aconn(_): receives a hand-off ticket, takes the connection, writes "hi", closes it, tells the
+    // main program it is done (sends 1 to address 0), then waits for Stop.
+    as.label("aconn");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.call_native_id(6, 5, 2, 1, NATIVE_MAIL_MSG);            // r6 = the ticket
+    as.R6(OpCode::MOV, 2, 6, 0);
+    as.call_native_id(7, 5, 2, 1, NATIVE_TAKE);                // r7 = the connection, here
+    as.load_str(2, "hi");
+    as.BYTES_FROM_STR(3, 2);
+    as.R6(OpCode::MOV, 2, 7, 0);
+    as.call_native_id(4, 5, 2, 2, NATIVE_TCP_SEND);
+    as.R6(OpCode::MOV, 2, 7, 0);
+    as.call_native_id(4, 5, 2, 1, NATIVE_TCP_CLOSE);
+    as.load_const(2, 0);
+    as.load_const(3, 1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_SEND);
+    as.label("aconn_wait");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BNE_INT, 4, 7, "aconn_wait");
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
+    as.label("astop");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.label("astop_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BNE_INT, 4, 7, "astop_loop");
+    as.load_str(6, "stopped");
+    as.R6(OpCode::PRINTLN, 7, 6, 0);
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+}
+
+inline void declare_task_fns(Assembler& as) {
+    as.declare_fn("tsum",   4, 1);
+    as.func("tsum_loop", 4);
+    as.declare_fn("tfail",  2, 1);
+    as.declare_fn("techo",  1, 1);
+    as.declare_fn("tshape", 4, 1);
+    as.declare_fn("ttalk",  3, 1);
+    as.declare_fn("tdeep",  3, 1);
+    as.declare_fn("aecho",  8, 1);
+    as.declare_fn("acrash", 2, 1);
+    as.declare_fn("astop",  8, 1);
+    as.declare_fn("aconn",  8, 1);
+}
+
+// r[rd] = native(r[ra]) / native(r[ra], r[rb]), through the argument scratch r40 / r41.
+inline void call1(Assembler& as, uint8_t rd, uint16_t native, uint8_t ra) {
+    as.R6(OpCode::MOV, 40, ra, 0);
+    as.call_native_id(rd, 42, 40, 1, native);
+}
+inline void call2(Assembler& as, uint8_t rd, uint16_t native, uint8_t ra, uint8_t rb) {
+    as.R6(OpCode::MOV, 40, ra, 0);
+    as.R6(OpCode::MOV, 41, rb, 0);
+    as.call_native_id(rd, 42, 40, 2, native);
+}
+
+// id -> r[rd]: spawnActor fn(arg), where arg is already in r41.
+inline void spawn_actor(Assembler& as, uint8_t rd, const char* fn) {
+    as.LOAD_FN(40, as.func_id(fn));
+    as.call_native_id(rd, 42, 40, 2, NATIVE_ACTOR_SPAWN);
+}
+// ok -> r[rd]: send the Int `n` to the actor whose address is in r[rpid].
+inline void send_int(Assembler& as, uint8_t rd, uint8_t rpid, int64_t n) {
+    as.R6(OpCode::MOV, 40, rpid, 0);
+    as.load_const(41, n);
+    as.call_native_id(rd, 42, 40, 2, NATIVE_SEND);
+}
+// kind -> r[rkind]: receive on the MAIN inbox (address 0), waiting at most `ms` (-1 = forever).
+inline void receive_main(Assembler& as, uint8_t rkind, int64_t ms) {
+    as.load_const(40, 0);
+    as.load_const(41, ms);
+    as.call_native_id(rkind, 42, 40, 2, NATIVE_RECEIVE);
+}
+// The main inbox's current mail, read by `native` (MAIL_MSG / MAIL_FROM / MAIL_REASON) -> r[rd].
+inline void mail_read(Assembler& as, uint8_t rd, uint16_t native) {
+    as.load_const(40, 0);
+    as.call_native_id(rd, 42, 40, 1, native);
+}
+inline void main_inbox(Assembler& as, uint8_t rd) {
+    as.call_native_id(rd, 42, 40, 0, NATIVE_MAIN_INBOX);
+}
+
+// id -> r[rd]: spawn fn(arg), where arg is already in r41.
+inline void spawn(Assembler& as, uint8_t rd, const char* fn) {
+    as.LOAD_FN(40, as.func_id(fn));
+    as.call_native_id(rd, 42, 40, 2, NATIVE_TASK_SPAWN);
+}
+// join the task whose id is in r[rid]: ok -> r[rok], result / message -> r[rres].
+inline void join(Assembler& as, uint8_t rid, uint8_t rok, uint8_t rres) {
+    as.R6(OpCode::MOV, 43, rid, 0);
+    as.call_native_id(rok, 42, 43, 1, NATIVE_TASK_JOIN);
+    as.call_native_id(rres, 42, 43, 1, NATIVE_TASK_TAKE);
+}
+
+struct Run {
+    std::vector<Value> regs;
+    std::string        printed;
+    std::string        fault;     // non-empty iff execute() threw
+};
+
+// Assemble main (already emitted by the caller) + the task functions, and run it. The Heap
+// outlives the copied registers, so pointers in `regs` stay readable for the checks.
+inline Run run(Assembler& as, Heap& heap) {
+    as.J(OpCode::HALT);
+    task_fns(as);
+    const auto code  = as.assemble();
+    const auto slits = as.string_literals();
+    const auto nat   = build_native_table();
+    StringInterner     interner;
+    std::ostringstream os;
+    Run r;
+    try {
+        auto res = execute(code, &heap, nullptr, &interner, TF, nullptr, nullptr, &slits, nullptr,
+                           &as.function_table(), &os, nullptr, 0, 0, nullptr, nullptr, nullptr, &nat);
+        r.regs.assign(res.get_reg_base(), res.get_reg_base() + TF);
+    } catch (const std::exception& e) { r.fault = e.what(); }
+    r.printed = os.str();
+    return r;
+}
+
+inline std::string str_of(Value v) {
+    if (!v.isPtr()) return "<not a string>";
+    const GcObject* o = GcObject::from_slots(v.asPtr());
+    if (o->kind != GcObject::KIND_STRING) return "<not a string>";
+    return std::string(o->bytes(), o->string_length());
+}
+} // namespace forkjoin
+
+// Eight tasks at once, each summing on its own heap; every result must come back, in id order.
+inline void test_task_parallel_sums() {
+    using namespace forkjoin;
+    std::cout << "=== task_parallel_sums (8 tasks, own heaps) ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        for (uint8_t i = 0; i < 8; ++i) {
+            as.load_const(41, 1000 + 250 * i);
+            spawn(as, static_cast<uint8_t>(10 + i), "tsum");
+        }
+        for (uint8_t i = 0; i < 8; ++i)
+            join(as, static_cast<uint8_t>(10 + i), static_cast<uint8_t>(20 + i), static_cast<uint8_t>(30 + i));
+        Heap heap;
+        const Run r = run(as, heap);
+        bool ok = r.fault.empty();
+        for (int i = 0; ok && i < 8; ++i) {
+            const int64_t n = 1000 + 250 * i;
+            ok = r.regs[20 + i].isBool() && r.regs[20 + i].asBool() &&
+                 r.regs[30 + i].isInt() && r.regs[30 + i].asSigned48() == n * (n + 1) / 2;
+        }
+        std::cout << std::format("  all 8 sums correct: {}{}\n", ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A task that faults: join says false, take gives the message, and the parent carries on.
+inline void test_task_failure() {
+    using namespace forkjoin;
+    std::cout << "=== task_failure (a task fault is a value to the parent) ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        as.load_const(41, 0);  spawn(as, 10, "tfail");  join(as, 10, 20, 30);
+        as.load_const(41, 10); spawn(as, 11, "tsum");   join(as, 11, 21, 31);
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool failed_ok = r.fault.empty() && r.regs[20].isBool() && !r.regs[20].asBool() &&
+                               str_of(r.regs[30]).find("boom") != std::string::npos;
+        const bool after_ok  = r.fault.empty() && r.regs[21].isBool() && r.regs[21].asBool() &&
+                               r.regs[31].isInt() && r.regs[31].asSigned48() == 55;
+        std::cout << std::format("  failed task -> false + message:  {}  (\"{}\")\n",
+                                 failed_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? str_of(r.regs[30]) : r.fault);
+        std::cout << std::format("  parent continues, next task ok:  {}\n", after_ok ? "PASS" : "FAIL");
+        check(failed_ok && after_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// Heap values both ways: an argument built by the parent comes back equal but copied, and a
+// value built in the task heap arrives intact.
+inline void test_task_values() {
+    using namespace forkjoin;
+    std::cout << "=== task_values (heap values in and out) ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        as.VEC_NEW(5); as.load_const(6, 7); as.VEC_PUSH(5, 6);
+        as.load_str(6, "hi"); as.VEC_PUSH(5, 6);                 // r5 = [7, "hi"]
+        as.R6(OpCode::MOV, 41, 5, 0);  spawn(as, 10, "techo");  join(as, 10, 20, 30);
+        as.R6(OpCode::EQ_DEEP, 31, 5, 30);                        // echo came back equal
+        as.load_const(41, 3);          spawn(as, 11, "tshape"); join(as, 11, 21, 32);
+        as.VEC_NEW(7); as.load_const(6, 3); as.VEC_PUSH(7, 6);
+        as.load_str(6, "from-task"); as.VEC_PUSH(7, 6);           // r7 = [3, "from-task"]
+        as.R6(OpCode::EQ_DEEP, 33, 7, 32);
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool echo_ok  = r.fault.empty() && r.regs[31].isBool() && r.regs[31].asBool() &&
+                              r.regs[30].isPtr() && r.regs[30].asPtr() != r.regs[5].asPtr();
+        const bool shape_ok = r.fault.empty() && r.regs[33].isBool() && r.regs[33].asBool();
+        std::cout << std::format("  argument echoed, equal but copied: {}{}\n", echo_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  task-built Vec arrives intact:     {}\n", shape_ok ? "PASS" : "FAIL");
+        check(echo_ok && shape_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A task's output reaches the parent's stream at join, not while it runs. A task nobody joins
+// is still waited for when execute() ends (no crash, no hang) -- and what it printed is dropped.
+inline void test_task_output_and_unjoined() {
+    using namespace forkjoin;
+    std::cout << "=== task_output_and_unjoined ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        as.load_const(41, 1);     spawn(as, 10, "ttalk"); join(as, 10, 20, 30);
+        as.load_const(41, 2);     spawn(as, 11, "ttalk");          // never joined
+        as.load_const(41, 20000); spawn(as, 12, "tsum");           // never joined, still running
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool out_ok = r.fault.empty() && r.printed == "child\n";
+        std::cout << std::format("  joined task's output only, once:   {}  (\"{}\")\n",
+                                 out_ok ? "PASS" : "FAIL", r.fault.empty() ? r.printed : r.fault);
+        std::cout << "  unjoined tasks collected at the end: PASS (returned)\n";
+        check(out_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A task starts with SMALL stacks (VM_Resources::ISOLATE_*: 1024 return frames), so a deep call
+// chain in a task exercises the on-demand growth from that small start -- 200 000 frames is many
+// doublings past it. Falsifier: a task whose stacks could not grow faults with "stack overflow".
+inline void test_task_deep_recursion() {
+    using namespace forkjoin;
+    std::cout << "=== task_deep_recursion (stacks grow from a small start) ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        as.load_const(41, 200000);  spawn(as, 10, "tdeep");  join(as, 10, 20, 30);
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool ok = r.fault.empty() && r.regs[20].isBool() && r.regs[20].asBool() &&
+                        r.regs[30].isInt() && r.regs[30].asSigned48() == 200000;
+        std::cout << std::format("  200000 nested calls in a task: {}{}\n", ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? (r.regs[20].isBool() && !r.regs[20].asBool()
+                                                        ? "  (task failed: " + str_of(r.regs[30]) + ")" : "")
+                                                 : "  (fault: " + r.fault + ")");
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// Misuse faults with a located message instead of running anything.
+inline void test_task_misuse() {
+    using namespace forkjoin;
+    std::cout << "=== task_misuse (located faults) ===\n";
+    auto expect = [](const char* label, const Run& r, const char* want) {
+        const bool ok = r.fault.find(want) != std::string::npos;
+        std::cout << std::format("  {:<32} {}{}\n", label, ok ? "PASS" : "FAIL",
+                                 ok ? "" : "  (got: \"" + r.fault + "\")");
+        return ok;
+    };
+    try {
+        bool ok = true;
+        {   // an Int where the function should be
+            Assembler as; declare_task_fns(as); as.label("main");
+            as.load_const(40, 5); as.load_const(41, 1);
+            as.call_native_id(10, 42, 40, 2, NATIVE_TASK_SPAWN);
+            Heap heap;
+            ok &= expect("spawn of a non-function", run(as, heap), "named top-level function");
+        }
+        {   // rawTaskInput outside a task
+            Assembler as; declare_task_fns(as); as.label("main");
+            as.call_native_id(10, 42, 43, 0, NATIVE_TASK_INPUT);
+            Heap heap;
+            ok &= expect("task input outside a task", run(as, heap), "not a task");
+        }
+        {   // joining twice
+            Assembler as; declare_task_fns(as); as.label("main");
+            as.load_const(41, 3); forkjoin::spawn(as, 10, "techo");
+            forkjoin::join(as, 10, 20, 30);
+            as.call_native_id(21, 42, 43, 1, NATIVE_TASK_JOIN);
+            Heap heap;
+            ok &= expect("joining a task twice", run(as, heap), "already joined");
+        }
+        {   // an id that was never handed out
+            Assembler as; declare_task_fns(as); as.label("main");
+            as.load_const(43, 7);
+            as.call_native_id(20, 42, 43, 1, NATIVE_TASK_JOIN);
+            Heap heap;
+            ok &= expect("joining an unknown id", run(as, heap), "not a task of this program");
+        }
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// actors -- rawSpawnActor / rawSend / rawReceive / rawMailMsg / rawMailFrom / rawMailReason /
+// rawMainInbox / rawSelfId, on the same world-wide runtime as the tasks above. Each program's
+// root takes the main inbox (address 0), which is where aecho replies. Every test also checks,
+// by returning at all, that the end of the world stops the actors: aecho and astop loop on
+// receive until they get Stop.
+// =============================================================================
+
+// A message there and a reply back, twice: the copy crosses heaps in both directions, and an
+// actor keeps its state (it is still there for the second message).
+inline void test_actor_ping_pong() {
+    using namespace forkjoin;
+    std::cout << "=== actor_ping_pong ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(41, 0);  spawn_actor(as, 11, "aecho");
+        send_int(as, 12, 11, 21);
+        receive_main(as, 13, -1);  mail_read(as, 14, NATIVE_MAIL_MSG);
+        send_int(as, 15, 11, 50);
+        receive_main(as, 16, -1);  mail_read(as, 17, NATIVE_MAIL_MSG);
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool ok = r.fault.empty() && r.regs[12].isBool() && r.regs[12].asBool() &&
+                        r.regs[13].isInt() && r.regs[13].asSigned48() == 1 &&
+                        r.regs[14].isInt() && r.regs[14].asSigned48() == 42 &&
+                        r.regs[17].isInt() && r.regs[17].asSigned48() == 100;
+        std::cout << std::format("  21 -> 42, then 50 -> 100:  {}{}\n", ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// An actor that faults is reported to its starter -- in the same stream as messages, with its id
+// and the fault message -- and from then on a send to it is refused.
+inline void test_actor_crash_reported() {
+    using namespace forkjoin;
+    std::cout << "=== actor_crash_reported ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(41, 0);  spawn_actor(as, 11, "acrash");
+        receive_main(as, 13, -1);
+        mail_read(as, 14, NATIVE_MAIL_FROM);
+        mail_read(as, 15, NATIVE_MAIL_REASON);
+        send_int(as, 16, 11, 1);
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool report_ok = r.fault.empty() && r.regs[13].isInt() && r.regs[13].asSigned48() == 2 &&
+                               r.regs[14].isInt() && r.regs[11].isInt() &&
+                               r.regs[14].asSigned48() == r.regs[11].asSigned48() &&
+                               str_of(r.regs[15]).find("boom") != std::string::npos;
+        const bool refused_ok = r.fault.empty() && r.regs[16].isBool() && !r.regs[16].asBool();
+        std::cout << std::format("  exit report: who + why:     {}{}\n", report_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  send to it afterwards false: {}\n", refused_ok ? "PASS" : "FAIL");
+        check(report_ok && refused_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A receive with a timeout on an empty inbox gives up with kind 0 (and waited at least roughly
+// that long); and at the end of the program an actor waiting on receive gets Stop.
+inline void test_actor_timeout_and_stop() {
+    using namespace forkjoin;
+    std::cout << "=== actor_timeout_and_stop ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(41, 0);  spawn_actor(as, 11, "astop");
+        receive_main(as, 13, 40);
+        Heap heap;
+        const auto t0 = std::chrono::steady_clock::now();
+        const Run r = run(as, heap);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const bool timeout_ok = r.fault.empty() && r.regs[13].isInt() && r.regs[13].asSigned48() == 0 && ms >= 30.0;
+        const bool stop_ok    = r.fault.empty() && r.printed == "stopped\n";
+        std::cout << std::format("  timed-out receive -> 0 ({:.0f} ms): {}{}\n", ms, timeout_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  actor stopped at the end:      {}  (\"{}\")\n", stop_ok ? "PASS" : "FAIL", r.printed);
+        check(timeout_ok && stop_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// Many actors at once, each answering one message; every reply arrives (in some order).
+inline void test_actor_many() {
+    using namespace forkjoin;
+    constexpr int N = 200;
+    std::cout << "=== actor_many (" << N << " actors) ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        for (int i = 1; i <= N; ++i) {
+            as.load_const(41, 0);  spawn_actor(as, 11, "aecho");
+            send_int(as, 12, 11, i);
+        }
+        as.load_const(20, 0);                                   // r20 = sum of the replies
+        for (int i = 1; i <= N; ++i) {
+            receive_main(as, 13, -1);
+            mail_read(as, 14, NATIVE_MAIL_MSG);
+            as.R6(OpCode::ADD_INT, 20, 20, 14);
+        }
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool ok = r.fault.empty() && r.regs[20].isInt() && r.regs[20].asSigned48() == int64_t{N} * (N + 1);
+        std::cout << std::format("  sum of {} replies = {}: {}{}\n", N, int64_t{N} * (N + 1), ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A connection handed to an actor: the socket moves between two isolates' registries. Over loopback,
+// with the port chosen by the OS. The root keeps its old descriptor and uses it on purpose, twice --
+// the second time after a new connection has reused the very SLOT it named, which is what the
+// descriptor's generation exists for: without it, the stale descriptor would reach the stranger.
+inline void test_actor_socket_hand_off() {
+    using namespace forkjoin;
+    std::cout << "=== actor_socket_hand_off ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        as.load_const(20, 0);          call1(as, 21, NATIVE_TCP_LISTEN, 20);        // listener
+        call1(as, 22, NATIVE_TCP_LOCAL_PORT, 21);                                   // its port
+        as.load_str(23, "127.0.0.1");  call2(as, 24, NATIVE_TCP_CONNECT, 23, 22);   // client
+        call1(as, 25, NATIVE_TCP_ACCEPT, 21);                                       // server side
+        main_inbox(as, 10);
+        as.load_const(41, 0);          spawn_actor(as, 11, "aconn");
+        call1(as, 26, NATIVE_HAND_OFF, 25);                                         // ticket
+        call2(as, 27, NATIVE_SEND, 11, 26);
+        receive_main(as, 28, -1);      mail_read(as, 29, NATIVE_MAIL_MSG);          // the actor is done
+        as.load_const(30, 16);         call2(as, 31, NATIVE_TCP_RECV, 24, 30);      // "hi"
+        as.R6(OpCode::LEN, 32, 31, 0);
+        as.load_str(33, "x");          as.BYTES_FROM_STR(34, 33);
+        call2(as, 35, NATIVE_TCP_SEND, 25, 34);                                     // stale: refused
+        call2(as, 36, NATIVE_TCP_CONNECT, 23, 22);                                  // reuses the slot
+        call1(as, 37, NATIVE_TCP_ACCEPT, 21);
+        call2(as, 38, NATIVE_TCP_SEND, 25, 34);                                     // still refused
+        call1(as, 39, NATIVE_TAKE, 26);                                             // taken already
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool moved_ok  = r.fault.empty() && r.regs[29].isInt() && r.regs[29].asSigned48() == 1 &&
+                               r.regs[32].isInt() && r.regs[32].asSigned48() == 2;
+        const bool stale_ok  = r.fault.empty() &&
+                               str_of(r.regs[35]).find("handed to another actor") != std::string::npos;
+        const bool reused    = r.fault.empty() && r.regs[36].isInt() && r.regs[25].isInt() &&
+                               (r.regs[36].asSigned48() & 0xFFFFFF) == (r.regs[25].asSigned48() & 0xFFFFFF);
+        const bool stale2_ok = r.fault.empty() &&
+                               str_of(r.regs[38]).find("handed to another actor") != std::string::npos;
+        const bool twice_ok  = r.fault.empty() && str_of(r.regs[39]).find("already taken") != std::string::npos;
+        std::cout << std::format("  actor answers on the moved connection: {}{}\n", moved_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  old descriptor refused:                {}  (\"{}\")\n", stale_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[35]));
+        std::cout << std::format("  ... also after its slot was reused:    {}{}\n", stale2_ok && reused ? "PASS" : "FAIL",
+                                 reused ? "" : "  (the slot was not reused -- the test no longer proves it)");
+        std::cout << std::format("  a second take refused:                 {}\n", twice_ok ? "PASS" : "FAIL");
+        check(moved_ok && stale_ok && stale2_ok && reused && twice_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// Misuse faults with a located message.
+inline void test_actor_misuse() {
+    using namespace forkjoin;
+    std::cout << "=== actor_misuse (located faults) ===\n";
+    auto expect = [](const char* label, const Run& r, const char* want) {
+        const bool ok = r.fault.find(want) != std::string::npos;
+        std::cout << std::format("  {:<36} {}{}\n", label, ok ? "PASS" : "FAIL",
+                                 ok ? "" : "  (got: \"" + r.fault + "\")");
+        return ok;
+    };
+    try {
+        bool ok = true;
+        {   // the root receives without having taken its inbox
+            Assembler as; declare_task_fns(as); as.label("main");
+            receive_main(as, 13, 0);
+            Heap heap;
+            ok &= expect("receive before mainInbox", run(as, heap), "no inbox");
+        }
+        {   // the main inbox twice
+            Assembler as; declare_task_fns(as); as.label("main");
+            main_inbox(as, 10); main_inbox(as, 11);
+            Heap heap;
+            ok &= expect("mainInbox twice", run(as, heap), "already taken");
+        }
+        {   // reading a message when the last receive timed out
+            Assembler as; declare_task_fns(as); as.label("main");
+            main_inbox(as, 10); receive_main(as, 13, 0); mail_read(as, 14, NATIVE_MAIL_MSG);
+            Heap heap;
+            ok &= expect("reading a message that is not there", run(as, heap), "no message to read");
+        }
+        {   // receiving on an actor's inbox from the root
+            Assembler as; declare_task_fns(as); as.label("main");
+            main_inbox(as, 10);
+            as.load_const(41, 0);  spawn_actor(as, 11, "aecho");
+            as.R6(OpCode::MOV, 40, 11, 0); as.load_const(41, 0);
+            as.call_native_id(13, 42, 40, 2, NATIVE_RECEIVE);
+            Heap heap;
+            ok &= expect("receiving on another actor's inbox", run(as, heap), "belongs to another actor");
+        }
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// concurrent_fault_probe -- the two-thread version of test_fault_probe, and the ONE
+// test that actually decides whether the POSIX rendezvous is per-thread.
+//
+// On Windows this passes without any of this branch's changes: the fault frame there
+// is a plain SEH __try around the dispatch loop, so it is per-thread by construction.
+// That is exactly why it is worth having here -- it establishes the baseline and pins
+// it. On POSIX the rendezvous is a lookup keyed by thread id, and before that existed
+// only the FIRST thread inside execute() could arm at all: every other instance lost
+// fault classification, turning a guard-page hit into a raw process kill. This probe
+// is what catches a regression back to that.
+//
+// It lives behind --fault-probe with its own sibling flag rather than in the ordinary
+// suite, for the same reason test_fault_probe does: its failure mode is a process kill,
+// and a crash here must not take the other hundred-odd tests down with it.
+// =============================================================================
+inline void test_concurrent_fault_probe() {
+    constexpr unsigned NT = 4;
+    std::cout << std::format("=== concurrent_fault_probe ({} threads faulting at once) ===\n", NT);
+    std::vector<char>        ok(NT, 0);        // distinct elements: no shared writes
+    std::vector<std::thread> workers;
+    for (unsigned i = 0; i < NT; ++i)
+        workers.emplace_back([&ok, i] { ok[i] = fault_probe_once(0, "Stack Overflow") ? 1 : 0; });
+    for (auto& w : workers) w.join();
+
+    bool all_ok = true;
+    for (unsigned i = 0; i < NT; ++i) {
+        std::cout << std::format("  thread {}: {}\n", i, ok[i] ? "classified" : "NOT classified");
+        all_ok = all_ok && ok[i] != 0;
+    }
+    check(all_ok);
 }
 
 // =============================================================================

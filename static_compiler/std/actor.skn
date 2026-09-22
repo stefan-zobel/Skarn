@@ -1,0 +1,111 @@
+// Actors -- long-lived functions on their own threads that talk ONLY by messages. An actor is
+// started with `spawnActor(f, init)`, gets an inbox, and loops on `inbox.receive()` until it is
+// told to stop; anyone holding its address sends it messages with `send(pid, m)`.
+//
+// OPT-IN: reach these via `use std::actor::*`.
+//
+// NOTHING IS SHARED. Every message is COPIED into the receiver's heap, so a sender may go on
+// changing its own copy. That is why the checker limits what an actor may receive: the message
+// type M and the start value must be SENDABLE -- plain data, with no function value, trait object,
+// socket, task or inbox anywhere inside (docs/Compiler.md, "Actors"). An ADDRESS (Pid) is plain
+// data, so a message may carry the address to reply to.
+//
+// THE MAIL. `receive` returns a Mail:
+//   * Msg(m)             -- a message;
+//   * Exited(id, reason) -- an actor THIS one started has faulted (v1 reports crashes only, and
+//                           only to the starter), in the same stream as the messages;
+//   * Stop               -- the program is ending. Return from the actor function; every later
+//                           receive answers Stop again.
+// A send to an actor that no longer runs returns false, and the message is dropped.
+//
+// The main program has an inbox too, taken ONCE with `mainInbox()`, for replies and crash
+// reports. Annotate its message type: `let inbox: Inbox[Reply] = mainInbox()`.
+//
+// Most actors only want their messages until the program ends: `inbox.messages()` is exactly that,
+// a lazy iterator that skips exit reports and ends at Stop.
+//
+//     fn echo(inbox: Inbox[Ask], unused: Int) -> () {
+//       for ask in inbox.messages() { send(ask.replyTo, ask.n * 2) }
+//     }
+
+// An actor's address. Only `spawnActor` and `inbox.pid()` make one.
+pub struct Pid[M] { id: Int }
+
+// The receiving end of an actor's mailbox: only the actor itself holds it (it cannot be sent).
+pub struct Inbox[M] { id: Int }
+
+// Names an actor regardless of its message type -- what an exit report carries.
+pub struct ActorId { id: Int }
+
+// What `receive` hands back.
+pub enum Mail[M] { Msg(M), Exited(ActorId, String), Stop }
+
+// What the runtime starts: the actor function and its start value, travelling together as the one
+// argument an isolate receives. The function is a named top-level function (the checker makes
+// sure), which crosses heaps as its function id.
+struct ActorStart[M, I] { f: fn(Inbox[M], I) -> (), init: I }
+
+// The trampoline every actor runs: build the actor's own inbox, then call its function.
+fn _actorMain[M, I](s: ActorStart[M, I]) -> () {
+  let f = s.f
+  f(Inbox { id: rawSelfId() }, s.init)
+}
+
+// Start `f(inbox, init)` as an actor and return its address.
+pub fn spawnActor[M, I](f: fn(Inbox[M], I) -> (), init: I) -> Pid[M] {
+  Pid { id: rawSpawnActor(_actorMain, ActorStart { f: f, init: init }) }
+}
+
+// Send `m` to the actor at `p`. False if it no longer runs (the message is then dropped).
+pub fn send[M](p: Pid[M], m: M) -> Bool { rawSend(p, m) }
+
+// The main program's own inbox. Once per program.
+pub fn mainInbox[M]() -> Inbox[M] { Inbox { id: rawMainInbox() } }
+
+impl[M] Pid[M] {
+  // This actor's id, to compare with the one in an exit report.
+  fn actorId(self) -> ActorId { ActorId { id: self.id } }
+}
+
+impl[M] Inbox[M] {
+  // Wait for the next mail.
+  fn receive(self) -> Mail[M] { _mail(self, rawReceive(self, -1)) }
+
+  // Wait at most `ms` milliseconds: None if nothing arrived.
+  fn receiveTimeout(self, ms: Int) -> Option[Mail[M]] {
+    let kind = rawReceive(self, ms)
+    if kind == 0 { None } else { Some(_mail(self, kind)) }
+  }
+
+  // The address of the actor this inbox belongs to -- to hand out, e.g. inside a message.
+  fn pid(self) -> Pid[M] { Pid { id: self.id } }
+
+  // The messages, one by one, as a lazy iterator that ends at Stop -- so an actor's whole loop can be
+  // `for m in inbox.messages() { .. }`. Exit reports are SKIPPED; an actor that needs them (because it
+  // starts actors of its own) uses `receive` instead.
+  fn messages(self) -> dyn Iterator[M] { MessageStream { inbox: self } }
+}
+
+struct MessageStream[M] { inbox: Inbox[M] }
+
+impl[M] Iterator[M] for MessageStream[M] {
+  fn next(mut self) -> Option[M] {
+    loop {
+      match self.inbox.receive() {
+        Mail::Msg(m) => break Some(m),
+        Mail::Exited(_, _) => {},
+        Mail::Stop => break None,
+      }
+    }
+  }
+}
+
+fn _mail[M](inbox: Inbox[M], kind: Int) -> Mail[M] {
+  if kind == 1 {
+    Mail::Msg(rawMailMsg(inbox))
+  } else if kind == 2 {
+    Mail::Exited(ActorId { id: rawMailFrom(inbox) }, rawMailReason(inbox))
+  } else {
+    Mail::Stop
+  }
+}

@@ -60,6 +60,12 @@ int main(int argc, char** argv) {
 #  endif
 #endif
         run("fault_probe", test_fault_probe);
+        // The multi-threaded sibling rides along in the same invocation rather than
+        // getting its own flag: it provokes the same class of fault for the same reason,
+        // so it belongs in the one run that is allowed to die. Order matters -- if the
+        // single-threaded frame is broken, there is nothing to learn from the concurrent
+        // one, and it will not run.
+        run("concurrent_fault_probe", test_concurrent_fault_probe);
         const TestStats& fs = g_test_stats;
         std::cout << "==== fault probe: " << fs.tests_passed << " passed, "
                   << fs.tests_failed << " failed ====\n";
@@ -163,6 +169,28 @@ int main(int argc, char** argv) {
     run("closure_self_recursion",   test_closure_self_recursion);
     run("tco_call_indirect_func",   test_tco_call_indirect_func);
     run("tco_call_indirect_closure",test_tco_call_indirect_closure);
+    run("value_codec_roundtrip",    test_value_codec_roundtrip);
+    run("value_codec_containers",   test_value_codec_containers);
+    run("value_codec_strings",      test_value_codec_strings_not_interned);
+    run("value_codec_sharing",      test_value_codec_sharing_and_cycles);
+    run("value_codec_refusals",     test_value_codec_refusals);
+    run("value_codec_malformed",    test_value_codec_malformed);
+    run("rooted_pool_release",      test_rooted_pool_release);
+    run("value_codec_collects",     test_value_codec_collects);
+    run("thread_slot_table",        test_thread_slot_table);
+    run("concurrent_execute",       test_concurrent_execute);
+    run("task_parallel_sums",       test_task_parallel_sums);
+    run("task_failure",             test_task_failure);
+    run("task_values",              test_task_values);
+    run("task_output_and_unjoined", test_task_output_and_unjoined);
+    run("task_deep_recursion",      test_task_deep_recursion);
+    run("task_misuse",              test_task_misuse);
+    run("actor_ping_pong",          test_actor_ping_pong);
+    run("actor_crash_reported",     test_actor_crash_reported);
+    run("actor_timeout_and_stop",   test_actor_timeout_and_stop);
+    run("actor_many",               test_actor_many);
+    run("actor_misuse",             test_actor_misuse);
+    run("actor_socket_hand_off",    test_actor_socket_hand_off);
     // Registered LAST on purpose: on the switch dispatcher a runaway loop can no
     // longer overflow the native stack, but the canary still guards its ~10M-instr
     // survival + r0 == 0 invariant (Release only; Debug prints SKIPPED).

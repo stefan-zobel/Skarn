@@ -1,0 +1,55 @@
+// CLAIM: std::poll serves MANY connections from one thread. A non-blocking socket answers
+//        "would block" instead of waiting, poll() reports which sockets can move, and the program
+//        advances each one a step -- so a second client is not ignored until the first one leaves.
+// GUIDE: 21 (Serving more than one connection)
+// EXPECT: ok alpha beta
+use std::net::*
+use std::poll::*
+
+
+fn serve() -> Result[String, String] {
+  let lst = listen(0)?
+  let port = lst.localPort()?
+  let srv = nonBlocking(lst)?
+  let a = nonBlockingConn(connect("127.0.0.1", port)?)?
+  let b = nonBlockingConn(connect("127.0.0.1", port)?)?
+  a.sendStr("alpha")?
+  b.sendStr("beta")?
+
+  let mut conns: Vec[NbConn] = vec()
+  let mut got: Vec[String] = vec()
+  let mut spins = 0
+  while len(got) < 2 && spins < 400 {
+    let mut fds: Vec[Int] = vec()
+    let mut want: Vec[Int] = vec()
+    push(fds, srv.fd)  push(want, READABLE)
+    for c in conns { push(fds, c.fd)  push(want, READABLE) }
+    let live = len(conns)
+    let ready = poll(fds, want, 50)?
+    if (ready[0] & READABLE) != 0 {
+      if let Accepted::Conn(c) = srv.accept()? { push(conns, c) }
+    }
+    let mut i = 0
+    while i < live {
+      if (ready[i + 1] & READABLE) != 0 {
+        if let Received::Data(bs) = conns[i].recv(256)? { push(got, fromBytes(bs)) }
+      }
+      i = i + 1
+    }
+    spins = spins + 1
+  }
+
+  for c in conns { c.close()? }
+  a.close()?
+  b.close()?
+  srv.close()?
+  let mut out = ""
+  for s in sorted(got) { out = out + s + " " }
+  Ok(trim(out))
+}
+
+
+match serve() {
+  Ok(s)  => println(s),
+  Err(e) => println("ERR " + e)
+}

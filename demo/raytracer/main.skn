@@ -9,9 +9,9 @@
 // can be blamed on one thing at a time: geometry and the file format each have their own layer,
 // and so do scattering and the reproducibility of the random stream.
 //
-// Everything here is DETERMINISTIC: one seed, one sequential stream, so the same source
-// produces the same file byte for byte. That is what makes the renderer its own regression
-// test.
+// Everything here is DETERMINISTIC: one seed, and from it one random stream PER ROW, so the same
+// source produces the same file byte for byte -- whether it renders on one thread or on many
+// (--threads=N). That is what makes the renderer its own regression test.
 //
 // Run:  static_vmrun demo/raytracer/main.skn
 
@@ -34,6 +34,7 @@ use std::env::*
 use std::random::*
 use std::cli::*
 use std::hash::*
+use std::task::*
 
 // Far enough to be "no limit" for a scene measured in single units.
 const T_MAX: Double = 1000000000.0
@@ -49,15 +50,18 @@ const SAMPLES:   Int = 16     // jittered rays per pixel
 const MAX_DEPTH: Int = 12     // bounce budget; beyond ~10 the contribution is invisible
 const SEED:      Int = 20260728
 
-// The renderer is DETERMINISTIC: one seed, one sequential random stream, no threads. A
-// given configuration therefore produces one exact file, and pinning its CRC-32 turns the
-// raytracer into its own regression test -- a change that moves a single pixel fails here
-// instead of passing quietly. It also checks the three intersection kernels against each
-// other for free, since all must reach the same number.
+// The renderer is DETERMINISTIC: one seed, and row y draws from its own stream seeded with
+// SEED + y, whichever task renders it. A given configuration therefore produces one exact
+// file for ANY number of tasks, and pinning its CRC-32 turns the raytracer into its own
+// regression test -- a change that moves a single pixel fails here instead of passing quietly.
+// It also checks the three intersection kernels against each other for free, and the parallel
+// render against the sequential one, since all must reach the same number.
 //
-// Re-pin these ONLY together with a deliberate change to the image, and say why.
-const CRC_PREVIEW: Int = 796770691      // 160x90,  4 samples, depth 12, seed above
-const CRC_FULL:    Int = 3519314400     // 470x264, 16 samples, depth 12, seed above
+// Re-pin these ONLY together with a deliberate change to the image, and say why. Last re-pin:
+// one random stream per row instead of one for the whole image, which parallel rendering needs
+// (with a single stream, row y depended on every draw made before it).
+const CRC_PREVIEW: Int = 3886897764     // 160x90,  4 samples, depth 12, seed above
+const CRC_FULL:    Int = 3340800133    // 470x264, 16 samples, depth 12, seed above
 
 // ---------------------------------------------------------------- test helpers
 
@@ -278,28 +282,97 @@ fn rayColor(r: Ray, world: Vec[dyn Hittable], depth: Int, mut rng: Rng) -> Vec3 
     }
 }
 
-fn render(width: Int, height: Int, samples: Int, cam: Camera, world: Vec[dyn Hittable], mut rng: Rng) -> Canvas {
-    let mut img = canvas(width, height)
-    let mut y = 0
-    while y < height {
+// The camera for an image of this size: at the origin, looking down -z, a 90 degree field of view.
+fn makeCamera(width: Int, height: Int) -> Camera {
+    camera(zero3(), vec3(0.0, 0.0, -1.0), vec3(0.0, 1.0, 0.0), 90.0,
+           toDouble(width) / toDouble(height))
+}
+
+// One unit of rendering work: every `step`-th row of the image, starting at row `first`.
+// `step` is 1 for the whole image in one go; with N tasks, task k takes rows k, k+N, k+2N, ...
+// The rows are INTERLEAVED rather than cut into N bands because they are far from equal work:
+// the top rows are mostly sky, one miss per ray, while the ground rows bounce up to MAX_DEPTH
+// times. Bands would leave the top tasks idle while the bottom ones still run.
+//
+// It is plain data -- a task's argument is copied to its own heap -- which is also why the
+// task builds the scene and the camera itself: the scene holds `dyn` values, and those cannot
+// be sent. Four spheres cost nothing to build.
+struct RowJob { first: Int, step: Int, width: Int, height: Int, samples: Int, kernel: Int }
+
+// Render the job's rows, packed 0xRRGGBB, row after row. EVERY ROW HAS ITS OWN RANDOM STREAM,
+// seeded from its index: that is what makes a row's pixels independent of which task renders
+// it, and of which rows were rendered before it -- so the image, and its checksum, are the same
+// for any number of tasks.
+fn renderRows(job: RowJob) -> Array[Int] {
+    let world = buildScene(job.kernel)
+    let cam   = makeCamera(job.width, job.height)
+    let rows  = (job.height - job.first + job.step - 1) / job.step
+    let mut out = array(rows * job.width, 0)
+    let mut i = 0
+    let mut y = job.first
+    while y < job.height {
+        let mut rng = Rng::fromSeed(SEED + y)
         let mut x = 0
-        while x < width {
+        while x < job.width {
             // `samples` rays per pixel, each aimed at a random point WITHIN the pixel rather
             // than at its centre. Averaging them is what turns a hard staircase edge into a
             // smooth one -- the jitter is the whole mechanism, not a refinement of it.
             let mut acc = zero3()
             let mut s = 0
-            while s < samples {
-                let u = (toDouble(x) + rng.nextDouble()) / toDouble(width - 1)
-                let v = 1.0 - (toDouble(y) + rng.nextDouble()) / toDouble(height - 1)
+            while s < job.samples {
+                let u = (toDouble(x) + rng.nextDouble()) / toDouble(job.width - 1)
+                let v = 1.0 - (toDouble(y) + rng.nextDouble()) / toDouble(job.height - 1)
                 acc = acc.add(rayColor(cam.rayAt(u, v), world, MAX_DEPTH, rng))
                 s = s + 1
             }
-            let c = acc.scale(1.0 / toDouble(samples))
-            img.set(x, y, toByteGamma(c.x), toByteGamma(c.y), toByteGamma(c.z))
+            let c = acc.scale(1.0 / toDouble(job.samples))
+            out[i] = ((toByteGamma(c.x) & 255) << 16) | ((toByteGamma(c.y) & 255) << 8) | (toByteGamma(c.z) & 255)
+            i = i + 1
             x = x + 1
         }
-        y = y + 1
+        y = y + job.step
+    }
+    out
+}
+
+// Copy a job's rows into their places in the image.
+fn place(mut img: Canvas, rows: Array[Int], first: Int, step: Int) -> () {
+    let mut i = 0
+    let mut y = first
+    while y < img.height {
+        let mut x = 0
+        while x < img.width {
+            img.px[y * img.width + x] = rows[i]
+            i = i + 1
+            x = x + 1
+        }
+        y = y + step
+    }
+}
+
+// The whole image, on `threads` tasks. With one thread nothing is spawned: the same renderRows
+// runs right here, which is the sequential baseline the parallel runs are measured against.
+fn render(width: Int, height: Int, samples: Int, kernel: Int, threads: Int) -> Canvas {
+    let mut img = canvas(width, height)
+    if threads <= 1 {
+        place(img, renderRows(RowJob { first: 0, step: 1, width: width, height: height,
+                                       samples: samples, kernel: kernel }), 0, 1)
+        return img
+    }
+    let mut tasks: Vec[Task[Array[Int]]] = vec()
+    let mut k = 0
+    while k < threads {
+        push(tasks, spawn(renderRows, RowJob { first: k, step: threads, width: width, height: height,
+                                               samples: samples, kernel: kernel }))
+        k = k + 1
+    }
+    k = 0
+    while k < threads {
+        match tasks[k].join() {
+            Ok(rows) => place(img, rows, k, threads),
+            Err(e)   => panic("render task ${k} failed: ${e}"),
+        }
+        k = k + 1
     }
     img
 }
@@ -345,11 +418,17 @@ fn buildScene(kernel: Int) -> Vec[dyn Hittable] {
 //              inlined -> fast is what scalar replacement would have to add on top.
 //   --preview  render small and quickly -- a sanity check, not a picture
 //   --quiet    skip the self-tests, so a timing run measures only the render
+//   --threads=N  render on N parallel tasks (default 1: no task at all). The image is the same for
+//              every N -- the checksum below is the check.
 let opts    = CliArgs::parse(args())
 let fast    = opts.hasFlag("fast")
 let inlined = opts.hasFlag("inlined")
 let kernel  = if fast { 1 } else if inlined { 2 } else { 0 }
 let preview = opts.hasFlag("preview")
+let threads = match parseInt(opts.getOptOr("threads", "1")) {
+    Ok(n)  => if n < 1 { 1 } else { n },
+    Err(_) => panic("--threads needs a whole number, e.g. --threads=4"),
+}
 
 println("Skarn raytracer -- three intersection kernels: idiomatic / compiler-inlined / hand-scalarized")
 println("")
@@ -367,14 +446,9 @@ let width   = if preview { 160 } else { WIDTH }
 let height  = if preview {  90 } else { HEIGHT }
 let samples = if preview {   4 } else { SAMPLES }
 
-let world = buildScene(kernel)
-let cam   = camera(zero3(), vec3(0.0, 0.0, -1.0), vec3(0.0, 1.0, 0.0), 90.0,
-                   toDouble(width) / toDouble(height))
-
-let mut rng = Rng::fromSeed(SEED)
 gcResetStats()
 let t0   = nanoTime()
-let img  = render(width, height, samples, cam, world, rng)
+let img  = render(width, height, samples, kernel, threads)
 let ns   = nanoTime() - t0
 let g    = gcStats()
 let rays = width * height * samples
@@ -386,9 +460,15 @@ println("kernel:   ${if kernel == 1 { "FastSphere (scalar-inlined by hand)" }
                      else if kernel == 2 { "InlinedSphere (compiler-style: calls gone, objects kept)" }
                      else { "Sphere (idiomatic Vec3)" }}")
 println("rendered  ${width}x${height}, ${samples} samples/pixel, depth ${MAX_DEPTH}  (${rays} primary rays)")
+println("  tasks   ${if threads <= 1 { "none (sequential)" } else { "${threads} in parallel" }}")
 println("  wall    ${ns / 1000000} ms   --   ${ns / rays} ns per primary ray")
-println("  alloc   ${g.bytesAlloced / 1048576.0} MiB in ${g.collections} collections")
-println("  GC      ${g.gcNanosTotal / 1000000.0} ms  (${100.0 * g.gcNanosTotal / toDouble(ns)} % of wall)")
+if threads <= 1 {
+    println("  alloc   ${g.bytesAlloced / 1048576.0} MiB in ${g.collections} collections")
+    println("  GC      ${g.gcNanosTotal / 1000000.0} ms  (${100.0 * g.gcNanosTotal / toDouble(ns)} % of wall)")
+} else {
+    // The counters belong to THIS heap; each task allocates on its own, where nothing here sees it.
+    println("  alloc   (in the tasks' own heaps -- not counted here)")
+}
 // The pinned checksum. Both kernels must reach it, so this one comparison covers both
 // "the renderer still produces the same picture" and "the two kernels still agree".
 let expected = if preview { CRC_PREVIEW } else { CRC_FULL }

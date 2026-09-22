@@ -24,7 +24,15 @@
 #include <cmath>      // std::math natives (sqrt/pow/sin/... + isnan/isinf)
 #include <cstdlib>    // std::getenv / std::free
 #include <filesystem> // fileExists / deleteFile natives
-#include <thread>     // reader threads that drain a child process's stdout/stderr (rawRun)
+#include <thread>     // reader threads that drain a child process's stdout/stderr (rawRun); fork-join tasks
+#include <memory>     // std::shared_ptr -- an isolate record outlives whoever still looks at it
+#include <sstream>    // a task's own output / input streams
+#include <mutex>      // the world registry, the mailboxes, the shared output line lock
+#include <condition_variable>   // a blocking receive
+#include <deque>      // a mailbox's queue
+#include <unordered_map>        // the world registry: isolate id -> record
+#include <atomic>     // World::actors_started, read by the root's output buffer
+#include <optional>   // the world a root execute() owns
 #ifdef _WIN32
 // Winsock MUST precede <windows.h> to avoid winsock.h/winsock2.h redefinition errors.
 #  include <winsock2.h>
@@ -40,6 +48,7 @@
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <fcntl.h>
+#  include <poll.h>     // poll() -- the readiness scan behind the std::poll natives
 #  include <unistd.h>
 #  include <cerrno>
 #  include <cstring>    // std::strerror
@@ -58,6 +67,7 @@
 #include "NativeRegistry.h" // NativeId ids for build_native_table()
 #include "Natives.h"        // build_native_table() declaration
 #include "Interpreter.h"   // run_switch: the register-resident while{switch} dispatcher
+#include "ValueCodec.h"    // vcodec::deep_eq is defined here, over Interpreter.h's worker
 
 // ---- Portable socket type aliases -------------------------------------------
 #ifdef _WIN32
@@ -70,30 +80,322 @@ static constexpr socket_t INVALID_SOCK = -1;
 static void sock_close(socket_t s) { ::close(s); }
 #endif
 
+// ---- Portable readiness poll (std::poll natives) ----------------------------
+// WSAPoll (Winsock 2.2) and POSIX poll() take the same {fd, events, revents} triple with the same
+// meaning for the flags used here; only the spelling differs, including the event masks -- Winsock
+// wants the *NORM variants, POSIX names the plain ones.
+//
+// KNOWN Windows limitation, deliberately not worked around: WSAPoll does not report a FAILED
+// connection through POLLERR. It does not bite here because a connection is still established by
+// the blocking tcpConnect (which has its own connect timeout) and only then switched to
+// non-blocking -- stage 1 has no non-blocking connect.
+#ifdef _WIN32
+using pollfd_t = WSAPOLLFD;
+static int sock_poll(pollfd_t* fds, unsigned n, int timeout_ms) { return WSAPoll(fds, n, timeout_ms); }
+static constexpr short POLL_READ  = POLLRDNORM;
+static constexpr short POLL_WRITE = POLLWRNORM;
+#else
+using pollfd_t = struct pollfd;
+static int sock_poll(pollfd_t* fds, unsigned n, int timeout_ms) { return ::poll(fds, n, timeout_ms); }
+static constexpr short POLL_READ  = POLLIN;
+static constexpr short POLL_WRITE = POLLOUT;
+#endif
+
+// Writing to a socket whose peer has already closed raises SIGPIPE on BSD-derived systems (macOS),
+// and SIGPIPE's default action TERMINATES the process -- a silent kill, not a returned error. With
+// one short-lived connection per program this was nearly unreachable; under an event loop, peers
+// disconnecting mid-write are routine, so it is suppressed at the source on every socket the
+// registry takes ownership of. Windows has no such signal. Linux offers no SO_NOSIGPIPE and uses
+// the per-call MSG_NOSIGNAL below instead.
+static void sock_suppress_sigpipe(socket_t s) {
+#ifdef SO_NOSIGPIPE
+    int on = 1;
+    setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, reinterpret_cast<char*>(&on), sizeof(on));
+#else
+    (void)s;
+#endif
+}
+
+#ifdef MSG_NOSIGNAL
+static constexpr int SOCK_SEND_FLAGS = MSG_NOSIGNAL;  // Linux: suppress SIGPIPE per send() call
+#else
+static constexpr int SOCK_SEND_FLAGS = 0;             // Windows: no signal; macOS: SO_NOSIGPIPE above
+#endif
+
 // TCP socket registry for the std::net natives -- defined here (before execute()) so execute() can
 // hold a stack-local instance whose destructor closes any socket still open at teardown. A socket is
 // exposed to Skarn as a small Int DESCRIPTOR (an index into `socks`), never a raw OS SOCKET (a 64-bit
 // kernel handle that need not fit a 48-bit Int). NOT a GC root (integer handles, no Values). The
 // tcp* native implementations live further down, next to build_native_table().
+//
+// A DESCRIPTOR IS A SLOT PLUS A GENERATION: `slot | gen << SLOT_BITS`. A slot is reused once its
+// socket is closed or handed to another isolate, and its generation then moves on, so a STALE
+// descriptor -- a TcpConn kept after close(), or after handOff() -- no longer matches and is refused,
+// instead of silently reaching whatever connection took the slot next. (Before generations, the
+// next accept() reused the slot at once, which made "a socket used after it was handed off" an
+// alias of a stranger's connection rather than an error.) The slot keeps one bit about how its
+// previous generation ended, for the message.
 struct NetRegistry {
-    std::vector<socket_t> socks;
+    static constexpr int     SLOT_BITS = 24;
+    static constexpr int64_t SLOT_MASK = (int64_t{1} << SLOT_BITS) - 1;
+    struct Slot {
+        socket_t s           = INVALID_SOCK;
+        int64_t  gen         = 0;
+        bool     prev_handed = false;   // the previous generation ended by a hand-off
+    };
+    std::vector<Slot> slots;
     ~NetRegistry() {
-        for (socket_t s : socks)
-            if (s != INVALID_SOCK) sock_close(s);
+        for (const Slot& sl : slots)
+            if (sl.s != INVALID_SOCK) sock_close(sl.s);
     }
-    int add(socket_t s) {
-        for (size_t i = 0; i < socks.size(); ++i)
-            if (socks[i] == INVALID_SOCK) { socks[i] = s; return static_cast<int>(i); }
-        socks.push_back(s);
-        return static_cast<int>(socks.size()) - 1;
+    int64_t add(socket_t s) {
+        size_t i = 0;
+        while (i < slots.size() && slots[i].s != INVALID_SOCK) ++i;
+        if (i == slots.size()) slots.push_back(Slot{});
+        slots[i].s = s;
+        return static_cast<int64_t>(i) | (slots[i].gen << SLOT_BITS);
     }
-    socket_t get(int fd) const {
-        if (fd < 0 || static_cast<size_t>(fd) >= socks.size()) return INVALID_SOCK;
-        return socks[fd];
+    // The live slot a descriptor names, or null (stale, never issued, or negative).
+    Slot* live(int64_t fd) {
+        if (fd < 0) return nullptr;
+        const auto i = static_cast<size_t>(fd & SLOT_MASK);
+        if (i >= slots.size() || slots[i].gen != (fd >> SLOT_BITS) || slots[i].s == INVALID_SOCK)
+            return nullptr;
+        return &slots[i];
     }
-    void drop(int fd) {
-        if (fd >= 0 && static_cast<size_t>(fd) < socks.size()) socks[fd] = INVALID_SOCK;
+    socket_t get(int64_t fd) { Slot* sl = live(fd); return sl ? sl->s : INVALID_SOCK; }
+    void release(Slot& sl, bool handed) {
+        sl.s = INVALID_SOCK;
+        sl.prev_handed = handed;
+        sl.gen = (sl.gen + 1) & ((int64_t{1} << 23) - 1);   // stays within a positive 48-bit Int
     }
+    void drop(int64_t fd) { if (Slot* sl = live(fd)) release(*sl, false); }
+    // Detach a socket for a hand-off to another isolate: the socket leaves this registry (it is not
+    // closed), and the descriptor goes stale. INVALID_SOCK if `fd` is not a live descriptor.
+    socket_t hand_off(int64_t fd) {
+        Slot* sl = live(fd);
+        if (!sl) return INVALID_SOCK;
+        const socket_t s = sl->s;
+        release(*sl, true);
+        return s;
+    }
+    // Why a descriptor is refused -- the text after "tcpX: ".
+    std::string invalid_reason(int64_t fd) const {
+        if (fd >= 0) {
+            const auto i = static_cast<size_t>(fd & SLOT_MASK);
+            const int64_t gen = fd >> SLOT_BITS;
+            if (i < slots.size() && slots[i].prev_handed &&
+                ((gen + 1) & ((int64_t{1} << 23) - 1)) == slots[i].gen)
+                return "socket was handed to another actor";
+        }
+        return "invalid socket";
+    }
+};
+
+// =============================================================================
+// Tasks and actors -- one runtime for both (the "isolates" of concurrency stage 2).
+//
+// An ISOLATE is a second execute() on its own thread, with its own Heap, interner and stacks, over
+// the program image of its WORLD. A TASK runs one function once and hands back one value (fork-
+// join: rawSpawn / rawJoin / rawTaskTake). An ACTOR runs a function that loops on a MAILBOX until
+// it is told to stop (rawSpawnActor / rawSend / rawReceive). Both are records in the same world.
+//
+// A WORLD is everything started, directly or not, under one ROOT execute() -- the call a driver
+// makes. Ids are world-wide, so an actor's id means the same in every isolate of the world, which
+// is what lets an address travel inside a message. The root owns the world as a stack local and
+// destroys it before it returns, on the fault path too: every actor is sent Stop, and every
+// thread still running is joined. So no isolate outlives the image it runs (the root's tables,
+// World::image), at the price that a root whose actors ignore Stop -- or whose tasks never end --
+// waits for them. Nothing can be cancelled.
+//
+// Nothing is shared between two heaps: every value crosses as a value-codec buffer, encoded in
+// the sender's heap and decoded in the receiver's.
+// =============================================================================
+
+// One message in a mailbox. MAIL_EXITED reports that an actor this isolate started has FAULTED
+// (v1 reports crashes only, to the starter). MAIL_STOP is delivered to every actor when the world
+// ends.
+enum : uint8_t { MAIL_NONE = 0, MAIL_MSG = 1, MAIL_EXITED = 2, MAIL_STOP = 3 };
+struct Mail {
+    uint8_t              kind = MAIL_NONE;
+    std::vector<uint8_t> buf;          // MAIL_MSG: the message, a value-codec buffer
+    int64_t              from = 0;     // MAIL_EXITED: the actor that ended
+    std::string          reason;       // MAIL_EXITED: its fault message
+};
+
+// An actor's (or the root's) queue. Unbounded in v1. `dead` is set when its owner has ended, and
+// from then on a send is refused (the sender learns it from rawSend's Bool). `stop_seen`: after an
+// actor has received Stop once, every further receive answers Stop again, so any loop ends.
+struct Mailbox {
+    std::mutex              m;
+    std::condition_variable cv;
+    std::deque<Mail>        q;
+    bool                    dead      = false;
+    bool                    stopped   = false;   // Stop has been queued
+    bool                    stop_seen = false;   // ... and received
+    bool put(Mail&& mail) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            if (dead) return false;
+            if (mail.kind == MAIL_STOP) { if (stopped) return true; stopped = true; }
+            q.push_back(std::move(mail));
+        }
+        cv.notify_one();
+        return true;
+    }
+};
+
+// One task or actor. The fields below `joined` belong to a TASK: written by its thread, read by
+// its starter only after joining it, so the join is the synchronization for them.
+struct Isolate {
+    int64_t                  id      = 0;
+    int64_t                  starter = 0;       // the isolate that started it (0 = the root)
+    bool                     actor   = false;
+    std::shared_ptr<Mailbox> mailbox;           // actors only
+    std::thread              thread;
+    std::mutex               join_m;            // one joiner at a time: the starter, or the world
+    bool                     thread_joined = false;
+    bool                     claimed = false;   // a task: rawJoin has been called (once)
+    std::vector<uint8_t>     input;             // the argument, encoded in the starter's heap
+    std::vector<uint8_t>     output;            // a task's result, encoded in its heap (iff ok)
+    std::string              error;             // a task's fault message (iff !ok)
+    std::string              printed;           // what a task printed; written out at join
+    bool                     ok    = false;
+    bool                     taken = false;
+    void join_thread() {
+        std::lock_guard<std::mutex> lk(join_m);
+        if (!thread_joined && thread.joinable()) thread.join();
+        thread_joined = true;
+    }
+};
+
+struct World;
+
+// The output of the root and of every actor goes to the ROOT's stream, a LINE at a time: PRINTLN
+// is two stream calls (text, newline), so unsynchronized writers would split each other's lines.
+// A task does not use this -- it buffers everything and hands it over at join, in join order.
+// Before the first actor starts, the root's writes pass straight through, so an ordinary program
+// (and a prompt printed without a newline before reading stdin) behaves exactly as before.
+class LineForwardBuf : public std::streambuf {
+public:
+    LineForwardBuf(World* w, bool always_lines) : world_(w), always_lines_(always_lines) {}
+    ~LineForwardBuf() override { flush_partial(); }
+    void flush_partial();
+protected:
+    int_type        overflow(int_type c) override;
+    std::streamsize xsputn(const char* s, std::streamsize n) override;
+    int             sync() override;
+private:
+    void emit(const char* s, size_t n);
+    World*      world_;
+    bool        always_lines_;
+    std::string line_;
+};
+
+struct World {
+    const ProgramImage*       image  = nullptr;   // the ROOT's image: what every isolate runs
+    std::ostream*             target = nullptr;   // the root's real output stream
+    std::mutex                out_m;              // one line at a time into `target`
+    std::atomic<bool>         actors_started{ false };
+    LineForwardBuf            root_buf{ this, false };
+    std::ostream              root_out{ &root_buf };
+    std::mutex                m;                  // guards everything below
+    std::unordered_map<int64_t, std::shared_ptr<Isolate>> isolates;
+    int64_t                   next_id  = 1;       // 0 is the root
+    std::shared_ptr<Mailbox>  main_mailbox = std::make_shared<Mailbox>();
+    bool                      main_inbox_taken = false;
+    bool                      stopping = false;
+    // Sockets in transit between isolates (rawHandOff -> rawTake): ticket -> OS socket. A socket here
+    // belongs to no isolate's NetRegistry; whatever is never taken is closed when the world ends.
+    std::unordered_map<int64_t, socket_t> handoffs;
+    int64_t                   next_ticket = 1;
+
+    std::shared_ptr<Isolate> find(int64_t id) {
+        std::lock_guard<std::mutex> lk(m);
+        auto it = isolates.find(id);
+        return it == isolates.end() ? nullptr : it->second;
+    }
+    // The mailbox an id addresses: the root's (id 0) or an actor's; null for anything else.
+    std::shared_ptr<Mailbox> mailbox_of(int64_t id) {
+        if (id == 0) return main_mailbox;
+        auto iso = find(id);
+        return iso && iso->actor ? iso->mailbox : nullptr;
+    }
+    // The end of the world: Stop to every actor, then join every thread -- repeatedly, because an
+    // actor may still start others while it winds down (those get Stop at birth, see spawn).
+    ~World() {
+        // The root's own partial line was written BEFORE anything the actors print while they stop;
+        // without this it would come out after them, when root_buf is destroyed.
+        root_out.flush();
+        {
+            std::lock_guard<std::mutex> lk(m);
+            stopping = true;
+            for (auto& [id, iso] : isolates)
+                if (iso->actor) iso->mailbox->put(Mail{ MAIL_STOP, {}, 0, {} });
+        }
+        for (;;) {
+            std::shared_ptr<Isolate> next;
+            {
+                std::lock_guard<std::mutex> lk(m);
+                for (auto& [id, iso] : isolates)
+                    if (!iso->thread_joined) { next = iso; break; }
+            }
+            if (!next) break;
+            next->join_thread();
+        }
+        {
+            std::lock_guard<std::mutex> lk(main_mailbox->m);
+            main_mailbox->dead = true;
+        }
+        // Every isolate has ended, so nobody can take these any more.
+        for (auto& [ticket, s] : handoffs) sock_close(s);
+    }
+};
+
+void LineForwardBuf::emit(const char* s, size_t n) {
+    std::lock_guard<std::mutex> lk(world_->out_m);
+    world_->target->write(s, static_cast<std::streamsize>(n));
+}
+void LineForwardBuf::flush_partial() {
+    if (!line_.empty()) { emit(line_.data(), line_.size()); line_.clear(); }
+    std::lock_guard<std::mutex> lk(world_->out_m);
+    world_->target->flush();
+}
+std::streamsize LineForwardBuf::xsputn(const char* s, std::streamsize n) {
+    if (!always_lines_ && !world_->actors_started.load(std::memory_order_acquire)) {
+        // No actor yet: nothing to interleave with, so write through at once. Still under the
+        // lock -- a task on another thread may start the first actor at any moment.
+        if (!line_.empty()) { emit(line_.data(), line_.size()); line_.clear(); }
+        emit(s, static_cast<size_t>(n));
+        return n;
+    }
+    line_.append(s, static_cast<size_t>(n));
+    size_t nl = line_.rfind('\n');
+    if (nl != std::string::npos) {                     // every complete line in one write
+        emit(line_.data(), nl + 1);
+        line_.erase(0, nl + 1);
+    }
+    return n;
+}
+LineForwardBuf::int_type LineForwardBuf::overflow(int_type c) {
+    if (c != traits_type::eof()) { const char ch = traits_type::to_char_type(c); xsputn(&ch, 1); }
+    return traits_type::not_eof(c);
+}
+// An explicit flush writes out a partial line too: a prompt printed without a newline before a read
+// must appear even while actors run (the stdin natives flush the output first).
+int LineForwardBuf::sync() {
+    flush_partial();
+    return 0;
+}
+
+// This execution's place in its world (VM::isolate). The root has id 0 and gets a mailbox only
+// through rawMainInbox; an actor has its own; a task has none. `current` is the mail rawReceive
+// took last, which rawMailMsg / rawMailFrom / rawMailReason then read.
+struct IsolateLocal {
+    World*                   world = nullptr;
+    int64_t                  id    = 0;
+    std::shared_ptr<Mailbox> mailbox;
+    Mail                     current;
 };
 
 // =============================================================================
@@ -101,23 +403,10 @@ struct NetRegistry {
 // so the caller can inspect registers after HALT. Declared in Execute.h (which
 // carries the default arguments); this definition must not repeat them.
 // =============================================================================
-// RAII holder for a pre-built GC-rooted Value pool (the string-literal pool, the
-// TO_STRING display-string pool, AND the const-array pool). Registers each slot as a
-// GC root when filled and removes them on scope exit, so a caller-owned Heap never
-// keeps a dangling root pointer into this (stack-local) vector after execute()
-// returns -- including on the exception path out of the interpreter. The vector is
-// sized once and never reallocates, so the registered &slot addresses stay stable.
-namespace {
-struct RootedValuePool {
-    Heap*              heap = nullptr;
-    std::vector<Value> slots;
-    ~RootedValuePool() {
-        if (heap)
-            for (Value& s : slots)
-                heap->remove_root(&s);
-    }
-};
-} // namespace
+// The three GC-rooted Value pools below (string literals, the TO_STRING display pool,
+// and const arrays) use RootedValuePool, which lives in Heap.h -- it is a general
+// rooting utility, not an execute() detail, and ValueCodec.h rebuilds object graphs
+// with the same one.
 
 VM_Resources execute(const std::vector<uint32_t>& bytecode,
                      Heap* heap,
@@ -140,7 +429,8 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
                      const std::vector<std::string>* script_args,
                      std::istream* in,
                      const std::vector<std::string>* function_modules,
-                     const std::vector<std::vector<Value>>* const_arrays) {
+                     const std::vector<std::vector<Value>>* const_arrays,
+                     const TaskEntry* task) {
     std::vector<uint32_t> padded = bytecode;
     padded.resize(bytecode.size() + 3,
         Instruction::J(static_cast<uint8_t>(OpCode::HALT)).raw);
@@ -170,10 +460,37 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
     // still open when execute() returns (incl. the VmFault path) -- the safety net behind tcpClose.
     NetRegistry net_registry;
     vm.net                 = &net_registry;
+    // Tasks and actors: the image this call runs, built from its own arguments, and its WORLD. A
+    // root (no `task`) owns a new world; a task or actor joins the one it was started in.
+    // Declared in this order so the world is destroyed FIRST -- its destructor stops every actor
+    // and joins every thread while the image (and the caller's vectors) are still alive.
+    const ProgramImage image{ &bytecode, const_pool, struct_types, string_literals, atom_names,
+                              fn_table, trait_table, trait_table_width, trait_method_count,
+                              line_table, function_names, column_table, native_table, script_args,
+                              function_modules, const_arrays };
+    std::optional<World> own_world;
+    IsolateLocal         local;
+    if (task) {
+        local.world        = task->world;
+        local.id           = task->isolate->id;
+        local.mailbox      = task->isolate->mailbox;
+        vm.task_input      = task->input;
+        vm.task_input_size = task->input_size;
+        vm.task_entry_pc   = task->entry_pc;
+    } else {
+        own_world.emplace();
+        own_world->image  = &image;
+        own_world->target = out ? out : &std::cout;
+        local.world       = &*own_world;
+    }
+    vm.image   = &image;
+    vm.isolate = &local;
 
     // PRINT / PRINTLN sink: caller-supplied stream, or std::cout by default. A caller
-    // (tests, a future REPL) can capture output by passing its own std::ostream.
-    vm.out               = out ? out : &std::cout;
+    // (tests, a future REPL) can capture output by passing its own std::ostream. A root writes
+    // through its world's line buffer, which passes everything straight on until an actor runs
+    // (see LineForwardBuf); an isolate's `out` comes from its runner.
+    vm.out               = task ? (out ? out : &std::cout) : &own_world->root_out;
     // stdin sink for readLine / readAllStdin: caller-supplied stream, or std::cin by
     // default. A caller (tests, a REPL) can feed input by passing its own std::istream.
     vm.in                = in ? in : &std::cin;
@@ -203,7 +520,11 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
     }
 #endif
 
-    VM_Resources res;
+    // A task or actor starts with small stacks (they grow on demand, see VM_Resources); the root
+    // keeps the historical initial commit.
+    VM_Resources res = task ? VM_Resources(VM_Resources::ISOLATE_REG_INIT_SIZE,
+                                           VM_Resources::ISOLATE_RET_FRAME_COUNT)
+                            : VM_Resources();
     // The parallel closure stack lives in VM_Resources; publish its base into the VM
     // so run_switch can push/pop saved caller closures and the collector can scan the
     // live entries (current_closure starts Undefined -- the top-level activation
@@ -217,7 +538,10 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
     vm.resources = &res;
 
     Context ctx;
-    ctx.ip                 = reinterpret_cast<const uint8_t*>(padded.data());
+    // A task starts at its entry stub, appended after the program's own code; everything
+    // else starts at instruction 0 (the top-level code).
+    assert((!task || task->entry_pc < bytecode.size()) && "task entry outside the code");
+    ctx.ip                 = reinterpret_cast<const uint8_t*>(padded.data() + (task ? task->entry_pc : 0));
     ctx.window_ptr         = res.get_reg_base();
     ctx.vm                 = &vm;
     ctx.ret_stack_base     = res.get_ret_base();
@@ -325,6 +649,16 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
 #endif
     return res;
 }
+
+// The structural-equality seam for ValueCodec.h. value_deep_eq is TU-local to this file
+// (it is `static` in Interpreter.h and inlined into the dispatch loop), so a test that
+// wants to check a round trip cannot reach it -- and a comparison written next to the
+// codec would be an oracle that shares the codec's assumptions, which is precisely the
+// kind of differential that cannot fail. One forwarder keeps the real comparison
+// available without touching Execute.h or the dispatch path.
+namespace vcodec {
+bool deep_eq(Value a, Value b, Context* ctx) { return value_deep_eq(a, b, ctx); }
+} // namespace vcodec
 
 // The decoupling seam that keeps Heap.h ignorant of VM's layout: the collector
 // calls this to forward external strong roots -- the active interner AND the
@@ -791,6 +1125,7 @@ MATHP(native_isinf, std::isinf)
 // Zero-arg (dummy window base). Allocates one string on the Some path (safepoint); None
 // allocates nothing.
 static Value native_read_line(Value*, uint8_t, Context* ctx) {
+    if (ctx->vm->out) ctx->vm->out->flush();   // a prompt printed without a newline must appear before the wait
     std::string line;
     if (!std::getline(*ctx->vm->in, line))
         return Value::fromNil();                    // EOF / stream error -> None
@@ -804,6 +1139,7 @@ static Value native_read_line(Value*, uint8_t, Context* ctx) {
 // an immediately-empty stream yields "" (a bulk read cannot "fail" -> Plain return kind, no
 // wrap, no prelude requirement). Zero-arg (dummy window base). Allocates one string (safepoint).
 static Value native_read_all_stdin(Value*, uint8_t, Context* ctx) {
+    if (ctx->vm->out) ctx->vm->out->flush();   // as readLine
     std::string all((std::istreambuf_iterator<char>(*ctx->vm->in)),
                     std::istreambuf_iterator<char>());
     GcObject* s = ctx->vm->heap->alloc_string_gc(all, ctx);
@@ -1180,12 +1516,19 @@ static Value native_gc_reset_stats(Value*, uint8_t, Context* ctx) {
 // itself is defined near the top of this file (execute() holds a stack-local instance).
 // =============================================================================
 
-// Lazy, once-only WSAStartup (single-threaded VM -> no synchronization). No WSACleanup:
-// process exit reclaims the Winsock state, and a paired cleanup would race a still-open socket.
+// Lazy, once-only WSAStartup. The latch is a MAGIC STATIC, not a plain `bool` pair: initialization
+// of a function-local static is exactly-once and thread-safe by the language rule (MSVC implements
+// it under /Zc:threadSafeInit, which is on by default), so several VM instances on several threads
+// may call this concurrently. The hand-rolled `inited`/`ok` pair it replaces was a data race -- the
+// unsynchronized read of `ok` could return false while another thread was still inside WSAStartup,
+// turning a healthy socket call into a bogus "WSAStartup failed". No WSACleanup: process exit
+// reclaims the Winsock state, and a paired cleanup would race a still-open socket.
 static bool ensure_wsa() {
 #ifdef _WIN32
-    static bool inited = false, ok = false;
-    if (!inited) { WSADATA d; ok = (WSAStartup(MAKEWORD(2, 2), &d) == 0); inited = true; }
+    static const bool ok = [] {
+        WSADATA d;
+        return WSAStartup(MAKEWORD(2, 2), &d) == 0;
+    }();
     return ok;
 #else
     return true;  // POSIX sockets need no initialization
@@ -1200,19 +1543,25 @@ static std::string net_error_msg(const char* op) {
 #endif
 }
 
-#ifndef _WIN32
-static int set_nonblocking(int s, bool nb) {
+// Switch a socket between blocking and non-blocking mode; 0 on success, -1 on failure. Both
+// platforms in one place: the timed connect below uses it to bound a dead host, and the std::poll
+// natives use it for their whole purpose -- a socket that answers "would block" instead of waiting.
+static int set_nonblocking(socket_t s, bool nb) {
+#ifdef _WIN32
+    u_long v = nb ? 1u : 0u;
+    return (ioctlsocket(s, FIONBIO, &v) == 0) ? 0 : -1;
+#else
     int flags = fcntl(s, F_GETFL, 0);
     if (flags < 0) return -1;
     return fcntl(s, F_SETFL, nb ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK));
-}
 #endif
-static const long NET_CONNECT_TIMEOUT_SEC = 10;   // connect() select() timeout
+}
+static const long NET_CONNECT_TIMEOUT_SEC = 10;   // connect timeout (select() on POSIX, TCP_MAXRT on Windows)
 static const long NET_RECV_CHUNK_MAX      = 1 << 20; // cap a single tcpRecv at 1 MiB
 
 // tcpConnect(host, port) -> Int descriptor (success) | String (error). Resolves host with
-// getaddrinfo(AF_UNSPEC) so BOTH IPv4 and IPv6 addresses are tried; connect is non-blocking
-// with a select() timeout so a dead host does not hang the VM.
+// getaddrinfo(AF_UNSPEC) so BOTH IPv4 and IPv6 addresses are tried; connect is bounded by
+// NET_CONNECT_TIMEOUT_SEC so a dead host does not hang the VM.
 static Value native_tcp_connect(Value* args, uint8_t nargs, Context* ctx) {
     if (!ctx->vm->net) return native_make_error(ctx, "tcpConnect: networking unavailable");
     if (nargs < 2 || !is_string(args[0]) || !args[1].isInt())
@@ -1234,34 +1583,30 @@ static Value native_tcp_connect(Value* args, uint8_t nargs, Context* ctx) {
     for (addrinfo* ai = res; ai && sock == INVALID_SOCK; ai = ai->ai_next) {
         socket_t s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (s == INVALID_SOCK) continue;
+        sock_suppress_sigpipe(s);
 #ifdef _WIN32
-        u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
+        // Windows: a BLOCKING connect, bounded by TCP_MAXRT (the SYN retransmission limit, in seconds).
+        // The non-blocking connect + select() below works here too, but on Windows it intermittently
+        // waits one full timer tick (~15.6 ms) even on loopback, where a blocking connect returns in
+        // ~0.1 ms (WSAPoll behaves like select). A load generator would report that tick as server
+        // latency.
+        DWORD maxrt = static_cast<DWORD>(NET_CONNECT_TIMEOUT_SEC);
+        setsockopt(s, IPPROTO_TCP, TCP_MAXRT, reinterpret_cast<const char*>(&maxrt), sizeof(maxrt));
+        const bool ok = connect(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0;
 #else
         set_nonblocking(s, true);
-#endif
         int rc = connect(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen));
         bool ok = (rc == 0);
-#ifdef _WIN32
-        if (rc == SOCKET_ERROR && WSAGetLastError() == WSAEWOULDBLOCK) {
-#else
         if (rc == -1 && (errno == EINPROGRESS || errno == EWOULDBLOCK)) {
-#endif
             fd_set wf; FD_ZERO(&wf); FD_SET(s, &wf);
             timeval tv{}; tv.tv_sec = NET_CONNECT_TIMEOUT_SEC; tv.tv_usec = 0;
-#ifdef _WIN32
-            if (select(0, nullptr, &wf, nullptr, &tv) > 0) {
-#else
             if (select(s + 1, nullptr, &wf, nullptr, &tv) > 0) {
-#endif
                 int soErr = 0; socklen_t len = sizeof(soErr);
                 getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &len);
                 ok = (soErr == 0);
             }
         }
-#ifdef _WIN32
-        u_long bl = 0; ioctlsocket(s, FIONBIO, &bl);
-#else
-        set_nonblocking(s, false);
+        set_nonblocking(s, false);   // every descriptor Skarn sees from std::net is blocking
 #endif
         if (ok) sock = s; else sock_close(s);
     }
@@ -1278,8 +1623,8 @@ static Value native_tcp_send(Value* args, uint8_t nargs, Context* ctx) {
         return native_make_error(ctx, "tcpSend: expected (sock: Int, data: Bytes)");
     if (!args[1].isPtr() || GcObject::from_slots(args[1].asPtr())->kind != GcObject::KIND_BYTES)
         return native_make_error(ctx, "tcpSend: data must be a byte buffer");
-    socket_t s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
-    if (s == INVALID_SOCK) return native_make_error(ctx, "tcpSend: invalid socket");
+    socket_t s = ctx->vm->net->get(args[0].asSigned48());
+    if (s == INVALID_SOCK) return native_make_error(ctx, std::string("tcpSend: ") + ctx->vm->net->invalid_reason(args[0].asSigned48()));
     std::string data;
     {
         GcObject*      hdr     = GcObject::from_slots(args[1].asPtr());
@@ -1289,7 +1634,7 @@ static Value native_tcp_send(Value* args, uint8_t nargs, Context* ctx) {
     }
     size_t sent = 0;
     while (sent < data.size()) {
-        int n = ::send(s, data.data() + sent, static_cast<int>(data.size() - sent), 0);
+        int n = ::send(s, data.data() + sent, static_cast<int>(data.size() - sent), SOCK_SEND_FLAGS);
         if (n < 0) return native_make_error(ctx, "tcpSend: " + net_error_msg("send"));
         sent += static_cast<size_t>(n);
     }
@@ -1302,8 +1647,8 @@ static Value native_tcp_recv(Value* args, uint8_t nargs, Context* ctx) {
     if (!ctx->vm->net) return native_make_error(ctx, "tcpRecv: networking unavailable");
     if (nargs < 2 || !args[0].isInt() || !args[1].isInt())
         return native_make_error(ctx, "tcpRecv: expected (sock: Int, maxBytes: Int)");
-    socket_t s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
-    if (s == INVALID_SOCK) return native_make_error(ctx, "tcpRecv: invalid socket");
+    socket_t s = ctx->vm->net->get(args[0].asSigned48());
+    if (s == INVALID_SOCK) return native_make_error(ctx, std::string("tcpRecv: ") + ctx->vm->net->invalid_reason(args[0].asSigned48()));
     long maxB = static_cast<long>(args[1].asSigned48());
     if (maxB < 0) return native_make_error(ctx, "tcpRecv: maxBytes must be non-negative");
     if (maxB > NET_RECV_CHUNK_MAX) maxB = NET_RECV_CHUNK_MAX;
@@ -1329,9 +1674,9 @@ static Value native_tcp_recv(Value* args, uint8_t nargs, Context* ctx) {
 static Value native_tcp_close(Value* args, uint8_t nargs, Context* ctx) {
     if (!ctx->vm->net) return native_make_error(ctx, "tcpClose: networking unavailable");
     if (nargs < 1 || !args[0].isInt()) return native_make_error(ctx, "tcpClose: expected (sock: Int)");
-    int fd = static_cast<int>(args[0].asSigned48());
+    const int64_t fd = args[0].asSigned48();
     socket_t s = ctx->vm->net->get(fd);
-    if (s == INVALID_SOCK) return native_make_error(ctx, "tcpClose: invalid socket");
+    if (s == INVALID_SOCK) return native_make_error(ctx, std::string("tcpClose: ") + ctx->vm->net->invalid_reason(fd));
     sock_close(s);
     ctx->vm->net->drop(fd);
     return Value::fromNil();
@@ -1347,6 +1692,7 @@ static Value native_tcp_listen(Value* args, uint8_t nargs, Context* ctx) {
     if (!ensure_wsa()) return native_make_error(ctx, "tcpListen: WSAStartup failed");
     socket_t s = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCK) return native_make_error(ctx, "tcpListen: " + net_error_msg("socket"));
+    sock_suppress_sigpipe(s);
 #ifdef _WIN32
     DWORD v6only = 0; setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<char*>(&v6only), sizeof(v6only));
     BOOL  reuse  = TRUE; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char*>(&reuse), sizeof(reuse));
@@ -1370,10 +1716,11 @@ static Value native_tcp_listen(Value* args, uint8_t nargs, Context* ctx) {
 static Value native_tcp_accept(Value* args, uint8_t nargs, Context* ctx) {
     if (!ctx->vm->net) return native_make_error(ctx, "tcpAccept: networking unavailable");
     if (nargs < 1 || !args[0].isInt()) return native_make_error(ctx, "tcpAccept: expected (sock: Int)");
-    socket_t s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
-    if (s == INVALID_SOCK) return native_make_error(ctx, "tcpAccept: invalid socket");
+    socket_t s = ctx->vm->net->get(args[0].asSigned48());
+    if (s == INVALID_SOCK) return native_make_error(ctx, std::string("tcpAccept: ") + ctx->vm->net->invalid_reason(args[0].asSigned48()));
     socket_t c = accept(s, nullptr, nullptr);
     if (c == INVALID_SOCK) return native_make_error(ctx, "tcpAccept: " + net_error_msg("accept"));
+    sock_suppress_sigpipe(c);
     return Value::fromSigned48(ctx->vm->net->add(c));
 }
 
@@ -1386,8 +1733,8 @@ static Value native_tcp_accept(Value* args, uint8_t nargs, Context* ctx) {
 static Value native_tcp_local_port(Value* args, uint8_t nargs, Context* ctx) {
     if (!ctx->vm->net) return native_make_error(ctx, "tcpLocalPort: networking unavailable");
     if (nargs < 1 || !args[0].isInt()) return native_make_error(ctx, "tcpLocalPort: expected (sock: Int)");
-    socket_t s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
-    if (s == INVALID_SOCK) return native_make_error(ctx, "tcpLocalPort: invalid socket");
+    socket_t s = ctx->vm->net->get(args[0].asSigned48());
+    if (s == INVALID_SOCK) return native_make_error(ctx, std::string("tcpLocalPort: ") + ctx->vm->net->invalid_reason(args[0].asSigned48()));
     sockaddr_storage ss{};
     socklen_t len = static_cast<socklen_t>(sizeof(ss));
     if (getsockname(s, reinterpret_cast<sockaddr*>(&ss), &len) < 0)
@@ -1405,8 +1752,8 @@ static Value native_tcp_set_timeout(Value* args, uint8_t nargs, Context* ctx) {
     if (!ctx->vm->net) return native_make_error(ctx, "tcpSetTimeout: networking unavailable");
     if (nargs < 2 || !args[0].isInt() || !args[1].isInt())
         return native_make_error(ctx, "tcpSetTimeout: expected (sock: Int, ms: Int)");
-    socket_t s = ctx->vm->net->get(static_cast<int>(args[0].asSigned48()));
-    if (s == INVALID_SOCK) return native_make_error(ctx, "tcpSetTimeout: invalid socket");
+    socket_t s = ctx->vm->net->get(args[0].asSigned48());
+    if (s == INVALID_SOCK) return native_make_error(ctx, std::string("tcpSetTimeout: ") + ctx->vm->net->invalid_reason(args[0].asSigned48()));
     long ms = static_cast<long>(args[1].asSigned48());
 #ifdef _WIN32
     DWORD tv = static_cast<DWORD>(ms < 0 ? 0 : ms);   // Windows SO_*TIMEO: DWORD of milliseconds
@@ -1419,6 +1766,233 @@ static Value native_tcp_set_timeout(Value* args, uint8_t nargs, Context* ctx) {
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
     return Value::fromNil();
+}
+
+// =============================================================================
+// Non-blocking I/O + readiness polling (std::poll). The natives behind the prelude's event loop:
+// a socket switched to non-blocking mode answers "would block" instead of waiting, and rawPoll
+// reports which of a set of sockets can be acted on. Everything else -- the loop, the per-connection
+// state, the unsent-tail bookkeeping -- is written in Skarn on top of these five.
+//
+// The "would block" outcome is neither a value nor an error, so each native encodes it in the
+// SUCCESS channel and the prelude turns it into an enum arm: -1 for accept, a 0-element array for
+// recv, a 0 count for send. It must never be folded into an empty read, because an empty read
+// already means the peer closed -- the exact conflation this module exists to remove.
+// =============================================================================
+
+// Skarn-side readiness flags, mirrored by the `READABLE` / `WRITABLE` / `CLOSED` consts in
+// std/poll.skn. They are a packed Int rather than an enum because a socket can be several of these
+// at once, which is precisely what an enum cannot say.
+static constexpr int64_t SK_POLL_READABLE = 1;
+static constexpr int64_t SK_POLL_WRITABLE = 2;
+static constexpr int64_t SK_POLL_CLOSED   = 4;
+
+// Read a Vec[Int] or Array[Int] argument into host memory. Same shape as rawRun's argv walk: the
+// whole read happens BEFORE any allocation, so nothing here can be moved out from under us.
+static bool read_int_seq(Value v, std::vector<int64_t>* out) {
+    if (!v.isPtr()) return false;
+    GcObject* hdr   = GcObject::from_slots(v.asPtr());
+    Value*    elems = nullptr;
+    uint32_t  n     = 0;
+    if (hdr->kind == GcObject::KIND_ARRAY) {
+        elems = hdr->slots();
+        n     = static_cast<uint32_t>(hdr->slot_count());
+    } else if (hdr->kind == GcObject::KIND_VEC) {
+        GcObject* backing = GcObject::from_slots(hdr->slots()[VEC_SLOT_BACKING].asPtr());
+        n     = static_cast<uint32_t>(hdr->slots()[VEC_SLOT_COUNT].asSigned48());
+        elems = backing->slots();
+    } else {
+        return false;
+    }
+    out->reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!elems[i].isInt()) return false;
+        out->push_back(elems[i].asSigned48());
+    }
+    return true;
+}
+
+// True when the last socket call failed only because it would have blocked -- the one "error" that
+// is not one. Windows reports it through WSAGetLastError, POSIX through errno, and POSIX is allowed
+// to use either of two spellings that may or may not be the same value.
+static bool sock_would_block() {
+#ifdef _WIN32
+    return WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+}
+
+// rawSetNonBlocking(sock, on) -> nil (success) | String (error). Switches an existing descriptor
+// between the two modes. std::net hands out blocking sockets only, so this is what the std::poll
+// wrappers call to take one over.
+static Value native_raw_set_non_blocking(Value* args, uint8_t nargs, Context* ctx) {
+    if (!ctx->vm->net) return native_make_error(ctx, "rawSetNonBlocking: networking unavailable");
+    if (nargs < 2 || !args[0].isInt() || !args[1].isBool())
+        return native_make_error(ctx, "rawSetNonBlocking: expected (sock: Int, on: Bool)");
+    socket_t s = ctx->vm->net->get(args[0].asSigned48());
+    if (s == INVALID_SOCK) return native_make_error(ctx, std::string("rawSetNonBlocking: ") + ctx->vm->net->invalid_reason(args[0].asSigned48()));
+    if (set_nonblocking(s, args[1].asBool()) != 0)
+        return native_make_error(ctx, "rawSetNonBlocking: " + net_error_msg("fcntl/ioctlsocket"));
+    return Value::fromNil();
+}
+
+// rawPoll(fds, interest, timeoutMs) -> Array[Int] (success) | String (error). Waits until at least
+// one socket is ready or the timeout expires, and answers INDEX-PARALLEL to `fds`: element i holds
+// the ready flags for fds[i], 0 when nothing happened. `interest` is the per-socket mask of what the
+// caller cares about -- a server with nothing to write must be able NOT to ask for writability, or
+// poll returns immediately every time and the loop spins.
+//
+// Allocation: exactly one, for the result array, and its elements are immediates -- so nothing can
+// move after the array exists and no rooting is needed (the native_raw_gc_stats shape, not the
+// native_args one).
+static Value native_raw_poll(Value* args, uint8_t nargs, Context* ctx) {
+    if (!ctx->vm->net) return native_make_error(ctx, "rawPoll: networking unavailable");
+    if (nargs < 3 || !args[2].isInt())
+        return native_make_error(ctx, "rawPoll: expected (fds: Vec[Int], interest: Vec[Int], timeoutMs: Int)");
+    std::vector<int64_t> fds, interest;
+    if (!read_int_seq(args[0], &fds) || !read_int_seq(args[1], &interest))
+        return native_make_error(ctx, "rawPoll: fds and interest must be sequences of Int");
+    if (fds.size() != interest.size())
+        return native_make_error(ctx, "rawPoll: fds and interest must have the same length");
+
+    std::vector<pollfd_t> pfds;
+    pfds.reserve(fds.size());
+    bool any_interest = false;
+    for (size_t i = 0; i < fds.size(); ++i) {
+        socket_t s = ctx->vm->net->get(fds[i]);
+        if (s == INVALID_SOCK) return native_make_error(ctx, std::string("rawPoll: ") + ctx->vm->net->invalid_reason(fds[i]));
+        pollfd_t p{};
+        p.fd     = s;
+        p.events = static_cast<short>(((interest[i] & SK_POLL_READABLE) ? POLL_READ  : 0) |
+                                      ((interest[i] & SK_POLL_WRITABLE) ? POLL_WRITE : 0));
+        if (p.events != 0) any_interest = true;
+        pfds.push_back(p);
+    }
+
+    // A platform difference that would otherwise surface as a baffling error: POSIX poll() accepts an
+    // all-zero events set -- and SLEEPS out the timeout, which is what makes poll(NULL, 0, ms) the
+    // canonical portable sleep -- while WSAPoll REJECTS it with WSAEINVAL. Asking for nothing is a
+    // legitimate state for a loop with nothing outstanding this round.
+    //
+    // So the set is levelled by EMULATING what POSIX does, not by adopting what Winsock can express:
+    // wait out the timeout, then report nothing ready. Returning early here instead would turn such a
+    // round into a 100 % CPU spin -- on POSIX that would be a REGRESSION, since its own poll() got
+    // this right. Do not "simplify" this branch back into an immediate return.
+    const long timeout_ms = static_cast<long>(args[2].asSigned48());
+    if (!pfds.empty() && any_interest) {
+        const int rc = sock_poll(pfds.data(), static_cast<unsigned>(pfds.size()),
+                                 static_cast<int>(timeout_ms));
+        if (rc < 0) return native_make_error(ctx, "rawPoll: " + net_error_msg("poll"));
+    } else {
+        // Nothing to watch. A negative timeout means "wait indefinitely", and with no interest at all
+        // nothing could ever end that wait -- a guaranteed hang, so it is an error rather than a VM
+        // that freezes indistinguishably from a crash. (A deliberate departure from poll(NULL, 0, -1).)
+        if (timeout_ms < 0)
+            return native_make_error(ctx, "rawPoll: a negative timeout with no interest would wait forever");
+        if (timeout_ms > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
+        for (pollfd_t& p : pfds) p.revents = 0;
+    }
+
+    const uint32_t n = static_cast<uint32_t>(pfds.size());
+    GcObject* arrObj = ctx->vm->heap->alloc_slots_gc(GcObject::KIND_ARRAY, n, ctx);
+    Value     arr    = Value::fromPtr(arrObj->payload());
+    Value*    slots  = GcObject::from_slots(arr.asPtr())->slots();
+    for (uint32_t i = 0; i < n; ++i) {
+        const short re = pfds[i].revents;
+        int64_t flags = 0;
+        if (re & POLL_READ)                            flags |= SK_POLL_READABLE;
+        if (re & POLL_WRITE)                           flags |= SK_POLL_WRITABLE;
+        if (re & (POLLERR | POLLHUP | POLLNVAL))       flags |= SK_POLL_CLOSED;
+        slots[i] = Value::fromSigned48(flags);   // immediates only -> no further allocation, no root
+    }
+    return arr;
+}
+
+// rawAcceptNb(listenSock) -> Int (success) | String (error). >= 0 is the descriptor of an accepted
+// connection, -1 means "would block" -- nobody is waiting. The accepted socket is explicitly put
+// into non-blocking mode: whether it INHERITS the listener's mode differs between platforms
+// (Windows inherits, BSD/macOS does not), and the loop must not depend on which one it is on.
+static Value native_raw_accept_nb(Value* args, uint8_t nargs, Context* ctx) {
+    if (!ctx->vm->net) return native_make_error(ctx, "rawAcceptNb: networking unavailable");
+    if (nargs < 1 || !args[0].isInt()) return native_make_error(ctx, "rawAcceptNb: expected (sock: Int)");
+    socket_t s = ctx->vm->net->get(args[0].asSigned48());
+    if (s == INVALID_SOCK) return native_make_error(ctx, std::string("rawAcceptNb: ") + ctx->vm->net->invalid_reason(args[0].asSigned48()));
+    socket_t c = accept(s, nullptr, nullptr);
+    if (c == INVALID_SOCK) {
+        if (sock_would_block()) return Value::fromSigned48(-1);
+        return native_make_error(ctx, "rawAcceptNb: " + net_error_msg("accept"));
+    }
+    sock_suppress_sigpipe(c);
+    set_nonblocking(c, true);
+    return Value::fromSigned48(ctx->vm->net->add(c));
+}
+
+// rawRecvNb(sock, maxBytes) -> Array[Bytes] (success) | String (error). THREE outcomes in one call:
+// an EMPTY array means "would block", a 1-element array holds the read, and that element being
+// empty means the peer closed. The array is the carrier because Bytes alone cannot say three
+// things -- empty is already taken by EOF -- and a homogeneous Array[Bytes] types without a codegen
+// special case, unlike rawRun's heterogeneous Array[3]. The prelude hides it behind `Received`.
+static Value native_raw_recv_nb(Value* args, uint8_t nargs, Context* ctx) {
+    if (!ctx->vm->net) return native_make_error(ctx, "rawRecvNb: networking unavailable");
+    if (nargs < 2 || !args[0].isInt() || !args[1].isInt())
+        return native_make_error(ctx, "rawRecvNb: expected (sock: Int, maxBytes: Int)");
+    socket_t s = ctx->vm->net->get(args[0].asSigned48());
+    if (s == INVALID_SOCK) return native_make_error(ctx, std::string("rawRecvNb: ") + ctx->vm->net->invalid_reason(args[0].asSigned48()));
+    long maxB = static_cast<long>(args[1].asSigned48());
+    if (maxB < 0) return native_make_error(ctx, "rawRecvNb: maxBytes must be non-negative");
+    if (maxB > NET_RECV_CHUNK_MAX) maxB = NET_RECV_CHUNK_MAX;
+
+    std::string buf;
+    buf.resize(static_cast<size_t>(maxB));
+    const int n = (maxB == 0) ? 0 : ::recv(s, buf.data(), static_cast<int>(maxB), 0);
+    Heap* heap = ctx->vm->heap;
+    if (n < 0) {
+        if (sock_would_block())                       // the empty array: nothing to read YET
+            return Value::fromPtr(heap->alloc_slots_gc(GcObject::KIND_ARRAY, 0, ctx)->payload());
+        return native_make_error(ctx, "rawRecvNb: " + net_error_msg("recv"));
+    }
+    const std::string got(buf.data(), static_cast<size_t>(n));  // host copy before the allocating build
+
+    // Build the payload FIRST and keep it rooted across the array allocation: bytes_from_str
+    // allocates twice internally, and the array allocation below can move what it produced.
+    Value payload = Value::fromNil();
+    heap->add_root(&payload);
+    bytes_from_str(ctx, &payload, got);
+    GcObject* arrObj = heap->alloc_slots_gc(GcObject::KIND_ARRAY, 1, ctx);   // may collect -> payload moves
+    Value     arr    = Value::fromPtr(arrObj->payload());
+    GcObject::from_slots(arr.asPtr())->slots()[0] = payload;                 // re-read through the root
+    heap->remove_root(&payload);
+    return arr;
+}
+
+// rawSendNb(sock, data) -> Int (success) | String (error). The count of bytes the kernel ACCEPTED,
+// which may be less than what was offered: on a non-blocking socket a full send buffer is normal,
+// not an error. 0 means nothing went out (would block). There is deliberately no send-all loop --
+// it cannot exist here; the caller keeps the unsent tail and tries again when poll says writable.
+static Value native_raw_send_nb(Value* args, uint8_t nargs, Context* ctx) {
+    if (!ctx->vm->net) return native_make_error(ctx, "rawSendNb: networking unavailable");
+    if (nargs < 2 || !args[0].isInt())
+        return native_make_error(ctx, "rawSendNb: expected (sock: Int, data: Bytes)");
+    if (!args[1].isPtr() || GcObject::from_slots(args[1].asPtr())->kind != GcObject::KIND_BYTES)
+        return native_make_error(ctx, "rawSendNb: data must be a byte buffer");
+    socket_t s = ctx->vm->net->get(args[0].asSigned48());
+    if (s == INVALID_SOCK) return native_make_error(ctx, std::string("rawSendNb: ") + ctx->vm->net->invalid_reason(args[0].asSigned48()));
+    std::string data;
+    {
+        GcObject*      hdr     = GcObject::from_slots(args[1].asPtr());
+        GcObject*      backing = GcObject::from_slots(hdr->slots()[BYTES_SLOT_BACKING].asPtr());
+        const uint32_t count   = static_cast<uint32_t>(hdr->slots()[BYTES_SLOT_COUNT].asSigned48());
+        data.assign(backing->bytes(), count);   // host copy; nothing allocates before the send
+    }
+    if (data.empty()) return Value::fromSigned48(0);
+    const int n = ::send(s, data.data(), static_cast<int>(data.size()), SOCK_SEND_FLAGS);
+    if (n < 0) {
+        if (sock_would_block()) return Value::fromSigned48(0);
+        return native_make_error(ctx, "rawSendNb: " + net_error_msg("send"));
+    }
+    return Value::fromSigned48(static_cast<int64_t>(n));
 }
 
 // =============================================================================
@@ -1492,6 +2066,387 @@ static Value native_sha256(Value* args, uint8_t nargs, Context* ctx) {
     return result;
 }
 
+// =============================================================================
+// Isolate natives -- tasks (rawSpawn / rawJoin / rawTaskTake), actors (rawSpawnActor / rawSend /
+// rawReceive / rawMailMsg / rawMailFrom / rawMailReason / rawMainInbox), and for both rawTaskInput
+// and rawSelfId. The runtime they share (World, Isolate, Mailbox) is described above execute().
+//
+// HOW AN ISOLATE STARTS AT A FUNCTION. execute() normally begins at instruction 0, the top-level
+// code. An isolate instead gets the world's code with a short ENTRY STUB appended -- appending
+// keeps every function's code_offset valid -- and starts there (TaskEntry::entry_pc). The stub is
+// ordinary bytecode, so the call goes through the VM's own calling convention:
+//     r1 = NATIVE_TASK_INPUT ; r2 = rawTaskInput()    -- the argument, decoded in the NEW heap
+//     r0 = Func(fn)          ; CALL_INDIRECT r0, 1    -- fn(r2); the result comes back in r2
+//     MOV_TAKE r0, r2        ; HALT
+// Top frame size 2: the argument sits at r2 = the outgoing window, exactly where CALL_INDIRECT
+// wants it. Skarn has no global variables, so skipping the top-level code loses nothing a top-level
+// function could depend on. An actor uses the same one-argument stub: std::actor starts a
+// trampoline that takes `{ f, init }` and asks rawSelfId for the actor's own id.
+// =============================================================================
+static constexpr uint8_t TASK_STUB_FRAME = 2;
+
+// An actor starts with a SMALL heap (the heap grows when it must): a task is one computation, but
+// a program may run hundreds of actors, and the default 2 x 4 MiB each would add up to gigabytes.
+static constexpr size_t ACTOR_INITIAL_SEMI = 64 * 1024;
+
+static std::vector<uint32_t> task_code(const std::vector<uint32_t>& program, uint16_t fn_id) {
+    auto op = [](OpCode o) { return static_cast<uint8_t>(o); };
+    std::vector<uint32_t> code;
+    code.reserve(program.size() + 6);
+    code = program;
+    code.push_back(Instruction::C2(op(OpCode::LOAD_CONST), 1, static_cast<int16_t>(NATIVE_TASK_INPUT)).raw);
+    code.push_back(Instruction::CallNative(op(OpCode::CALL_NATIVE), 2, 1, 2, 0).raw);
+    code.push_back(Instruction::C2(op(OpCode::LOAD_FN), 0, static_cast<int16_t>(fn_id)).raw);
+    code.push_back(Instruction::R6(op(OpCode::CALL_INDIRECT), 0, 0, 1).raw);
+    code.push_back(Instruction::R6(op(OpCode::MOV_TAKE), 0, 2, 0).raw);
+    code.push_back(Instruction::J(op(OpCode::HALT)).raw);
+    return code;
+}
+
+// The body of an isolate's thread. Catches EVERYTHING: an exception escaping a std::thread
+// terminates the process.
+//   * A TASK buffers its output and hands it over at join; on success its result is encoded
+//     straight after execute() returns (encode() allocates nothing, so the heap cannot collect
+//     between HALT and the copy).
+//   * An ACTOR writes its output a line at a time to the root's stream. When it ends its mailbox is
+//     marked dead FIRST, so a sender told about the crash can no longer reach it; then, if it
+//     FAULTED, its starter gets MAIL_EXITED (v1 reports crashes only).
+static void run_isolate(World* world, std::shared_ptr<Isolate> iso, uint16_t fn_id) {
+    std::ostringstream task_out;
+    LineForwardBuf     actor_buf(world, /*always_lines=*/true);
+    std::ostream       actor_out(&actor_buf);
+    std::ostream&      out = iso->actor ? actor_out : static_cast<std::ostream&>(task_out);
+    std::string        fault;
+    bool               faulted = false;
+    try {
+        const ProgramImage* img  = world->image;
+        const std::vector<uint32_t> code = task_code(*img->bytecode, fn_id);
+        const TaskEntry entry{ static_cast<uint32_t>(img->bytecode->size()),
+                               iso->input.data(), iso->input.size(), world, iso.get() };
+        Heap               heap(iso->actor ? ACTOR_INITIAL_SEMI : Heap::INITIAL_SEMI);
+        StringInterner     interner;
+        std::istringstream in;   // an isolate reads no stdin: it shares the process with the root
+        auto res = execute(code, &heap, nullptr, &interner, TASK_STUB_FRAME,
+                           img->const_pool, img->struct_types, img->string_literals,
+                           img->atom_names, img->fn_table, &out,
+                           img->trait_table, img->trait_table_width, img->trait_method_count,
+                           img->line_table, img->function_names, img->column_table,
+                           img->native_table, img->script_args, &in,
+                           img->function_modules, img->const_arrays, &entry);
+        if (!iso->actor) {
+            iso->output = vcodec::encode(res.get_reg_base()[0]);
+            iso->ok     = true;
+        }
+    } catch (const std::exception& e) {
+        faulted = true;
+        fault   = e.what();
+    } catch (...) {
+        faulted = true;
+        fault   = "the isolate failed with an unknown exception";
+    }
+    if (!iso->actor) {
+        if (faulted) iso->error = std::move(fault);
+        iso->printed = task_out.str();
+        return;
+    }
+    actor_buf.flush_partial();
+    {
+        std::lock_guard<std::mutex> lk(iso->mailbox->m);
+        iso->mailbox->dead = true;
+        iso->mailbox->q.clear();
+    }
+    if (faulted)
+        if (auto box = world->mailbox_of(iso->starter))
+            box->put(Mail{ MAIL_EXITED, {}, iso->id, std::move(fault) });
+}
+
+// The id inside a handle: a bare Int, or Skarn's one-field `Task[R]` / `Pid[M]` / `Inbox[M]`
+// struct holding it (the checker hands the struct over so these natives can be typed by it).
+static Value handle_id(Value v) {
+    if (v.isPtr()) {
+        const GcObject* o = GcObject::from_slots(v.asPtr());
+        if (o->kind == GcObject::KIND_OBJECT && o->slot_count() >= 1) return o->slots()[0];
+    }
+    return v;
+}
+
+// Start an isolate: encode the argument HERE, in the starter, before the thread exists (so the
+// starter may go on changing its own copy), start the thread, THEN register the record.
+//
+// Registering last is what makes the world's final join safe. The world ends only when the root
+// finishes, and it joins every registered isolate -- including the one running this native, which
+// therefore registers the new record before the world can be done with it; the next pass of the
+// world's join loop finds it. Registering first would let that loop see a record whose `thread` is
+// still being assigned. Nothing else needs the record before spawn returns its id.
+static int64_t start_isolate(Value* args, uint8_t nargs, Context* ctx, bool actor, const char* who) {
+    VM* vm = ctx->vm;
+    IsolateLocal* local = vm->isolate;
+    if (!local || !local->world)
+        raise_located(ctx, (std::string(who) + ": this execution cannot start isolates").c_str());
+    if (nargs < 2 || !args[0].isFunc())
+        raise_located(ctx, (std::string(who) + ": the function must be a named top-level function").c_str());
+    const uint32_t fn_id = args[0].asFuncId();
+    if (fn_id >= vm->fn_table_size || vm->fn_table[fn_id].arity != 1)
+        raise_located(ctx, (std::string(who) + ": the function must take exactly one argument").c_str());
+    World* world = local->world;
+    auto iso = std::make_shared<Isolate>();
+    iso->actor   = actor;
+    iso->starter = local->id;
+    try {
+        iso->input = vcodec::encode(args[1]);
+    } catch (const vcodec::ValueCodecError& e) {
+        raise_located(ctx, (std::string(who) + ": the argument cannot be sent: " + e.what()).c_str());
+    }
+    if (actor) {
+        iso->mailbox = std::make_shared<Mailbox>();
+        world->actors_started.store(true, std::memory_order_release);
+    }
+    {
+        std::lock_guard<std::mutex> lk(world->m);
+        iso->id = world->next_id++;
+    }
+    try {
+        iso->thread = std::thread(run_isolate, world, iso, static_cast<uint16_t>(fn_id));
+    } catch (const std::system_error& e) {
+        raise_located(ctx, (std::string(who) + ": could not start a thread: " + e.what()).c_str());
+    }
+    {
+        std::lock_guard<std::mutex> lk(world->m);
+        world->isolates.emplace(iso->id, iso);
+        if (actor && world->stopping)          // born while the world ends: stop at once
+            iso->mailbox->put(Mail{ MAIL_STOP, {}, 0, {} });
+    }
+    return iso->id;
+}
+
+// rawSpawn(fn, arg) -> Int, the task id.
+static Value native_task_spawn(Value* args, uint8_t nargs, Context* ctx) {
+    return Value::fromSigned48(start_isolate(args, nargs, ctx, /*actor=*/false, "spawn"));
+}
+
+// The task a handle names. Faults (located) on anything that is not a task THIS isolate started --
+// a Task cannot be sent, so its starter is the only isolate that can hold it.
+static std::shared_ptr<Isolate> own_task(Value h, Context* ctx) {
+    const Value id = handle_id(h);
+    IsolateLocal* local = ctx->vm->isolate;
+    std::shared_ptr<Isolate> iso =
+        (local && local->world && id.isInt()) ? local->world->find(id.asSigned48()) : nullptr;
+    if (!iso || iso->actor || iso->starter != local->id)
+        raise_located(ctx, "join: not a task of this program");
+    return iso;
+}
+
+// rawJoin(id) -> Bool. Waits for the task; true iff it returned a value. What it printed is
+// written to this isolate's output HERE, in join order -- so output does not depend on how the
+// threads were scheduled.
+static Value native_task_join(Value* args, uint8_t nargs, Context* ctx) {
+    auto iso = own_task(nargs >= 1 ? args[0] : Value::fromNil(), ctx);
+    if (iso->claimed)
+        raise_located(ctx, "join: this task was already joined");
+    iso->claimed = true;
+    iso->join_thread();
+    if (!iso->printed.empty()) {
+        *ctx->vm->out << iso->printed;
+        iso->printed.clear();
+    }
+    return Value::fromBool(iso->ok);
+}
+
+// rawTaskTake(id) -> the task's result, decoded into THIS heap, or its failure message. Once per
+// task, after rawJoin; the buffers are released afterwards. The decoded value is held by the pool
+// until the return, and by the register CALL_NATIVE writes it to after -- nothing allocates in
+// between.
+static Value native_task_take(Value* args, uint8_t nargs, Context* ctx) {
+    auto iso = own_task(nargs >= 1 ? args[0] : Value::fromNil(), ctx);
+    if (!iso->claimed || iso->taken)
+        raise_located(ctx, "join: the task's result is not available");
+    iso->taken = true;
+    if (!iso->ok) {
+        const std::string msg = std::move(iso->error);
+        return native_make_error(ctx, msg);
+    }
+    const std::vector<uint8_t> buf = std::move(iso->output);
+    try {
+        RootedValuePool pool;
+        return vcodec::decode(buf.data(), buf.size(), *ctx->vm->heap, ctx, pool,
+                              ctx->vm->struct_types, ctx->vm->struct_type_count);
+    } catch (const vcodec::ValueCodecError& e) {
+        raise_located(ctx, (std::string("join: the result cannot be received: ") + e.what()).c_str());
+    }
+}
+
+// rawTaskInput() -> the isolate's argument, decoded into its own heap. Called once, by the entry
+// stub; anywhere else it faults.
+static Value native_task_input(Value*, uint8_t, Context* ctx) {
+    VM* vm = ctx->vm;
+    if (!vm->task_input)
+        raise_located(ctx, "rawTaskInput: this execution is not a task or an actor");
+    try {
+        RootedValuePool pool;
+        return vcodec::decode(vm->task_input, vm->task_input_size, *vm->heap, ctx, pool,
+                              vm->struct_types, vm->struct_type_count);
+    } catch (const vcodec::ValueCodecError& e) {
+        raise_located(ctx, (std::string("task: the argument cannot be received: ") + e.what()).c_str());
+    }
+}
+
+// rawSelfId() -> Int: this isolate's id (0 for the root). An actor's trampoline builds its
+// Inbox from it.
+static Value native_self_id(Value*, uint8_t, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    return Value::fromSigned48(local ? local->id : 0);
+}
+
+// rawSpawnActor(fn, arg) -> Int, the actor id.
+static Value native_actor_spawn(Value* args, uint8_t nargs, Context* ctx) {
+    return Value::fromSigned48(start_isolate(args, nargs, ctx, /*actor=*/true, "spawnActor"));
+}
+
+// rawMainInbox() -> Int. Gives the ROOT a mailbox, so it can receive replies and crash reports.
+// ONCE: the Inbox it becomes fixes the message type, and a second one of another type could read
+// the same queue as something else.
+static Value native_main_inbox(Value*, uint8_t, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world || local->id != 0)
+        raise_located(ctx, "mainInbox: only the main program has a main inbox");
+    {
+        std::lock_guard<std::mutex> lk(local->world->m);
+        if (local->world->main_inbox_taken)
+            raise_located(ctx, "mainInbox: the main inbox was already taken");
+        local->world->main_inbox_taken = true;
+    }
+    local->mailbox = local->world->main_mailbox;
+    return Value::fromSigned48(0);
+}
+
+// rawSend(pid, msg) -> Bool. The message is encoded HERE, in the sender's heap. False when the
+// addressee no longer runs (or never was an actor); the message is then dropped, as in Erlang.
+static Value native_send(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    const Value   id    = handle_id(nargs >= 1 ? args[0] : Value::fromNil());
+    if (!local || !local->world || !id.isInt() || nargs < 2)
+        raise_located(ctx, "send: not an actor address");
+    Mail mail;
+    mail.kind = MAIL_MSG;
+    try {
+        mail.buf = vcodec::encode(args[1]);
+    } catch (const vcodec::ValueCodecError& e) {
+        raise_located(ctx, (std::string("send: the message cannot be sent: ") + e.what()).c_str());
+    }
+    auto box = local->world->mailbox_of(id.asSigned48());
+    return Value::fromBool(box && box->put(std::move(mail)));
+}
+
+// This isolate's mailbox, checked against the inbox the program names. An Inbox cannot be sent,
+// so a mismatch means a forged one.
+static Mailbox& own_mailbox(Value inbox, Context* ctx, const char* who) {
+    IsolateLocal* local = ctx->vm->isolate;
+    const Value   id    = handle_id(inbox);
+    if (!local || !local->mailbox)
+        raise_located(ctx, (std::string(who) + ": this execution has no inbox (mainInbox first?)").c_str());
+    if (!id.isInt() || id.asSigned48() != local->id)
+        raise_located(ctx, (std::string(who) + ": this inbox belongs to another actor").c_str());
+    return *local->mailbox;
+}
+
+// rawReceive(inbox, timeoutMs) -> Int: MAIL_NONE (the timeout passed), MAIL_MSG, MAIL_EXITED or
+// MAIL_STOP. A negative timeout waits indefinitely. The mail itself is kept as the isolate's
+// `current`, for rawMailMsg / rawMailFrom / rawMailReason. Once Stop has been received, every
+// later receive answers Stop at once. Blocking here holds no VM lock and touches no heap.
+static Value native_receive(Value* args, uint8_t nargs, Context* ctx) {
+    Mailbox& box = own_mailbox(nargs >= 1 ? args[0] : Value::fromNil(), ctx, "receive");
+    const int64_t ms = (nargs >= 2 && args[1].isInt()) ? args[1].asSigned48() : -1;
+    IsolateLocal* local = ctx->vm->isolate;
+    std::unique_lock<std::mutex> lk(box.m);
+    auto ready = [&] { return !box.q.empty() || box.stop_seen; };
+    if (ms < 0) box.cv.wait(lk, ready);
+    else        box.cv.wait_for(lk, std::chrono::milliseconds(ms), ready);
+    if (box.q.empty()) {
+        local->current = Mail{ box.stop_seen ? MAIL_STOP : MAIL_NONE, {}, 0, {} };
+        return Value::fromSigned48(local->current.kind);
+    }
+    local->current = std::move(box.q.front());
+    box.q.pop_front();
+    if (local->current.kind == MAIL_STOP) box.stop_seen = true;
+    return Value::fromSigned48(local->current.kind);
+}
+
+// rawMailMsg(inbox) -> the message rawReceive took, decoded into THIS heap. Once per message.
+static Value native_mail_msg(Value* args, uint8_t nargs, Context* ctx) {
+    (void)own_mailbox(nargs >= 1 ? args[0] : Value::fromNil(), ctx, "receive");
+    Mail& cur = ctx->vm->isolate->current;
+    if (cur.kind != MAIL_MSG)
+        raise_located(ctx, "receive: there is no message to read");
+    const std::vector<uint8_t> buf = std::move(cur.buf);
+    cur.kind = MAIL_NONE;
+    try {
+        RootedValuePool pool;
+        return vcodec::decode(buf.data(), buf.size(), *ctx->vm->heap, ctx, pool,
+                              ctx->vm->struct_types, ctx->vm->struct_type_count);
+    } catch (const vcodec::ValueCodecError& e) {
+        raise_located(ctx, (std::string("receive: the message cannot be received: ") + e.what()).c_str());
+    }
+}
+
+// rawMailFrom(inbox) -> Int, and rawMailReason(inbox) -> String: the actor a MAIL_EXITED reports,
+// and its fault message.
+static Value native_mail_from(Value* args, uint8_t nargs, Context* ctx) {
+    (void)own_mailbox(nargs >= 1 ? args[0] : Value::fromNil(), ctx, "receive");
+    const Mail& cur = ctx->vm->isolate->current;
+    if (cur.kind != MAIL_EXITED)
+        raise_located(ctx, "receive: there is no exit report to read");
+    return Value::fromSigned48(cur.from);
+}
+static Value native_mail_reason(Value* args, uint8_t nargs, Context* ctx) {
+    (void)own_mailbox(nargs >= 1 ? args[0] : Value::fromNil(), ctx, "receive");
+    const Mail& cur = ctx->vm->isolate->current;
+    if (cur.kind != MAIL_EXITED)
+        raise_located(ctx, "receive: there is no exit report to read");
+    const std::string reason = cur.reason;
+    return native_make_error(ctx, reason);
+}
+
+// rawHandOff(fd) -> Int ticket | String. Moves a connection OUT of this isolate: the socket leaves
+// this NetRegistry (it is not closed) and waits in the world under a fresh ticket until an isolate
+// takes it. The descriptor goes stale at once, so a later use of it is refused with "socket was
+// handed to another actor" (see NetRegistry). The ticket is plain data and travels in a message.
+static Value native_hand_off(Value* args, uint8_t nargs, Context* ctx) {
+    VM* vm = ctx->vm;
+    if (!vm->net) return native_make_error(ctx, "handOff: networking unavailable");
+    if (nargs < 1 || !args[0].isInt()) return native_make_error(ctx, "handOff: expected (sock: Int)");
+    IsolateLocal* local = vm->isolate;
+    if (!local || !local->world) return native_make_error(ctx, "handOff: this execution has no world");
+    const int64_t fd = args[0].asSigned48();
+    const socket_t s = vm->net->hand_off(fd);
+    if (s == INVALID_SOCK)
+        return native_make_error(ctx, std::string("handOff: ") + vm->net->invalid_reason(fd));
+    std::lock_guard<std::mutex> lk(local->world->m);
+    const int64_t ticket = local->world->next_ticket++;
+    local->world->handoffs.emplace(ticket, s);
+    return Value::fromSigned48(ticket);
+}
+
+// rawTake(ticket) -> Int fd | String. Moves a handed-off connection INTO this isolate's NetRegistry.
+// Once per ticket: a second take, or a ticket never issued, is an error.
+static Value native_take(Value* args, uint8_t nargs, Context* ctx) {
+    VM* vm = ctx->vm;
+    if (!vm->net) return native_make_error(ctx, "take: networking unavailable");
+    if (nargs < 1 || !args[0].isInt()) return native_make_error(ctx, "take: expected (ticket: Int)");
+    IsolateLocal* local = vm->isolate;
+    if (!local || !local->world) return native_make_error(ctx, "take: this execution has no world");
+    socket_t s = INVALID_SOCK;
+    {
+        std::lock_guard<std::mutex> lk(local->world->m);
+        auto it = local->world->handoffs.find(args[0].asSigned48());
+        if (it != local->world->handoffs.end()) {
+            s = it->second;
+            local->world->handoffs.erase(it);
+        }
+    }
+    if (s == INVALID_SOCK) return native_make_error(ctx, "take: this connection was already taken");
+    return Value::fromSigned48(vm->net->add(s));
+}
+
 std::vector<NativeFunc> build_native_table() {
     std::vector<NativeFunc> t(NATIVE_COUNT, nullptr);
     t[NATIVE_READ_FILE]   = native_read_file;
@@ -1534,5 +2489,24 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_TCP_LOCAL_PORT] = native_tcp_local_port;
     t[NATIVE_SHA256]       = native_sha256;
     t[NATIVE_OS_ID]        = native_os_id;
+    t[NATIVE_SET_NON_BLOCKING] = native_raw_set_non_blocking;
+    t[NATIVE_POLL]         = native_raw_poll;
+    t[NATIVE_ACCEPT_NB]    = native_raw_accept_nb;
+    t[NATIVE_RECV_NB]      = native_raw_recv_nb;
+    t[NATIVE_SEND_NB]      = native_raw_send_nb;
+    t[NATIVE_TASK_SPAWN]   = native_task_spawn;
+    t[NATIVE_TASK_JOIN]    = native_task_join;
+    t[NATIVE_TASK_TAKE]    = native_task_take;
+    t[NATIVE_TASK_INPUT]   = native_task_input;
+    t[NATIVE_ACTOR_SPAWN]  = native_actor_spawn;
+    t[NATIVE_SEND]         = native_send;
+    t[NATIVE_RECEIVE]      = native_receive;
+    t[NATIVE_MAIL_MSG]     = native_mail_msg;
+    t[NATIVE_MAIL_FROM]    = native_mail_from;
+    t[NATIVE_MAIL_REASON]  = native_mail_reason;
+    t[NATIVE_MAIN_INBOX]   = native_main_inbox;
+    t[NATIVE_SELF_ID]      = native_self_id;
+    t[NATIVE_HAND_OFF]     = native_hand_off;
+    t[NATIVE_TAKE]         = native_take;
     return t;
 }

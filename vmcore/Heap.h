@@ -277,6 +277,18 @@ public:
         }
     }
 
+    // Unregister every root whose slot lies in [first, last) -- one pass over the root list.
+    // A block of roots released one remove_root() at a time is QUADRATIC (each call is a
+    // linear search plus an erase that shifts the rest): ~0.5 s for a 100 k-slot pool.
+    void remove_root_range(Value* first, Value* last) noexcept {
+        const auto lo = reinterpret_cast<uintptr_t>(first);
+        const auto hi = reinterpret_cast<uintptr_t>(last);
+        std::erase_if(global_roots_, [lo, hi](Value* p) {
+            const auto a = reinterpret_cast<uintptr_t>(p);
+            return a >= lo && a < hi;
+        });
+    }
+
     [[nodiscard]] size_t root_count() const noexcept {
         return global_roots_.size();
     }
@@ -928,4 +940,42 @@ private:
             (void)commit_both(new_cap); // best-effort; a later alloc still checks room
         }
     }
+};
+
+// =============================================================================
+// RootedValuePool -- a fixed-size block of GC roots with RAII teardown.
+//
+// The pattern every multi-object build site in vmcore uses, and the reason it works:
+// the vector is sized ONCE and never reallocates, so the `&slot` addresses handed to
+// add_root() stay stable for the pool's whole lifetime, which is exactly what
+// Heap::add_root requires ("Registering a root" above). Fill the slots one at a time;
+// a collection between fills rewrites every already-filled slot in place, so a partially
+// built object graph is never lost and never stale.
+//
+// The destructor unregisters everything, INCLUDING on the exception path -- so a
+// caller-owned Heap can never keep a dangling root into a stack-local vector. It does so
+// in ONE pass over the root list (remove_root_range), because the slots are contiguous;
+// one remove_root per slot made releasing a large pool quadratic.
+//
+// Usage is always the same four steps, and the order matters:
+//   pool.heap = &heap;  pool.slots.resize(n);          // size before rooting
+//   for (Value& s : pool.slots) heap.add_root(&s);     // root BEFORE the first alloc
+//   ... allocate and publish into pool.slots[i] ...    // safepoints are now safe
+//   (destructor unregisters)
+//
+// A second use falls out of the stability guarantee: the pool doubles as a RELOCATION
+// TABLE. An index into `slots` names an object for as long as the pool lives, whatever
+// the collector does to the addresses -- which is what lets a rebuild pass refer to
+// objects it has not finished wiring up yet.
+// =============================================================================
+struct RootedValuePool {
+    Heap*              heap = nullptr;
+    std::vector<Value> slots;
+    ~RootedValuePool() {
+        if (heap && !slots.empty())
+            heap->remove_root_range(slots.data(), slots.data() + slots.size());
+    }
+    RootedValuePool()                                  = default;
+    RootedValuePool(const RootedValuePool&)            = delete;
+    RootedValuePool& operator=(const RootedValuePool&) = delete;
 };

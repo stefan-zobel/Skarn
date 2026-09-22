@@ -1,0 +1,34 @@
+// Fork-join tasks -- running functions in PARALLEL. `spawn(f, x)` starts the top-level function
+// `f` on `x` on its own thread, with its own heap; `t.join()` waits for it and hands back its
+// result. Real parallelism: tasks run on separate cores.
+//
+// OPT-IN: reach these via `use std::task::*`.
+//
+// NOTHING IS SHARED. The argument is COPIED into the task and the result copied back, so a task
+// never sees its parent's later changes, nor the parent the task's. That is why the checker limits
+// what `spawn` accepts (docs/Compiler.md, "Fork-join tasks"): `f` must be a named top-level
+// function with one parameter, and both that parameter and the result must be SENDABLE -- plain
+// data, with no function value, trait object, socket or task handle anywhere inside.
+//
+// FAILURE IS A VALUE. A task that faults does not stop its parent: `join` returns `Err` with the
+// fault message. What a task prints appears when it is joined, in join order. A task nobody joins
+// is still waited for when the program ends, and what it printed is dropped.
+//
+//     fn square(n: Int) -> Int { n * n }
+//
+//     let t = spawn(square, 7)
+//     println(t.join())           // Ok(49)
+
+// A started task whose function returns an R. Only `spawn` creates one.
+pub struct Task[R] { id: Int }
+
+// Start `f(arg)` as a task.
+pub fn spawn[A, R](f: fn(A) -> R, arg: A) -> Task[R] { Task { id: rawSpawn(f, arg) } }
+
+impl[R] Task[R] {
+    // Wait for the task: Ok(its result), or Err(the message of the fault that ended it). A task
+    // can be joined once.
+    fn join(self) -> Result[R, String] {
+        if rawJoin(self) { Ok(rawTaskTake(self)) } else { Err(rawTaskError(self)) }
+    }
+}

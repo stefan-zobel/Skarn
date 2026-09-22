@@ -87,7 +87,41 @@ enum NativeId : uint16_t {
                                 //   listener actually bound -- the point of `tcpListen(0)`, which asks
                                 //   the OS for a free one instead of guessing a fixed number)
     NATIVE_OS_ID       = 51,    // rawOsId()              -> Int (0 Windows, 1 macOS, 2 other; Plain, total)
-    NATIVE_COUNT       = 52,
+    // std::poll -- non-blocking I/O + readiness. "Would block" is neither a value nor an error, so
+    // each of these encodes it in the SUCCESS channel and the prelude turns it into an enum arm.
+    NATIVE_SET_NON_BLOCKING = 52, // rawSetNonBlocking(sock, on) -> nil | String
+    NATIVE_POLL        = 53,    // rawPoll(fds, interest, timeoutMs) -> Array[Int] | String (flags
+                                //   index-parallel to fds; 1 readable, 2 writable, 4 closed/error)
+    NATIVE_ACCEPT_NB   = 54,    // rawAcceptNb(sock)      -> Int    | String (>= 0 descriptor, -1 would block)
+    NATIVE_RECV_NB     = 55,    // rawRecvNb(sock, max)   -> Array[Bytes] | String (0 elements = would
+                                //   block; 1 element = the read, EMPTY = peer closed)
+    NATIVE_SEND_NB     = 56,    // rawSendNb(sock, data)  -> Int    | String (bytes ACCEPTED, may be
+                                //   short; 0 = would block -- there is no send-all on a nb socket)
+    // Fork-join tasks (concurrency stage 2). A task runs a top-level function on its own thread,
+    // with its own heap, over the same program image; its argument and result are COPIED
+    // (vmcore/ValueCodec.h). A task is exposed as a small Int id into the per-execute() registry.
+    NATIVE_TASK_SPAWN  = 57,    // rawSpawn(fn, arg)      -> Int  (the task id; Plain -- a refused
+                                //   argument or a failed thread start raises a located fault)
+    NATIVE_TASK_JOIN   = 58,    // rawJoin(id)            -> Bool (waits; true = the task returned)
+    NATIVE_TASK_TAKE   = 59,    // rawTaskTake(id)        -> the result, or the failure message String
+                                //   (after rawJoin; which one is rawJoin's Bool, NOT the kind)
+    NATIVE_TASK_INPUT  = 60,    // rawTaskInput()         -> the task's argument (only the entry stub
+                                //   execute() appends for a task calls it)
+    // Actors (concurrency stage 2): long-lived isolates with a mailbox, in the same world-wide runtime
+    // as tasks. Ids are world-wide, so an actor address can travel inside a message.
+    NATIVE_ACTOR_SPAWN = 61,    // rawSpawnActor(fn, arg)  -> Int  (the actor id)
+    NATIVE_SEND        = 62,    // rawSend(pid, msg)       -> Bool (false: the addressee no longer runs)
+    NATIVE_RECEIVE     = 63,    // rawReceive(inbox, ms)   -> Int  (0 timeout, 1 message, 2 exit report, 3 stop)
+    NATIVE_MAIL_MSG    = 64,    // rawMailMsg(inbox)       -> the message rawReceive took
+    NATIVE_MAIL_FROM   = 65,    // rawMailFrom(inbox)      -> Int, the actor an exit report is about
+    NATIVE_MAIL_REASON = 66,    // rawMailReason(inbox)    -> String, its fault message
+    NATIVE_MAIN_INBOX  = 67,    // rawMainInbox()          -> Int  (0: the main program's mailbox; once)
+    NATIVE_SELF_ID     = 68,    // rawSelfId()             -> Int  (this isolate's id; 0 = the root)
+    // Handing a connection to another isolate (std::net, stage B of the actor work). The socket moves
+    // between NetRegistries through a world-wide ticket; the sender's descriptor goes stale.
+    NATIVE_HAND_OFF    = 69,    // rawHandOff(sock)        -> Int    | String (a ticket)
+    NATIVE_TAKE        = 70,    // rawTake(ticket)         -> Int    | String (a descriptor in THIS isolate; once)
+    NATIVE_COUNT       = 71,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -151,6 +185,26 @@ inline int native_id_of(const std::string& name) {
     if (name == "tcpSetTimeout") return NATIVE_TCP_SET_TIMEOUT;
     if (name == "sha256")     return NATIVE_SHA256;
     if (name == "rawOsId")    return NATIVE_OS_ID;
+    if (name == "rawSetNonBlocking") return NATIVE_SET_NON_BLOCKING;
+    if (name == "rawPoll")    return NATIVE_POLL;
+    if (name == "rawAcceptNb") return NATIVE_ACCEPT_NB;
+    if (name == "rawRecvNb")  return NATIVE_RECV_NB;
+    if (name == "rawSendNb")  return NATIVE_SEND_NB;
+    if (name == "rawSpawn")   return NATIVE_TASK_SPAWN;
+    if (name == "rawJoin")    return NATIVE_TASK_JOIN;
+    if (name == "rawTaskTake") return NATIVE_TASK_TAKE;
+    if (name == "rawTaskError") return NATIVE_TASK_TAKE;   // the same native, typed as the failure message
+    if (name == "rawTaskInput") return NATIVE_TASK_INPUT;
+    if (name == "rawSpawnActor") return NATIVE_ACTOR_SPAWN;
+    if (name == "rawSend")    return NATIVE_SEND;
+    if (name == "rawReceive") return NATIVE_RECEIVE;
+    if (name == "rawMailMsg") return NATIVE_MAIL_MSG;
+    if (name == "rawMailFrom") return NATIVE_MAIL_FROM;
+    if (name == "rawMailReason") return NATIVE_MAIL_REASON;
+    if (name == "rawMainInbox") return NATIVE_MAIN_INBOX;
+    if (name == "rawSelfId")  return NATIVE_SELF_ID;
+    if (name == "rawHandOff") return NATIVE_HAND_OFF;
+    if (name == "rawTake")    return NATIVE_TAKE;
     return -1;
 }
 
@@ -176,6 +230,11 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_TCP_ACCEPT:
         case NATIVE_TCP_SET_TIMEOUT:
         case NATIVE_TCP_LOCAL_PORT:
+        case NATIVE_SET_NON_BLOCKING:
+        case NATIVE_POLL:
+        case NATIVE_ACCEPT_NB:
+        case NATIVE_RECV_NB:
+        case NATIVE_SEND_NB:
         case NATIVE_RUN_PROCESS: return NRET_RESULT;
         case NATIVE_GET_ENV:
         case NATIVE_READ_LINE:   return NRET_OPTION;
@@ -195,6 +254,12 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_F64_TO_BYTES:
         case NATIVE_SHA256:
         case NATIVE_OS_ID:
+        case NATIVE_TASK_SPAWN:
+        case NATIVE_TASK_JOIN:
+        case NATIVE_TASK_TAKE:
+        case NATIVE_TASK_INPUT:
+        case NATIVE_ACTOR_SPAWN: case NATIVE_SEND: case NATIVE_RECEIVE: case NATIVE_MAIL_MSG:
+        case NATIVE_MAIL_FROM: case NATIVE_MAIL_REASON: case NATIVE_MAIN_INBOX: case NATIVE_SELF_ID:
         case NATIVE_READ_ALL_STDIN: return NRET_PLAIN;
         default:                 return NRET_RESULT;
     }
@@ -214,7 +279,15 @@ inline int native_arity(int id) {
         case NATIVE_TCP_SEND:
         case NATIVE_TCP_RECV:
         case NATIVE_TCP_SET_TIMEOUT:
+        case NATIVE_SET_NON_BLOCKING:
+        case NATIVE_RECV_NB:
+        case NATIVE_SEND_NB:
+        case NATIVE_TASK_SPAWN:
+        case NATIVE_ACTOR_SPAWN:
+        case NATIVE_SEND:
+        case NATIVE_RECEIVE:
         case NATIVE_RUN_PROCESS: return 2;
+        case NATIVE_POLL:        return 3;
         case NATIVE_READ_FILE:
         case NATIVE_GET_ENV:
         case NATIVE_FILE_EXISTS:
@@ -234,6 +307,14 @@ inline int native_arity(int id) {
         case NATIVE_TCP_LISTEN:
         case NATIVE_TCP_ACCEPT:
         case NATIVE_TCP_LOCAL_PORT:
+        case NATIVE_ACCEPT_NB:
+        case NATIVE_TASK_JOIN:
+        case NATIVE_TASK_TAKE:
+        case NATIVE_MAIL_MSG:
+        case NATIVE_MAIL_FROM:
+        case NATIVE_MAIL_REASON:
+        case NATIVE_HAND_OFF:
+        case NATIVE_TAKE:
         case NATIVE_SHA256:
         case NATIVE_F64_TO_BYTES: return 1;
         case NATIVE_NANO_TIME:
@@ -242,6 +323,9 @@ inline int native_arity(int id) {
         case NATIVE_READ_LINE:
         case NATIVE_RAW_GC_STATS:
         case NATIVE_GC_RESET_STATS:
+        case NATIVE_TASK_INPUT:
+        case NATIVE_MAIN_INBOX:
+        case NATIVE_SELF_ID:
         case NATIVE_OS_ID:
         case NATIVE_READ_ALL_STDIN: return 0;
         default:                return 0;

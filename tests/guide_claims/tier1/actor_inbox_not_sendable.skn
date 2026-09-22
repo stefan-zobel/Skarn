@@ -1,0 +1,8 @@
+// CLAIM: an actor's Inbox is its own -- a message type that contains one is a compile error, while an address (Pid) may travel.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: fail cannot be sent to an actor: they contain an actor's inbox
+use std::actor::*
+
+fn keeper(inbox: Inbox[Inbox[Int]], unused: Int) -> () {}
+
+let k = spawnActor(keeper, 0)
