@@ -52,8 +52,9 @@
 // out, and after a crash another actor can be started into the same slot. A send while the slot has no
 // actor WAITS in it and reaches the next one; what an actor left unread when it crashed is dropped.
 // `s.release()` ends the address for good (and tells an actor still running in it to stop).
-// `stopActor(p)` tells any actor to end -- it ends when it next receives, so an actor that never
-// receives cannot be stopped this way.
+// `stopActor(p)` tells any actor to end -- it ends when it next receives. An actor whose loop is its own
+// work never reaches a receive, and ASKS instead: `inbox.stopRequested()` is true once anyone has told it
+// to end, so such an actor can end itself. Nothing can end one that neither receives nor asks.
 //
 // WATCHING ANOTHER ACTOR. A crash is reported to the STARTER only, and a normal end to nobody. Whoever
 // else wants to know sets a monitor: `monitor(p, rx)` puts one `Exited(id, reason)` into the inbox `rx`
@@ -224,6 +225,21 @@ impl[M] Pid[M] {
   fn actorId(self) -> ActorId { ActorId { id: self.id } }
 }
 
+impl ActorId {
+  // Tell this actor to end -- `stopActor` by id, for a supervisor holding children whose message types
+  // it cannot name. False if it no longer runs.
+  fn stop(self) -> Bool {
+    let p: Pid[Int] = Pid { id: self.id }
+    stopActor(p)
+  }
+
+  // Be told when this actor ends -- `monitor` by id: one report in `rx`, exactly once.
+  fn watch[R](self, rx: Inbox[R]) -> Bool {
+    let p: Pid[Int] = Pid { id: self.id }
+    monitor(p, rx)
+  }
+}
+
 impl[M] Inbox[M] {
   // Wait for the next mail.
   fn receive(self) -> Mail[M] { _mail(self, rawReceive(self, -1)) }
@@ -236,6 +252,11 @@ impl[M] Inbox[M] {
 
   // The address of the actor this inbox belongs to -- to hand out, e.g. inside a message.
   fn pid(self) -> Pid[M] { Pid { id: self.id } }
+
+  // Has this actor been told to end? For an actor whose loop is its OWN work and which therefore never
+  // reaches a receive: it asks, and ends itself. It consumes no mail, so a later receive is unaffected,
+  // and asking any one of an actor's inboxes is enough -- a stop reaches them all.
+  fn stopRequested(self) -> Bool { rawStopRequested(self) }
 
   // Close an inbox made with `newInbox`: later sends to it answer false (trySend: Gone), and what
   // it still holds is dropped. The main inbox cannot be closed; it ends with its actor.

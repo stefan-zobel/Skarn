@@ -106,6 +106,14 @@ pub fn dateOnly(y: Int, mo: Int, d: Int) -> Option[DateTime] { dateTime(y, mo, d
 // The current wall-clock instant (UTC). IMPURE: reads the millisTime native. Excluded from the oracle.
 pub fn now() -> Instant { Instant { ms: millisTime() } }
 
+// Wait `ms` milliseconds. Only THIS isolate waits: an actor or a task has a thread of its own, so a
+// sleeping one holds up nobody else. It is a plain wait, not a scheduling point -- there is nothing else
+// to run on this thread. IMPURE, and excluded from the oracle.
+pub fn sleep(ms: Int) -> () {
+  if ms < 0 { panic("sleep: the time must not be negative") }
+  rawSleep(ms)
+}
+
 pub fn instantFromMillis(ms: Int) -> Instant { Instant { ms: ms } }
 
 // Recompose an Instant from civil UTC fields. Assumes `dt` is valid (build one via `dateTime`).

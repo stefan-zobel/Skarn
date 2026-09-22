@@ -370,6 +370,11 @@ A `Pid[M]` promises that the actor it names receives `M`. The checker keeps that
   `Mail::Exited(id, reason)` arrives in the caller's own inbox `rx`, for a crash, for a normal end
   (`"normal"`), or at once if it had already ended (`"gone"`, and the call answers `false`). It watches
   that actor, not the address. It needs no rule of its own — it creates neither an isolate nor an address.
+- **`inbox.stopRequested() -> Bool`** answers whether anyone has told this actor to end. `stopActor(p)` is
+  a message, so an actor whose loop is its own work never reads it; asking is how such an actor ends
+  itself (`while i < n && !inbox.stopRequested() { … }`). It consumes no mail.
+- **`a.stop()` and `a.watch(rx)` on an `ActorId`** are `stopActor` and `monitor` by id, for code holding
+  children whose message type is erased — what a supervisor over `Vec[dyn Supervised]` has.
 - **`actorFn(f)`** makes an `ActorFn[M, I]` under the rules of `spawnActor`. `a.spawn(init)` and
   `a.spawnBounded(init, n)` then start actors from code that received the function as a value — a worker
   pool, or a supervisor that is sent a child's function and start value and starts it. An `ActorFn` is
@@ -401,6 +406,14 @@ its own.
 - **What it does:** `supervise(inbox, children, limit)` starts every child and starts again each one that
   crashes (`one_for_one`), and it returns at `Stop`. More than `maxRestarts` restarts within `withinMs`
   milliseconds, and it panics; its own starter is then told, so supervisors nest into trees.
+- **The full form:** `superviseWith(inbox, children, SupervisorSpec { strategy, limit, stopTimeoutMs })`
+  is the same loop with both choices spelled out. `Strategy::OneForAll` stops every other child when one
+  crashes, waits until they have all ended, and starts them all again; `Strategy::RestForOne` does that
+  for the children started AFTER the crashed one, which is what children that depend on the ones before
+  them need. A group restart counts as one restart. The wait is for an end REPORT, which arrives only
+  once that actor's address is free, so a child in a slot is started again exactly where it was.
+- **Shutdown:** at `Stop` the children are stopped in reverse start order and every address is released.
+  With a `stopTimeoutMs` the supervisor waits for each child before telling the next.
 - **Why a function, not an actor:** a crash is reported to the actor that started the child. The loop
   therefore runs inside the supervising actor, which builds its children there, as `child(actorFn(f),
   init)` values in a `Vec[dyn Supervised]`. The children may have different message types; a trait object
@@ -409,10 +422,17 @@ its own.
   address survives every restart and a message sent while it is being started again waits in the slot
   instead of being dropped. Past the limit the supervisor releases its children's addresses before it
   gives up, so none is left to swallow mail nobody will read.
+- **A child that never receives cannot be stopped**, because a stop is a message. Such a child must ask
+  `inbox.stopRequested()` in its own loop, and then it ends like any other. For the one that does not,
+  `stopTimeoutMs` decides: 0, the default, waits — the group stands still, but the supervisor stays
+  receive-ready, so the program still ends. A deadline makes a restart panic, naming the child, so the
+  supervisor's own starter learns of it rather than the group being restarted on a false assumption;
+  during a shutdown the child is abandoned instead and the supervisor returns normally.
 - **Limits:**
-  - Only a crash is reported, so only a crash restarts a child.
+  - Only a crash restarts a child. A child that returns of its own accord stays ended.
   - A child made with `child` has a new address after a restart; one made with `childIn` keeps the slot's.
-  - A supervisor that gives up leaves its children running.
+  - A supervisor that gives up tells its children to stop and releases their addresses, but it cannot end
+    one that never receives.
 
 The reference interpreter used for differential testing does not model actors. A receive depends on which
 actor ran first, and a sequential model would present one schedule as the answer. Actor programs are

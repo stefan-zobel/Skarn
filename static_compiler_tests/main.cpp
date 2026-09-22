@@ -8222,6 +8222,12 @@ void test_std_time() {
         cg_run_native(U + "let t = now()\n if t.toEpochMillis() > 0 { println(\"ok\") } else { println(\"bad\") }"), "ok\n");
     check_str("time_stopwatch_smoke",
         cg_run_native(U + "let sw = startStopwatch()\n let e = sw.elapsedNanos()\n if e >= 0 { println(\"ok\") } else { println(\"bad\") }"), "ok\n");
+    // sleep waits at least the time asked for (it never returns early), and 0 is allowed.
+    check_str("std_time_sleep_waits",
+        cg_run_native(U + "let sw = startStopwatch()\n sleep(0)\n sleep(30)\n"
+                          "if sw.elapsedMillis() >= 25 { println(\"ok\") } else { println(\"early\") }"), "ok\n");
+    check_true("std_time_sleep_not_negative",
+        cg_faults_msg(U + "sleep(0 - 1)\n", "must not be negative"));
 
     // Differentials -- VM == RefEval on the pure, deterministic calendar/duration math.
     check_same("diff_time_roundtrip", U + "fromDateTime(instantFromMillis(1784644215123).toDateTime()).toEpochMillis()", true);
@@ -9407,6 +9413,58 @@ void test_std_actor() {
         "match rx.receiveTimeout(50) { None => println(\"the monitor does not\"), _ => println(\"?\") }\n"),
         "true\nservice died\nthe starter hears the second one\nthe monitor does not\n");
 
+    // ---- stopRequested(): an actor whose loop is its own work ends itself ----
+    // It never receives, so stopActor's message would never be read -- it ASKS instead.
+    const std::string BUSY =
+        "fn busy(inbox: Inbox[Int], boss: Pid[Int]) -> () {\n"
+        "  send(boss, 1)\n"
+        "  let mut n = 0\n"
+        "  while !inbox.stopRequested() { n += 1 }\n"
+        "  send(boss, if n >= 0 { 2 } else { 3 })\n"
+        "}\n";
+    check_str("stop_requested_ends_a_busy_actor", cg_run_native(U + BUSY +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let p = spawnActor(busy, me.pid())\n"
+        "match me.receive() { Mail::Msg(_) => {}, _ => println(\"?\") }\n"
+        "println(stopActor(p))\n"
+        "match me.receive() { Mail::Msg(m) => println(\"ended: ${m}\"), _ => println(\"?\") }\n"),
+        "true\nended: 2\n");
+    // Nobody has asked, so it is false -- and asking consumes no mail.
+    check_str("stop_requested_false_until_asked", cg_run_native(U +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "println(me.stopRequested())\n"
+        "send(me.pid(), 7)\n"
+        "println(me.stopRequested())\n"
+        "match me.receive() { Mail::Msg(m) => println(m), _ => println(\"?\") }\n"),
+        "false\nfalse\n7\n");
+    // A released slot tells the actor running in it, exactly as stopActor does.
+    check_str("stop_requested_by_a_released_slot", cg_run_native(U + BUSY +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let at: Slot[Int] = newSlot()\n"
+        "let _id = at.spawn(actorFn(busy), me.pid())\n"
+        "match me.receive() { Mail::Msg(_) => {}, _ => println(\"?\") }\n"
+        "at.release()\n"
+        "match me.receive() { Mail::Msg(m) => println(\"ended: ${m}\"), _ => println(\"?\") }\n"),
+        "ended: 2\n");
+    // ActorId's stop/watch are stopActor/monitor for a child whose message type is erased.
+    check_str("actor_id_stop_and_watch", cg_run_native(U + BUSY +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let p = spawnActor(busy, me.pid())\n"
+        "match me.receive() { Mail::Msg(_) => {}, _ => println(\"?\") }\n"
+        "let a = p.actorId()\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "println(a.watch(rx))\n"
+        "println(a.stop())\n"
+        "match me.receive() { Mail::Msg(_) => {}, _ => println(\"?\") }\n"
+        "match rx.receive() { Mail::Exited(_, why) => println(why), _ => println(\"?\") }\n"),
+        "true\ntrue\nnormal\n");
+    // Only one's OWN inbox can be asked. The runtime refuses another actor's (actor_stop_requested in
+    // vm_tests); from Skarn it is not even reachable, because an Inbox is neither sendable nor buildable.
+    check_true("stop_requested_is_own_inbox_only", check_has_p(U +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let forged: Inbox[Int] = Inbox { id: 7 }\n"
+        "println(forged.stopRequested())\n", "can only be created by std::actor"));
+
     // ---- Slot[M]: an address that outlives its actor ----
     const std::string WORKER =
         "fn worker(inbox: Inbox[Ask], factor: Int) -> () {\n"
@@ -9617,6 +9675,188 @@ void test_std_supervisor() {
         "send(p, Job { n: 13, replyTo: me.pid() })\n"
         "match me.receive() { Mail::Exited(_, _) => println(\"gave up\"), _ => println(\"?\") }\n"
         "println(send(p, Job { n: 1, replyTo: me.pid() }))\n"), "-1\ngave up\nfalse\n");
+    // ---- the strategies: what a crash costs the SIBLINGS ----
+    // Three children, each announcing its number at start. The one in the middle is made to crash, and
+    // the case counts who starts again. The announcements after a group restart come in whatever order
+    // the schedule picks, so they are SORTED -- never compared as a sequence.
+    const std::string GROUP =
+        "struct Note { i: Int, me: Pid[Int] }\n"
+        "struct Kid { i: Int, boss: Pid[Note] }\n"
+        "fn member(inbox: Inbox[Int], s: Kid) -> () {\n"
+        "  send(s.boss, Note { i: s.i, me: inbox.pid() })\n"
+        "  for m in inbox.messages() { if m == 0 { panic(\"boom\") } }\n"
+        "}\n"
+        "fn three(boss: Pid[Note]) -> Vec[dyn Supervised] {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(member), Kid { i: 0, boss: boss }))\n"
+        "  push(kids, child(actorFn(member), Kid { i: 1, boss: boss }))\n"
+        "  push(kids, child(actorFn(member), Kid { i: 2, boss: boss }))\n"
+        "  kids\n"
+        "}\n"
+        "fn spec(s: Strategy) -> SupervisorSpec {\n"
+        "  SupervisorSpec { strategy: s, limit: RestartLimit { maxRestarts: 3, withinMs: 60000 },\n"
+        "                   stopTimeoutMs: 0 }\n"
+        "}\n"
+        "fn allKeeper(inbox: Inbox[()], boss: Pid[Note]) -> () {\n"
+        "  superviseWith(inbox, three(boss), spec(Strategy::OneForAll))\n"
+        "}\n"
+        "fn restKeeper(inbox: Inbox[()], boss: Pid[Note]) -> () {\n"
+        "  superviseWith(inbox, three(boss), spec(Strategy::RestForOne))\n"
+        "}\n"
+        "fn oneKeeper(inbox: Inbox[()], boss: Pid[Note]) -> () {\n"
+        "  superviseWith(inbox, three(boss), spec(Strategy::OneForOne))\n"
+        "}\n"
+        // Start the group, crash the middle child, and report who announced itself afterwards.
+        "fn round(me: Inbox[Note], keeper: ActorFn[(), Pid[Note]], after: Int) -> String {\n"
+        "  let _k = keeper.spawn(me.pid())\n"
+        "  let mut victim: Option[Pid[Int]] = None\n"
+        "  let mut up = 0\n"
+        "  while up < 3 {\n"
+        "    match me.receive() {\n"
+        "      Mail::Msg(note) => { if note.i == 1 { victim = Some(note.me) }\n up += 1 },\n"
+        "      _ => { up = 3 },\n"
+        "    }\n"
+        "  }\n"
+        "  match victim { Some(p) => { send(p, 0) }, None => {} }\n"
+        "  let mut seen: Vec[Int] = vec()\n"
+        "  let mut n = 0\n"
+        "  while n < after {\n"
+        "    match me.receive() {\n"
+        "      Mail::Msg(note) => { push(seen, note.i)\n n += 1 },\n"
+        "      _ => { n = after },\n"
+        "    }\n"
+        "  }\n"
+        "  let mut out = \"\"\n"
+        "  for x in sorted(seen) { out = if out == \"\" { \"${x}\" } else { \"${out},${x}\" } }\n"
+        "  out\n"
+        "}\n"
+        "let me: Inbox[Note] = mainInbox()\n";
+    check_str("supervisor_one_for_all_restarts_siblings", cg_run_native(U + GROUP +
+        "println(round(me, actorFn(allKeeper), 3))\n"), "0,1,2\n");
+    check_str("supervisor_rest_for_one_spares_earlier", cg_run_native(U + GROUP +
+        "println(round(me, actorFn(restKeeper), 2))\n"), "1,2\n");
+    check_str("supervisor_one_for_one_touches_nobody", cg_run_native(U + GROUP +
+        "println(round(me, actorFn(oneKeeper), 1))\n"), "1\n");
+    // A group restart of children in SLOTS is what the wait for the end reports is for: a report
+    // arrives only once that actor's address is free, so the successor takes the same slot.
+    check_str("supervisor_group_restart_keeps_addresses", cg_run_native(U +
+        "struct Job { n: Int, replyTo: Pid[Int] }\n"
+        "struct Up { at: Pid[Job] }\n"
+        "fn twin(inbox: Inbox[Job], boss: Pid[Up]) -> () {\n"
+        "  send(boss, Up { at: inbox.pid() })\n"
+        "  for j in inbox.messages() {\n"
+        "    if j.n == 0 { panic(\"boom\") }\n"
+        "    send(j.replyTo, j.n * 2)\n"
+        "  }\n"
+        "}\n"
+        "fn keeper2(inbox: Inbox[()], boss: Pid[Up]) -> () {\n"
+        "  let a: Slot[Job] = newSlot()\n"
+        "  let b: Slot[Job] = newSlot()\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, childIn(a, actorFn(twin), boss))\n"
+        "  push(kids, childIn(b, actorFn(twin), boss))\n"
+        "  superviseWith(inbox, kids, SupervisorSpec { strategy: Strategy::OneForAll,\n"
+        "    limit: RestartLimit { maxRestarts: 3, withinMs: 60000 }, stopTimeoutMs: 0 })\n"
+        "}\n"
+        "fn waitFor(me: Inbox[Up], n: Int) -> Int {\n"
+        "  let mut seen = 0\n"
+        "  while seen < n { match me.receive() { Mail::Msg(_) => { seen += 1 }, _ => { seen = n } } }\n"
+        "  seen\n"
+        "}\n"
+        "let me: Inbox[Up] = mainInbox()\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "let _k = spawnActor(keeper2, me.pid())\n"
+        "match me.receive() {\n"
+        "  Mail::Msg(first) => {\n"
+        "    println(waitFor(me, 1) == 1)\n"
+        "    send(first.at, Job { n: 0, replyTo: rx.pid() })\n"
+        "    println(waitFor(me, 2) == 2)\n"
+        "    match ask(first.at, fn(r) { Job { n: 21, replyTo: r } }, 60000) {\n"
+        "      Ok(v) => println(\"the same address answers: ${v}\"),\n"
+        "      Err(_) => println(\"the address is dead\"),\n"
+        "    }\n"
+        "  },\n"
+        "  _ => println(\"nothing started\"),\n"
+        "}\n"), "true\ntrue\nthe same address answers: 42\n");
+    // Stopping the supervisor stops its children, in REVERSE start order, each waited for before the
+    // next is told -- which is what a child that depends on an earlier one needs.
+    check_str("supervisor_shutdown_is_reverse_order", cg_run_native(U +
+        "struct Kid { i: Int, boss: Pid[Int] }\n"
+        "fn quiet(inbox: Inbox[Int], s: Kid) -> () {\n"
+        "  send(s.boss, s.i)\n"
+        "  for _m in inbox.messages() {}\n"
+        "  println(\"child ${s.i} ended\")\n"
+        "}\n"
+        "fn keeper3(inbox: Inbox[()], boss: Pid[Int]) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(quiet), Kid { i: 0, boss: boss }))\n"
+        "  push(kids, child(actorFn(quiet), Kid { i: 1, boss: boss }))\n"
+        "  push(kids, child(actorFn(quiet), Kid { i: 2, boss: boss }))\n"
+        "  superviseWith(inbox, kids, SupervisorSpec { strategy: Strategy::OneForOne,\n"
+        "    limit: RestartLimit { maxRestarts: 3, withinMs: 60000 }, stopTimeoutMs: 60000 })\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let k = spawnActor(keeper3, me.pid())\n"
+        "let mut up = 0\n"
+        "while up < 3 { match me.receive() { Mail::Msg(_) => { up += 1 }, _ => { up = 3 } } }\n"
+        "let watch: Inbox[Int] = newInbox()\n"
+        "let _w = monitor(k, watch)\n"
+        "let _s = stopActor(k)\n"
+        "match watch.receive() { Mail::Exited(_, why) => println(\"the supervisor ended: ${why}\"),\n"
+        "  _ => println(\"?\") }\n"),
+        "child 2 ended\nchild 1 ended\nchild 0 ended\nthe supervisor ended: normal\n");
+    // A child that does not end within the deadline: the supervisor escalates instead of restarting the
+    // group on a false assumption. `stubborn` ignores Stop, so only the main program can end it.
+    check_str("supervisor_escalates_past_stop_deadline", cg_run_native(U +
+        "struct Up { at: Pid[Int] }\n"
+        "fn poisonable(inbox: Inbox[Int], boss: Pid[Up]) -> () {\n"
+        "  send(boss, Up { at: inbox.pid() })\n"
+        "  for m in inbox.messages() { if m == 0 { panic(\"boom\") } }\n"
+        "}\n"
+        "fn stubborn(inbox: Inbox[Int], boss: Pid[Up]) -> () {\n"
+        "  send(boss, Up { at: inbox.pid() })\n"
+        "  let mut go = true\n"
+        "  while go { match inbox.receive() { Mail::Msg(m) => { if m == 9 { go = false } }, _ => {} } }\n"
+        "}\n"
+        "fn keeper4(inbox: Inbox[()], boss: Pid[Up]) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(poisonable), boss))\n"
+        "  push(kids, child(actorFn(stubborn), boss))\n"
+        "  superviseWith(inbox, kids, SupervisorSpec { strategy: Strategy::OneForAll,\n"
+        "    limit: RestartLimit { maxRestarts: 3, withinMs: 60000 }, stopTimeoutMs: 100 })\n"
+        "}\n"
+        "fn reason(why: String) -> String { let k = indexOf(why, \" at line \")\n"
+        "  if k < 0 { why } else { slice(why, 0, k) } }\n"
+        "let me: Inbox[Up] = mainInbox()\n"
+        "let _k = spawnActor(keeper4, me.pid())\n"
+        "match me.receive() {\n"
+        "  Mail::Msg(first) => {\n"
+        "    match me.receive() {\n"
+        "      Mail::Msg(second) => {\n"
+        "        send(first.at, 0)\n"
+        "        match me.receive() {\n"
+        "          Mail::Exited(_, why) => println(reason(why)),\n"
+        "          _ => println(\"no report\"),\n"
+        "        }\n"
+        "        send(second.at, 9)\n"            // let the stubborn one end, so the program can
+        "      },\n"
+        "      _ => println(\"?\"),\n"
+        "    }\n"
+        "  },\n"
+        "  _ => println(\"?\"),\n"
+        "}\n"),
+        "supervisor: child 1 did not stop within 100 ms"
+        " (an actor that never receives must ask inbox.stopRequested())\n");
+    check_str("supervisor_checks_stop_timeout", cg_run_native(U + COUNTER + MAIN +
+        "fn sup(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  superviseWith(inbox, kids, SupervisorSpec { strategy: Strategy::OneForOne,\n"
+        "    limit: RestartLimit { maxRestarts: 2, withinMs: 60000 }, stopTimeoutMs: -1 })\n"
+        "}\n"
+        "let p = spawnActor(sup, start(me, 1))\n"
+        "report(me.receive())\n"),
+        "died: supervise: stopTimeoutMs must not be negative (0 = wait as long as it takes)\n");
+
     // The list of children is built where it is used: a trait object cannot be sent.
     check_true("supervisor_children_not_sendable", check_has_p(U +
         "fn f(inbox: Inbox[Vec[dyn Supervised]], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0",
@@ -10331,7 +10571,11 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // when an actor crashed and what was on its way. Pinned by the actor_slot_* tests in vm_tests.
 // rawMonitor (id 79) is NOT listed either: it reports when another isolate ends, which no sequential
 // model has. Pinned by the actor_monitor_* tests in vm_tests.
-static_assert(NATIVE_COUNT == 80,
+// rawStopRequested (id 80) is NOT listed either: it answers whether another isolate has asked this one
+// to stop, which no sequential model has. Pinned by actor_stop_requested in vm_tests.
+// rawSleep (id 81) is NOT listed either: its whole effect is the passing of time, which the oracle does
+// not model. Pinned by std_time_sleep_waits.
+static_assert(NATIVE_COUNT == 82,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 

@@ -440,13 +440,18 @@ and stacks, sharing the program with its starter read-only. Values cross between
     typically for a reply; `rawCloseInbox(inbox)` closes one again, and later sends to it answer false. The
     end of an actor closes all of its inboxes.
   - `rawStopActor(pid)` tells an actor to end: `Stop` goes into every inbox it owns, so it stops wherever
-    it waits. An actor that never receives cannot be stopped this way, and there is no kill.
+    it waits. It is a message, so an actor that never receives is not ended by it, and there is no kill.
+  - `rawStopRequested(inbox)` answers whether anyone has told this actor to end. It reads the flag that
+    every queued `Stop` sets and consumes no mail, so an actor whose loop is its own work — one that never
+    reaches a receive — can ask and end itself. Any one of its inboxes answers: a stop reaches them all.
   - `rawMonitor(pid, inbox)` asks to be told when that actor ends. Exactly one report follows, into an
     inbox of the caller's own, as the same mail a crash report uses: the address plus a reason — the
     fault message, `"normal"` when the actor returned, or `"gone"` when it had already ended, in which
     case the report comes at once and the call answers false. It watches that one actor, not the address,
     so an actor started into the same slot afterwards is not watched. The automatic report to the starter
-    is unaffected and stays crash-only.
+    is unaffected and stays crash-only. A report also means the ADDRESS IS FREE: the actor's mailboxes are
+    closed, and a slot vacated, before either report goes out, so an actor started into that slot on the
+    strength of the report never meets an address its predecessor still holds.
 - `rawTaskInput()` and `rawSelfId()` are internal: an isolate reads its argument and its own id with them.
 
 **An address that outlives its actor.** A restarted actor is a new actor, so anyone holding the old
@@ -459,7 +464,11 @@ it and answers where its predecessor did.
 - What arrives while the slot has no actor waits in it for the next one, instead of being refused.
 - The report of a crash names the slot, so a supervisor recognizes its child across restarts.
 - `rawReleaseSlot(slot)` ends the address: later sends answer false, and an actor still running in it is
-  told to stop.
+  told to stop — also when it had been told once already, because releasing drops whatever was queued.
+
+**Waiting.** `rawSleep(ms)` makes this isolate wait, and only this one: every isolate has a thread of its
+own. It is what a loop that must poll uses — once an actor has received `Stop`, every further receive
+answers `Stop` at once, so an actor winding down can no longer wait on its inbox.
 
 **Back-pressure.** An inbox may be **bounded** — `rawSpawnActorBounded(fn, arg, capacity)` starts an actor
 whose mailbox holds at most `capacity` messages, and `rawNewInbox` takes a capacity too (0 = unbounded).

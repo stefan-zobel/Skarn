@@ -1,0 +1,19 @@
+// CLAIM: an actor whose loop is its own work never reaches a receive, so stopActor's message would never
+//        be read -- inbox.stopRequested() is how it learns, and it ends itself.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: ok told: true, it ended itself: 1
+use std::actor::*
+
+fn grind(inbox: Inbox[Int], boss: Pid[Int]) -> () {
+  let mut i = 0
+  while !inbox.stopRequested() { i = i + 1 }
+  send(boss, 1)
+}
+
+let me: Inbox[Int] = mainInbox()
+let p = spawnActor(grind, me.pid())
+let told = stopActor(p)
+match me.receive() {
+  Mail::Msg(n) => println("told: ${told}, it ended itself: ${n}"),
+  _ => println("no end"),
+}

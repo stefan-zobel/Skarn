@@ -16,22 +16,46 @@
 //       supervise(inbox, kids, RestartLimit { maxRestarts: 3, withinMs: 5000 })
 //     }
 //
-// WHAT IT DOES (one_for_one): start every child; when one crashes, start that one again with the
-// same start value; return at Stop, when the program ends. Messages to the supervisor are dropped.
-// More than `maxRestarts` restarts within `withinMs` milliseconds, and it panics -- releasing the
-// addresses of its children first, so none of them is left to swallow mail nobody will read.
+// THE SIMPLE FORM AND THE FULL ONE. `supervise` is one_for_one with no stop deadline, which is what
+// most trees want. `superviseWith(inbox, children, SupervisorSpec { strategy, limit, stopTimeoutMs })`
+// is the same loop with the two choices spelled out.
+//
+// THE THREE STRATEGIES, i.e. what a crash costs:
+//   * OneForOne  -- start the crashed child again, and nothing else. The others never notice.
+//   * OneForAll  -- the children depend on each other: stop every other one, wait until they have all
+//                   ended, then start them all again.
+//   * RestForOne -- the children depend on the ones BEFORE them: stop every child started after the
+//                   crashed one, wait, then start it and all of them again, in order.
+// Waiting means waiting for an end REPORT, which arrives only once that actor's address is free -- so a
+// child in a slot is started again where it was, never into a slot its predecessor still holds. More
+// than `maxRestarts` restarts within `withinMs` milliseconds, and the supervisor panics, telling every
+// child to stop and releasing their addresses first. A group restart counts as ONE restart.
 //
 // A CHILD WITH A FIXED ADDRESS. A child made with `child(a, init)` gets a new address at every
 // restart. `childIn(slot, a, init)` puts it in a `Slot` instead (std::actor): the address then stays
 // the same across restarts, and a send while the child is being started again waits in the slot
 // instead of being dropped. Make the slot where the address is needed and hand out `slot.pid()`.
 //
+// A CHILD THAT NEVER RECEIVES CANNOT BE STOPPED, and this is the one thing to design for. `stop` is a
+// message; an actor whose loop is its own work never reads it. Such an actor must ask
+// `inbox.stopRequested()` in its loop (std::actor) -- then it is stoppable like any other. For the one
+// that does not, `stopTimeoutMs` decides what the supervisor does rather than waiting forever:
+//   * 0 (the default) -- wait for the reports. The supervisor stays receive-ready throughout, so it
+//     still answers Stop and the program still ends; only that group stands still.
+//   * more -- give up after that many milliseconds. On a RESTART the supervisor panics, naming the
+//     child, so its own starter learns of it: it must not go on pretending the group is intact. On
+//     SHUTDOWN it abandons that child, releases its address and returns normally -- its job there is to
+//     end, and a crash would only report a failure to a parent that is itself shutting down.
+//
+// SHUTDOWN. At `Stop` the supervisor stops its children in REVERSE start order -- the order a child
+// that depends on an earlier one needs -- and releases every address. With a deadline it waits for each
+// child to end before it stops the next; without one it tells them all and returns, because after Stop
+// every receive answers Stop at once and a supervisor can no longer wait on its inbox.
+//
 // LIMITS (deliberate):
 //   * A child is started again only after a CRASH. A child that returns stays ended.
 //   * A child made with `child` has a NEW address after a restart, so whoever must reach it either
 //     lives on `childIn`, or learns the address from the child itself when it starts.
-//   * A supervisor that gives up leaves its children RUNNING (a child in a slot is told to stop, but
-//     an actor that never receives goes on).
 //   * The main program cannot supervise: it never receives Stop, so the program would never end.
 use std::actor::*
 use std::time::*
@@ -72,35 +96,219 @@ impl[M, I] Supervised for SlotChild[M, I] {
 // Give up when more than `maxRestarts` restarts happen within `withinMs` milliseconds.
 pub struct RestartLimit { maxRestarts: Int, withinMs: Int }
 
+// What a crash costs the SIBLINGS of the child that crashed. See the top of this module.
+pub enum Strategy { OneForOne, OneForAll, RestForOne }
+
+// Everything a supervisor decides: how a crash spreads, how often it may happen, and how long a child
+// may take to stop (0 = as long as it takes).
+pub struct SupervisorSpec { strategy: Strategy, limit: RestartLimit, stopTimeoutMs: Int }
+
 // Start every child, start again each one that crashes, and return at Stop (see the top of this
-// module). Past the limit it panics, with the last crash's reason in the message.
+// module). The simple form: one_for_one, and a stop takes as long as it takes.
 pub fn supervise[M](inbox: Inbox[M], children: Vec[dyn Supervised], limit: RestartLimit) -> () {
-  if limit.maxRestarts < 0 { panic("supervise: maxRestarts must not be negative") }
-  if limit.withinMs < 1 { panic("supervise: withinMs must be at least 1") }
+  superviseWith(inbox, children, SupervisorSpec {
+    strategy: Strategy::OneForOne,
+    limit: limit,
+    stopTimeoutMs: 0
+  })
+}
+
+// The full form, with the strategy and the stop deadline spelled out.
+pub fn superviseWith[M](inbox: Inbox[M], children: Vec[dyn Supervised], spec: SupervisorSpec) -> () {
+  if spec.limit.maxRestarts < 0 { panic("supervise: maxRestarts must not be negative") }
+  if spec.limit.withinMs < 1 { panic("supervise: withinMs must be at least 1") }
+  if spec.stopTimeoutMs < 0 {
+    panic("supervise: stopTimeoutMs must not be negative (0 = wait as long as it takes)")
+  }
   let clock = startStopwatch()
   let mut running: Vec[ActorId] = vec()
-  for c in children { push(running, c.start()) }
+  let mut state: Vec[Int] = vec()
+  for c in children {
+    push(running, c.start())
+    push(state, _UP)
+  }
   // When the recent restarts happened, in milliseconds since the start, oldest first.
   let mut recent: Vec[Int] = vec()
+  // While a group is stopping: the first child to start again once every one of them has ended.
+  let mut restartFrom = -1
+  let mut deadline = 0
   loop {
-    match inbox.receive() {
-      Mail::Msg(_) => {},
-      Mail::Stop => break,
-      Mail::Exited(id, why) => {
+    let mail = if _countStopping(state) > 0 && spec.stopTimeoutMs > 0 {
+      let left = deadline - clock.elapsedMillis()
+      if left <= 0 { None } else { inbox.receiveTimeout(left) }
+    } else {
+      Some(inbox.receive())
+    }
+    match mail {
+      // The deadline passed and a child we told to stop has still not ended. Give the addresses up --
+      // one left behind would take messages nobody reads -- and let our own starter hear of it.
+      None => {
+        for c in children { c.release() }
+        panic("supervisor: ${_stillStopping(state)} did not stop within ${spec.stopTimeoutMs} ms" +
+              " (an actor that never receives must ask inbox.stopRequested())")
+      },
+      Some(Mail::Msg(_)) => {},
+      Some(Mail::Stop) => {
+        _shutdown(inbox, children, running, state, clock, spec.stopTimeoutMs)
+        break
+      },
+      Some(Mail::Exited(id, why)) => {
         let i = _indexOf(running, id)
         if i >= 0 {
-          let now = clock.elapsedMillis()
-          recent = _since(recent, now - limit.withinMs)
-          if len(recent) >= limit.maxRestarts {
-            // Give up -- but give up the addresses too: one left behind would take messages that
-            // nobody is going to read.
-            for c in children { c.release() }
-            panic("supervisor: more than ${limit.maxRestarts} restarts within ${limit.withinMs} ms; the last: ${why}")
+          if state[i] == _STOPPING {
+            // A child we asked to stop has ended. When the last one has, the group starts again.
+            state[i] = _DOWN
+            if _countStopping(state) == 0 && restartFrom >= 0 {
+              _startDown(children, running, state, restartFrom)
+              restartFrom = -1
+            }
+          } else if state[i] == _UP {
+            // A crash. (A second report for a child already down -- a child that crashed while it was
+            // stopping sends one of each -- falls through both arms and is ignored.)
+            state[i] = _DOWN
+            let now = clock.elapsedMillis()
+            recent = _since(recent, now - spec.limit.withinMs)
+            if len(recent) >= spec.limit.maxRestarts {
+              _tellToStop(running, state)
+              for c in children { c.release() }
+              panic("supervisor: more than ${spec.limit.maxRestarts} restarts within" +
+                    " ${spec.limit.withinMs} ms; the last: ${why}")
+            }
+            push(recent, now)
+            match spec.strategy {
+              Strategy::OneForOne => {
+                running[i] = children[i].start()
+                state[i] = _UP
+              },
+              Strategy::OneForAll => {
+                _stopGroup(inbox, running, state, 0, i)
+                restartFrom = 0
+              },
+              Strategy::RestForOne => {
+                _stopGroup(inbox, running, state, i + 1, -1)
+                restartFrom = i
+              },
+            }
+            if restartFrom >= 0 {
+              if _countStopping(state) > 0 {
+                deadline = clock.elapsedMillis() + spec.stopTimeoutMs
+              } else {
+                // Every sibling was down already: there is nothing to wait for.
+                _startDown(children, running, state, restartFrom)
+                restartFrom = -1
+              }
+            }
           }
-          push(recent, now)
-          running[i] = children[i].start()
+        }
+      },
+    }
+  }
+}
+
+// The three states a child is in, as seen from here.
+const _DOWN: Int = 0
+const _UP: Int = 1
+const _STOPPING: Int = 2
+
+// Tell every child from `from` on that is up to stop, and watch it first, so exactly one end report
+// arrives for each -- also for one that has just ended by itself ("gone", at once). `except` is the
+// child that is already down (the crashed one) and is not to be told; -1 means none.
+fn _stopGroup[M](inbox: Inbox[M], running: Vec[ActorId], mut state: Vec[Int], from: Int, except: Int) -> () {
+  let mut i = from
+  while i < len(state) {
+    if i != except && state[i] == _UP {
+      let _watching = running[i].watch(inbox)
+      let _told = running[i].stop()
+      state[i] = _STOPPING
+    }
+    i += 1
+  }
+}
+
+// Tell every child that is up to stop, without watching: for the path that panics right afterwards.
+fn _tellToStop(running: Vec[ActorId], state: Vec[Int]) -> () {
+  let mut i = 0
+  while i < len(state) {
+    if state[i] == _UP { let _told = running[i].stop() }
+    i += 1
+  }
+}
+
+// Start every child from `from` on that is down, in order.
+fn _startDown(children: Vec[dyn Supervised], mut running: Vec[ActorId], mut state: Vec[Int], from: Int) -> () {
+  let mut i = from
+  while i < len(state) {
+    if state[i] == _DOWN {
+      running[i] = children[i].start()
+      state[i] = _UP
+    }
+    i += 1
+  }
+}
+
+// How many children we are waiting for.
+fn _countStopping(state: Vec[Int]) -> Int {
+  let mut n = 0
+  for s in state { if s == _STOPPING { n += 1 } }
+  n
+}
+
+// Which ones, for the message of a deadline that passed.
+fn _stillStopping(state: Vec[Int]) -> String {
+  let mut out = ""
+  let mut i = 0
+  while i < len(state) {
+    if state[i] == _STOPPING {
+      out = if out == "" { "child ${i}" } else { "${out}, ${i}" }
+    }
+    i += 1
+  }
+  out
+}
+
+// Stop the children in reverse start order and release every address. With a deadline, each child is
+// waited for before the next is told, so one that depends on an earlier one still has it. The wait is
+// POLLED, not blocked on: after Stop every receive answers Stop at once, so the inbox can no longer
+// hold this actor. Without a deadline the children are told and we return -- there is nothing to wait
+// on, and the world is joining its threads.
+fn _shutdown[M](inbox: Inbox[M], children: Vec[dyn Supervised], running: Vec[ActorId],
+                mut state: Vec[Int], clock: Stopwatch, timeoutMs: Int) -> () {
+  let mut i = len(state) - 1
+  while i >= 0 {
+    if state[i] == _UP {
+      let _watching = running[i].watch(inbox)
+      let _told = running[i].stop()
+      state[i] = _STOPPING
+      let deadline = clock.elapsedMillis() + timeoutMs
+      let mut waiting = timeoutMs > 0
+      while waiting {
+        _drain(inbox, running, state)
+        if state[i] != _STOPPING {
+          waiting = false
+        } else if clock.elapsedMillis() >= deadline {
+          waiting = false            // abandoned: its address is released below like every other
+        } else {
+          sleep(1)
         }
       }
+    }
+    i -= 1
+  }
+  for c in children { c.release() }
+}
+
+// Take what is already in the inbox, without waiting: the end reports of children we told to stop.
+fn _drain[M](inbox: Inbox[M], running: Vec[ActorId], mut state: Vec[Int]) -> () {
+  let mut more = true
+  while more {
+    match inbox.receiveTimeout(0) {
+      Some(Mail::Exited(id, _)) => {
+        let i = _indexOf(running, id)
+        if i >= 0 && state[i] == _STOPPING { state[i] = _DOWN }
+      },
+      Some(Mail::Msg(_)) => {},
+      Some(Mail::Stop) => { more = false },
+      None => { more = false },
     }
   }
 }

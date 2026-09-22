@@ -1230,6 +1230,7 @@ private:
         add_native("getEnv",       { S },    make_named(std_Option(), { S }),                  STD_ENV);
         add_native("nanoTime",     {},       ty_int(),                                         STD_ENV);
         add_native("millisTime",   {},       ty_int(),                                         STD_ENV);
+        add_native("rawSleep",     { ty_int() }, ty_unit(),                                    STD_ENV);
         add_native("args",         {},       make_named("Array", { S }),                       STD_ENV);
         // Ambient / ring natives (always available -- no `use` needed).
         add_native("parseInt",     { S },    make_named(std_Result(), { ty_int(),    S }));
@@ -1395,6 +1396,11 @@ private:
         // message type and the watcher's are unrelated.
         add_generic_native("rawMonitor", { "M", "R" },
             [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ pid_of(v[0]), inbox_of(v[1]) }; },
+            [](const std::vector<TyPtr>&)    { return ty_bool(); });
+        // "Have I been told to stop?" -- for an actor whose loop is its own work and which therefore
+        // never reaches a receive. It reads the flag and consumes no mail.
+        add_generic_native("rawStopRequested", { "M" },
+            [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ inbox_of(v[0]) }; },
             [](const std::vector<TyPtr>&)    { return ty_bool(); });
     }
 

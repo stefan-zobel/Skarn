@@ -65,8 +65,14 @@ time it is handed a multiple of 5. The keeper starts it again, and the dispatche
 whose result is missing once its queue is empty. The main program checks the total against a sequential
 sum. Because the workers pull, a restarted worker's new address does no harm: nobody needs to reach it.
 
+`--strategy=` picks what a crash costs the other workers: `one_for_one` (the default) restarts only the
+worker that crashed, `one_for_all` stops all of them, waits until they have ended and starts them all
+again, and `rest_for_one` does that for the workers started after the crashed one. All three give the same
+total, because pull dispatch hands out again every job whose result is missing — a worker stopped mid-job
+simply stops asking.
+
 ```
-static_vmrun demo/actors/supervised.skn
+static_vmrun demo/actors/supervised.skn [--strategy=one_for_one|one_for_all|rest_for_one]
 ```
 
 ## `stable_address.skn`

@@ -137,7 +137,11 @@ enum NativeId : uint16_t {
     // it, and for a normal end, neither of which the starter's own report covers.
     NATIVE_MONITOR     = 79,    // rawMonitor(pid, inbox)  -> Bool (false: it had already ended, and the
                                 //   report -- exactly one per monitor -- was delivered at once)
-    NATIVE_COUNT       = 80,
+    // Being stoppable without receiving: reads the flag every ending path already sets, so an actor
+    // whose loop is its own work can end on its own instead of being unstoppable.
+    NATIVE_STOP_REQUESTED = 80, // rawStopRequested(inbox) -> Bool (consumes no mail, never waits)
+    NATIVE_SLEEP       = 81,    // rawSleep(ms)            -> ()   (this isolate waits; std::time's sleep)
+    NATIVE_COUNT       = 82,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -230,6 +234,8 @@ inline int native_id_of(const std::string& name) {
     if (name == "rawReleaseSlot") return NATIVE_RELEASE_SLOT;
     if (name == "rawStopActor") return NATIVE_STOP_ACTOR;
     if (name == "rawMonitor") return NATIVE_MONITOR;
+    if (name == "rawStopRequested") return NATIVE_STOP_REQUESTED;
+    if (name == "rawSleep") return NATIVE_SLEEP;
     return -1;
 }
 
@@ -287,7 +293,7 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_MAIL_FROM: case NATIVE_MAIL_REASON: case NATIVE_MAIN_INBOX: case NATIVE_SELF_ID:
         case NATIVE_NEW_INBOX: case NATIVE_CLOSE_INBOX: case NATIVE_TRY_SEND: case NATIVE_ACTOR_SPAWN_BOUNDED:
         case NATIVE_NEW_SLOT: case NATIVE_SPAWN_INTO: case NATIVE_RELEASE_SLOT: case NATIVE_STOP_ACTOR:
-        case NATIVE_MONITOR:
+        case NATIVE_MONITOR: case NATIVE_STOP_REQUESTED: case NATIVE_SLEEP:
         case NATIVE_READ_ALL_STDIN: return NRET_PLAIN;
         default:                 return NRET_RESULT;
     }
@@ -352,6 +358,8 @@ inline int native_arity(int id) {
         case NATIVE_NEW_SLOT:
         case NATIVE_RELEASE_SLOT:
         case NATIVE_STOP_ACTOR:
+        case NATIVE_STOP_REQUESTED:
+        case NATIVE_SLEEP:
         case NATIVE_SHA256:
         case NATIVE_F64_TO_BYTES: return 1;
         case NATIVE_NANO_TIME:

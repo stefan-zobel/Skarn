@@ -310,14 +310,17 @@ struct Mailbox {
         space.notify_all();
     }
     // Ending a slot for good: no later send gets in, and an actor still running in it is told to
-    // stop. NOT close(), which clears the queue and would drop that very Stop.
+    // stop. NOT close(), which clears the queue and would drop that very Stop. The Stop goes in
+    // whether or not one was queued before, BECAUSE the clear above has just dropped it: an actor
+    // told to stop and then released -- what an orderly shutdown does -- would otherwise wait on a
+    // mailbox that is empty, dead and out of the registry, which nothing can reach again.
     void retire() {
         {
             std::lock_guard<std::mutex> lk(m);
             dead     = true;
             q.clear();
             messages = 0;
-            if (owner != NO_OWNER && !stopped) { stopped = true; q.push_back(Mail{ MAIL_STOP, {}, 0, {} }); }
+            if (owner != NO_OWNER) { stopped = true; q.push_back(Mail{ MAIL_STOP, {}, 0, {} }); }
         }
         cv.notify_all();
         space.notify_all();
@@ -2674,6 +2677,29 @@ static Value native_monitor(Value* args, uint8_t nargs, Context* ctx) {
     return Value::fromBool(watching);
 }
 
+// rawStopRequested(inbox) -> Bool. Has this actor been told to end? It reads the flag that every ending
+// path sets when it queues Stop -- rawStopActor, a released slot, and the end of the world -- and
+// consumes no mail, so the loop that asks may go on receiving as usual afterwards. It is for an actor
+// whose loop is its OWN work and which therefore never reaches a receive: such an actor cannot be ended
+// from outside, and this is how it ends itself. Checking any ONE of its inboxes is enough, because every
+// ending path puts Stop into ALL of them.
+static Value native_stop_requested(Value* args, uint8_t nargs, Context* ctx) {
+    Mailbox& box = own_mailbox(nargs >= 1 ? args[0] : Value::fromNil(), ctx, "stopRequested");
+    std::lock_guard<std::mutex> lk(box.m);
+    return Value::fromBool(box.stopped);
+}
+
+// rawSleep(ms) -> (). This isolate waits, and nothing else does: every isolate has its own thread, so a
+// sleeping actor holds up no other. It is what `std::time`'s sleep calls, and what a loop that must poll
+// -- a supervisor waiting for its children to end after it has been told to stop, when every receive
+// answers Stop at once -- uses to poll without burning a core.
+static Value native_sleep(Value* args, uint8_t nargs, Context* ctx) {
+    const Value ms = nargs >= 1 ? args[0] : Value::fromNil();
+    if (!ms.isInt() || ms.asSigned48() < 0) raise_located(ctx, "sleep: the time must be 0 milliseconds or more");
+    if (ms.asSigned48() > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms.asSigned48()));
+    return Value::fromNil();
+}
+
 // The message of a send, encoded HERE, in the sender's heap -- before any waiting, so a sender
 // blocked on a full inbox holds no heap object.
 static Mail encode_message(Value* args, uint8_t nargs, Context* ctx, const char* who) {
@@ -2896,5 +2922,7 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_RELEASE_SLOT] = native_release_slot;
     t[NATIVE_STOP_ACTOR]   = native_stop_actor;
     t[NATIVE_MONITOR]      = native_monitor;
+    t[NATIVE_STOP_REQUESTED] = native_stop_requested;
+    t[NATIVE_SLEEP]        = native_sleep;
     return t;
 }

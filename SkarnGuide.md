@@ -4174,15 +4174,103 @@ send(p, Job { n: 5, replyTo: me.pid() })
 println(got(me.receive()))                // => 10
 ```
 
-`stopActor(p)` tells any actor to end. It stops when it next receives, so an actor that loops without
-receiving cannot be stopped from outside — there is no kill.
+**When a crash takes the siblings with it.** `supervise` restarts the child that crashed and nothing else.
+Where the children depend on one another, `superviseWith` takes a `SupervisorSpec` and says so:
+`Strategy::OneForAll` stops every other child, waits until they have all ended, and starts them all again;
+`Strategy::RestForOne` does the same for the children started *after* the crashed one, which is what
+children that build on the ones before them need. The wait is for an end report, which arrives only once
+that actor's address is free — so a child in a slot is started again exactly where it was. A group restart
+counts as one restart against the limit.
+
+```rust
+use std::actor::*
+use std::supervisor::*
+
+struct Note { i: Int, me: Pid[Int] }
+
+struct Kid { i: Int, boss: Pid[Note] }
+
+// Announces itself at every start; the message 0 makes it crash.
+fn member(inbox: Inbox[Int], k: Kid) -> () {
+  send(k.boss, Note { i: k.i, me: inbox.pid() })
+  for m in inbox.messages() { if m == 0 { panic("boom") } }
+}
+
+fn keeper(inbox: Inbox[()], boss: Pid[Note]) -> () {
+  let mut kids: Vec[dyn Supervised] = vec()
+  push(kids, child(actorFn(member), Kid { i: 0, boss: boss }))
+  push(kids, child(actorFn(member), Kid { i: 1, boss: boss }))
+  superviseWith(inbox, kids, SupervisorSpec {
+    strategy: Strategy::OneForAll,
+    limit: RestartLimit { maxRestarts: 3, withinMs: 10000 },
+    stopTimeoutMs: 1000
+  })
+}
+
+// How many announcements arrived.
+fn waitFor(me: Inbox[Note], n: Int) -> Int {
+  let mut seen = 0
+  while seen < n {
+    match me.receive() {
+      Mail::Msg(_) => { seen = seen + 1 },
+      _ => { seen = n },
+    }
+  }
+  seen
+}
+
+let me: Inbox[Note] = mainInbox()
+spawnActor(keeper, me.pid())
+match me.receive() {
+  Mail::Msg(first) => {
+    // the other child is up as well
+    println(waitFor(me, 1))            // => 1
+    send(first.me, 0)
+    // both start again, not only the one that crashed
+    println(waitFor(me, 2))            // => 2
+  },
+  _ => {},
+}
+```
+
+**Stopping an actor that never receives.** `stopActor(p)` is a *message*: the actor ends when it next
+receives. An actor whose loop is its own work never gets there, and there is no kill — so such an actor
+asks instead. `inbox.stopRequested()` is true once anyone has told it to end, and it takes no mail out of
+the inbox, so the rest of the loop is unaffected.
+
+```rust
+use std::actor::*
+
+// Its loop is its own work: it never receives, so it asks.
+fn grind(inbox: Inbox[Int], boss: Pid[Int]) -> () {
+  let mut i = 0
+  while !inbox.stopRequested() { i = i + 1 }
+  send(boss, 1)
+}
+
+let me: Inbox[Int] = mainInbox()
+let p = spawnActor(grind, me.pid())
+println(stopActor(p))                  // => true
+match me.receive() {
+  Mail::Msg(n) => println(n),          // => 1
+  _ => {},
+}
+```
+
+A child that neither receives nor asks is the one case a supervisor cannot resolve. `stopTimeoutMs` says
+what it does then: `0`, the default, waits — that group stands still, but the supervisor keeps receiving,
+so the program still ends. A deadline makes a *restart* give up and crash, naming the child, so the tree
+above is told rather than the group being restarted as if it were whole; during a *shutdown* the child is
+abandoned instead and the supervisor ends normally.
+
+At `Stop` a supervisor stops its children in reverse start order and releases every address; with a
+`stopTimeoutMs` it waits for each child to end before it tells the next.
 
 Limits of this supervisor:
 - **Crashes only.** A child is started again only after a crash; a child that returns stays ended.
 - **New addresses, unless a slot.** A child made with `child` has a new address after a restart, and must
   announce it itself — for example by sending `inbox.pid()` to an address in its start value. A child made
   with `childIn` keeps the slot's address.
-- **Children outlive a supervisor that gives up.** When it gives up, its children keep running.
 - **Not in the main program.** The main program cannot supervise, because it never receives `Stop`, so the
   program would never end.
 
@@ -4886,6 +4974,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `a.add(b)` / `a.sub(b)` / `d.scale(k)` / `d.negate()` | `Duration` algebra |
 | `a.isBefore(b)` / `a.isAfter(b)` | order two `Instant`s → `Bool` |
 | `startStopwatch()` / `sw.elapsedNanos()` / `sw.elapsedMillis()` | a monotonic stopwatch (`startStopwatch` free) |
+| `sleep(ms)` | wait `ms` milliseconds. Only this actor or task waits — each has a thread of its own |
 
 **TCP networking** *(all `std::net` — `use std::net::*`; blocking, plaintext only; close sockets explicitly)*
 
@@ -4944,6 +5033,8 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `s.pid()` / `s.spawn(a, init)` / `s.release()` | the address to hand out → `Pid[M]` / start an actor at it → `ActorId` (an error if one is running there) / end the address: later sends answer `false`, an actor still there is told to stop |
 | `stopActor(p)` | tell the actor at `p` to end → `Bool`: `false` if it no longer runs. It stops when it next receives; an actor that never receives cannot be stopped |
 | `monitor(p, rx)` | be told when the actor at `p` ends → `Bool`: `false` if it had already ended. Exactly ONE `Mail::Exited(id, reason)` follows, in your own inbox `rx`; the reason is `"normal"`, `"gone"`, or the fault message. It watches that actor, not the address |
+| `inbox.stopRequested()` | has anyone told this actor to end? → `Bool`. Takes no mail out of the inbox. How an actor whose loop is its own work ends itself, since a stop is a message it would never read |
+| `a.stop()` / `a.watch(rx)` | `stopActor` / `monitor` by `ActorId`, for code holding actors whose message type is erased — a supervisor over `Vec[dyn Supervised]` |
 
 **Supervision** *(all `std::supervisor` — `use std::supervisor::*`; builds on `std::actor`)*
 
@@ -4952,6 +5043,9 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `child(a, init)` | a child a supervisor can start again: the `ActorFn` `a` and its start value → `Child[M, I]`, which is `Supervised` (free) |
 | `childIn(slot, a, init)` | the same, but always started at the address `slot` (`std::actor`'s `newSlot`), so the child keeps one address across its restarts → `SlotChild[M, I]` (free) |
 | `supervise(inbox, children, limit)` | run in an actor with its own inbox: start every `children: Vec[dyn Supervised]`, start again each one that crashes, return at `Stop`. More than `limit.maxRestarts` restarts within `limit.withinMs` milliseconds (`RestartLimit { maxRestarts, withinMs }`), and it panics, so its own starter is told. Messages to it are dropped |
+| `superviseWith(inbox, children, spec)` | the same loop with both choices spelled out: `SupervisorSpec { strategy, limit, stopTimeoutMs }`. `supervise` is this with `OneForOne` and no deadline |
+| `Strategy::OneForOne` / `OneForAll` / `RestForOne` | what a crash costs the siblings: nothing / stop them all, wait, start them all / the same for those started after the crashed one. A group restart counts as ONE restart |
+| `stopTimeoutMs` | how long a child may take to stop. `0` waits (the group stands still, the supervisor keeps receiving); more makes a RESTART give up and crash, naming the child, and a SHUTDOWN abandon it. A child that neither receives nor asks `stopRequested()` cannot be ended at all |
 
 **Regex** *(all `std::regex` — `use std::regex::*`; byte-level, linear-time Pike VM; no backrefs/lookaround. Note the names: matching anywhere is `search`, not `find`, and rewriting is `replaceRe`, not `replace` — those two belong to `std::iter` / `std::string`)*
 

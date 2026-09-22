@@ -11,9 +11,14 @@
 // Pulling is also why a restart does no harm here: a restarted worker has a new address, but nobody
 // needs it -- the worker comes to the dispatcher, not the other way round.
 //
-//     static_vmrun demo/actors/supervised.skn
+// The strategy decides what a crash costs the OTHER workers. Pull dispatch makes all three work here:
+// a worker that is stopped mid-job simply stops asking, and the dispatcher hands that job out again.
+//
+//     static_vmrun demo/actors/supervised.skn [--strategy=one_for_one|one_for_all|rest_for_one]
 use std::actor::*
 use std::supervisor::*
+use std::cli::*
+use std::env::*
 
 const JOBS: Int = 40
 const WORKERS: Int = 4
@@ -80,20 +85,38 @@ fn worker(inbox: Inbox[()], dispatcher: Pid[ToDispatcher]) -> () {
   }
 }
 
-// The supervisor: WORKERS workers, each started again when it crashes.
-fn keeper(inbox: Inbox[()], dispatcher: Pid[ToDispatcher]) -> () {
+struct Pool { dispatcher: Pid[ToDispatcher], strategy: Strategy }
+
+// The supervisor: WORKERS workers, started again when one crashes -- how many of them depends on the
+// strategy. A Strategy is plain data, so the pool's setup travels in the start value like anything else.
+fn keeper(inbox: Inbox[()], pool: Pool) -> () {
   let mut kids: Vec[dyn Supervised] = vec()
   let mut i = 0
   while i < WORKERS {
-    push(kids, child(actorFn(worker), dispatcher))
+    push(kids, child(actorFn(worker), pool.dispatcher))
     i += 1
   }
-  supervise(inbox, kids, RestartLimit { maxRestarts: 20, withinMs: 10000 })
+  superviseWith(inbox, kids, SupervisorSpec {
+    strategy: pool.strategy,
+    limit: RestartLimit { maxRestarts: 20, withinMs: 10000 },
+    stopTimeoutMs: 10000
+  })
 }
 
+let opts = CliArgs::parse(args())
+let name = opts.getOptOr("strategy", "one_for_one")
+let strategy = if name == "one_for_one" {
+  Strategy::OneForOne
+} else if name == "one_for_all" {
+  Strategy::OneForAll
+} else if name == "rest_for_one" {
+  Strategy::RestForOne
+} else {
+  panic("--strategy must be one_for_one, one_for_all or rest_for_one")
+}
 let me: Inbox[Int] = mainInbox()
 let d = spawnActor(dispatcher, Plan { jobs: JOBS, boss: me.pid() })
-spawnActor(keeper, d)
+spawnActor(keeper, Pool { dispatcher: d, strategy: strategy })
 let mut expected = 0
 let mut n = 1
 while n <= JOBS {
@@ -102,7 +125,7 @@ while n <= JOBS {
 }
 match me.receive() {
   Mail::Msg(sum) => {
-    println("${JOBS} jobs, ${JOBS / 5} of them crashed a worker on the first try")
+    println("${JOBS} jobs, ${JOBS / 5} of them crashed a worker on the first try (${name})")
     println("sum of squares: ${sum} (sequential: ${expected}) ${if sum == expected { "ok" } else { "WRONG" }}")
   },
   _ => println("no result"),

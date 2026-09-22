@@ -3334,6 +3334,25 @@ inline void task_fns(Assembler& as) {
     as.load_const(0, 0);
     as.J(OpCode::RET);
 
+    // abusy(inbox_id): an actor that NEVER receives -- its loop is its own work. It cannot be stopped by
+    // mail, so it asks rawStopRequested instead, and ends itself. Then it reports 77 to the main program.
+    // The argument is the inbox to ask about: 0 means "my own", anything else the slot it was started
+    // into (whose id is not the actor's own).
+    as.label("abusy");
+    as.R6(OpCode::MOV, 1, 0, 0);
+    as.load_const(7, 0);
+    as.B (OpCode::BNE_INT, 1, 7, "abusy_loop");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.label("abusy_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.call_native_id(4, 5, 2, 1, NATIVE_STOP_REQUESTED);
+    as.B1(OpCode::BF, 4, "abusy_loop");
+    as.load_const(2, 0);
+    as.load_const(3, 77);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
     // aslot(inbox_id): like aecho, but it receives on the inbox its ARGUMENT names -- the slot it was
     // started into, whose id is not its own (rawSpawnInto). Doubles each message to the main program.
     as.label("aslot");
@@ -3533,6 +3552,7 @@ inline void declare_task_fns(Assembler& as) {
     as.declare_fn("aslot",  8, 1);
     as.declare_fn("acrashon", 8, 1);
     as.declare_fn("awatch", 8, 1);
+    as.declare_fn("abusy",  8, 1);
     as.declare_fn("astop",  8, 1);
     as.declare_fn("aconn",  8, 1);
     as.declare_fn("areply", 8, 1);
@@ -4365,6 +4385,52 @@ inline void test_actor_monitor_others() {
         std::cout << std::format("  already ended: false, report now: {}  (\"{}\")\n", gone_ok ? "PASS" : "FAIL",
                                  str_of(r.regs[21]));
         check(watcher_ok && gone_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// An actor whose loop is its OWN work never reaches a receive, so mail cannot end it. rawStopRequested
+// reads the flag every ending path sets, so such an actor can end itself -- and it consumes no mail.
+inline void test_actor_stop_requested() {
+    using namespace forkjoin;
+    std::cout << "=== actor_stop_requested ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        call1(as, 11, NATIVE_STOP_REQUESTED, 10);       // the root's own inbox: nobody has asked
+        as.load_const(41, 0);  spawn_actor(as, 12, "abusy");
+        call1(as, 13, NATIVE_STOP_ACTOR, 12);
+        receive_main(as, 14, -1);  mail_read(as, 15, NATIVE_MAIL_MSG);
+        new_slot(as, 16, 0);                            // releasing a slot tells the actor in it too
+        spawn_into(as, 17, 16, "abusy");
+        call1(as, 18, NATIVE_RELEASE_SLOT, 16);
+        receive_main(as, 19, -1);  mail_read(as, 20, NATIVE_MAIL_MSG);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool quiet_ok = r.fault.empty() && r.regs[11].isBool() && !r.regs[11].asBool();
+        const bool stop_ok  = r.fault.empty() && r.regs[13].isBool() && r.regs[13].asBool() &&
+                              is_int(14, 1) && is_int(15, 77);
+        const bool slot_ok  = r.fault.empty() && is_int(19, 1) && is_int(20, 77);
+        std::cout << std::format("  nothing asked: false:            {}{}\n", quiet_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  a busy actor ends on the flag:   {}\n", stop_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  a released slot sets it as well: {}\n", slot_ok ? "PASS" : "FAIL");
+        {   // ... and it may only be asked about one's OWN inbox
+            Assembler bad;
+            declare_task_fns(bad);
+            bad.label("main");
+            main_inbox(bad, 10);
+            bad.load_const(41, 0);  spawn_actor(bad, 11, "aecho");
+            call1(bad, 12, NATIVE_STOP_REQUESTED, 11);
+            Heap bad_heap;
+            const Run br = run(bad, bad_heap);
+            const bool foreign_ok = br.fault.find("belongs to another actor") != std::string::npos;
+            std::cout << std::format("  someone else's inbox: a fault:   {}  (\"{}\")\n",
+                                     foreign_ok ? "PASS" : "FAIL", br.fault);
+            check(quiet_ok && stop_ok && slot_ok && foreign_ok);
+        }
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 

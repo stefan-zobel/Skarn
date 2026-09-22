@@ -1,0 +1,54 @@
+// CLAIM: with Strategy::RestForOne a crash costs only the children started AFTER the crashed one: with
+//        three children, the middle one's crash starts 1 and 2 again and leaves 0 running.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: ok started again: 1,2
+use std::actor::*
+use std::supervisor::*
+
+struct Note { i: Int, me: Pid[Int] }
+
+struct Kid { i: Int, boss: Pid[Note] }
+
+fn member(inbox: Inbox[Int], k: Kid) -> () {
+  send(k.boss, Note { i: k.i, me: inbox.pid() })
+  for m in inbox.messages() { if m == 0 { panic("boom") } }
+}
+
+fn keeper(inbox: Inbox[()], boss: Pid[Note]) -> () {
+  let mut kids: Vec[dyn Supervised] = vec()
+  push(kids, child(actorFn(member), Kid { i: 0, boss: boss }))
+  push(kids, child(actorFn(member), Kid { i: 1, boss: boss }))
+  push(kids, child(actorFn(member), Kid { i: 2, boss: boss }))
+  superviseWith(inbox, kids, SupervisorSpec {
+    strategy: Strategy::RestForOne,
+    limit: RestartLimit { maxRestarts: 3, withinMs: 60000 },
+    stopTimeoutMs: 0
+  })
+}
+
+let me: Inbox[Note] = mainInbox()
+spawnActor(keeper, me.pid())
+// Wait until all three are up, keeping the address of the middle one.
+let mut victim: Option[Pid[Int]] = None
+let mut up = 0
+while up < 3 {
+  match me.receive() {
+    Mail::Msg(note) => {
+      if note.i == 1 { victim = Some(note.me) }
+      up = up + 1
+    },
+    _ => { up = 3 },
+  }
+}
+match victim { Some(p) => { send(p, 0) }, None => {} }
+// The two that start again announce themselves in whatever order the schedule picks, so they are sorted.
+let mut seen: Vec[Int] = vec()
+while len(seen) < 2 {
+  match me.receive() {
+    Mail::Msg(note) => { push(seen, note.i) },
+    _ => { push(seen, -1) },
+  }
+}
+let mut out = ""
+for x in sorted(seen) { out = if out == "" { "${x}" } else { "${out},${x}" } }
+println("started again: ${out}")
