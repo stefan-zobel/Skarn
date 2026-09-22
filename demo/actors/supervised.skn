@@ -1,0 +1,109 @@
+// A pool of workers that crash, kept running by a supervisor (std::supervisor).
+//
+//   main --> dispatcher <--pull-- worker 1..N  (children of the keeper, restarted when they crash)
+//
+// The workers PULL their jobs from a dispatcher and report each result back to it. A worker crashes
+// the first time it is handed a multiple of 5, as a stand-in for a bug that bites now and then. The
+// keeper starts the crashed worker again, and the dispatcher hands out again every job whose result
+// has not come back once its queue is empty, so the lost job gets done by someone else. When all
+// results are in, the dispatcher sends the total to the main program, which checks it.
+//
+// Pulling is also why a restart does no harm here: a restarted worker has a new address, but nobody
+// needs it -- the worker comes to the dispatcher, not the other way round.
+//
+//     static_vmrun demo/actors/supervised.skn
+use std::actor::*
+use std::supervisor::*
+
+const JOBS: Int = 40
+const WORKERS: Int = 4
+
+struct Job { n: Int, attempt: Int }
+
+enum ToDispatcher {
+  Pull(Pid[Option[Job]]),     // a worker wants a job; None = all work is done
+  Done(Int, Int),             // job n, its result
+}
+
+struct Plan { jobs: Int, boss: Pid[Int] }
+
+// Hands out jobs 1..jobs, then again every job that is still missing, and sends the sum of all results
+// to the boss when the last one comes in.
+fn dispatcher(inbox: Inbox[ToDispatcher], plan: Plan) -> () {
+  let mut next = 1
+  let mut attempts: Map[Int, Int] = #{}
+  let mut results: Map[Int, Int] = #{}
+  let mut again = 1                 // where the search for a missing job goes on
+  let mut reported = false
+  for m in inbox.messages() {
+    match m {
+      ToDispatcher::Pull(worker) => {
+        if next <= plan.jobs {
+          attempts[next] = 1
+          send(worker, Some(Job { n: next, attempt: 1 }))
+          next += 1
+        } else if len(results) < plan.jobs {
+          // The queue is empty but results are missing: hand out the next missing job again.
+          while has(results, again) { again = if again >= plan.jobs { 1 } else { again + 1 } }
+          let a = getOr(attempts, again, 0) + 1
+          attempts[again] = a
+          send(worker, Some(Job { n: again, attempt: a }))
+          again = if again >= plan.jobs { 1 } else { again + 1 }
+        } else {
+          send(worker, None)
+        }
+      },
+      ToDispatcher::Done(n, r) => {
+        if !has(results, n) { results[n] = r }
+        if len(results) == plan.jobs && !reported {
+          let mut sum = 0
+          for (_, v) in results { sum += v }
+          send(plan.boss, sum)
+          reported = true
+        }
+      },
+    }
+  }
+}
+
+// Pulls jobs until there are none left. Crashes on the first attempt at a multiple of 5.
+fn worker(inbox: Inbox[()], dispatcher: Pid[ToDispatcher]) -> () {
+  loop {
+    match ask(dispatcher, fn(me) { ToDispatcher::Pull(me) }, 5000) {
+      Ok(Some(job)) => {
+        if job.n % 5 == 0 && job.attempt == 1 { panic("worker: job ${job.n} went wrong") }
+        send(dispatcher, ToDispatcher::Done(job.n, job.n * job.n))
+      },
+      Ok(None) => break,
+      Err(_) => break,
+    }
+  }
+}
+
+// The supervisor: WORKERS workers, each started again when it crashes.
+fn keeper(inbox: Inbox[()], dispatcher: Pid[ToDispatcher]) -> () {
+  let mut kids: Vec[dyn Supervised] = vec()
+  let mut i = 0
+  while i < WORKERS {
+    push(kids, child(actorFn(worker), dispatcher))
+    i += 1
+  }
+  supervise(inbox, kids, RestartLimit { maxRestarts: 20, withinMs: 10000 })
+}
+
+let me: Inbox[Int] = mainInbox()
+let d = spawnActor(dispatcher, Plan { jobs: JOBS, boss: me.pid() })
+spawnActor(keeper, d)
+let mut expected = 0
+let mut n = 1
+while n <= JOBS {
+  expected += n * n
+  n += 1
+}
+match me.receive() {
+  Mail::Msg(sum) => {
+    println("${JOBS} jobs, ${JOBS / 5} of them crashed a worker on the first try")
+    println("sum of squares: ${sum} (sequential: ${expected}) ${if sum == expected { "ok" } else { "WRONG" }}")
+  },
+  _ => println("no result"),
+}

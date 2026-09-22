@@ -51,3 +51,39 @@ the rest of the text piles up in their mailboxes. `--capacity=N` starts the coun
 `spawnActorBounded`, so a send to a full mailbox waits until the counter has taken a message. With a million
 generated lines and two counters, `--capacity=2` lowers the peak working set from ~349 MB to ~265 MB at the
 same speed (~10.2 s for the actor phase either way).
+
+## `supervised.skn`
+
+A pool of workers that crash, kept running by a supervisor (`std::supervisor`):
+
+```
+main --> dispatcher <--pull-- worker 1..4  (children of the keeper, restarted when they crash)
+```
+
+The workers pull their jobs from a dispatcher and report each result back to it. A worker crashes the first
+time it is handed a multiple of 5. The keeper starts it again, and the dispatcher hands out again every job
+whose result is missing once its queue is empty. The main program checks the total against a sequential
+sum. Because the workers pull, a restarted worker's new address does no harm: nobody needs to reach it.
+
+```
+static_vmrun demo/actors/supervised.skn
+```
+
+## `stable_address.skn`
+
+A service that keeps ONE address across its restarts (`std::actor`'s `Slot` plus `std::supervisor`):
+
+```
+main --requests--> [ slot ] <-- the supervisor starts a service here, again after every crash
+```
+
+The service squares the numbers it is sent, and one request makes it crash. The supervisor starts a new
+service at the same address, and the main program goes on using the `Pid` it has had from the start — it
+never learns a new one. At the end the address is released, and a send to it answers `false`.
+
+Each service announces itself when it starts, which is what makes the output the same under every
+schedule: a request goes out only once its receiver is known to be up.
+
+```
+static_vmrun demo/actors/stable_address.skn
+```

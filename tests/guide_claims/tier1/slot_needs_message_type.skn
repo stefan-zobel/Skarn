@@ -1,0 +1,8 @@
+// CLAIM: a new address fixes the type of the messages it will carry, so it must be annotated -- exactly as
+//        an inbox is, and for the same reason: everything sent to it is copied into another heap.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: fail a new address needs its message type here
+use std::actor::*
+
+let s = newSlot()
+println("unreachable")

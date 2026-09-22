@@ -1,0 +1,124 @@
+// Supervision -- keeping actors running. A supervisor starts its children and, when one of them
+// crashes, starts it again; if they crash too often, it gives up and crashes itself, so that ITS
+// starter learns of it. A supervisor is an ordinary actor, so supervisors nest into trees.
+//
+// OPT-IN: reach these via `use std::supervisor::*`. Builds on std::actor.
+//
+// THE LOOP RUNS IN YOUR ACTOR. `supervise(inbox, children, limit)` is a function, not an actor of its
+// own: call it from the actor that is to supervise, with that actor's main inbox (a crash is reported
+// to the actor that started the child, in its main inbox). The children are built right there, which
+// is why they may be of different types -- a `Vec[dyn Supervised]` cannot be sent, and need not be.
+//
+//     fn workers(inbox: Inbox[()], boss: Pid[Pid[Job]]) -> () {
+//       let mut kids: Vec[dyn Supervised] = vec()
+//       push(kids, child(actorFn(worker), boss))
+//       push(kids, child(actorFn(worker), boss))
+//       supervise(inbox, kids, RestartLimit { maxRestarts: 3, withinMs: 5000 })
+//     }
+//
+// WHAT IT DOES (one_for_one): start every child; when one crashes, start that one again with the
+// same start value; return at Stop, when the program ends. Messages to the supervisor are dropped.
+// More than `maxRestarts` restarts within `withinMs` milliseconds, and it panics -- releasing the
+// addresses of its children first, so none of them is left to swallow mail nobody will read.
+//
+// A CHILD WITH A FIXED ADDRESS. A child made with `child(a, init)` gets a new address at every
+// restart. `childIn(slot, a, init)` puts it in a `Slot` instead (std::actor): the address then stays
+// the same across restarts, and a send while the child is being started again waits in the slot
+// instead of being dropped. Make the slot where the address is needed and hand out `slot.pid()`.
+//
+// LIMITS (deliberate):
+//   * A child is started again only after a CRASH. A child that returns stays ended.
+//   * A child made with `child` has a NEW address after a restart, so whoever must reach it either
+//     lives on `childIn`, or learns the address from the child itself when it starts.
+//   * A supervisor that gives up leaves its children RUNNING (a child in a slot is told to stop, but
+//     an actor that never receives goes on).
+//   * The main program cannot supervise: it never receives Stop, so the program would never end.
+use std::actor::*
+use std::time::*
+
+// A child a supervisor can start again after it crashed: its function and its start value.
+pub struct Child[M, I] { run: ActorFn[M, I], init: I }
+
+// The child that runs `run` with the start value `init`.
+pub fn child[M, I](run: ActorFn[M, I], init: I) -> Child[M, I] { Child { run: run, init: init } }
+
+// A child that lives at a fixed address: every actor started for it receives on the same slot.
+pub struct SlotChild[M, I] { at: Slot[M], run: ActorFn[M, I], init: I }
+
+// The child that runs `run` with the start value `init`, always at the address `at`.
+pub fn childIn[M, I](at: Slot[M], run: ActorFn[M, I], init: I) -> SlotChild[M, I] {
+  SlotChild { at: at, run: run, init: init }
+}
+
+// Anything a supervisor can start, whatever its message type: what a `Vec[dyn Supervised]` holds.
+pub trait Supervised {
+  // Start it once more and return the id its crash report will carry.
+  fn start(self) -> ActorId
+
+  // Give up its address, if it has one of its own. A supervisor does this when it stops supervising.
+  fn release(self) -> ()
+}
+
+impl[M, I] Supervised for Child[M, I] {
+  fn start(self) -> ActorId { self.run.spawn(self.init).actorId() }
+  fn release(self) -> () {}
+}
+
+impl[M, I] Supervised for SlotChild[M, I] {
+  fn start(self) -> ActorId { self.at.spawn(self.run, self.init) }
+  fn release(self) -> () { self.at.release() }
+}
+
+// Give up when more than `maxRestarts` restarts happen within `withinMs` milliseconds.
+pub struct RestartLimit { maxRestarts: Int, withinMs: Int }
+
+// Start every child, start again each one that crashes, and return at Stop (see the top of this
+// module). Past the limit it panics, with the last crash's reason in the message.
+pub fn supervise[M](inbox: Inbox[M], children: Vec[dyn Supervised], limit: RestartLimit) -> () {
+  if limit.maxRestarts < 0 { panic("supervise: maxRestarts must not be negative") }
+  if limit.withinMs < 1 { panic("supervise: withinMs must be at least 1") }
+  let clock = startStopwatch()
+  let mut running: Vec[ActorId] = vec()
+  for c in children { push(running, c.start()) }
+  // When the recent restarts happened, in milliseconds since the start, oldest first.
+  let mut recent: Vec[Int] = vec()
+  loop {
+    match inbox.receive() {
+      Mail::Msg(_) => {},
+      Mail::Stop => break,
+      Mail::Exited(id, why) => {
+        let i = _indexOf(running, id)
+        if i >= 0 {
+          let now = clock.elapsedMillis()
+          recent = _since(recent, now - limit.withinMs)
+          if len(recent) >= limit.maxRestarts {
+            // Give up -- but give up the addresses too: one left behind would take messages that
+            // nobody is going to read.
+            for c in children { c.release() }
+            panic("supervisor: more than ${limit.maxRestarts} restarts within ${limit.withinMs} ms; the last: ${why}")
+          }
+          push(recent, now)
+          running[i] = children[i].start()
+        }
+      }
+    }
+  }
+}
+
+// The position of `id` in `ids`, or -1: a report from an actor that is not one of the children.
+fn _indexOf(ids: Vec[ActorId], id: ActorId) -> Int {
+  let mut i = 0
+  let mut found = -1
+  while found < 0 && i < len(ids) {
+    if ids[i] == id { found = i }
+    i += 1
+  }
+  found
+}
+
+// The times after `cutoff`.
+fn _since(times: Vec[Int], cutoff: Int) -> Vec[Int] {
+  let mut kept: Vec[Int] = vec()
+  for t in times { if t > cutoff { push(kept, t) } }
+  kept
+}

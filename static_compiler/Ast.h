@@ -522,6 +522,10 @@ inline std::string std_newBoundedInbox() { return mangle_name(STD_ACTOR, "newBou
 inline std::string std_ask()          { return mangle_name(STD_ACTOR, "ask"); }
 inline std::string std_Pid()          { return mangle_name(STD_ACTOR, "Pid"); }
 inline std::string std_Inbox()        { return mangle_name(STD_ACTOR, "Inbox"); }
+// An address that outlives its actor: `newSlot` fixes its message type, as the inbox makers do.
+inline std::string std_Slot()         { return mangle_name(STD_ACTOR, "Slot"); }
+inline std::string std_newSlot()      { return mangle_name(STD_ACTOR, "newSlot"); }
+inline std::string std_newBoundedSlot() { return mangle_name(STD_ACTOR, "newBoundedSlot"); }
 // The checked function values: made only by `actorFn(f)` / `taskFn(f)` with a named function.
 inline std::string std_ActorFn()      { return mangle_name(STD_ACTOR, "ActorFn"); }
 inline std::string std_actorFn()      { return mangle_name(STD_ACTOR, "actorFn"); }

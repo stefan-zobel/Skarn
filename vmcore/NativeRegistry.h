@@ -126,7 +126,14 @@ enum NativeId : uint16_t {
     NATIVE_CLOSE_INBOX = 72,    // rawCloseInbox(inbox)    -> ()   (later sends answer false)
     NATIVE_TRY_SEND    = 73,    // rawTrySend(pid, msg)    -> Int  (0 sent, 1 full, 2 gone; never waits)
     NATIVE_ACTOR_SPAWN_BOUNDED = 74, // rawSpawnActorBounded(fn, arg, capacity) -> Int (the actor id)
-    NATIVE_COUNT       = 75,
+    // Stable addresses: a SLOT is a mailbox made before its actor and outliving it, so an actor can be
+    // started into it again after a crash and its address stays good. What was queued when its actor
+    // ended is dropped; what arrives while it is empty waits for the next one.
+    NATIVE_NEW_SLOT    = 75,    // rawNewSlot(capacity)    -> Int  (an address with no actor yet)
+    NATIVE_SPAWN_INTO  = 76,    // rawSpawnInto(slot, fn, arg) -> Int (the actor id; the slot must be free)
+    NATIVE_RELEASE_SLOT = 77,   // rawReleaseSlot(slot)    -> ()   (stops an actor in it; later sends false)
+    NATIVE_STOP_ACTOR  = 78,    // rawStopActor(pid)       -> Bool (Stop into each of its inboxes)
+    NATIVE_COUNT       = 79,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -214,6 +221,10 @@ inline int native_id_of(const std::string& name) {
     if (name == "rawCloseInbox") return NATIVE_CLOSE_INBOX;
     if (name == "rawTrySend") return NATIVE_TRY_SEND;
     if (name == "rawSpawnActorBounded") return NATIVE_ACTOR_SPAWN_BOUNDED;
+    if (name == "rawNewSlot") return NATIVE_NEW_SLOT;
+    if (name == "rawSpawnInto") return NATIVE_SPAWN_INTO;
+    if (name == "rawReleaseSlot") return NATIVE_RELEASE_SLOT;
+    if (name == "rawStopActor") return NATIVE_STOP_ACTOR;
     return -1;
 }
 
@@ -270,6 +281,7 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_ACTOR_SPAWN: case NATIVE_SEND: case NATIVE_RECEIVE: case NATIVE_MAIL_MSG:
         case NATIVE_MAIL_FROM: case NATIVE_MAIL_REASON: case NATIVE_MAIN_INBOX: case NATIVE_SELF_ID:
         case NATIVE_NEW_INBOX: case NATIVE_CLOSE_INBOX: case NATIVE_TRY_SEND: case NATIVE_ACTOR_SPAWN_BOUNDED:
+        case NATIVE_NEW_SLOT: case NATIVE_SPAWN_INTO: case NATIVE_RELEASE_SLOT: case NATIVE_STOP_ACTOR:
         case NATIVE_READ_ALL_STDIN: return NRET_PLAIN;
         default:                 return NRET_RESULT;
     }
@@ -299,6 +311,7 @@ inline int native_arity(int id) {
         case NATIVE_TRY_SEND:
         case NATIVE_RUN_PROCESS: return 2;
         case NATIVE_ACTOR_SPAWN_BOUNDED:
+        case NATIVE_SPAWN_INTO:
         case NATIVE_POLL:        return 3;
         case NATIVE_READ_FILE:
         case NATIVE_GET_ENV:
@@ -329,6 +342,9 @@ inline int native_arity(int id) {
         case NATIVE_TAKE:
         case NATIVE_NEW_INBOX:
         case NATIVE_CLOSE_INBOX:
+        case NATIVE_NEW_SLOT:
+        case NATIVE_RELEASE_SLOT:
+        case NATIVE_STOP_ACTOR:
         case NATIVE_SHA256:
         case NATIVE_F64_TO_BYTES: return 1;
         case NATIVE_NANO_TIME:

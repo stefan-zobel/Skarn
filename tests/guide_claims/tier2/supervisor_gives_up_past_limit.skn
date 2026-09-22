@@ -1,0 +1,22 @@
+// CLAIM: a supervisor whose child crashes more often than its restart limit allows gives up by crashing
+//        itself, so its own starter receives Mail::Exited, with the limit and the child's last reason.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: ok gave up: true, last reason: true
+use std::actor::*
+use std::supervisor::*
+
+fn broken(inbox: Inbox[Int], unused: Int) -> () { panic("boom") }
+
+fn keeper(inbox: Inbox[()], unused: Int) -> () {
+  let mut kids: Vec[dyn Supervised] = vec()
+  push(kids, child(actorFn(broken), 0))
+  supervise(inbox, kids, RestartLimit { maxRestarts: 3, withinMs: 60000 })
+}
+
+let me: Inbox[Int] = mainInbox()
+spawnActor(keeper, 0)
+match me.receive() {
+  Mail::Exited(_, why) =>
+    println("gave up: ${hasSubstr(why, "more than 3 restarts")}, last reason: ${hasSubstr(why, "boom")}"),
+  _ => println("no report"),
+}

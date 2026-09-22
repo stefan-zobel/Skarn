@@ -1376,6 +1376,21 @@ private:
             [](const std::vector<TyPtr>& v) {
                 return std::vector<TyPtr>{ make_fn({ v[0] }, v[1]), v[0], ty_int() }; },
             [](const std::vector<TyPtr>&)   { return ty_int(); });
+        // Stable addresses: a Slot[M] is a mailbox made before its actor and outliving it, so an actor
+        // restarted into it keeps the address. rawNewSlot returns the bare id (std::actor wraps it in
+        // the Slot[M] the checker validated at the newSlot call).
+        auto slot_of = [](const TyPtr& m) { return make_named(std_Slot(), { m }); };
+        add_native("rawNewSlot", { ty_int() }, ty_int(), STD_ACTOR);
+        add_generic_native("rawSpawnInto", { "M", "A", "R" },
+            [&](const std::vector<TyPtr>& v) {
+                return std::vector<TyPtr>{ slot_of(v[0]), make_fn({ v[1] }, v[2]), v[1] }; },
+            [](const std::vector<TyPtr>&)    { return ty_int(); });
+        add_generic_native("rawReleaseSlot", { "M" },
+            [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ slot_of(v[0]) }; },
+            [](const std::vector<TyPtr>&)    { return ty_unit(); });
+        add_generic_native("rawStopActor", { "M" },
+            [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ pid_of(v[0]) }; },
+            [](const std::vector<TyPtr>&)    { return ty_bool(); });
     }
 
     // Is a gated native `name` callable from the module currently being checked? A native NOT in
@@ -3652,7 +3667,7 @@ private:
             if (((key == std_spawn() || key == std_taskFn()) && cur_module_ != STD_TASK) ||
                 ((key == std_spawnActor() || key == std_spawnActorBounded() || key == std_mainInbox() ||
                   key == std_newInbox() || key == std_newBoundedInbox() || key == std_ask() ||
-                  key == std_actorFn()) &&
+                  key == std_actorFn() || key == std_newSlot() || key == std_newBoundedSlot()) &&
                  cur_module_ != STD_ACTOR)) {
                 error(e.line, e.col, "'" + short_name(key) + "' can only be called, not used as a value");
                 return ty_error();
@@ -4286,6 +4301,10 @@ private:
             check_new_inbox_site(ret, node, "a new inbox", "let rx: Inbox[T] = newInbox()");
         else if (is_std_sig(sig, std_newBoundedInbox(), STD_ACTOR))
             check_new_inbox_site(ret, node, "a new inbox", "let rx: Inbox[T] = newBoundedInbox(n)");
+        else if (is_std_sig(sig, std_newSlot(), STD_ACTOR))
+            check_new_inbox_site(ret, node, "a new address", "let s: Slot[T] = newSlot()");
+        else if (is_std_sig(sig, std_newBoundedSlot(), STD_ACTOR))
+            check_new_inbox_site(ret, node, "a new address", "let s: Slot[T] = newBoundedSlot(n)");
         else if (is_std_sig(sig, std_ask(), STD_ACTOR))            check_ask_site(ret, node);
         return apply(ret);
     }
@@ -5880,6 +5899,9 @@ private:
         if ((e.name == std_Pid() || e.name == std_Inbox()) && cur_module_ != STD_ACTOR)
             error(e.line, e.col, std::string(e.name == std_Pid() ? "a Pid" : "an Inbox") +
                   " can only be created by std::actor (spawnActor, inbox.pid(), mainInbox, newInbox)");
+        // A Slot[M] is an address others send to: a forged one would take over a foreign mailbox.
+        if (e.name == std_Slot() && cur_module_ != STD_ACTOR)
+            error(e.line, e.col, "a Slot can only be created by `newSlot()` / `newBoundedSlot(n)`");
         // A SocketHandOff is a ticket for a connection in transit: a forged one could take over
         // somebody else's connection. Only `c.handOff()` makes one.
         if (e.name == mangle_name(STD_NET, "SocketHandOff") && cur_module_ != STD_NET)

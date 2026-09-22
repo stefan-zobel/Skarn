@@ -439,7 +439,21 @@ and stacks, sharing the program with its starter read-only. Values cross between
   - `rawNewInbox(capacity)` gives an actor or the main program a further inbox with an address of its own,
     typically for a reply; `rawCloseInbox(inbox)` closes one again, and later sends to it answer false. The
     end of an actor closes all of its inboxes.
+  - `rawStopActor(pid)` tells an actor to end: `Stop` goes into every inbox it owns, so it stops wherever
+    it waits. An actor that never receives cannot be stopped this way, and there is no kill.
 - `rawTaskInput()` and `rawSelfId()` are internal: an isolate reads its argument and its own id with them.
+
+**An address that outlives its actor.** A restarted actor is a new actor, so anyone holding the old
+address would have to learn the new one. A **slot** is a mailbox made before its actor: `rawNewSlot(capacity)`
+returns its address, and `rawSpawnInto(slot, fn, arg)` starts an actor that receives on it instead of on a
+mailbox of its own. When that actor ends, the slot keeps its address, so another actor can be started into
+it and answers where its predecessor did.
+- What the ended actor had not read is dropped: delivering the message that crashed it to its successor is
+  the classic crash loop.
+- What arrives while the slot has no actor waits in it for the next one, instead of being refused.
+- The report of a crash names the slot, so a supervisor recognizes its child across restarts.
+- `rawReleaseSlot(slot)` ends the address: later sends answer false, and an actor still running in it is
+  told to stop.
 
 **Back-pressure.** An inbox may be **bounded** — `rawSpawnActorBounded(fn, arg, capacity)` starts an actor
 whose mailbox holds at most `capacity` messages, and `rawNewInbox` takes a capacity too (0 = unbounded).

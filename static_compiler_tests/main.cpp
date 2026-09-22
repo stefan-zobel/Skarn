@@ -9341,6 +9341,224 @@ void test_std_actor() {
         "fn f(inbox: Inbox[Int], unused: Int) -> () {}\nlet a = actorFn(f)\n"
         "let b = ActorFn { f: fn(i: Inbox[Int], u: Int) -> () {}, ..a }\n0",
         "an ActorFn can only be created by `actorFn(f)`"));
+
+    // ---- Slot[M]: an address that outlives its actor ----
+    const std::string WORKER =
+        "fn worker(inbox: Inbox[Ask], factor: Int) -> () {\n"
+        "  for a in inbox.messages() {\n"
+        "    if a.n == 13 { panic(\"unlucky\") }\n"
+        "    send(a.replyTo, a.n * factor)\n"
+        "  }\n"
+        "}\n";
+    // One address, three actors behind it: the first answers, crashes, and the message sent while the
+    // slot stands empty reaches the one started next.
+    check_str("slot_address_survives_restart", cg_run_native(U + ASK_S + WORKER + GET +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let s: Slot[Ask] = newSlot()\n"
+        "let id = s.spawn(actorFn(worker), 2)\n"
+        "let p = s.pid()\n"
+        "send(p, Ask { n: 5, replyTo: me.pid() })\n"
+        "println(got(me.receive()))\n"
+        "send(p, Ask { n: 13, replyTo: me.pid() })\n"
+        "match me.receive() { Mail::Exited(who, _) => println(who == id), _ => println(\"?\") }\n"
+        "send(p, Ask { n: 7, replyTo: me.pid() })\n"
+        "let again = s.spawn(actorFn(worker), 3)\n"
+        "println(got(me.receive()))\n"
+        "println(send(p, Ask { n: 1, replyTo: me.pid() }))\n"
+        "s.release()\n"
+        "println(send(p, Ask { n: 1, replyTo: me.pid() }))\n"), "10\ntrue\n21\ntrue\nfalse\n");
+    // A slot can be sent, so a supervisor actor can be handed the addresses it keeps alive.
+    check_str("slot_travels_to_a_supervisor", cg_run_native(U + ASK_S + WORKER + GET +
+        "fn keeper(inbox: Inbox[Slot[Ask]], unused: Int) -> () {\n"
+        "  for s in inbox.messages() { let id = s.spawn(actorFn(worker), 4) }\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let s: Slot[Ask] = newSlot()\n"
+        "send(spawnActor(keeper, 0), s)\n"
+        "send(s.pid(), Ask { n: 6, replyTo: me.pid() })\n"
+        "println(got(me.receive()))\n"), "24\n");
+    check_str("slot_stop_actor", cg_run_native(U + ASK_S + WORKER + GET +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let p = spawnActor(worker, 5)\n"
+        "send(p, Ask { n: 2, replyTo: me.pid() })\n"
+        "println(got(me.receive()))\n"
+        "println(stopActor(p))\n"), "10\ntrue\n");
+    check_true("slot_needs_message_type", check_has_p(U +
+        "let s = newSlot()\n0", "a new address needs its message type here"));
+    check_true("slot_message_must_be_sendable", check_has_p(U +
+        "let s: Slot[fn(Int) -> Int] = newSlot()\n0", "a new address's messages"));
+    check_true("slot_not_a_value", check_has_p(U + "let f = newSlot\n0", "can only be called"));
+    check_true("slot_no_literal", check_has_p(U +
+        "let s: Slot[Int] = Slot { id: 0 }\n0",
+        "a Slot can only be created by `newSlot()` / `newBoundedSlot(n)`"));
+    check_true("slot_bounded_needs_type", check_has_p(U +
+        "let s = newBoundedSlot(2)\n0", "a new address needs its message type here"));
+}
+
+// =============================================================================
+// std::supervisor -- the library supervisor over std::actor: restart a crashed child, give up past
+// the restart limit (the crash then reaches the supervisor's own starter), children of different
+// types, trees. Every case has exactly one possible output: a child counts its attempts at a
+// counter actor, so which attempt succeeds does not depend on timing.
+// =============================================================================
+void test_std_supervisor() {
+    std::cout << "[codegen: std::supervisor]\n";
+    const std::string U = "use std::actor::*\nuse std::supervisor::*\n";
+    // A counter that answers each request with the next number, and a child that fails until its
+    // attempt number reaches `okAt`, then announces "<tag> up <attempt>" to the boss.
+    const std::string COUNTER =
+        "enum Count { Next(Pid[Int]) }\n"
+        "fn counter(inbox: Inbox[Count], unused: Int) -> () {\n"
+        "  let mut n = 0\n"
+        "  for m in inbox.messages() { match m { Count::Next(r) => { n += 1\n send(r, n) } } }\n"
+        "}\n"
+        "struct Start { counter: Pid[Count], boss: Pid[String], okAt: Int, tag: String }\n"
+        "fn flaky(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let attempt = match ask(s.counter, fn(me) { Count::Next(me) }, 5000) { Ok(n) => n, Err(_) => 0 }\n"
+        "  if attempt < s.okAt { panic(\"attempt ${attempt} failed\") }\n"
+        "  send(s.boss, \"${s.tag} up ${attempt}\")\n"
+        "}\n";
+    const std::string MAIN =
+        "let me: Inbox[String] = mainInbox()\n"
+        "fn start(me: Inbox[String], okAt: Int) -> Start {\n"
+        "  Start { counter: spawnActor(counter, 0), boss: me.pid(), okAt: okAt, tag: \"a\" }\n"
+        "}\n"
+        // A fault's reason ends in its location (\" at line N (in f)\"); the cases compare the text before it.
+        "fn reason(why: String) -> String { let k = indexOf(why, \" at line \")\n if k < 0 { why } else { slice(why, 0, k) } }\n"
+        "fn report(m: Mail[String]) -> () {\n"
+        "  match m { Mail::Msg(t) => println(t), Mail::Exited(_, why) => println(\"died: ${reason(why)}\"), Mail::Stop => println(\"stop\") }\n"
+        "}\n";
+    const std::string ONE =
+        "fn sup(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(flaky), s))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 2, withinMs: 60000 })\n"
+        "}\n";
+
+    check_str("supervisor_restarts_crashed_child", cg_run_native(U + COUNTER + MAIN + ONE +
+        "let p = spawnActor(sup, start(me, 3))\n"
+        "report(me.receive())\n"), "a up 3\n");
+    check_str("supervisor_gives_up_past_limit", cg_run_native(U + COUNTER + MAIN + ONE +
+        "let p = spawnActor(sup, start(me, 4))\n"
+        "report(me.receive())\n"),
+        "died: supervisor: more than 2 restarts within 60000 ms; the last: attempt 3 failed\n");
+    check_str("supervisor_no_restarts_allowed", cg_run_native(U + COUNTER + MAIN +
+        "fn sup(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(flaky), s))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 0, withinMs: 60000 })\n"
+        "}\n"
+        "let p = spawnActor(sup, start(me, 2))\n"
+        "report(me.receive())\n"),
+        "died: supervisor: more than 0 restarts within 60000 ms; the last: attempt 1 failed\n");
+    // Children of two different message and start-value types in one list.
+    check_str("supervisor_heterogeneous_children", cg_run_native(U + COUNTER + MAIN +
+        "fn greeter(inbox: Inbox[String], boss: Pid[String]) -> () { send(boss, \"b up\") }\n"
+        "struct Both { s: Start, boss: Pid[String] }\n"
+        "fn sup(inbox: Inbox[Int], b: Both) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(flaky), b.s))\n"
+        "  push(kids, child(actorFn(greeter), b.boss))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 5, withinMs: 60000 })\n"
+        "}\n"
+        "let p = spawnActor(sup, Both { s: start(me, 2), boss: me.pid() })\n"
+        "let mut got: Vec[String] = vec()\n"
+        "while len(got) < 2 { match me.receive() { Mail::Msg(t) => push(got, t), _ => push(got, \"?\") } }\n"
+        "for t in sorted(got) { println(t) }\n"), "a up 2\nb up\n");
+    // A tree: the inner supervisor allows no restart and gives up at the child's first crash; the
+    // outer one starts the inner again, whose new child then succeeds.
+    check_str("supervisor_tree_restarts_inner", cg_run_native(U + COUNTER + MAIN +
+        "fn inner(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(flaky), s))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 0, withinMs: 60000 })\n"
+        "}\n"
+        "fn outer(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(inner), s))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 1, withinMs: 60000 })\n"
+        "}\n"
+        "let p = spawnActor(outer, start(me, 2))\n"
+        "report(me.receive())\n"), "a up 2\n");
+    // A crash of an actor that is not a child, and messages to the supervisor, change nothing: with
+    // a limit of exactly the two restarts the child needs, a counted stranger would make it give up.
+    check_str("supervisor_ignores_strangers", cg_run_native(U + COUNTER + MAIN +
+        "fn crasher(inbox: Inbox[Int], unused: Int) -> () { panic(\"stranger\") }\n"
+        "fn sup(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let c = spawnActor(crasher, 0)\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(flaky), s))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 2, withinMs: 60000 })\n"
+        "}\n"
+        "let p = spawnActor(sup, start(me, 3))\n"
+        "send(p, 1)\nsend(p, 2)\n"
+        "report(me.receive())\n"), "a up 3\n");
+    // supervise returns at Stop, when the program ends.
+    check_str("supervisor_returns_at_stop", cg_run_native(U + COUNTER + MAIN +
+        "fn sup(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(flaky), s))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 2, withinMs: 60000 })\n"
+        "  println(\"supervisor done\")\n"
+        "}\n"
+        "let p = spawnActor(sup, start(me, 1))\n"
+        "report(me.receive())\n"), "a up 1\nsupervisor done\n");
+    check_str("supervisor_checks_limit", cg_run_native(U + COUNTER + MAIN +
+        "fn sup(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 2, withinMs: 0 })\n"
+        "}\n"
+        "let p = spawnActor(sup, start(me, 1))\n"
+        "report(me.receive())\n"), "died: supervise: withinMs must be at least 1\n");
+    // A child in a SLOT keeps one address across its restarts, and a send while it is being started
+    // again waits in the slot instead of being dropped.
+    // Each start announces itself with -1, so every step is ordered whatever the schedule: a message
+    // is only sent once its receiver is known to be up.
+    const std::string SLOTTED =
+        "struct Job { n: Int, replyTo: Pid[Int] }\n"
+        "fn flakyWorker(inbox: Inbox[Job], boss: Pid[Int]) -> () {\n"
+        "  send(boss, -1)\n"
+        "  for j in inbox.messages() {\n"
+        "    if j.n == 13 { panic(\"unlucky\") }\n"
+        "    send(j.replyTo, j.n * 2)\n"
+        "  }\n"
+        "}\n"
+        "struct Setup { at: Slot[Job], boss: Pid[Int], limit: Int }\n"
+        "fn keeper(inbox: Inbox[Int], s: Setup) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, childIn(s.at, actorFn(flakyWorker), s.boss))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: s.limit, withinMs: 60000 })\n"
+        "}\n"
+        "fn got(m: Mail[Int]) -> Int { match m { Mail::Msg(v) => v, _ => -2 } }\n";
+    check_str("supervisor_slot_child_keeps_address", cg_run_native(U + SLOTTED +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let at: Slot[Job] = newSlot()\n"
+        "let k = spawnActor(keeper, Setup { at: at, boss: me.pid(), limit: 3 })\n"
+        "let p = at.pid()\n"
+        "println(got(me.receive()))\n"                     // the first child is up
+        "send(p, Job { n: 4, replyTo: me.pid() })\n"
+        "println(got(me.receive()))\n"
+        "send(p, Job { n: 13, replyTo: me.pid() })\n"      // it crashes on this one
+        "println(got(me.receive()))\n"                     // its successor, at the SAME address
+        "send(p, Job { n: 5, replyTo: me.pid() })\n"
+        "println(got(me.receive()))\n"), "-1\n8\n-1\n10\n");
+    // Past the limit the supervisor gives up AND gives up the address: a later send answers false.
+    check_str("supervisor_slot_released_when_giving_up", cg_run_native(U + SLOTTED +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let at: Slot[Job] = newSlot()\n"
+        "let k = spawnActor(keeper, Setup { at: at, boss: me.pid(), limit: 0 })\n"
+        "let p = at.pid()\n"
+        "println(got(me.receive()))\n"
+        "send(p, Job { n: 13, replyTo: me.pid() })\n"
+        "match me.receive() { Mail::Exited(_, _) => println(\"gave up\"), _ => println(\"?\") }\n"
+        "println(send(p, Job { n: 1, replyTo: me.pid() }))\n"), "-1\ngave up\nfalse\n");
+    // The list of children is built where it is used: a trait object cannot be sent.
+    check_true("supervisor_children_not_sendable", check_has_p(U +
+        "fn f(inbox: Inbox[Vec[dyn Supervised]], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0",
+        "a trait object (dyn std::supervisor::Supervised)"));
+    check_true("supervisor_needs_use", check_has_p(
+        "use std::actor::*\nfn f(inbox: Inbox[Int], unused: Int) -> () {}\nlet c = child(actorFn(f), 0)\n0",
+        "child"));
 }
 
 // =============================================================================
@@ -10043,7 +10261,10 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // The inbox four (ids 71-74: rawNewInbox / rawCloseInbox / rawTrySend / rawSpawnActorBounded) are NOT
 // listed for the actor eight's reason: whether a bounded inbox is full, or a reply has arrived, depends
 // on how the actors interleave. Pinned by the actor_* tests in vm_tests.
-static_assert(NATIVE_COUNT == 75,
+// The slot four (ids 75-78: rawNewSlot / rawSpawnInto / rawReleaseSlot / rawStopActor) are NOT listed
+// for the same reason: they are about an address a restarted actor keeps, so what they do depends on
+// when an actor crashed and what was on its way. Pinned by the actor_slot_* tests in vm_tests.
+static_assert(NATIVE_COUNT == 79,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 
@@ -12065,6 +12286,7 @@ int main(int argc, char** argv) {
     test_std_poll();
     test_std_task();
     test_std_actor();
+    test_std_supervisor();
     test_interpolation();
     test_format();
     test_string_iter();

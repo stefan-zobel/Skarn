@@ -1,0 +1,14 @@
+// CLAIM: a supervisor's list of children, a Vec[dyn Supervised], cannot be sent to an actor -- it holds trait
+//        objects -- which is why `supervise` runs inside the supervising actor and builds the list there.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: fail it contains a trait object (dyn std::supervisor::Supervised)
+use std::actor::*
+use std::supervisor::*
+
+fn keeper(inbox: Inbox[()], kids: Vec[dyn Supervised]) -> () {
+  supervise(inbox, kids, RestartLimit { maxRestarts: 3, withinMs: 60000 })
+}
+
+let kids: Vec[dyn Supervised] = vec()
+spawnActor(keeper, kids)
+println("unreachable")

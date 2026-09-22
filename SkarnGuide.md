@@ -3486,6 +3486,7 @@ the filesystem, and one without `use std::process` cannot start a program.
 | `std::poll` | non-blocking sockets and readiness polling — many connections from one thread, with the loop written by the program; builds on `std::net` |
 | `std::task` | fork-join parallelism — `spawn` runs a function on its own thread and heap, `join` waits for its result; the argument and result are **copied**, nothing else is shared |
 | `std::actor` | actors — long-lived functions on their own threads with a mailbox; `spawnActor`, `send`, `inbox.messages()`, `ask`, bounded mailboxes; every message is **copied**, a crash is reported to the actor's starter |
+| `std::supervisor` | keeping actors running — `supervise` starts a group of child actors and starts again each one that crashes, up to a restart limit; supervisors nest into trees |
 | `std::regex` | linear-time byte-level regular expressions (Thompson NFA / Pike VM) — no catastrophic backtracking, and therefore **no** backreferences or lookaround |
 
 This table says only what each module is *for*. **Every function of every module, with its signature, is listed
@@ -4042,6 +4043,114 @@ match demo() { Ok(_) => {}, Err(e) => println(e) }
 
 That is how a server spreads over several cores: one actor accepts and hands each connection to a worker.
 `demo/actor_server/` is one, with a load generator built on tasks.
+
+**Supervision.** `std::supervisor` keeps actors running. `supervise(inbox, children, limit)` starts every
+child and, when one crashes, starts it again with the same start value. More than `limit.maxRestarts`
+restarts within `limit.withinMs` milliseconds, and the supervisor gives up by crashing itself, so that its
+own starter learns of it. A supervisor is an ordinary actor, so supervisors nest into trees. `supervise` is
+a function that runs inside the supervising actor, with that actor's inbox, because a crash is reported to
+the actor that started the child. The children are built right there as a `Vec[dyn Supervised]`, so they
+may have different message types. A trait object cannot be sent, and this list never needs to be.
+
+```rust
+use std::actor::*
+use std::supervisor::*
+
+// Hands out 1, 2, 3, ... to whoever asks.
+fn counter(inbox: Inbox[Pid[Int]], unused: Int) -> () {
+  let mut n = 0
+  for replyTo in inbox.messages() {
+    n = n + 1
+    send(replyTo, n)
+  }
+}
+
+struct Job { counter: Pid[Pid[Int]], boss: Pid[String] }
+
+// Fails on its first two attempts, then reports to the boss.
+fn flaky(inbox: Inbox[Int], job: Job) -> () {
+  let attempt = match ask(job.counter, fn(me) { me }, 5000) { Ok(n) => n, Err(_) => 0 }
+  if attempt < 3 { panic("attempt ${attempt} failed") }
+  send(job.boss, "up at attempt ${attempt}")
+}
+
+// The supervisor: an actor that runs `supervise` over its children.
+fn keeper(inbox: Inbox[()], job: Job) -> () {
+  let mut kids: Vec[dyn Supervised] = vec()
+  push(kids, child(actorFn(flaky), job))
+  supervise(inbox, kids, RestartLimit { maxRestarts: 5, withinMs: 10000 })
+}
+
+let me: Inbox[String] = mainInbox()
+spawnActor(keeper, Job { counter: spawnActor(counter, 0), boss: me.pid() })
+match me.receive() {
+  Mail::Msg(s) => println(s),                     // => up at attempt 3
+  _ => {},
+}
+```
+
+**A fixed address across restarts.** A restarted child is a new actor with a new address, which is awkward
+for anyone holding the old one. A **slot** is an address made before its actor and kept across the actors
+started into it: `newSlot()` returns a `Slot[M]`, `slot.pid()` is the address to hand out, and
+`childIn(slot, a, init)` tells the supervisor to start the child there every time. A message sent while
+the child is being started again waits in the slot instead of being dropped — but what the crashed actor
+had not read is gone, because delivering the message that crashed it to its successor would crash that one
+too. `slot.release()` ends the address: later sends answer `false`, and an actor still running there is
+told to stop. A supervisor releases its children's addresses when it gives up.
+
+```rust
+use std::actor::*
+use std::supervisor::*
+
+struct Job { n: Int, replyTo: Pid[Int] }
+
+// Announces itself at every start, and cannot cope with 13.
+fn worker(inbox: Inbox[Job], boss: Pid[Int]) -> () {
+  send(boss, -1)
+  for j in inbox.messages() {
+    if j.n == 13 { panic("unlucky") }
+    send(j.replyTo, j.n * 2)
+  }
+}
+
+struct Setup { at: Slot[Job], boss: Pid[Int] }
+
+fn keeper(inbox: Inbox[Int], s: Setup) -> () {
+  let mut kids: Vec[dyn Supervised] = vec()
+  push(kids, childIn(s.at, actorFn(worker), s.boss))
+  supervise(inbox, kids, RestartLimit { maxRestarts: 3, withinMs: 10000 })
+}
+
+fn got(m: Mail[Int]) -> Int { match m { Mail::Msg(v) => v, _ => -2 } }
+
+let me: Inbox[Int] = mainInbox()
+let at: Slot[Job] = newSlot()
+spawnActor(keeper, Setup { at: at, boss: me.pid() })
+let p = at.pid()                          // one address, however often the worker is restarted
+// The first worker announces itself.
+println(got(me.receive()))                // => -1
+send(p, Job { n: 4, replyTo: me.pid() })
+println(got(me.receive()))                // => 8
+send(p, Job { n: 13, replyTo: me.pid() }) // it crashes on this one
+// Its successor, at the same address, announces itself in turn.
+println(got(me.receive()))                // => -1
+send(p, Job { n: 5, replyTo: me.pid() })
+println(got(me.receive()))                // => 10
+```
+
+`stopActor(p)` tells any actor to end. It stops when it next receives, so an actor that loops without
+receiving cannot be stopped from outside — there is no kill.
+
+Limits of this supervisor:
+- **Crashes only.** A child is started again only after a crash; a child that returns stays ended.
+- **New addresses, unless a slot.** A child made with `child` has a new address after a restart, and must
+  announce it itself — for example by sending `inbox.pid()` to an address in its start value. A child made
+  with `childIn` keeps the slot's address.
+- **Children outlive a supervisor that gives up.** When it gives up, its children keep running.
+- **Not in the main program.** The main program cannot supervise, because it never receives `Stop`, so the
+  program would never end.
+
+`demo/actors/supervised.skn` keeps a pool of crashing workers busy until their work is done.
 
 And `std::regex` matches, captures, and rewrites text with a linear-time engine (compile once, reuse):
 
@@ -4795,6 +4904,17 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `spawnActorBounded(f, init, n)` | as `spawnActor`, but its mailbox holds at most `n` messages; a `send` to it waits while it is full (free) |
 | `trySend(p, m)` | send without ever waiting → `SendResult`: `Sent`, `Full` (nothing was queued) or `Gone` (free) |
 | `actorFn(f)` / `a.spawn(init)` / `a.spawnBounded(init, n)` | `f` as a value that generic code can take and start actors from → `ActorFn[M, I]`, checked as `spawnActor` would check `f` / start an actor → `Pid[M]` (free). An `ActorFn` can itself be sent |
+| `newSlot()` / `newBoundedSlot(n)` | an address that outlives the actors started into it → `Slot[M]` (free; annotate it: `let s: Slot[T] = newSlot()`; the bounded one holds at most `n` messages) |
+| `s.pid()` / `s.spawn(a, init)` / `s.release()` | the address to hand out → `Pid[M]` / start an actor at it → `ActorId` (an error if one is running there) / end the address: later sends answer `false`, an actor still there is told to stop |
+| `stopActor(p)` | tell the actor at `p` to end → `Bool`: `false` if it no longer runs. It stops when it next receives; an actor that never receives cannot be stopped |
+
+**Supervision** *(all `std::supervisor` — `use std::supervisor::*`; builds on `std::actor`)*
+
+| Function | Purpose |
+|----------|---------|
+| `child(a, init)` | a child a supervisor can start again: the `ActorFn` `a` and its start value → `Child[M, I]`, which is `Supervised` (free) |
+| `childIn(slot, a, init)` | the same, but always started at the address `slot` (`std::actor`'s `newSlot`), so the child keeps one address across its restarts → `SlotChild[M, I]` (free) |
+| `supervise(inbox, children, limit)` | run in an actor with its own inbox: start every `children: Vec[dyn Supervised]`, start again each one that crashes, return at `Stop`. More than `limit.maxRestarts` restarts within `limit.withinMs` milliseconds (`RestartLimit { maxRestarts, withinMs }`), and it panics, so its own starter is told. Messages to it are dropped |
 
 **Regex** *(all `std::regex` — `use std::regex::*`; byte-level, linear-time Pike VM; no backrefs/lookaround. Note the names: matching anywhere is `search`, not `find`, and rewriting is `replaceRe`, not `replace` — those two belong to `std::iter` / `std::string`)*
 

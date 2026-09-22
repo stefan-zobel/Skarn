@@ -1,0 +1,20 @@
+// CLAIM: `slot.release()` ends an address for good: a send to it answers false from then on, and the actor
+//        that was running there is told to stop.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: ok true then false
+use std::actor::*
+
+struct Job { n: Int, replyTo: Pid[Int] }
+
+fn worker(inbox: Inbox[Job], unused: Int) -> () {
+  for j in inbox.messages() { send(j.replyTo, j.n) }
+}
+
+let me: Inbox[Int] = mainInbox()
+let at: Slot[Job] = newSlot()
+let _id = at.spawn(actorFn(worker), 0)
+let p = at.pid()
+let before = send(p, Job { n: 1, replyTo: me.pid() })
+match me.receive() { Mail::Msg(_) => {}, _ => println("no reply") }
+at.release()
+println("${before} then ${send(p, Job { n: 2, replyTo: me.pid() })}")

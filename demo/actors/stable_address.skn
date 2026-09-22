@@ -1,0 +1,80 @@
+// A service that keeps ONE address across its restarts (std::actor's Slot + std::supervisor).
+//
+//   main --requests--> [ slot ] <-- the supervisor starts a service here, again after every crash
+//
+// The service squares the numbers it is sent. One of the requests makes it crash; the supervisor
+// starts a new one at the SAME address, and the main program goes on using the `Pid` it has had from
+// the start -- it never learns a new one. At the end the address is released, and a send to it says so.
+//
+// Each service announces itself when it starts, which is what makes this program's output the same
+// under every schedule: a request goes out only once its receiver is known to be up.
+//
+//     static_vmrun demo/actors/stable_address.skn
+use std::actor::*
+use std::supervisor::*
+
+// What the main program hears: a service has started, or a request has been answered.
+enum Note { Up, Answer(Int) }
+
+// A request: square `n`, or (n = 0) the one this service cannot cope with.
+struct Req { n: Int, replyTo: Pid[Note] }
+
+fn service(inbox: Inbox[Req], boss: Pid[Note]) -> () {
+  send(boss, Note::Up)
+  for r in inbox.messages() {
+    if r.n == 0 { panic("service: a request of 0 is not something I can square") }
+    send(r.replyTo, Note::Answer(r.n * r.n))
+  }
+}
+
+struct Setup { at: Slot[Req], boss: Pid[Note] }
+
+// The supervisor: one child, always at the address `at`.
+fn keeper(inbox: Inbox[Int], s: Setup) -> () {
+  let mut kids: Vec[dyn Supervised] = vec()
+  push(kids, childIn(s.at, actorFn(service), s.boss))
+  supervise(inbox, kids, RestartLimit { maxRestarts: 3, withinMs: 10000 })
+}
+
+fn answer(m: Mail[Note]) -> Int {
+  match m {
+    Mail::Msg(Note::Answer(v)) => v,
+    Mail::Msg(Note::Up) => 0,
+    _ => 0,
+  }
+}
+
+fn waitUp(inbox: Inbox[Note]) -> () {
+  match inbox.receive() {
+    Mail::Msg(Note::Up) => {},
+    _ => panic("expected a service to start"),
+  }
+}
+
+let me: Inbox[Note] = mainInbox()
+let at: Slot[Req] = newSlot()
+spawnActor(keeper, Setup { at: at, boss: me.pid() })
+
+let p = at.pid()                       // the one address this program ever uses
+waitUp(me)
+
+let mut total = 0
+let mut n = 1
+while n <= 5 {
+  send(p, Req { n: n, replyTo: me.pid() })
+  total += answer(me.receive())
+  n += 1
+}
+
+send(p, Req { n: 0, replyTo: me.pid() })   // the service crashes on this one
+waitUp(me)                                 // its successor, at the same address
+
+while n <= 10 {
+  send(p, Req { n: n, replyTo: me.pid() })
+  total += answer(me.receive())
+  n += 1
+}
+
+println("squares 1..10 = ${total} (expected 385), one address across one crash")
+at.release()
+println("after release, a send to the address returns ${send(p, Req { n: 1, replyTo: me.pid() })}")

@@ -371,8 +371,11 @@ A `Pid[M]` promises that the actor it names receives `M`. The checker keeps that
   sendable, because only `actorFn` makes one.
 - **Inside a generic function**, the message type of a new inbox and the reply type of `ask` may be a type
   parameter bounded `Sendable`.
+- **`newSlot()` / `newBoundedSlot(n)`** get the same rule as the inbox makers: a `Slot[M]` is an address
+  that outlives the actors started into it (`s.spawn(actorFn(f), init)`), so `M` must be known at the call
+  and sendable. A `Slot` is plain data, so it can be sent to the supervisor that keeps the address alive.
 - **These functions can only be called**, never used as values, so no call escapes the rules above.
-- **`Pid`, `Inbox` and `ActorFn` literals are an error outside `std::actor`.**
+- **`Pid`, `Inbox`, `Slot` and `ActorFn` literals are an error outside `std::actor`.**
 
 A request that wants an answer does not need a selective receive: the answer goes to an inbox of its own,
 with its own type. A bounded inbox provides back-pressure — `send` waits while it is full, `trySend` reports
@@ -387,6 +390,24 @@ back. A `SocketHandOff` literal or record update outside `std::net` is an error,
 ticket for someone else's connection. After the hand-off the sender's `TcpConn` still type-checks; it is a
 rule of the runtime, not of the type system, that every operation on it now returns an `Err` saying the
 socket was handed to another actor.
+
+`std::supervisor` keeps actors running, written in Skarn over `std::actor`, with no rule and no native of
+its own.
+- **What it does:** `supervise(inbox, children, limit)` starts every child and starts again each one that
+  crashes (`one_for_one`), and it returns at `Stop`. More than `maxRestarts` restarts within `withinMs`
+  milliseconds, and it panics; its own starter is then told, so supervisors nest into trees.
+- **Why a function, not an actor:** a crash is reported to the actor that started the child. The loop
+  therefore runs inside the supervising actor, which builds its children there, as `child(actorFn(f),
+  init)` values in a `Vec[dyn Supervised]`. The children may have different message types; a trait object
+  cannot be sent, and the list never is.
+- **A child at a fixed address:** `childIn(slot, actorFn(f), init)` puts the child in a `Slot`, so its
+  address survives every restart and a message sent while it is being started again waits in the slot
+  instead of being dropped. Past the limit the supervisor releases its children's addresses before it
+  gives up, so none is left to swallow mail nobody will read.
+- **Limits:**
+  - Only a crash is reported, so only a crash restarts a child.
+  - A child made with `child` has a new address after a restart; one made with `childIn` keeps the slot's.
+  - A supervisor that gives up leaves its children running.
 
 The reference interpreter used for differential testing does not model actors. A receive depends on which
 actor ran first, and a sequential model would present one schedule as the answer. Actor programs are

@@ -3306,6 +3306,29 @@ inline void task_fns(Assembler& as) {
     as.R6(OpCode::PANIC, 0, 1, 0);
     as.J(OpCode::RET);
 
+    // aslot(inbox_id): like aecho, but it receives on the inbox its ARGUMENT names -- the slot it was
+    // started into, whose id is not its own (rawSpawnInto). Doubles each message to the main program.
+    as.label("aslot");
+    as.R6(OpCode::MOV, 1, 0, 0);
+    as.label("aslot_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BEQ_INT, 4, 7, "aslot_done");
+    as.load_const(7, 1);
+    as.B (OpCode::BNE_INT, 4, 7, "aslot_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.call_native_id(6, 5, 2, 1, NATIVE_MAIL_MSG);
+    as.R6(OpCode::ADD_INT, 6, 6, 6);
+    as.load_const(2, 0);
+    as.R6(OpCode::MOV, 3, 6, 0);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.J(OpCode::J, "aslot_loop");
+    as.label("aslot_done");
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
     // aconn(_): receives a hand-off ticket, takes the connection, writes "hi", closes it, tells the
     // main program it is done (sends 1 to address 0), then waits for Stop.
     as.label("aconn");
@@ -3479,6 +3502,7 @@ inline void declare_task_fns(Assembler& as) {
     as.declare_fn("tdeep",  3, 1);
     as.declare_fn("aecho",  8, 1);
     as.declare_fn("acrash", 2, 1);
+    as.declare_fn("aslot",  8, 1);
     as.declare_fn("astop",  8, 1);
     as.declare_fn("aconn",  8, 1);
     as.declare_fn("areply", 8, 1);
@@ -3505,6 +3529,19 @@ inline void call2(Assembler& as, uint8_t rd, uint16_t native, uint8_t ra, uint8_
     as.call_native_id(rd, 42, 40, 2, native);
 }
 
+// id -> r[rd]: rawNewSlot(capacity) -- an address with no actor yet.
+inline void new_slot(Assembler& as, uint8_t rd, int64_t capacity) {
+    as.load_const(43, capacity);
+    as.call_native_id(rd, 42, 43, 1, NATIVE_NEW_SLOT);
+}
+// id -> r[rd]: rawSpawnInto(slot, fn, arg), with the slot's id in r[rslot] and as the start value
+// (which is what an actor in a slot needs: the inbox it receives on is the slot, not itself).
+inline void spawn_into(Assembler& as, uint8_t rd, uint8_t rslot, const char* fn) {
+    as.R6(OpCode::MOV, 43, rslot, 0);
+    as.LOAD_FN(44, as.func_id(fn));
+    as.R6(OpCode::MOV, 45, rslot, 0);
+    as.call_native_id(rd, 42, 43, 3, NATIVE_SPAWN_INTO);
+}
 // id -> r[rd]: spawnActor fn(arg), where arg is already in r41.
 inline void spawn_actor(Assembler& as, uint8_t rd, const char* fn) {
     as.LOAD_FN(40, as.func_id(fn));
@@ -4117,6 +4154,148 @@ inline void test_actor_bounded_shutdown() {
         std::cout << std::format("  B's send was let go, the end came:   {}  ({:.0f} ms, \"{}\")\n", b_ok ? "PASS" : "FAIL",
                                  ms, r.printed);
         check(setup_ok && a_ok && b_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A SLOT is an address that outlives its actor. The crashed actor's report names the SLOT (so a
+// supervisor's comparison survives a restart), a send while the slot is empty waits in it, and the
+// actor started into it next reads that mail and answers at the same address. Releasing the slot
+// ends the address.
+inline void test_actor_slot_restart() {
+    using namespace forkjoin;
+    std::cout << "=== actor_slot_restart ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        new_slot(as, 11, 0);
+        as.load_const(41, 0);  spawn_into(as, 12, 11, "acrash");
+        receive_main(as, 13, -1);                       // the crash report ...
+        mail_read(as, 14, NATIVE_MAIL_FROM);            // ... names the SLOT, not the isolate
+        send_int(as, 15, 11, 21);                       // nobody is in the slot: this waits in it
+        spawn_into(as, 16, 11, "aslot");
+        receive_main(as, 17, -1);  mail_read(as, 18, NATIVE_MAIL_MSG);
+        send_int(as, 19, 11, 50);                       // the SAME address, a new actor
+        receive_main(as, 20, -1);  mail_read(as, 21, NATIVE_MAIL_MSG);
+        call1(as, 22, NATIVE_RELEASE_SLOT, 11);
+        send_int(as, 23, 11, 1);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool report_ok = r.fault.empty() && is_int(13, 2) && r.regs[14].isInt() && r.regs[11].isInt() &&
+                               r.regs[14].asSigned48() == r.regs[11].asSigned48();
+        const bool queued_ok = r.fault.empty() && r.regs[15].isBool() && r.regs[15].asBool() &&
+                               is_int(17, 1) && is_int(18, 42);
+        const bool same_ok   = r.fault.empty() && is_int(20, 1) && is_int(21, 100);
+        const bool gone_ok   = r.fault.empty() && r.regs[23].isBool() && !r.regs[23].asBool();
+        std::cout << std::format("  the exit report names the slot:   {}{}\n", report_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  a send while empty waits in it:   {}\n", queued_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  the address survives the restart: {}\n", same_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  released: a later send is false:  {}\n", gone_ok ? "PASS" : "FAIL");
+        check(report_ok && queued_ok && same_ok && gone_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// What an actor did not read before it crashed is DROPPED: delivering the message that crashed it to
+// its successor would crash that one too. Only what arrives afterwards waits for the new actor.
+inline void test_actor_slot_drops_pending() {
+    using namespace forkjoin;
+    std::cout << "=== actor_slot_drops_pending ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        new_slot(as, 11, 0);
+        send_int(as, 12, 11, 7);                        // waits in the slot ...
+        as.load_const(41, 0);  spawn_into(as, 13, 11, "acrash");   // ... and this one never reads it
+        receive_main(as, 14, -1);                       // the crash report
+        send_int(as, 15, 11, 9);
+        spawn_into(as, 16, 11, "aslot");
+        receive_main(as, 17, -1);  mail_read(as, 18, NATIVE_MAIL_MSG);
+        receive_main(as, 19, 50);                       // nothing else is coming
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool ok = r.fault.empty() && is_int(14, 2) && is_int(17, 1) && is_int(18, 18) && is_int(19, 0);
+        std::cout << std::format("  the unread message is dropped:  {}{}\n", ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// rawStopActor tells an actor to end, wherever it waits. An address nobody answers at is false.
+inline void test_actor_stop_actor() {
+    using namespace forkjoin;
+    std::cout << "=== actor_stop_actor ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(41, 0);  spawn_actor(as, 11, "aecho");
+        send_int(as, 12, 11, 21);
+        receive_main(as, 13, -1);  mail_read(as, 14, NATIVE_MAIL_MSG);
+        call1(as, 15, NATIVE_STOP_ACTOR, 11);
+        as.load_const(20, 987654);  call1(as, 16, NATIVE_STOP_ACTOR, 20);
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool alive_ok = r.fault.empty() && r.regs[14].isInt() && r.regs[14].asSigned48() == 42;
+        const bool stop_ok  = r.fault.empty() && r.regs[15].isBool() && r.regs[15].asBool() &&
+                              r.regs[16].isBool() && !r.regs[16].asBool();
+        std::cout << std::format("  21 -> 42, then stopped:      {}{}\n", alive_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  a stranger's address: false: {}\n", stop_ok ? "PASS" : "FAIL");
+        check(alive_ok && stop_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// Misusing a slot is a located fault in the caller, never a silently shared address.
+inline void test_actor_slot_misuse() {
+    using namespace forkjoin;
+    std::cout << "=== actor_slot_misuse ===\n";
+    try {
+        auto expect = [](const char* label, const Run& r, const char* want) {
+            const bool ok = r.fault.find(want) != std::string::npos;
+            std::cout << std::format("  {:<28} {}  (\"{}\")\n", label, ok ? "PASS" : "FAIL", r.fault);
+            return ok;
+        };
+        bool all = true;
+        {   // two actors in one slot
+            Assembler as;
+            declare_task_fns(as);
+            as.label("main");
+            main_inbox(as, 10);
+            new_slot(as, 11, 0);
+            spawn_into(as, 12, 11, "aslot");
+            spawn_into(as, 13, 11, "aslot");
+            Heap heap;
+            all &= expect("occupied slot:", run(as, heap), "already has an actor");
+        }
+        {   // a released slot is gone
+            Assembler as;
+            declare_task_fns(as);
+            as.label("main");
+            main_inbox(as, 10);
+            new_slot(as, 11, 0);
+            call1(as, 12, NATIVE_RELEASE_SLOT, 11);
+            spawn_into(as, 13, 11, "aslot");
+            Heap heap;
+            all &= expect("released slot:", run(as, heap), "not a slot");
+        }
+        {   // an ordinary actor's address is not a slot
+            Assembler as;
+            declare_task_fns(as);
+            as.label("main");
+            main_inbox(as, 10);
+            as.load_const(41, 0);  spawn_actor(as, 11, "aecho");
+            spawn_into(as, 12, 11, "aslot");
+            Heap heap;
+            all &= expect("an actor's own address:", run(as, heap), "not a slot");
+        }
+        check(all);
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 

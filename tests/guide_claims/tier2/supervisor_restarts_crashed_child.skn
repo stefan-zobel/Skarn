@@ -1,0 +1,37 @@
+// CLAIM: `supervise` starts a crashed child again with the same start value, so a child that fails twice
+//        and then succeeds is up at its third attempt.
+// GUIDE: 20 (Actors: long-lived, talking by messages)
+// EXPECT: ok up at attempt 3
+use std::actor::*
+use std::supervisor::*
+
+// Hands out 1, 2, 3, ... to whoever asks.
+fn counter(inbox: Inbox[Pid[Int]], unused: Int) -> () {
+  let mut n = 0
+  for replyTo in inbox.messages() {
+    n = n + 1
+    send(replyTo, n)
+  }
+}
+
+struct Job { counter: Pid[Pid[Int]], boss: Pid[String] }
+
+fn flaky(inbox: Inbox[Int], job: Job) -> () {
+  let attempt = match ask(job.counter, fn(me) { me }, 5000) { Ok(n) => n, Err(_) => 0 }
+  if attempt < 3 { panic("attempt ${attempt} failed") }
+  send(job.boss, "up at attempt ${attempt}")
+}
+
+fn keeper(inbox: Inbox[()], job: Job) -> () {
+  let mut kids: Vec[dyn Supervised] = vec()
+  push(kids, child(actorFn(flaky), job))
+  supervise(inbox, kids, RestartLimit { maxRestarts: 2, withinMs: 60000 })
+}
+
+let me: Inbox[String] = mainInbox()
+spawnActor(keeper, Job { counter: spawnActor(counter, 0), boss: me.pid() })
+match me.receive() {
+  Mail::Msg(s) => println(s),
+  Mail::Exited(_, why) => println("died: ${why}"),
+  Mail::Stop => println("stop"),
+}

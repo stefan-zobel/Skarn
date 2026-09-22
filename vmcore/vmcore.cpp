@@ -238,8 +238,13 @@ struct Mail {
 //     (`released`) -- the last so that no sender blocked here can hold up the world's final join.
 //   * `stop_seen`: once Stop has been received, every further receive answers Stop again, so any
 //     loop ends.
+//   * A SLOT (rawNewSlot) is a mailbox made BEFORE its actor and outliving it: an address that
+//     survives a restart. When its actor ends it is VACATED instead of closed -- it keeps its id and
+//     stays in the registry, so a send during the gap waits in it for the next actor. Only
+//     rawReleaseSlot ends it.
 struct Mailbox {
     enum Offer { SENT, FULL, GONE };
+    static constexpr int64_t NO_OWNER = -1;      // a slot between two actors
     std::mutex              m;
     std::condition_variable cv;                  // a receiver waits for mail
     std::condition_variable space;               // a sender waits for room (bounded inboxes only)
@@ -248,6 +253,7 @@ struct Mailbox {
     size_t                  capacity  = 0;       // messages; 0 = unbounded
     size_t                  messages  = 0;       // MAIL_MSG entries in q
     bool                    dead      = false;
+    bool                    slot      = false;   // an address that outlives its actor (rawNewSlot)
     bool                    released  = false;   // the world is ending: a full inbox refuses
     bool                    stopped   = false;   // Stop has been queued
     bool                    stop_seen = false;   // ... and received
@@ -291,6 +297,31 @@ struct Mailbox {
         { std::lock_guard<std::mutex> lk(m); released = true; }
         space.notify_all();
     }
+    // A slot whose actor ended: it keeps its id and stays reachable, but what the actor did not read
+    // is dropped -- re-delivering the message that crashed it would crash its successor too. A sender
+    // waiting for room goes on, into the queue the next actor will read.
+    void vacate() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            owner    = NO_OWNER;
+            q.clear();
+            messages = 0;
+        }
+        space.notify_all();
+    }
+    // Ending a slot for good: no later send gets in, and an actor still running in it is told to
+    // stop. NOT close(), which clears the queue and would drop that very Stop.
+    void retire() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            dead     = true;
+            q.clear();
+            messages = 0;
+            if (owner != NO_OWNER && !stopped) { stopped = true; q.push_back(Mail{ MAIL_STOP, {}, 0, {} }); }
+        }
+        cv.notify_all();
+        space.notify_all();
+    }
 };
 
 // One task or actor. The fields below `joined` belong to a TASK: written by its thread, read by
@@ -299,7 +330,8 @@ struct Isolate {
     int64_t                  id      = 0;
     int64_t                  starter = 0;       // the isolate that started it (0 = the root)
     bool                     actor   = false;
-    std::shared_ptr<Mailbox> mailbox;           // actors only: the main inbox (its id is the actor's)
+    std::shared_ptr<Mailbox> mailbox;           // actors only: the main inbox
+    int64_t                  mailbox_id = 0;    // its id: the actor's own, or a slot's (rawSpawnInto)
     std::thread              thread;
     std::mutex               join_m;            // one joiner at a time: the starter, or the world
     bool                     thread_joined = false;
@@ -391,16 +423,28 @@ struct World {
         }
         box->close();
     }
+    // Every inbox an isolate owns, right now (rawStopActor: an actor may be waiting on any of them).
+    std::vector<std::shared_ptr<Mailbox>> mailboxes_of(int64_t owner) {
+        std::vector<std::shared_ptr<Mailbox>> boxes;
+        std::lock_guard<std::mutex> lk(m);
+        for (auto& [id, box] : mailboxes) if (box->owner == owner) boxes.push_back(box);
+        return boxes;
+    }
+    // Every inbox an isolate owns, at its end: closed -- except a SLOT, which is vacated and stays
+    // in the registry, so its address survives until the next actor is started into it.
     void close_mailboxes_of(int64_t owner) {
         std::vector<std::shared_ptr<Mailbox>> boxes;
+        std::vector<std::shared_ptr<Mailbox>> slots;
         {
             std::lock_guard<std::mutex> lk(m);
             for (auto it = mailboxes.begin(); it != mailboxes.end();) {
-                if (it->second->owner == owner) { boxes.push_back(it->second); it = mailboxes.erase(it); }
-                else ++it;
+                if (it->second->owner != owner) { ++it; continue; }
+                if (it->second->slot) { slots.push_back(it->second); ++it; }
+                else { boxes.push_back(it->second); it = mailboxes.erase(it); }
             }
         }
         for (auto& b : boxes) b->close();
+        for (auto& s : slots) s->vacate();
     }
     // The end of the world: Stop into every actor's inboxes (an actor may be waiting on any of them),
     // release every sender blocked on a full inbox, then join every thread -- repeatedly, because an
@@ -477,6 +521,7 @@ int LineForwardBuf::sync() {
 struct IsolateLocal {
     World*                   world = nullptr;
     int64_t                  id    = 0;
+    int64_t                  main_box = 0;   // the id of its main inbox: its own, or the slot it runs in
     bool                     actor = false;
     std::vector<std::pair<int64_t, std::shared_ptr<Mailbox>>> inboxes;
     Mail                     current;
@@ -562,7 +607,9 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
         local.world        = task->world;
         local.id           = task->isolate->id;
         local.actor        = task->isolate->actor;
-        if (task->isolate->mailbox) local.inboxes.emplace_back(local.id, task->isolate->mailbox);
+        local.main_box     = task->isolate->mailbox_id;
+        if (task->isolate->mailbox)
+            local.inboxes.emplace_back(task->isolate->mailbox_id, task->isolate->mailbox);
         vm.task_input      = task->input;
         vm.task_input_size = task->input_size;
         vm.task_entry_pc   = task->entry_pc;
@@ -2242,10 +2289,16 @@ static void run_isolate(World* world, std::shared_ptr<Isolate> iso, uint16_t fn_
         return;
     }
     actor_buf.flush_partial();
-    world->close_mailboxes_of(iso->id);   // the main inbox and every extra one
-    if (faulted)
-        if (auto box = world->mailbox_of(iso->starter))
-            box->put(Mail{ MAIL_EXITED, {}, iso->id, std::move(fault) });
+    world->close_mailboxes_of(iso->id);   // the main inbox and every extra one (a slot is vacated)
+    // The report names the ADDRESS, which for an actor in a slot outlives it -- so a supervisor's
+    // comparison survives a restart. It goes to the starter's main inbox, found through its record:
+    // its id is not its inbox's when the starter itself lives in a slot.
+    if (faulted) {
+        std::shared_ptr<Mailbox> box;
+        if (iso->starter == 0) box = world->mailbox_of(0);
+        else if (auto st = world->find(iso->starter)) box = st->mailbox;
+        if (box) box->put(Mail{ MAIL_EXITED, {}, iso->mailbox_id, std::move(fault) });
+    }
 }
 
 // The id inside a handle: a bare Int, or Skarn's one-field `Task[R]` / `Pid[M]` / `Inbox[M]`
@@ -2266,8 +2319,12 @@ static Value handle_id(Value v) {
 // therefore registers the new record before the world can be done with it; the next pass of the
 // world's join loop finds it. Registering first would let that loop see a record whose `thread` is
 // still being assigned. Nothing else needs the record before spawn returns its id.
+//
+// `into` is a SLOT the actor takes over instead of getting a mailbox of its own (rawSpawnInto): the
+// slot keeps its id, so the new actor answers at the address its predecessor had.
 static int64_t start_isolate(Value* args, uint8_t nargs, Context* ctx, bool actor, const char* who,
-                             size_t capacity = 0) {
+                             size_t capacity = 0, std::shared_ptr<Mailbox> into = nullptr,
+                             int64_t into_id = 0) {
     VM* vm = ctx->vm;
     IsolateLocal* local = vm->isolate;
     if (!local || !local->world)
@@ -2287,22 +2344,31 @@ static int64_t start_isolate(Value* args, uint8_t nargs, Context* ctx, bool acto
         raise_located(ctx, (std::string(who) + ": the argument cannot be sent: " + e.what()).c_str());
     }
     if (actor) {
-        iso->mailbox = std::make_shared<Mailbox>();
-        iso->mailbox->capacity = capacity;
+        iso->mailbox = into ? into : std::make_shared<Mailbox>();
+        if (!into) iso->mailbox->capacity = capacity;
         world->actors_started.store(true, std::memory_order_release);
     }
     {
         // The main inbox is registered together with the id, before the thread exists: the actor may
         // receive at once, and a world ending from now on finds it (born while the world ends: Stop
-        // at once, in add_mailbox_locked).
+        // at once, in add_mailbox_locked). A slot is registered already and keeps its id.
         std::lock_guard<std::mutex> lk(world->m);
         iso->id = world->next_id++;
-        if (actor) { iso->mailbox->owner = iso->id; world->add_mailbox_locked(iso->id, iso->mailbox); }
+        if (actor && into) {
+            iso->mailbox_id = into_id;
+            std::lock_guard<std::mutex> box_lk(into->m);
+            into->owner = iso->id;
+        } else if (actor) {
+            iso->mailbox_id       = iso->id;
+            iso->mailbox->owner   = iso->id;
+            world->add_mailbox_locked(iso->id, iso->mailbox);
+        }
     }
     try {
         iso->thread = std::thread(run_isolate, world, iso, static_cast<uint16_t>(fn_id));
     } catch (const std::system_error& e) {
-        if (actor) world->close_mailbox(iso->id);
+        if (actor && into) into->vacate();
+        else if (actor) world->close_mailbox(iso->id);
         raise_located(ctx, (std::string(who) + ": could not start a thread: " + e.what()).c_str());
     }
     {
@@ -2405,6 +2471,81 @@ static Value native_actor_spawn_bounded(Value* args, uint8_t nargs, Context* ctx
                                              static_cast<size_t>(cap.asSigned48())));
 }
 
+// rawNewSlot(capacity) -> Int: an ADDRESS with no actor yet. Messages sent to it wait until an actor
+// is started into it (rawSpawnInto), and it survives that actor -- which is how a restarted actor
+// keeps the address its predecessor had. Anyone may make one; only holding its id means anything.
+static Value native_new_slot(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world)
+        raise_located(ctx, "newSlot: this execution has no world");
+    const Value cap = nargs >= 1 ? args[0] : Value::fromNil();
+    if (!cap.isInt() || cap.asSigned48() < 0)
+        raise_located(ctx, "newSlot: the capacity must be 0 (unbounded) or more");
+    auto box = std::make_shared<Mailbox>();
+    box->slot     = true;
+    box->owner    = Mailbox::NO_OWNER;
+    box->capacity = static_cast<size_t>(cap.asSigned48());
+    int64_t id;
+    {
+        std::lock_guard<std::mutex> lk(local->world->m);
+        id = local->world->next_id++;
+        local->world->add_mailbox_locked(id, box);
+    }
+    return Value::fromSigned48(id);
+}
+
+// rawSpawnInto(slot, fn, arg) -> Int, the actor id. The actor receives on the slot instead of on a
+// mailbox of its own, so it answers at the slot's address. One actor at a time.
+static Value native_spawn_into(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world)
+        raise_located(ctx, "spawnInto: this execution cannot start isolates");
+    if (nargs < 3)
+        raise_located(ctx, "spawnInto: needs a slot, a function and a start value");
+    const Value id = handle_id(args[0]);
+    if (!id.isInt()) raise_located(ctx, "spawnInto: not an address");
+    auto box = local->world->mailbox_of(id.asSigned48());
+    if (!box || !box->slot) raise_located(ctx, "spawnInto: this address is not a slot, or it was released");
+    {
+        std::lock_guard<std::mutex> lk(box->m);
+        if (box->owner != Mailbox::NO_OWNER)
+            raise_located(ctx, "spawnInto: this address already has an actor");
+    }
+    return Value::fromSigned48(start_isolate(args + 1, static_cast<uint8_t>(nargs - 1), ctx,
+                                             /*actor=*/true, "spawnInto", 0, box, id.asSigned48()));
+}
+
+// rawReleaseSlot(slot) -> (). Ends an address: later sends answer false, and an actor still running
+// in it is told to stop (it ends when it reads its mail, as at the end of the program).
+static Value native_release_slot(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world) raise_located(ctx, "release: this execution has no world");
+    const Value id = handle_id(nargs >= 1 ? args[0] : Value::fromNil());
+    if (!id.isInt()) raise_located(ctx, "release: not an address");
+    if (auto box = local->world->mailbox_of(id.asSigned48()); box && box->slot) {
+        local->world->close_mailbox(id.asSigned48());   // out of the registry first: no later send gets in
+        box->retire();
+    }
+    return Value::fromNil();
+}
+
+// rawStopActor(pid) -> Bool. Tells an actor to end: Stop into EVERY inbox it owns, because it may be
+// waiting on any of them. False if it no longer runs. Its own return is what actually ends it -- an
+// actor that never receives cannot be stopped from outside.
+static Value native_stop_actor(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world) raise_located(ctx, "stopActor: this execution has no world");
+    const Value id = handle_id(nargs >= 1 ? args[0] : Value::fromNil());
+    if (!id.isInt()) raise_located(ctx, "stopActor: not an actor address");
+    auto box = local->world->mailbox_of(id.asSigned48());
+    if (!box) return Value::fromBool(false);
+    int64_t owner;
+    { std::lock_guard<std::mutex> lk(box->m); owner = box->owner; }
+    if (owner == Mailbox::NO_OWNER || owner == 0) return Value::fromBool(false);
+    for (auto& b : local->world->mailboxes_of(owner)) b->put(Mail{ MAIL_STOP, {}, 0, {} });
+    return Value::fromBool(true);
+}
+
 // rawMainInbox() -> Int. Gives the ROOT a mailbox, so it can receive replies and crash reports.
 // ONCE: the Inbox it becomes fixes the message type, and a second one of another type could read
 // the same queue as something else.
@@ -2473,7 +2614,7 @@ static Value native_close_inbox(Value* args, uint8_t nargs, Context* ctx) {
     (void)own_mailbox(nargs >= 1 ? args[0] : Value::fromNil(), ctx, "close");
     IsolateLocal* local = ctx->vm->isolate;
     const int64_t id    = handle_id(args[0]).asSigned48();
-    if (id == local->id)
+    if (id == local->main_box)
         raise_located(ctx, "close: the main inbox cannot be closed (it ends with its owner)");
     local->world->close_mailbox(id);
     std::erase_if(local->inboxes, [id](const auto& e) { return e.first == id; });
@@ -2697,5 +2838,9 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_CLOSE_INBOX]  = native_close_inbox;
     t[NATIVE_TRY_SEND]     = native_try_send;
     t[NATIVE_ACTOR_SPAWN_BOUNDED] = native_actor_spawn_bounded;
+    t[NATIVE_NEW_SLOT]     = native_new_slot;
+    t[NATIVE_SPAWN_INTO]   = native_spawn_into;
+    t[NATIVE_RELEASE_SLOT] = native_release_slot;
+    t[NATIVE_STOP_ACTOR]   = native_stop_actor;
     return t;
 }
