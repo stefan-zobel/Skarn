@@ -3835,9 +3835,9 @@ crash that stays with the actor that crashed and is reported instead of spreadin
   subjects than to Erlang's untyped ones.
 - **Every actor is an operating-system thread.** Erlang's lightweight processes run on a scheduler of their
   own. Thousands of actors are fine; millions are not.
-- **There is no selective receive, and no links or supervisors.** A reply goes to an inbox of its own
-  instead (see `ask` below). A crash is reported to the actor that started the crashed one, and nothing is
-  restarted.
+- **There is no selective receive, and there are no links.** A reply goes to an inbox of its own instead
+  (see `ask` below), and `select` waits on several inboxes at once. Supervisors exist, as an ordinary
+  library (`std::supervisor`), not as a runtime feature.
 
 `spawnActor(f, init)` starts `f(inbox, init)` on a thread of its own and returns the actor's **address**, a
 `Pid[M]`. `send(pid, m)` puts a copy of `m` into its mailbox. The actor reads its mail with
@@ -3981,6 +3981,61 @@ while i <= 100 {
 
 Two actors that each wait to send into the other's full mailbox wait forever; nothing detects that, so keep
 the messages of a bounded pair flowing in one direction.
+
+**Serving several inboxes from one loop.** `receive()` waits on ONE inbox. `select(boxes, timeoutMs)` waits
+on several and answers **which** of them has something — the index into the list, or `None` when the
+timeout passed (a negative timeout waits indefinitely). The list is built from `inbox.ref()`, because
+inboxes of different message types are different types and cannot share a `Vec`:
+
+```rust
+use std::actor::*
+
+enum Ctl { Pause, Resume }
+
+fn worker(jobs: Inbox[Int], boss: Pid[String]) -> () {
+  let ctl: Inbox[Ctl] = newInbox()
+  send(boss, "ready")
+  let watching = toVec([ctl.ref(), jobs.ref()])   // control first: it wins a tie
+  let mut running = true
+  while running {
+    match select(watching, 1000) {
+      Some(0) => {
+        match ctl.receive() {
+          Mail::Msg(Ctl::Pause)  => { send(boss, "paused") },
+          Mail::Msg(Ctl::Resume) => { send(boss, "resumed") },
+          _                      => { running = false }
+        }
+      },
+      Some(1) => {
+        match jobs.receive() {
+          Mail::Msg(n) => { send(boss, "job ${n}") },
+          _            => { running = false }
+        }
+      },
+      _ => { running = false }             // a second with nothing to do
+    }
+  }
+}
+
+let me: Inbox[String] = mainInbox()
+let w = spawnActor(worker, me.pid())
+match me.receive() { Mail::Msg(s) => println(s), _ => println("?") }
+send(w, 7)
+match me.receive() { Mail::Msg(s) => println(s), _ => println("?") }
+// => ready
+// => job 7
+```
+
+The receive that follows a `select` **cannot wait**: only the owner of an inbox takes mail out of it, and
+the owner is you. Two more things worth knowing:
+
+- **Ties go to the lowest index**, so the order of the list is a priority order — and an inbox that is
+  always ready starves the ones after it.
+- **Watching nothing forever is refused.** `select(vec(), -1)` is a fault rather than a program that hangs
+  with no output; with a timeout, an empty list simply waits it out.
+
+An `InboxRef` names the same mailbox an `Inbox` does, so like an `Inbox` it cannot be sent to another
+actor, and only `inbox.ref()` makes one.
 
 **A generic actor body.** The function an actor runs may itself be generic, wherever the call fixes its
 type parameters — types are erased, so one compiled body serves every message type. That also lets you
@@ -5064,6 +5119,8 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `inbox.close()` | close an inbox made with `newInbox`: later sends answer `false`, what it holds is dropped. A main inbox cannot be closed |
 | `spawnActorBounded(f, init, n)` | as `spawnActor`, but its mailbox holds at most `n` messages; a `send` to it waits while it is full (free) |
 | `trySend(p, m)` | send without ever waiting → `SendResult`: `Sent`, `Full` (nothing was queued) or `Gone` (free) |
+| `inbox.ref()` | this inbox as an entry for a `select` list → `InboxRef`. It carries no message type, which is what lets inboxes of different types be waited on together. Like an `Inbox`, it cannot be sent |
+| `select(boxes, ms)` | wait until one of several inboxes has something → `Option[Int]`, the INDEX into `boxes` (`None` = the timeout passed; a negative `ms` waits indefinitely) (free). Ties go to the LOWEST index, so the order is a priority order. It takes nothing out: the `receive()` that follows cannot wait. An empty list with a negative `ms` is a fault |
 | `actorFn(f)` / `a.spawn(init)` / `a.spawnBounded(init, n)` | `f` as a value that generic code can take and start actors from → `ActorFn[M, I]`, checked as `spawnActor` would check `f` / start an actor → `Pid[M]` (free). An `ActorFn` can itself be sent |
 | a GENERIC `f` | allowed wherever the call fixes its type parameters (one erased body serves every use). `spawnActor(relay, boss)` learns them from `boss`; `actorFn(relay)` alone needs an annotation |
 | `newSlot()` / `newBoundedSlot(n)` | an address that outlives the actors started into it → `Slot[M]` (free; annotate it: `let s: Slot[T] = newSlot()`; the bounded one holds at most `n` messages) |

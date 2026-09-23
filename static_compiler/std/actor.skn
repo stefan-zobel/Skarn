@@ -35,6 +35,12 @@
 // closes the inbox again. Close an inbox you made yourself with `inbox.close()` when you are done;
 // the end of the actor closes all of them.
 //
+// WAITING ON SEVERAL OF THEM. A `receive` waits on ONE inbox. To serve several from one loop,
+// `select(boxes, timeoutMs)` waits until any of them has something and answers WHICH -- the index
+// into the list, which is built from `inbox.ref()` because inboxes of different message types
+// cannot share a Vec. The receive that follows is an ordinary typed one and cannot wait. Ties go to
+// the lowest index, so the order of the list is a priority order.
+//
 // BACK-PRESSURE. An inbox may be BOUNDED: `spawnActorBounded(f, init, n)` starts an actor whose main
 // inbox holds at most n messages, and `newBoundedInbox(n)` makes such an extra inbox. A `send` to a
 // full inbox WAITS until the receiver has taken a message, so a fast sender is slowed to the pace
@@ -74,6 +80,12 @@ pub struct Slot[M] { id: Int }
 
 // Names an actor regardless of its message type -- what an exit report carries.
 pub struct ActorId { id: Int }
+
+// An inbox in a `select` list. Inboxes of different message types are different types and cannot
+// share a Vec, so the list holds these instead: an InboxRef names a mailbox and says nothing else,
+// which is exactly what a readiness question needs. Only `inbox.ref()` makes one, and like an Inbox
+// it cannot be sent -- only its owner may read the mailbox behind it.
+pub struct InboxRef { id: Int }
 
 // What `receive` hands back.
 pub enum Mail[M] { Msg(M), Exited(ActorId, String), Stop }
@@ -184,6 +196,33 @@ pub fn newBoundedInbox[M](capacity: Int) -> Inbox[M] {
   Inbox { id: rawNewInbox(capacity) }
 }
 
+// Wait until one of several inboxes has something to read, and answer WHICH -- the index into
+// `boxes`, or None when `timeoutMs` passed without anything arriving. A negative timeout waits
+// indefinitely; a zero one asks and returns at once. Every inbox must be one of yours.
+//
+// It takes nothing out. Call `receive()` on the inbox the index names; that receive cannot wait,
+// because only the owner takes mail out of an inbox and the owner is you. The mail it then gets may
+// be a message, an exit report or Stop, exactly as any other receive.
+//
+// TIES GO TO THE LOWEST INDEX, so the order of the list is a priority order: put a control inbox
+// before a work inbox and the control mail is served first when both are ready. Beware the other
+// side of that -- an inbox that is always ready starves the ones after it.
+//
+//     let jobs: Inbox[Job]  = mainInbox()
+//     let ctl:  Inbox[Ctl]  = newInbox()
+//     let boxes = toVec([ctl.ref(), jobs.ref()])    // control first: it wins a tie
+//     match select(boxes, -1) {
+//       Some(0) => handle(ctl.receive()),
+//       Some(1) => work(jobs.receive()),
+//       _       => {}
+//     }
+//
+// An empty list with a negative timeout is a fault: nothing could ever end that wait.
+pub fn select(boxes: Vec[InboxRef], timeoutMs: Int) -> Option[Int] {
+  let i = rawSelect(boxes, timeoutMs)
+  if i < 0 { None } else { Some(i) }
+}
+
 // Be told when the actor at `p` ends: an `Exited(id, reason)` arrives in `rx`, one of YOUR inboxes. It
 // watches that one actor and reports exactly once -- an actor started into the same slot afterwards is
 // not watched, so monitor again if you want to go on watching. The reason is "normal" if it returned,
@@ -252,6 +291,10 @@ impl[M] Inbox[M] {
 
   // The address of the actor this inbox belongs to -- to hand out, e.g. inside a message.
   fn pid(self) -> Pid[M] { Pid { id: self.id } }
+
+  // This inbox as an entry for a `select` list. It carries no message type, which is what lets
+  // inboxes of different types be waited on together.
+  fn ref(self) -> InboxRef { InboxRef { id: self.id } }
 
   // Has this actor been told to end? For an actor whose loop is its OWN work and which therefore never
   // reaches a receive: it asks, and ends itself. It consumes no mail, so a later receive is unaffected,

@@ -201,6 +201,8 @@ int main(int argc, char** argv) {
     run("actor_monitor",            test_actor_monitor);
     run("actor_monitor_others",     test_actor_monitor_others);
     run("actor_stop_requested",     test_actor_stop_requested);
+    run("actor_select",             test_actor_select);
+    run("actor_select_stop",        test_actor_select_stop);
     // Registered LAST on purpose: on the switch dispatcher a runaway loop can no
     // longer overflow the native stack, but the canary still guards its ~10M-instr
     // survival + r0 == 0 invariant (Release only; Debug prints SKIPPED).

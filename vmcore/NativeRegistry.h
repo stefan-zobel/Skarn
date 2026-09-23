@@ -141,7 +141,10 @@ enum NativeId : uint16_t {
     // whose loop is its own work can end on its own instead of being unstoppable.
     NATIVE_STOP_REQUESTED = 80, // rawStopRequested(inbox) -> Bool (consumes no mail, never waits)
     NATIVE_SLEEP       = 81,    // rawSleep(ms)            -> ()   (this isolate waits; std::time's sleep)
-    NATIVE_COUNT       = 82,
+    // Waiting on SEVERAL inboxes: answers WHICH one has something, so the receive that follows is an
+    // ordinary typed one. The wait is on the isolate's WaitPad, not on any one mailbox.
+    NATIVE_SELECT      = 82,    // rawSelect(boxes, timeoutMs) -> Int (the index, or -1 on the timeout)
+    NATIVE_COUNT       = 83,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -236,6 +239,7 @@ inline int native_id_of(const std::string& name) {
     if (name == "rawMonitor") return NATIVE_MONITOR;
     if (name == "rawStopRequested") return NATIVE_STOP_REQUESTED;
     if (name == "rawSleep") return NATIVE_SLEEP;
+    if (name == "rawSelect") return NATIVE_SELECT;
     return -1;
 }
 
@@ -293,7 +297,7 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_MAIL_FROM: case NATIVE_MAIL_REASON: case NATIVE_MAIN_INBOX: case NATIVE_SELF_ID:
         case NATIVE_NEW_INBOX: case NATIVE_CLOSE_INBOX: case NATIVE_TRY_SEND: case NATIVE_ACTOR_SPAWN_BOUNDED:
         case NATIVE_NEW_SLOT: case NATIVE_SPAWN_INTO: case NATIVE_RELEASE_SLOT: case NATIVE_STOP_ACTOR:
-        case NATIVE_MONITOR: case NATIVE_STOP_REQUESTED: case NATIVE_SLEEP:
+        case NATIVE_MONITOR: case NATIVE_STOP_REQUESTED: case NATIVE_SLEEP: case NATIVE_SELECT:
         case NATIVE_READ_ALL_STDIN: return NRET_PLAIN;
         default:                 return NRET_RESULT;
     }
@@ -320,6 +324,7 @@ inline int native_arity(int id) {
         case NATIVE_ACTOR_SPAWN:
         case NATIVE_SEND:
         case NATIVE_RECEIVE:
+        case NATIVE_SELECT:
         case NATIVE_TRY_SEND:
         case NATIVE_MONITOR:
         case NATIVE_RUN_PROCESS: return 2;

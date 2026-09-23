@@ -228,6 +228,27 @@ struct Mail {
     std::string          reason;       // MAIL_EXITED: its fault message
 };
 
+// Several inboxes, one sleeper. A receive waits on ONE mailbox's `cv`; rawSelect waits here instead,
+// and every mailbox wakes its owner's pad in addition to its own `cv`. The pad belongs to the
+// ISOLATE, not to a mailbox, which is what lets one wait cover all of them.
+//   * `waiters` is why an ordinary send does not pay for a feature it does not use: with nobody
+//     parked, waking is one relaxed load and no mutex.
+//   * `gen` closes the race between the scan and the wait. rawSelect looks at the mailboxes while
+//     holding NO pad lock, so mail can arrive in between; it then parks only if `gen` is unchanged.
+//   * A notifier takes the mailbox mutex and this one in SEQUENCE, never nested (put/offer release
+//     the box before waking) -- so no lock order between the two exists to get wrong.
+struct WaitPad {
+    std::mutex              m;
+    std::condition_variable cv;
+    uint64_t                gen = 0;        // guarded by m; bumped on every wake
+    std::atomic<int>        waiters{ 0 };
+    void wake() {
+        if (waiters.load(std::memory_order_relaxed) == 0) return;
+        { std::lock_guard<std::mutex> lk(m); ++gen; }
+        cv.notify_all();
+    }
+};
+
 // One inbox's queue: an actor's main inbox (its id is the actor's), the root's (id 0), or an extra
 // inbox an actor or the root made with rawNewInbox. Only its OWNER receives from it.
 //   * `dead` is set when the inbox is closed -- by rawCloseInbox or because its owner ended -- and
@@ -257,19 +278,26 @@ struct Mailbox {
     bool                    released  = false;   // the world is ending: a full inbox refuses
     bool                    stopped   = false;   // Stop has been queued
     bool                    stop_seen = false;   // ... and received
+    // The OWNER's wake pad, for rawSelect: copied out under `m` and woken after it is released, so
+    // the two mutexes are only ever held in sequence. Null while a slot has no actor.
+    std::shared_ptr<WaitPad> pad;
     // System mail (MAIL_EXITED, MAIL_STOP): never waits, ignores the capacity.
     bool put(Mail&& mail) {
+        std::shared_ptr<WaitPad> p;
         {
             std::lock_guard<std::mutex> lk(m);
             if (dead) return false;
             if (mail.kind == MAIL_STOP) { if (stopped) return true; stopped = true; }
             q.push_back(std::move(mail));
+            p = pad;
         }
         cv.notify_one();
+        if (p) p->wake();
         return true;
     }
     // A message. `wait`: block while the inbox is full (rawSend); otherwise answer FULL (rawTrySend).
     Offer offer(Mail&& mail, bool wait) {
+        std::shared_ptr<WaitPad> p;
         {
             std::unique_lock<std::mutex> lk(m);
             if (capacity != 0 && wait)
@@ -278,21 +306,29 @@ struct Mailbox {
             if (capacity != 0 && messages >= capacity) return wait ? GONE : FULL;
             q.push_back(std::move(mail));
             ++messages;
+            p = pad;
         }
         cv.notify_one();
+        if (p) p->wake();
         return SENT;
     }
     // Closing: refuse every later send, drop what is queued, and wake anyone waiting on either side.
     void close() {
+        std::shared_ptr<WaitPad> p;
         {
             std::lock_guard<std::mutex> lk(m);
             dead = true;
             q.clear();
             messages = 0;
+            p = pad;
         }
         cv.notify_all();
         space.notify_all();
+        if (p) p->wake();
     }
+    // No pad wake here: `released` says nothing about what a select waits for (queued mail or Stop),
+    // and the end of the world puts Stop into every actor's inboxes -- which does wake it -- before
+    // releasing them.
     void release() {
         { std::lock_guard<std::mutex> lk(m); released = true; }
         space.notify_all();
@@ -306,6 +342,7 @@ struct Mailbox {
             owner    = NO_OWNER;
             q.clear();
             messages = 0;
+            pad.reset();       // with the owner: the next rawSpawnInto brings its own
         }
         space.notify_all();
     }
@@ -315,15 +352,18 @@ struct Mailbox {
     // told to stop and then released -- what an orderly shutdown does -- would otherwise wait on a
     // mailbox that is empty, dead and out of the registry, which nothing can reach again.
     void retire() {
+        std::shared_ptr<WaitPad> p;
         {
             std::lock_guard<std::mutex> lk(m);
             dead     = true;
             q.clear();
             messages = 0;
             if (owner != NO_OWNER) { stopped = true; q.push_back(Mail{ MAIL_STOP, {}, 0, {} }); }
+            p = pad;
         }
         cv.notify_all();
         space.notify_all();
+        if (p) p->wake();   // the actor in the slot may be in a select, not in a receive
     }
 };
 
@@ -335,6 +375,9 @@ struct Isolate {
     bool                     actor   = false;
     std::shared_ptr<Mailbox> mailbox;           // actors only: the main inbox
     int64_t                  mailbox_id = 0;    // its id: the actor's own, or a slot's (rawSpawnInto)
+    // Where this isolate sleeps when it waits on SEVERAL inboxes (rawSelect). Every mailbox it owns
+    // holds a copy, and wakes it. Made at birth, so an inbox can be attached before the thread runs.
+    std::shared_ptr<WaitPad> pad = std::make_shared<WaitPad>();
     // Who asked to be told when this actor ends (rawMonitor): the inboxes the reports go into, and
     // whether the end has already happened. Both are guarded by World::m, like the registries.
     std::vector<int64_t>     watchers;
@@ -389,6 +432,9 @@ struct World {
     std::mutex                m;                  // guards everything below
     std::unordered_map<int64_t, std::shared_ptr<Isolate>> isolates;
     int64_t                   next_id  = 1;       // 0 is the root
+    // The ROOT has no Isolate record, so its wake pad lives here; main_mailbox is given a copy in
+    // execute(), where the root builds its world.
+    std::shared_ptr<WaitPad>  root_pad = std::make_shared<WaitPad>();
     std::shared_ptr<Mailbox>  main_mailbox = std::make_shared<Mailbox>();
     // Every open inbox by id: the root's (0), each actor's main inbox (under the actor's id) and the
     // extra ones (ids from the same counter as the isolates, so one id names one thing). A closed
@@ -531,6 +577,9 @@ struct IsolateLocal {
     int64_t                  main_box = 0;   // the id of its main inbox: its own, or the slot it runs in
     bool                     actor = false;
     std::vector<std::pair<int64_t, std::shared_ptr<Mailbox>>> inboxes;
+    // This isolate's wake pad: where rawSelect sleeps, and what every inbox above wakes. The same
+    // object the World reaches through Isolate::pad -- the two ends a wait-for graph would need.
+    std::shared_ptr<WaitPad> pad;
     Mail                     current;
     Mailbox* inbox(int64_t box_id) const {
         for (const auto& [i, b] : inboxes) if (i == box_id) return b.get();
@@ -615,6 +664,7 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
         local.id           = task->isolate->id;
         local.actor        = task->isolate->actor;
         local.main_box     = task->isolate->mailbox_id;
+        local.pad          = task->isolate->pad;
         if (task->isolate->mailbox)
             local.inboxes.emplace_back(task->isolate->mailbox_id, task->isolate->mailbox);
         vm.task_input      = task->input;
@@ -624,7 +674,9 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
         own_world.emplace();
         own_world->image  = &image;
         own_world->target = out ? out : &std::cout;
+        own_world->main_mailbox->pad = own_world->root_pad;   // the root's inbox wakes the root
         local.world       = &*own_world;
+        local.pad         = own_world->root_pad;
     }
     vm.image   = &image;
     vm.isolate = &local;
@@ -2380,9 +2432,11 @@ static int64_t start_isolate(Value* args, uint8_t nargs, Context* ctx, bool acto
             iso->mailbox_id = into_id;
             std::lock_guard<std::mutex> box_lk(into->m);
             into->owner = iso->id;
+            into->pad   = iso->pad;          // vacate() cleared the previous actor's
         } else if (actor) {
             iso->mailbox_id       = iso->id;
             iso->mailbox->owner   = iso->id;
+            iso->mailbox->pad     = iso->pad;
             world->add_mailbox_locked(iso->id, iso->mailbox);
         }
     }
@@ -2598,6 +2652,7 @@ static Value native_new_inbox(Value* args, uint8_t nargs, Context* ctx) {
     auto box = std::make_shared<Mailbox>();
     box->owner    = local->id;
     box->capacity = static_cast<size_t>(cap.asSigned48());
+    box->pad      = local->pad;      // so a select over it is woken
     int64_t id;
     {
         std::lock_guard<std::mutex> lk(local->world->m);
@@ -2776,6 +2831,88 @@ static Value native_receive(Value* args, uint8_t nargs, Context* ctx) {
     return Value::fromSigned48(local->current.kind);
 }
 
+// Read a Vec or Array of inbox handles into host memory. Like read_int_seq, but each element goes
+// through handle_id, so a bare Int and Skarn's one-field `InboxRef` both work. The whole read
+// happens BEFORE anything else, so nothing here can be moved out from under us by a collection.
+static bool read_handle_seq(Value v, std::vector<int64_t>* out) {
+    if (!v.isPtr()) return false;
+    GcObject* hdr   = GcObject::from_slots(v.asPtr());
+    Value*    elems = nullptr;
+    uint32_t  n     = 0;
+    if (hdr->kind == GcObject::KIND_ARRAY) {
+        elems = hdr->slots();
+        n     = static_cast<uint32_t>(hdr->slot_count());
+    } else if (hdr->kind == GcObject::KIND_VEC) {
+        GcObject* backing = GcObject::from_slots(hdr->slots()[VEC_SLOT_BACKING].asPtr());
+        n     = static_cast<uint32_t>(hdr->slots()[VEC_SLOT_COUNT].asSigned48());
+        elems = backing->slots();
+    } else {
+        return false;
+    }
+    out->reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        const Value id = handle_id(elems[i]);
+        if (!id.isInt()) return false;
+        out->push_back(id.asSigned48());
+    }
+    return true;
+}
+
+// rawSelect(boxes, timeoutMs) -> Int: the INDEX of the first inbox with something to read, or -1
+// when the timeout passed. A negative timeout waits indefinitely. Ties go to the lowest index, so a
+// caller expresses a priority by the order of the list.
+//
+// It reports readiness and takes nothing out: the caller then calls rawReceive on the inbox it
+// names, which cannot block, because only the owner dequeues and the owner is the caller. The
+// readiness test is rawReceive's own predicate, which is what makes that exact.
+//
+// Unlike rawReceive it cannot wait on any one mailbox's `cv` -- it waits on the ISOLATE's WaitPad,
+// which every one of its mailboxes wakes. The scan below holds no pad lock while it takes a
+// mailbox's, and the generation counter catches mail that arrived during the scan; see WaitPad.
+static Value native_select(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    std::vector<int64_t> ids;
+    if (nargs < 1 || !read_handle_seq(args[0], &ids))
+        raise_located(ctx, "select: expected (boxes: Vec[InboxRef], timeoutMs: Int)");
+    const int64_t ms = (nargs >= 2 && args[1].isInt()) ? args[1].asSigned48() : -1;
+    // Every inbox must be one of ours, checked before anything waits -- own_mailbox words the two
+    // refusals (someone else's, or closed) exactly as receive does.
+    std::vector<Mailbox*> boxes;
+    boxes.reserve(ids.size());
+    for (const int64_t id : ids)
+        boxes.push_back(&own_mailbox(Value::fromSigned48(id), ctx, "select"));
+    // Nothing to watch and no deadline: no event could ever end this wait. rawPoll refuses the same
+    // shape rather than leaving a program hanging with no output.
+    if (boxes.empty() && ms < 0)
+        raise_located(ctx, "select: a negative timeout with no inbox would wait forever");
+    if (!local || !local->pad)
+        raise_located(ctx, "select: this execution has no inbox (mainInbox first?)");
+    WaitPad& pad = *local->pad;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms < 0 ? 0 : ms);
+    pad.waiters.fetch_add(1, std::memory_order_relaxed);
+    int64_t found = -1;
+    for (;;) {
+        uint64_t gen;
+        { std::lock_guard<std::mutex> lk(pad.m); gen = pad.gen; }
+        for (size_t i = 0; i < boxes.size() && found < 0; ++i) {
+            std::lock_guard<std::mutex> lk(boxes[i]->m);
+            if (!boxes[i]->q.empty() || boxes[i]->stop_seen) found = static_cast<int64_t>(i);
+        }
+        if (found >= 0) break;
+        std::unique_lock<std::mutex> lk(pad.m);
+        if (pad.gen != gen) continue;             // something arrived while we were scanning
+        if (ms < 0) {
+            pad.cv.wait(lk, [&] { return pad.gen != gen; });
+        } else if (pad.cv.wait_until(lk, deadline, [&] { return pad.gen != gen; })) {
+            continue;
+        } else {
+            break;                                 // the deadline passed with nothing to read
+        }
+    }
+    pad.waiters.fetch_sub(1, std::memory_order_relaxed);
+    return Value::fromSigned48(found);
+}
+
 // rawMailMsg(inbox) -> the message rawReceive took, decoded into THIS heap. Once per message.
 static Value native_mail_msg(Value* args, uint8_t nargs, Context* ctx) {
     (void)own_mailbox(nargs >= 1 ? args[0] : Value::fromNil(), ctx, "receive");
@@ -2924,5 +3061,6 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_MONITOR]      = native_monitor;
     t[NATIVE_STOP_REQUESTED] = native_stop_requested;
     t[NATIVE_SLEEP]        = native_sleep;
+    t[NATIVE_SELECT]       = native_select;
     return t;
 }

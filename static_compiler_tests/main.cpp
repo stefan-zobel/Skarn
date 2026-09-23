@@ -2562,7 +2562,18 @@ std::string cg_run_native(const std::string& src,
     // The I/O / env / process natives live in opt-in modules. A native-exercising
     // test program pulls all three in; an unused `use` is harmless.
     const std::string full = "use std::io::*\nuse std::env::*\nuse std::process::*\n" + src;
-    svc::Module m = svc::compile(full.c_str(), svc::builtin_prelude());
+    // A test program that does not COMPILE is a broken test, not a result. Returning the message
+    // makes it one WRONG line naming the test; letting it out would end the whole suite in
+    // std::terminate -- and with stdout block-buffered into a file, the lines saying which test it
+    // was are lost with it. Only the COMPILE is caught: a RUNTIME fault must still escape, because
+    // `faults_with` and the socket tests read it as the outcome under test.
+    std::unique_ptr<svc::Module> compiled;
+    try {
+        compiled = std::make_unique<svc::Module>(svc::compile(full.c_str(), svc::builtin_prelude()));
+    } catch (const std::exception& e) {
+        return std::string("[the test program does not compile] ") + e.what();
+    }
+    svc::Module& m = *compiled;
     Heap heap;
     StringInterner interner;
     std::ostringstream out;
@@ -9535,6 +9546,75 @@ void test_std_actor() {
         "let forged: Inbox[Int] = Inbox { id: 7 }\n"
         "println(forged.stopRequested())\n", "can only be created by std::actor"));
 
+    // ---- select: waiting on several inboxes at once ----
+    // The case that was impossible before: one loop serving the actor's own mail AND a reply inbox
+    // fed by someone else. The reply arrives in the SECOND inbox and wakes the same select.
+    const std::string SELWORK =
+        "fn helper(inbox: Inbox[Pid[String]], unused: Int) -> () {\n"
+        "  for to in inbox.messages() { send(to, \"hello\") }\n"
+        "}\n"
+        "fn serve(inbox: Inbox[Int], boss: Pid[String]) -> () {\n"
+        "  let rx: Inbox[String] = newInbox()\n"
+        "  let h = spawnActor(helper, 0)\n"
+        "  let boxes = toVec([rx.ref(), inbox.ref()])\n"
+        "  let mut on = true\n"
+        "  while on {\n"
+        "    match select(boxes, 10000) {\n"
+        "      Some(0) => {\n"
+        "        match rx.receive() {\n"
+        "          Mail::Msg(s) => { send(boss, \"rx ${s}\") },\n"
+        "          _            => { on = false }\n"
+        "        }\n"
+        "      },\n"
+        "      Some(1) => {\n"
+        "        match inbox.receive() {\n"
+        "          Mail::Msg(n) => { if n == 0 { send(h, rx.pid()) } else { send(boss, \"job ${n}\") } },\n"
+        "          _            => { on = false }\n"
+        "        }\n"
+        "      },\n"
+        "      _ => { on = false }\n"
+        "    }\n"
+        "  }\n"
+        "  send(boss, \"done\")\n"
+        "}\n";
+    check_str("select_serves_two_inboxes", cg_run_native(U + SELWORK +
+        "let me: Inbox[String] = mainInbox()\n"
+        "let p = spawnActor(serve, me.pid())\n"
+        "send(p, 4)\n"
+        "match me.receive() { Mail::Msg(s) => println(s), _ => println(\"?\") }\n"
+        "send(p, 0)\n"
+        "match me.receive() { Mail::Msg(s) => println(s), _ => println(\"?\") }\n"
+        "stopActor(p)\n"
+        "match me.receive() { Mail::Msg(s) => println(s), _ => println(\"?\") }\n"),
+        "job 4\nrx hello\ndone\n");
+    // Nothing to read: the deadline answers None. Then both are ready and the LOWEST index wins, so
+    // the order of the list is a priority order.
+    check_str("select_timeout_and_tie_break", cg_run_native(U +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let rx: Inbox[String] = newInbox()\n"
+        "println(toString(select(toVec([me.ref(), rx.ref()]), 30)))\n"
+        "send(me.pid(), 1)\n"
+        "send(rx.pid(), \"x\")\n"
+        "println(toString(select(toVec([me.ref(), rx.ref()]), 0)))\n"
+        "println(toString(select(toVec([rx.ref(), me.ref()]), 0)))\n"),
+        "None\nSome(0)\nSome(0)\n");
+    // Watching nothing with no deadline could never end: a located fault, as rawPoll refuses the
+    // same shape rather than leaving a program hanging with no output.
+    check_true("select_empty_forever_faults", cg_faults_msg(U +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let none: Vec[InboxRef] = vec()\n"
+        "println(toString(select(none, -1)))\n", "would wait forever"));
+    // An InboxRef names the same mailbox an Inbox does: it cannot travel to another isolate ...
+    check_true("select_ref_is_not_sendable", check_has_p(U +
+        "struct Watch { r: InboxRef }\n"
+        "fn w(inbox: Inbox[Watch], unused: Int) -> () { let _m = inbox.receive() }\n"
+        "let _p = spawnActor(w, 0)\n", "a reference to an actor's inbox"));
+    // ... and it cannot be forged, for the reason an Inbox cannot.
+    check_true("select_ref_cannot_be_forged", check_has_p(U +
+        "let forged = InboxRef { id: 7 }\n"
+        "println(toString(select(toVec([forged]), 0)))\n",
+        "an InboxRef can only be created by `inbox.ref()`"));
+
     // ---- Slot[M]: an address that outlives its actor ----
     const std::string WORKER =
         "fn worker(inbox: Inbox[Ask], factor: Int) -> () {\n"
@@ -10645,7 +10725,9 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // to stop, which no sequential model has. Pinned by actor_stop_requested in vm_tests.
 // rawSleep (id 81) is NOT listed either: its whole effect is the passing of time, which the oracle does
 // not model. Pinned by std_time_sleep_waits.
-static_assert(NATIVE_COUNT == 82,
+// rawSelect (id 82) is NOT listed either: it answers which of several inboxes has mail, which depends on
+// how the isolates interleave. Pinned by the select_* tests here and by actor_select_* in vm_tests.
+static_assert(NATIVE_COUNT == 83,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 

@@ -3353,6 +3353,32 @@ inline void task_fns(Assembler& as) {
     as.load_const(0, 0);
     as.J(OpCode::RET);
 
+    // aselect(_): parks in a SELECT over its own inbox and a second one, with no deadline. Whatever
+    // wakes it, it receives that inbox and sends the mail KIND to the main program -- so a test can
+    // see that Stop reaches an actor sleeping in a select, not only one sleeping in a receive.
+    as.label("aselect");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.load_const(2, 0);
+    as.call_native_id(6, 5, 2, 1, NATIVE_NEW_INBOX);     // r6 = a second inbox
+    as.VEC_NEW(7);
+    as.VEC_PUSH(7, 1);
+    as.VEC_PUSH(7, 6);
+    as.R6(OpCode::MOV, 2, 7, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_SELECT);        // r4 = the index that woke us
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(7, 0);
+    as.B (OpCode::BEQ_INT, 4, 7, "aselect_read");
+    as.R6(OpCode::MOV, 2, 6, 0);
+    as.label("aselect_read");
+    as.load_const(3, 0);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);       // cannot wait: select said it is ready
+    as.load_const(2, 0);
+    as.R6(OpCode::MOV, 3, 4, 0);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
     // aslot(inbox_id): like aecho, but it receives on the inbox its ARGUMENT names -- the slot it was
     // started into, whose id is not its own (rawSpawnInto). Doubles each message to the main program.
     as.label("aslot");
@@ -3553,6 +3579,7 @@ inline void declare_task_fns(Assembler& as) {
     as.declare_fn("acrashon", 8, 1);
     as.declare_fn("awatch", 8, 1);
     as.declare_fn("abusy",  8, 1);
+    as.declare_fn("aselect", 8, 1);
     as.declare_fn("astop",  8, 1);
     as.declare_fn("aconn",  8, 1);
     as.declare_fn("areply", 8, 1);
@@ -4431,6 +4458,114 @@ inline void test_actor_stop_requested() {
                                      foreign_ok ? "PASS" : "FAIL", br.fault);
             check(quiet_ok && stop_ok && slot_ok && foreign_ok);
         }
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A receive waits on ONE inbox. rawSelect waits on SEVERAL and answers which of them has something,
+// so an actor can serve its own mail and a reply inbox from one loop. It takes nothing out: the
+// receive that follows reads the inbox the index names, and cannot wait.
+inline void test_actor_select() {
+    using namespace forkjoin;
+    std::cout << "=== actor_select ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);                                    // the root's own inbox: address 0
+        as.load_const(43, 0);  as.call_native_id(11, 42, 43, 1, NATIVE_NEW_INBOX);
+        as.VEC_NEW(12);                                        // [ main, extra ] -- main wins a tie
+        as.load_const(13, 0);
+        as.VEC_PUSH(12, 13);
+        as.VEC_PUSH(12, 11);
+        auto select = [&](uint8_t rd, uint8_t rlist, int64_t ms) {
+            as.R6(OpCode::MOV, 40, rlist, 0);
+            as.load_const(41, ms);
+            as.call_native_id(rd, 42, 40, 2, NATIVE_SELECT);
+        };
+        select(14, 12, 50);                                    // nothing yet: the deadline, so -1
+        as.load_const(41, 0);  spawn_actor(as, 15, "aecho");
+        send_int(as, 16, 15, 21);                              // it answers 42 to address 0
+        select(17, 12, 10000);                                 // the MAIN inbox: index 0
+        receive_main(as, 18, 0);                               // ... and this cannot wait
+        mail_read(as, 19, NATIVE_MAIL_MSG);
+        send_int(as, 20, 11, 7);                               // into our SECOND inbox
+        select(21, 12, 10000);                                 // index 1
+        as.R6(OpCode::MOV, 40, 11, 0);                         // and reading it is an ordinary receive
+        as.load_const(41, 0);
+        as.call_native_id(22, 42, 40, 2, NATIVE_RECEIVE);
+        as.R6(OpCode::MOV, 40, 11, 0);
+        as.call_native_id(23, 42, 40, 1, NATIVE_MAIL_MSG);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool timeout_ok = r.fault.empty() && is_int(14, -1);
+        const bool first_ok   = r.fault.empty() && is_int(17, 0) && is_int(18, 1) && is_int(19, 42);
+        const bool second_ok  = r.fault.empty() && is_int(21, 1) && is_int(22, 1) && is_int(23, 7);
+        std::cout << std::format("  nothing to read: the deadline:  {}{}\n", timeout_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  mail in the first inbox:        {}\n", first_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  mail in the second inbox:       {}\n", second_ok ? "PASS" : "FAIL");
+        bool rules_ok = true;
+        {   // someone else's inbox in the list: refused exactly as a receive on it would be
+            Assembler bad;
+            declare_task_fns(bad);
+            bad.label("main");
+            main_inbox(bad, 10);
+            bad.load_const(41, 0);  spawn_actor(bad, 11, "aecho");
+            bad.VEC_NEW(12);
+            bad.VEC_PUSH(12, 11);
+            bad.R6(OpCode::MOV, 40, 12, 0);
+            bad.load_const(41, 0);
+            bad.call_native_id(13, 42, 40, 2, NATIVE_SELECT);
+            Heap bad_heap;
+            const Run br = run(bad, bad_heap);
+            const bool foreign_ok = br.fault.find("belongs to another actor") != std::string::npos;
+            std::cout << std::format("  someone else's inbox: a fault:  {}  (\"{}\")\n",
+                                     foreign_ok ? "PASS" : "FAIL", br.fault);
+            rules_ok = rules_ok && foreign_ok;
+        }
+        {   // watching nothing with no deadline: no event could ever end it, so it is a fault
+            Assembler bad;
+            declare_task_fns(bad);
+            bad.label("main");
+            main_inbox(bad, 10);
+            bad.VEC_NEW(11);
+            bad.R6(OpCode::MOV, 40, 11, 0);
+            bad.load_const(41, -1);
+            bad.call_native_id(12, 42, 40, 2, NATIVE_SELECT);
+            Heap bad_heap;
+            const Run br = run(bad, bad_heap);
+            const bool empty_ok = br.fault.find("would wait forever") != std::string::npos;
+            std::cout << std::format("  no inbox, no deadline: a fault: {}  (\"{}\")\n",
+                                     empty_ok ? "PASS" : "FAIL", br.fault);
+            rules_ok = rules_ok && empty_ok;
+        }
+        check(timeout_ok && first_ok && second_ok && rules_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A select is not a receive, so the ways an actor is ENDED must reach it too: Stop goes into every
+// inbox an actor owns, and each of them wakes the pad the select sleeps on.
+inline void test_actor_select_stop() {
+    using namespace forkjoin;
+    std::cout << "=== actor_select_stop ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(41, 0);  spawn_actor(as, 11, "aselect");   // parks in a select, forever
+        call1(as, 12, NATIVE_STOP_ACTOR, 11);
+        receive_main(as, 13, 10000);                              // it reports what woke it
+        mail_read(as, 14, NATIVE_MAIL_MSG);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool ok = r.fault.empty() && r.regs[12].isBool() && r.regs[12].asBool() &&
+                        is_int(13, 1) && is_int(14, 3);          // MAIL_STOP, seen through the select
+        std::cout << std::format("  Stop wakes a parked select:     {}{}\n", ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        check(ok);
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 

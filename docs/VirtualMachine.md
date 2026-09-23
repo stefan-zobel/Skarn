@@ -452,6 +452,11 @@ and stacks, sharing the program with its starter read-only. Values cross between
     is unaffected and stays crash-only. A report also means the ADDRESS IS FREE: the actor's mailboxes are
     closed, and a slot vacated, before either report goes out, so an actor started into that slot on the
     strength of the report never meets an address its predecessor still holds.
+  - `rawSelect(boxes, ms)` waits until one of SEVERAL inboxes has something and answers which — the index
+    into the list, or `-1` when the timeout passed. It takes nothing out; the `rawReceive` that follows
+    reads the inbox that index names and cannot wait, because only the owner takes mail out of an inbox.
+    Ties go to the lowest index, so the order of the list is a priority order. Every inbox must belong to
+    the caller, and watching nothing with no deadline is refused — no event could ever end that wait.
 - `rawTaskInput()` and `rawSelfId()` are internal: an isolate reads its argument and its own id with them.
 
 **An address that outlives its actor.** A restarted actor is a new actor, so anyone holding the old
@@ -469,6 +474,14 @@ it and answers where its predecessor did.
 **Waiting.** `rawSleep(ms)` makes this isolate wait, and only this one: every isolate has a thread of its
 own. It is what a loop that must poll uses — once an actor has received `Stop`, every further receive
 answers `Stop` at once, so an actor winding down can no longer wait on its inbox.
+
+**Waiting on several inboxes.** A receive waits on one mailbox's condition variable, which is why
+`rawSelect` cannot use it. Instead every isolate has a **wake pad**, and every mailbox wakes its owner's
+pad in addition to its own condition variable — so one wait covers all of an actor's inboxes. A send pays
+for this only while somebody is actually parked on a pad: with nobody waiting, waking is a single atomic
+read and no lock. The two locks are never nested — a mailbox is released before its owner's pad is woken —
+so the select scans the mailboxes holding no pad lock, and a counter bumped on every wake is what catches
+mail that arrives during the scan.
 
 **Back-pressure.** An inbox may be **bounded** — `rawSpawnActorBounded(fn, arg, capacity)` starts an actor
 whose mailbox holds at most `capacity` messages, and `rawNewInbox` takes a capacity too (0 = unbounded).

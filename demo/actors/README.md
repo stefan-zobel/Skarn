@@ -75,6 +75,35 @@ simply stops asking.
 static_vmrun demo/actors/supervised.skn [--strategy=one_for_one|one_for_all|rest_for_one]
 ```
 
+## `select.skn`
+
+One worker serving TWO queues from one loop (`std::actor`'s `select`):
+
+```
+main --jobs----> [ jobs inbox ] --\
+                                   >-- one worker, one loop
+main --control-> [ ctl inbox  ] --/
+```
+
+A `receive` waits on one inbox, so a worker could otherwise block on only one of its queues at a time.
+`select(boxes, timeoutMs)` waits on several and answers WHICH one has something; the receive that follows
+is an ordinary typed one on the inbox that index names, and cannot wait. The list is built from
+`inbox.ref()`, because inboxes of different message types cannot share a `Vec` — here a job is an `Int` and
+a control message is a `Ctl`, and neither has to be squeezed into a case of the other.
+
+Ties go to the lowest index, so the order of the list is a priority order. The worker puts control first,
+and while it is paused it watches the control queue alone — so the jobs sit untouched in their own inbox,
+which is back-pressure the program chooses rather than suffers. The run shows exactly that: a report taken
+while paused says nothing has been done, although every job has already been sent.
+
+```
+static_vmrun demo/actors/select.skn [--jobs=N]
+```
+
+| option | effect |
+|---|---|
+| `--jobs=N` | jobs queued while the worker is paused (default 4) |
+
 ## `stable_address.skn`
 
 A service that keeps ONE address across its restarts (`std::actor`'s `Slot` plus `std::supervisor`):

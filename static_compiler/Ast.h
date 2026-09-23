@@ -522,6 +522,8 @@ inline std::string std_newBoundedInbox() { return mangle_name(STD_ACTOR, "newBou
 inline std::string std_ask()          { return mangle_name(STD_ACTOR, "ask"); }
 inline std::string std_Pid()          { return mangle_name(STD_ACTOR, "Pid"); }
 inline std::string std_Inbox()        { return mangle_name(STD_ACTOR, "Inbox"); }
+// An inbox in a `select` list: names a mailbox, carries no message type. Made only by inbox.ref().
+inline std::string std_InboxRef()     { return mangle_name(STD_ACTOR, "InboxRef"); }
 // An address that outlives its actor: `newSlot` fixes its message type, as the inbox makers do.
 inline std::string std_Slot()         { return mangle_name(STD_ACTOR, "Slot"); }
 inline std::string std_newSlot()      { return mangle_name(STD_ACTOR, "newSlot"); }

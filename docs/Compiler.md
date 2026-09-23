@@ -393,12 +393,20 @@ A `Pid[M]` promises that the actor it names receives `M`. The checker keeps that
   that outlives the actors started into it (`s.spawn(actorFn(f), init)`), so `M` must be known at the call
   and sendable. A `Slot` is plain data, so it can be sent to the supervisor that keeps the address alive.
 - **These functions can only be called**, never used as values, so no call escapes the rules above.
-- **`Pid`, `Inbox`, `Slot` and `ActorFn` literals are an error outside `std::actor`.**
+- **`Pid`, `Inbox`, `Slot`, `InboxRef` and `ActorFn` literals are an error outside `std::actor`.**
 
 A request that wants an answer does not need a selective receive: the answer goes to an inbox of its own,
 with its own type. A bounded inbox provides back-pressure — `send` waits while it is full, `trySend` reports
 `Full` instead — and exit reports and `Stop` always get through. None of this needs a checker rule beyond
 the ones above; the waiting is the runtime's.
+
+To serve several of those inboxes from one loop, `select(boxes, timeoutMs)` waits until any of them has
+something and answers WHICH — the index into the list, or `None` when the timeout passed. The list holds
+`InboxRef`s, made by `inbox.ref()`, because inboxes of different message types are different types and
+cannot share a `Vec`; the receive that follows is an ordinary typed one on the inbox that index names, and
+cannot wait, because only the owner takes mail out of an inbox. Ties go to the lowest index, so the order
+of the list is a priority order. An `InboxRef` names the same mailbox an `Inbox` does, so like an `Inbox`
+it cannot be sent to another actor.
 
 A connection cannot be a message: `TcpConn` stays unsendable, since its descriptor means something only in
 the actor that opened it. `std::net` moves it in two steps instead. `c.handOff()` detaches the connection

@@ -1402,6 +1402,11 @@ private:
         add_generic_native("rawStopRequested", { "M" },
             [&](const std::vector<TyPtr>& v) { return std::vector<TyPtr>{ inbox_of(v[0]) }; },
             [](const std::vector<TyPtr>&)    { return ty_bool(); });
+        // Waiting on several inboxes: the list is type-FREE (an InboxRef carries no message type),
+        // which is what lets inboxes of different types be waited on together. It answers an index,
+        // so the receive that follows is an ordinary typed one on the inbox the caller already holds.
+        add_native("rawSelect",
+            { make_named("Vec", { make_named(std_InboxRef(), {}) }), ty_int() }, ty_int(), gate);
     }
 
     // Is a gated native `name` callable from the module currently being checked? A native NOT in
@@ -4531,6 +4536,9 @@ private:
         // An Inbox is the RECEIVING end of one actor's mailbox; a copy in another isolate could read
         // that actor's mail. Its address (Pid) is plain data and may travel.
         if (t->name == std_Inbox()) return "an actor's inbox (" + r(t) + ")";
+        // An InboxRef names the same mailbox an Inbox does, only without the message type, so it is
+        // barred for the same reason: elsewhere it would be an inbox of someone else's.
+        if (t->name == std_InboxRef()) return "a reference to an actor's inbox (" + r(t) + ")";
         // A checked function value holds a function, but only a NAMED one (actorFn / taskFn made it, and a
         // literal elsewhere is an error), which the codec carries as its Func id. Its message, start and
         // result types were checked there.
@@ -5969,6 +5977,9 @@ private:
         if ((e.name == std_Pid() || e.name == std_Inbox()) && cur_module_ != STD_ACTOR)
             error(e.line, e.col, std::string(e.name == std_Pid() ? "a Pid" : "an Inbox") +
                   " can only be created by std::actor (spawnActor, inbox.pid(), mainInbox, newInbox)");
+        // An InboxRef names a mailbox to wait on: a forged one would ask about somebody else's.
+        if (e.name == std_InboxRef() && cur_module_ != STD_ACTOR)
+            error(e.line, e.col, "an InboxRef can only be created by `inbox.ref()`");
         // A Slot[M] is an address others send to: a forged one would take over a foreign mailbox.
         if (e.name == std_Slot() && cur_module_ != STD_ACTOR)
             error(e.line, e.col, "a Slot can only be created by `newSlot()` / `newBoundedSlot(n)`");
