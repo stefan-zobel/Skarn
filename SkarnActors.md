@@ -720,7 +720,108 @@ thing you do with that connection.
 That is how a server spreads over cores: one actor accepts, and hands each connection to whichever worker
 is free. `demo/actor_server/` is the worked version, with a pool and two ways of dispatching work to it.
 
-## 17. What Skarn does not have
+## 17. Logging from several actors
+
+`println` is fine until there are actors. Then the output is interleaved by arrival, it is gone when the
+window closes, and there is no way to turn the noisy parts off. `std::log` is the small answer: a line is
+a timestamp, a level and your text, and a `Log` knows where to put it and what to leave out.
+
+```rust
+use std::log::*
+use std::io::*
+
+let path = "app.log"
+let _ = deleteFile(path)
+
+let log = Log::toFile(path, Level::Info)
+log.debug("not written")                  // below the minimum: dropped, silently and on purpose
+log.info("started")
+log.warn("disk is filling up")
+
+match readTextFile(path) {
+  Ok(text) => {
+    for line in lines(text) {
+      if len(line) > 0 { println(slice(line, indexOf(line, " ") + 1, len(line))) }
+    }
+  },
+  Err(e) => println(e),
+}
+// => INFO  started
+// => WARN  disk is filling up
+```
+
+The example cuts the timestamp off so the output is the same on every run; a real line looks like
+`2025-03-04T09:12:41.007Z INFO  started`.
+
+Two things about the shape. `info`, `warn`, `error` and `debug` are **methods**, not free functions, so
+`use std::log::*` does not claim four of the names your program is most likely to want for itself — it
+brings in the type `Log` and nothing else. And a `Log` is plain data, which by §5 makes it **sendable**: an
+actor is handed its logger in its start value, like any other address.
+
+### Two sinks
+
+`Log::toFile(path, min)` appends straight to the file. Each line is one append, and an append is atomic at
+the operating-system level, so several actors writing to one file neither lose a line nor tear one in half.
+For most programs that is the whole story.
+
+`Log::toActor(to, min)` sends the line to one actor that owns the file instead. It costs a message and buys
+two things the file sink cannot give: the lines of the whole program are in **one** order, and — because
+`startLogger` gives its actor a bounded inbox — a program that logs faster than the disk can write is
+**slowed down** rather than grown, which is §13 applied to logging.
+
+```rust
+use std::log::*
+use std::io::*
+use std::actor::*
+
+fn worker(inbox: Inbox[Int], log: Log) -> () {
+  for n in inbox.messages() { log.info("job ${n}") }
+}
+
+// Stop `p` and wait for its end, so nothing below races with what it is still doing.
+fn endOf[M](p: Pid[M]) -> () {
+  let done: Inbox[Int] = newInbox()
+  let _ = monitor(p, done)
+  let _ = stopActor(p)
+  let _ = done.receiveTimeout(10000)
+  done.close()
+}
+
+let path = "jobs.log"
+let _ = deleteFile(path)
+
+let sink = startLogger(path, 2)                  // at most 2 lines waiting: senders wait for room
+let w = spawnActor(worker, Log::toActor(sink, Level::Info))
+
+let mut i = 0
+while i < 8 { send(w, i)  i = i + 1 }
+
+endOf(w)                                         // first the worker ...
+endOf(sink)                                      // ... then the logger, once nothing writes any more
+
+match readTextFile(path) {
+  Ok(text) => {
+    let mut n = 0
+    for line in lines(text) { if len(line) > 0 { n = n + 1 } }
+    println("lines: ${n}")                       // => lines: 8
+  },
+  Err(e) => println(e),
+}
+println("after it ended: ${send(sink, "too late\n")}")   // => after it ended: false
+```
+
+**Shut the logger down last.** A `Stop` goes in at the *end* of a mailbox (§12), so a logger told to stop
+still writes everything already sent to it — all eight lines are there. What it cannot write is a line sent
+*after* it ended, and `send` returns `false` to say so.
+
+### What it does not do
+
+There is no rotation, no truncation and no configuration file; nothing writes to stderr; and a line is
+written in one call, so a message with newlines in it arrives as several lines and only the first carries a
+timestamp. If you want any of that, `Log` is forty lines of ordinary Skarn — read `std/log.skn` and write
+the one you want.
+
+## 18. What Skarn does not have
 
 This is the Erlang/OTP model, and the names match where the ideas do. Four differences are deliberate:
 
@@ -732,7 +833,7 @@ This is the Erlang/OTP model, and the names match where the ideas do. Four diffe
 - **No links and no kill.** A crash is reported, never propagated, and an actor is asked to stop rather
   than forced. Supervision is a library on top of those reports.
 
-## 18. Where to look next
+## 19. Where to look next
 
 - `demo/actors/stable_address.skn` — a service behind a slot, restarted under one address.
 - `demo/actors/supervised.skn` — a pool of crashing workers that pull their jobs, all three strategies.

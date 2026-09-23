@@ -254,6 +254,13 @@ standard library turns that into an ordinary enum before a program sees it. Pick
 system can already describe keeps this out of the compiler; a heterogeneous array would need a special
 case in code generation, as the process-spawning native does.
 
+`appendFile` is atomic per call, which matters because it is the one file native several isolates may
+legitimately aim at the same target: they share no heap, so they share no handle and no lock, and nothing
+in the VM can serialize them. It opens with `FILE_APPEND_DATA` on Windows and `O_APPEND` on POSIX, both of
+which position at the end of the file **as part of** the write, so the offset cannot go stale between
+finding it and using it. What that does not cover is a write larger than the operating system's atomic-append
+size, and it says nothing about `writeFile` or a read-modify-write, neither of which is one call.
+
 The socket natives work on small integer descriptors into a per-execution table, never on raw OS handles,
 and close whatever is still open when the execution ends. `tcpConnect` gives up after 10 seconds: on POSIX
 through a non-blocking connect and `select()`, on Windows through a blocking connect bounded by `TCP_MAXRT`,

@@ -3492,6 +3492,7 @@ the filesystem, and one without `use std::process` cannot start a program.
 | `std::actor` | actors — long-lived functions on their own threads with a mailbox; `spawnActor`, `send`, `inbox.messages()`, `ask`, bounded mailboxes; every message is **copied**, a crash is reported to the actor's starter |
 | `std::supervisor` | keeping actors running — `supervise` starts a group of child actors and starts again each one that crashes, up to a restart limit; supervisors nest into trees |
 | `std::regex` | linear-time byte-level regular expressions (Thompson NFA / Pike VM) — no catastrophic backtracking, and therefore **no** backreferences or lookaround |
+| `std::log` | timestamped log lines at four levels, filtered by a minimum, written to a file directly or through a logger actor that owns the file; no rotation and no configuration file |
 
 This table says only what each module is *for*. **Every function of every module, with its signature, is listed
 in [§27](#27-quick-reference-the-standard-library).**
@@ -4627,6 +4628,21 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `superviseWith(inbox, children, spec)` | the same loop with both choices spelled out: `SupervisorSpec { strategy, limit, stopTimeoutMs }`. `supervise` is this with `OneForOne` and no deadline |
 | `Strategy::OneForOne` / `OneForAll` / `RestForOne` | what a crash costs the siblings: nothing / stop them all, wait, start them all / the same for those started after the crashed one. A group restart counts as ONE restart |
 | `stopTimeoutMs` | how long a child may take to stop. `0` waits (the group stands still, the supervisor keeps receiving); more makes a RESTART give up and crash, naming the child, and a SHUTDOWN abandon it. A child that neither receives nor asks `stopRequested()` cannot be ended at all |
+
+**Logging** *(all `std::log` — `use std::log::*`; builds on `std::io`, `std::time` and `std::actor`. A line is `<iso timestamp> <LEVEL> <text>`; the verbs are methods, so `use std::log::*` claims none of the names `info`, `warn`, `error` or `debug`)*
+
+| Function | Purpose |
+|----------|---------|
+| `Log::toFile(path, min)` | a logger appending straight to `path`; nothing below `min` is written. One append per line, and that call is atomic, so several actors may share the file |
+| `Log::toActor(to, min)` | a logger sending its lines to `to: Pid[String]` instead. Costs a message, and buys one order for the whole program and, with a bounded inbox, back-pressure |
+| `log.debug(msg)` / `log.info(msg)` / `log.warn(msg)` / `log.error(msg)` | write one line at that level (also `Log::info(log, msg)`, as for any method) |
+| `log.at(level, msg)` | the same with the level as a value — the one place that filters, formats and writes |
+| `Level::Debug` / `Info` / `Warn` / `Error` | the four levels; `l.rank()` orders them, `l.atLeast(min)` is the filter, `l.label()` is the fixed-width text in the line |
+| `startLogger(path, capacity)` | start a logger actor owning `path` → `Pid[String]`. Its inbox holds at most `capacity` lines, so a program logging faster than the disk writes is slowed rather than grown |
+
+A `Log` is plain data, so it is sendable: an actor is handed its logger in its start value. Stop a logger
+actor **last** — `Stop` is queued at the end of a mailbox, so everything already sent is written, but a line
+sent after it has ended is dropped.
 
 **Regex** *(all `std::regex` — `use std::regex::*`; byte-level, linear-time Pike VM; no backrefs/lookaround. Note the names: matching anywhere is `search`, not `find`, and rewriting is `replaceRe`, not `replace` — those two belong to `std::iter` / `std::string`)*
 

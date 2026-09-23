@@ -2759,6 +2759,9 @@ void test_import_matrix() {
         // std::poll is the one module that `use`s another (std::net). This row pins that its own
         // items still travel every import form -- and, via the `_other` cell, that a const does too.
         { "std_poll",    "std::poll",    "READABLE",     "WRITABLE",     "READABLE | 6", 7 },
+        // std::log builds on THREE modules (std::io, std::time, std::actor) and re-exports none of
+        // them; this row pins that its own items still travel every import form.
+        { "std_log",     "std::log",     "Level",        "Log",          "match Level::Warn { Level::Warn => 2, _ => 0 }", 2 },
     };
     for (const auto& r : std_rows) {
         const std::string id = std::string("imx_") + r.id;
@@ -5503,6 +5506,42 @@ void test_codegen_natives() {
             "let _ = deleteFile(\"" + f + "\")\n"
             "println(toString(fileExists(\"" + f + "\")))\n";
         check_true("native_file_exists", cg_run_native(src) == "true\nfalse\n");
+    }
+    // appendFile is ATOMIC per call, so several actors may append to one file without losing or
+    // tearing a line. It was not: as `std::ofstream(path, app)` it found the end when it OPENED and
+    // wrote at that remembered offset, so concurrent appends overwrote each other -- measured at 496
+    // of 800 lines from four actors, and silently, with no error anywhere. This test is the guard on
+    // the fix (FILE_APPEND_DATA / O_APPEND, which position at the end AS PART OF the write).
+    {
+        const std::string src =
+            "use std::actor::*\n"
+            "struct Job { path: String, who: Int }\n"
+            "fn writer(inbox: Inbox[Int], j: Job) -> () {\n"
+            "  let mut i = 0\n"
+            "  while i < 150 { let _r = appendTextFile(j.path, \"w${j.who} n${i}|\\n\")\n i += 1 }\n"
+            "  for _m in inbox.messages() {}\n"
+            "}\n"
+            "let _d = deleteFile(\"" + f + "\")\n"
+            "let mut kids: Vec[Pid[Int]] = vec()\n"
+            "let mut w = 0\n"
+            "while w < 4 { push(kids, spawnActor(writer, Job { path: \"" + f + "\", who: w }))\n w += 1 }\n"
+            // Stop each writer and wait for its end, so every write is done before the file is read.
+            "let watch: Inbox[Int] = newInbox()\n"
+            "for k in kids { let _m = k.actorId().watch(watch)\n let _s = stopActor(k) }\n"
+            "let mut ended = 0\n"
+            "while ended < 4 {\n"
+            "  match watch.receive() { Mail::Exited(_, _) => { ended += 1 }, _ => { ended = 4 } }\n"
+            "}\n"
+            "let text = match readTextFile(\"" + f + "\") { Ok(s) => s, Err(e) => panic(e) }\n"
+            "let mut n = 0\n"
+            "let mut bad = 0\n"
+            "for ln in lines(text) {\n"
+            "  if len(ln) > 0 { n += 1\n"
+            "    if indexOf(ln, \"|\") != len(ln) - 1 { bad += 1 } }\n"
+            "}\n"
+            "let _d2 = deleteFile(\"" + f + "\")\n"
+            "println(\"${n} ${bad}\")\n";
+        check_true("native_append_is_atomic", cg_run_native(src) == "600 0\n");
     }
     // mkdir + listDir: exactly one file in a fresh dir -> len 1.
     {
@@ -10155,6 +10194,117 @@ void test_std_supervisor() {
 }
 
 // =============================================================================
+// std::log -- the opt-in logging module over std::io, std::time and std::actor. Two sinks (a file
+// appended directly, or a logger actor that owns the file) behind one `Log`, one level filter and
+// one line format. Every case reads the file back, so it checks what was WRITTEN, not what was
+// returned; the timestamp differs on every run, so only the rest of the line is compared.
+// =============================================================================
+void test_std_log() {
+    std::cout << "[codegen: std::log]\n";
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path base = fs::temp_directory_path() / "svc_log_test";
+    fs::remove_all(base, ec);
+    fs::create_directories(base, ec);
+    const std::string f = (base / "app.log").generic_string();
+
+    const std::string U = "use std::log::*\n";
+    // Print each line with its timestamp cut away: a line is "<iso> <LEVEL> <text>", and the ISO
+    // stamp holds no space, so everything from the first space on is the part under test.
+    const std::string SHOW =
+        "fn show(p: String) -> () {\n"
+        "  let text = match readTextFile(p) { Ok(s) => s, Err(e) => panic(e) }\n"
+        "  for ln in lines(text) {\n"
+        "    if len(ln) > 0 { let k = indexOf(ln, \" \")\n println(slice(ln, k + 1, len(ln))) }\n"
+        "  }\n"
+        "}\n";
+    const std::string FRESH = "let _d = deleteFile(\"" + f + "\")\n";
+
+    // The file sink: the four verbs, the fixed-width label, and `at` reached directly.
+    check_str("log_file_sink_writes_all_levels", cg_run_native(U + SHOW + FRESH +
+        "let log = Log::toFile(\"" + f + "\", Level::Debug)\n"
+        "log.debug(\"d\")\n log.info(\"i\")\n log.warn(\"w\")\n log.error(\"e\")\n"
+        "log.at(Level::Info, \"direct\")\n"
+        "show(\"" + f + "\")\n"),
+        "DEBUG d\nINFO  i\nWARN  w\nERROR e\nINFO  direct\n");
+    // The filter: nothing below `min` is written at all -- the file holds the two lines only.
+    check_str("log_filters_below_min", cg_run_native(U + SHOW + FRESH +
+        "let log = Log::toFile(\"" + f + "\", Level::Warn)\n"
+        "log.debug(\"no\")\n log.info(\"no\")\n log.warn(\"yes\")\n log.error(\"yes\")\n"
+        "show(\"" + f + "\")\n"),
+        "WARN  yes\nERROR yes\n");
+    // An inherent method answers to both spellings, so `Log::info(log, msg)` is the same call.
+    check_str("log_qualified_call_form", cg_run_native(U + SHOW + FRESH +
+        "let log = Log::toFile(\"" + f + "\", Level::Info)\n"
+        "Log::info(log, \"qualified\")\n"
+        "show(\"" + f + "\")\n"),
+        "INFO  qualified\n");
+    // The ordering the filter rests on, at every boundary. `>=` works on numbers, not on variants,
+    // which is why the rank exists at all.
+    check_int_p("log_level_rank_orders",
+        "use std::log::*\n"
+        "let ok = Level::Debug.rank() < Level::Info.rank()\n"
+        "  && Level::Info.rank() < Level::Warn.rank()\n"
+        "  && Level::Warn.rank() < Level::Error.rank()\n"
+        "  && Level::Warn.atLeast(Level::Warn) && !Level::Info.atLeast(Level::Warn)\n"
+        "if ok { 1 } else { 0 }\n", 1);
+    // The actor sink. The logger is stopped LAST and its end is waited for, so everything the
+    // worker sent has been written by the time the file is read -- Stop is queued at the END of a
+    // mailbox, so a logger told to stop still drains what is already in it.
+    check_str("log_actor_sink_drains_before_it_ends", cg_run_native(
+        U + "use std::actor::*\n" +
+        "fn worker(inbox: Inbox[Int], log: Log) -> () {\n"
+        "  for n in inbox.messages() { log.info(\"job ${n}\") }\n"
+        "}\n"
+        "fn endOf[M](p: Pid[M]) -> () {\n"
+        "  let done: Inbox[Int] = newInbox()\n"
+        "  let _m = monitor(p, done)\n"
+        "  let _s = stopActor(p)\n"
+        "  let _e = done.receiveTimeout(10000)\n"
+        "  done.close()\n"
+        "}\n" + FRESH +
+        // A capacity of 2 against 12 messages, so the sends really do wait for room.
+        "let sink = startLogger(\"" + f + "\", 2)\n"
+        "let w = spawnActor(worker, Log::toActor(sink, Level::Info))\n"
+        "let mut i = 0\n"
+        "while i < 12 { send(w, i)\n i += 1 }\n"
+        "endOf(w)\n"
+        "endOf(sink)\n"
+        "let text = match readTextFile(\"" + f + "\") { Ok(s) => s, Err(e) => panic(e) }\n"
+        "let mut n = 0\n"
+        "for ln in lines(text) { if len(ln) > 0 { n += 1 } }\n"
+        "println(\"${n}\")\n"),
+        "12\n");
+    // A `Log` is plain data, so it travels to an actor in its start value -- the case above rests
+    // on that, and this is what says so if it ever stops being true.
+    check_int_p("log_is_sendable",
+        "use std::log::*\nuse std::actor::*\n"
+        "fn body(inbox: Inbox[Int], log: Log) -> () {}\n"
+        "let p = spawnActor(body, Log::toFile(\"x\", Level::Info))\n"
+        "1\n", 1);
+    // A capacity below 1 would make a logger nobody can ever send to.
+    check_true("log_rejects_bad_capacity", cg_faults_msg(
+        "use std::log::*\nlet p = startLogger(\"x\", 0)\n0\n", "capacity"));
+    // `use` is not transitive: std::log reaches std::io, std::time and std::actor; an importer of
+    // std::log reaches none of them.
+    check_true("log_does_not_reexport_io", cg_check_fails_p(
+        "use std::log::*\nlet r = appendTextFile(\"x\", \"y\")\n0\n"));
+    check_true("log_does_not_reexport_actor", cg_check_fails_p(
+        "use std::log::*\nlet i = mainInbox()\n0\n"));
+    check_true("log_does_not_reexport_time", cg_check_fails_p(
+        "use std::log::*\nlet t = now()\n0\n"));
+    // The whole module is tree-shaken out of a program that does not use it.
+    check_true("shake_default_drops_log", [] {
+        const svc::Module m = svc::compile("42", svc::builtin_prelude());
+        for (const auto& s : m.struct_types)   if (s.name == "Log") return false;
+        for (const auto& s : m.function_names) if (s.find("startLogger") != std::string::npos) return false;
+        return true;
+    }());
+
+    fs::remove_all(base, ec);
+}
+
+// =============================================================================
 // std::regex -- the opt-in byte-level Pike-VM regex engine, pure prelude (compile / isMatch /
 // find / findFrom first). A `use std::regex::*` prefix + gate pair, then KAT triples. isMatch cases use
 // check_bool_p; find cases encode start*1000+end as an Int (-1 = no match); plus check_same diffs.
@@ -12888,6 +13038,7 @@ int main(int argc, char** argv) {
     test_std_task();
     test_std_actor();
     test_std_supervisor();
+    test_std_log();
     test_interpolation();
     test_format();
     test_string_iter();

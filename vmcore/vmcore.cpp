@@ -1255,11 +1255,21 @@ static Value native_make_dir(Value* args, uint8_t nargs, Context* ctx) {
 }
 
 // appendFile(path, buffer) -> nil (success) | String (error message). The compiler wraps
-// this Ok/Err (NativeReturn::Result). Like writeFile but opens the file in APPEND mode
-// (std::ios::app), creating it if absent -- so repeated calls accumulate. `buffer` must be
-// a KIND_BYTES (a String source is served by the pure-prelude appendTextFile wrapper). The
-// buffer's live bytes are materialized host-side BEFORE the file op (a later error alloc
-// could otherwise relocate the backing).
+// this Ok/Err (NativeReturn::Result). Like writeFile but APPENDS, creating the file if
+// absent -- so repeated calls accumulate. `buffer` must be a KIND_BYTES (a String source is
+// served by the pure-prelude appendTextFile wrapper). The buffer's live bytes are
+// materialized host-side BEFORE the file op (a later error alloc could otherwise relocate
+// the backing).
+//
+// IT APPENDS AT THE OS LEVEL, not through a stream, and that is the whole point. It used to
+// be `std::ofstream(path, std::ios::app)`, which finds the end when it OPENS and then writes
+// at that remembered offset -- so two isolates appending at the same moment remember the same
+// offset and overwrite each other. That lost whole lines, silently and with no error anywhere:
+// four actors kept 496 of 800, one kept 800 of 800. FILE_APPEND_DATA (granted WITHOUT
+// FILE_WRITE_DATA, which is what arms it) and O_APPEND both position at the true end AS PART
+// OF the write, so a single write cannot be overtaken. One write per call keeps that
+// guarantee; a caller that wants a line to arrive whole must pass it in one call, which
+// appendTextFile does. Guarded by native_append_is_atomic in static_compiler_tests.
 static Value native_append_file(Value* args, uint8_t nargs, Context* ctx) {
     if (nargs < 2 || !is_string(args[0]))
         return native_make_error(ctx, "appendFile: path must be a string");
@@ -1278,12 +1288,30 @@ static Value native_append_file(Value* args, uint8_t nargs, Context* ctx) {
         const uint32_t count   = static_cast<uint32_t>(hdr->slots()[BYTES_SLOT_COUNT].asSigned48());
         data.assign(backing->bytes(), count);
     }
-    std::ofstream f(path, std::ios::binary | std::ios::app);
-    if (!f)
+#ifdef _WIN32
+    const HANDLE h = CreateFileA(path.c_str(), FILE_APPEND_DATA,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
         return native_make_error(ctx, "could not open file: " + path);
-    f.write(data.data(), static_cast<std::streamsize>(data.size()));
-    if (!f)
+    DWORD wrote = 0;
+    const BOOL ok = data.empty()
+                  ? TRUE                              // an empty append still creates the file
+                  : WriteFile(h, data.data(), static_cast<DWORD>(data.size()), &wrote, nullptr);
+    CloseHandle(h);
+    if (!ok || (!data.empty() && wrote != data.size()))
         return native_make_error(ctx, "could not write file: " + path);
+#else
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0)
+        return native_make_error(ctx, "could not open file: " + path);
+    const ssize_t wrote = data.empty()
+                        ? 0
+                        : ::write(fd, data.data(), data.size());
+    ::close(fd);
+    if (wrote < 0 || static_cast<size_t>(wrote) != data.size())
+        return native_make_error(ctx, "could not write file: " + path);
+#endif
     return Value::fromNil();
 }
 

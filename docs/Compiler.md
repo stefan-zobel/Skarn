@@ -453,6 +453,25 @@ its own.
   - A supervisor that gives up tells its children to stop and releases their addresses, but it cannot end
     one that never receives.
 
+`std::log` is logging, also plain Skarn and also over `std::actor`, with no rule and no native of its own.
+A `Log` holds a sink and a minimum level; a line is a timestamp, a level and the text.
+- **Two sinks.** `Log::toFile(path, min)` appends straight to the file, one append per line, and that call
+  is atomic, so several actors may share one file. `Log::toActor(to, min)` sends the line to an actor that
+  owns the file instead: it costs a message and buys one order for the whole program and, with the bounded
+  inbox `startLogger` gives its actor, back-pressure.
+- **The verbs are methods, not free functions.** `info`, `warn`, `error` and `debug` are four of the names
+  a program is most likely to want for itself, and an inherent method belongs to its type, so
+  `use std::log::*` brings in the type `Log` and does not claim any of them. One declaration answers to
+  both `log.info(msg)` and `Log::info(log, msg)`. `startLogger` is the module's one free name.
+- **`Level` is a plain enum**, not an integer-backed one: an erased enum can carry no methods, and the
+  comparison operators accept only numbers, strings and characters, so the ordering the filter needs is a
+  `rank()` written out once.
+- **A `Log` is plain data and therefore sendable**, so an actor is handed its logger in its start value.
+- **Stop a logger actor last.** A stop is queued at the end of a mailbox, so everything already sent is
+  written; a line sent after it has ended is dropped, and `send` reports that.
+- Deliberately absent: rotation, truncation, structured fields, a configuration file, and any output to
+  standard error.
+
 The reference interpreter used for differential testing does not model actors. A receive depends on which
 actor ran first, and a sequential model would present one schedule as the answer. Actor programs are
 therefore tested through the VM, with programs whose output is the same under every schedule.

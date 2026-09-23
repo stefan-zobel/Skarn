@@ -1,0 +1,36 @@
+// CLAIM: a logger actor told to stop still writes what it was already sent -- `Stop` goes in at the END of a
+//        mailbox, so it is read after the lines before it. Shut the logger down LAST: a line sent after it
+//        has ended is dropped, and `send` says so.
+// GUIDE: SkarnActors.md (Logging from several actors)
+// EXPECT: ok wrote 8 then false
+use std::log::*
+use std::io::*
+use std::actor::*
+
+fn worker(inbox: Inbox[Int], log: Log) -> () {
+  for n in inbox.messages() { log.info("job ${n}") }
+}
+
+// Stop `p` and wait for its end, so nothing below races with what it is still doing.
+fn endOf[M](p: Pid[M]) -> () {
+  let done: Inbox[Int] = newInbox()
+  let _ = monitor(p, done)
+  let _ = stopActor(p)
+  let _ = done.receiveTimeout(10000)
+  done.close()
+}
+
+let path = "claim_log_drain.tmp"
+let _ = deleteFile(path)
+// A capacity of 2 against 8 lines, so the sends really do wait for room.
+let sink = startLogger(path, 2)
+let w = spawnActor(worker, Log::toActor(sink, Level::Info))
+let mut i = 0
+while i < 8 { send(w, i)  i = i + 1 }
+endOf(w)
+endOf(sink)
+let text = match readTextFile(path) { Ok(s) => s, Err(e) => panic(e) }
+let mut n = 0
+for line in lines(text) { if len(line) > 0 { n = n + 1 } }
+let _ = deleteFile(path)
+print("wrote ${n} then ${send(sink, "too late\n")}")

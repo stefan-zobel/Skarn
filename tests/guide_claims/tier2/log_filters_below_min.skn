@@ -1,0 +1,26 @@
+// CLAIM: a `Log` writes nothing below its minimum level -- the call is made, and the line never reaches the
+//        sink. The sink here is an ordinary actor rather than `startLogger`, which is all `Sink::ToActor`
+//        asks for: any `Pid[String]`.
+// GUIDE: SkarnActors.md (Logging from several actors)
+// EXPECT: ok kept 2
+use std::log::*
+use std::actor::*
+
+fn sink(inbox: Inbox[String], boss: Pid[Int]) -> () {
+  let mut n = 0
+  for _line in inbox.messages() { n = n + 1 }
+  send(boss, n)
+}
+
+let me: Inbox[Int] = mainInbox()
+let s = spawnActor(sink, me.pid())
+let log = Log::toActor(s, Level::Warn)
+log.debug("dropped")
+log.info("dropped")
+log.warn("kept")
+log.error("kept")
+let _ = stopActor(s)
+match me.receive() {
+  Mail::Msg(n) => print("kept ${n}"),
+  _ => print("no answer"),
+}

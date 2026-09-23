@@ -1,0 +1,8 @@
+// CLAIM: `use` is not transitive. `std::log` writes files, but a program that imports `std::log` does not
+//        get `std::io` with it -- it has to ask for the capability itself.
+// GUIDE: SkarnActors.md (Logging from several actors)
+// EXPECT: fail unknown variable 'appendTextFile'
+use std::log::*
+
+let r = appendTextFile("out.txt", "line\n")
+println("unreachable")

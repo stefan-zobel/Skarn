@@ -1,0 +1,118 @@
+// Logging -- a timestamped line, a level, and somewhere to put it. Deliberately small: no
+// rotation, no structured fields, no configuration file. What it gives you is one format, one
+// filter, and a sink that is correct when several actors share it.
+//
+// OPT-IN: reach these via `use std::log::*`. Builds on std::actor, std::io and std::time.
+//
+// THE VERBS ARE METHODS, not free functions, and that is on purpose: `info`, `warn`, `error` and
+// `debug` are four of the names a program is most likely to want for itself, and a free `pub fn`
+// would claim them in every importer. An inherent method belongs to its type, so `use std::log::*`
+// brings in `Log` and nothing else.
+//
+//     let log = Log::toFile("app.log", Level::Info)
+//     log.info("started")               // or the qualified form, Log::info(log, "started")
+//     log.debug("not written")          // below the minimum level: dropped
+//
+// A `Log` is plain data, so it is SENDABLE -- an actor is handed its logger in its start value,
+// like any other address:
+//
+//     let log = Log::toActor(startLogger("app.log", 256), Level::Info)
+//     spawnActor(worker, log)
+//
+// TWO SINKS, AND WHEN EACH IS RIGHT.
+//   * `ToFile` appends directly. One `appendFile` per line, and that call is atomic at the OS
+//     level, so several actors writing to one file neither lose nor tear a line. It is the right
+//     choice for a script and for most actor programs.
+//   * `ToActor` sends the line to one actor that owns the file. It costs a message, and buys two
+//     things `ToFile` cannot give: the lines of the whole program are in ONE order, and with a
+//     bounded inbox (which `startLogger` uses) a program that logs faster than the disk writes is
+//     slowed down instead of growing.
+//
+// LIMITS, stated rather than discovered. There is no stderr: a line goes to a file, or through an
+// actor to a file. Nothing here rotates, truncates or reopens a file. And a line is written as one
+// call, so a message with embedded newlines arrives as several lines and only the first carries the
+// timestamp.
+use std::actor::*
+use std::io::*
+use std::time::*
+
+
+// How important a line is. A plain enum, not an int-backed one: an int-backed enum cannot carry
+// methods, and the ordering below is what a filter needs.
+pub enum Level { Debug, Info, Warn, Error }
+
+
+impl Level {
+  // Ordering for the filter. Comparison operators work on numbers, not on enum variants, so the
+  // rank is written out once here rather than at every call.
+  fn rank(self) -> Int {
+    match self {
+      Level::Debug => 0,
+      Level::Info  => 1,
+      Level::Warn  => 2,
+      Level::Error => 3,
+    }
+  }
+
+  // Is this level at least as important as `min`?
+  fn atLeast(self, min: Level) -> Bool { self.rank() >= min.rank() }
+
+  // The fixed-width label a line carries, so columns line up in the file.
+  fn label(self) -> String {
+    match self {
+      Level::Debug => "DEBUG",
+      Level::Info  => "INFO ",
+      Level::Warn  => "WARN ",
+      Level::Error => "ERROR",
+    }
+  }
+}
+
+
+// Where the lines go. Plain data either way, which is what keeps a `Log` sendable.
+pub enum Sink { ToFile(String), ToActor(Pid[String]) }
+
+
+// A logger: where to write, and the lowest level worth writing.
+pub struct Log { sink: Sink, min: Level }
+
+
+impl Log {
+  // Write straight to `path`, appending. Every call is one atomic append.
+  fn toFile(path: String, min: Level) -> Log { Log { sink: Sink::ToFile(path), min: min } }
+
+  // Send the lines to a logger actor -- see `startLogger`.
+  fn toActor(to: Pid[String], min: Level) -> Log { Log { sink: Sink::ToActor(to), min: min } }
+
+  // The one place that filters, formats and writes. The four verbs below are its callers.
+  fn at(self, level: Level, msg: String) -> () {
+    if level.atLeast(self.min) {
+      let line = "${now().toDateTime().toIso()} ${level.label()} ${msg}\n"
+      match self.sink {
+        Sink::ToFile(path) => { let _ = appendTextFile(path, line) },
+        Sink::ToActor(to)  => { send(to, line) },
+      }
+    }
+  }
+
+  fn debug(self, msg: String) -> () { self.at(Level::Debug, msg) }
+  fn info(self, msg: String)  -> () { self.at(Level::Info,  msg) }
+  fn warn(self, msg: String)  -> () { self.at(Level::Warn,  msg) }
+  fn error(self, msg: String) -> () { self.at(Level::Error, msg) }
+}
+
+
+// The body of a logger actor: it owns the file and writes whatever it is sent, already formatted.
+// It ends at Stop -- and because Stop goes in at the END of the mailbox, every line sent before the
+// program ended is written first. A logger that drops its backlog would be worse than none.
+fn _writeLines(inbox: Inbox[String], path: String) -> () {
+  for line in inbox.messages() { let _ = appendTextFile(path, line) }
+}
+
+
+// Start a logger actor for `path`. Its inbox holds at most `capacity` lines, so a program that logs
+// faster than the disk can write is slowed to the disk's pace rather than growing without bound.
+pub fn startLogger(path: String, capacity: Int) -> Pid[String] {
+  if capacity < 1 { panic("startLogger: the capacity must be at least 1") }
+  spawnActorBounded(_writeLines, path, capacity)
+}
