@@ -9957,14 +9957,19 @@ void test_std_supervisor() {
         "child 2 ended\nchild 1 ended\nchild 0 ended\nthe supervisor ended: normal\n");
     // A child that does not end within the deadline: the supervisor escalates instead of restarting the
     // group on a false assumption. `stubborn` ignores Stop, so only the main program can end it.
+    // Each announcement says WHICH child it is. Picking them apart by ARRIVAL ORDER would be a race:
+    // two children announce themselves from two threads, and the runtime promises nothing about who
+    // gets there first. Measured before this was fixed: the order was the expected one in 29 of 30
+    // runs, and in the thirtieth the poison went to `stubborn` -- which crashes nobody, so the
+    // supervisor never reports, and every party waited for ever.
     check_str("supervisor_escalates_past_stop_deadline", cg_run_native(U +
-        "struct Up { at: Pid[Int] }\n"
+        "struct Up { at: Pid[Int], poison: Bool }\n"
         "fn poisonable(inbox: Inbox[Int], boss: Pid[Up]) -> () {\n"
-        "  send(boss, Up { at: inbox.pid() })\n"
+        "  send(boss, Up { at: inbox.pid(), poison: true })\n"
         "  for m in inbox.messages() { if m == 0 { panic(\"boom\") } }\n"
         "}\n"
         "fn stubborn(inbox: Inbox[Int], boss: Pid[Up]) -> () {\n"
-        "  send(boss, Up { at: inbox.pid() })\n"
+        "  send(boss, Up { at: inbox.pid(), poison: false })\n"
         "  let mut go = true\n"
         "  while go { match inbox.receive() { Mail::Msg(m) => { if m == 9 { go = false } }, _ => {} } }\n"
         "}\n"
@@ -9979,22 +9984,20 @@ void test_std_supervisor() {
         "  if k < 0 { why } else { slice(why, 0, k) } }\n"
         "let me: Inbox[Up] = mainInbox()\n"
         "let _k = spawnActor(keeper4, me.pid())\n"
+        "fn up(me: Inbox[Up]) -> Up {\n"
+        "  match me.receive() { Mail::Msg(u) => u, _ => panic(\"a child did not announce itself\") }\n"
+        "}\n"
+        "let a = up(me)\n"
+        "let b = up(me)\n"
+        "let poison  = if a.poison { a.at } else { b.at }\n"
+        "let patient = if a.poison { b.at } else { a.at }\n"
+        "send(poison, 0)\n"
         "match me.receive() {\n"
-        "  Mail::Msg(first) => {\n"
-        "    match me.receive() {\n"
-        "      Mail::Msg(second) => {\n"
-        "        send(first.at, 0)\n"
-        "        match me.receive() {\n"
-        "          Mail::Exited(_, why) => println(reason(why)),\n"
-        "          _ => println(\"no report\"),\n"
-        "        }\n"
-        "        send(second.at, 9)\n"            // let the stubborn one end, so the program can
-        "      },\n"
-        "      _ => println(\"?\"),\n"
-        "    }\n"
-        "  },\n"
-        "  _ => println(\"?\"),\n"
-        "}\n"),
+        "  Mail::Exited(_, why) => println(reason(why)),\n"
+        "  _ => println(\"no report\"),\n"
+        "}\n"
+        "send(patient, 9)\n"                      // let the stubborn one end, so the program can
+        ),
         "supervisor: child 1 did not stop within 100 ms"
         " (an actor that never receives must ask inbox.stopRequested())\n");
     check_str("supervisor_checks_stop_timeout", cg_run_native(U + COUNTER + MAIN +
