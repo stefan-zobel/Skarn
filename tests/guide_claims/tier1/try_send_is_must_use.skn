@@ -1,0 +1,10 @@
+// CLAIM: `trySend`'s result is must-use -- `Full` means nothing was queued, so dropping it loses a
+//        message while the caller believes it sent one. (`send`'s Bool is deliberately NOT must-use.)
+// GUIDE: 21 (Actors: long-lived, talking by messages)
+// EXPECT: warn unused std::actor::SendResult
+use std::actor::*
+
+
+let rx: Inbox[Int] = newBoundedInbox(1)
+trySend(rx.pid(), 1)
+println("sent, maybe")

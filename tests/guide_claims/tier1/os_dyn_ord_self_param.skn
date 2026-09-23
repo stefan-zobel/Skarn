@@ -1,5 +1,5 @@
 // CLAIM: `dyn Ord` does not exist — Self in a non-receiver param makes a trait not object-safe (OS2).
-// GUIDE: Traits / object safety; §23 (Ord row)
+// GUIDE: Traits / object safety; §24 (Ord row)
 // EXPECT: fail is not object-safe
 fn f(x: dyn Ord) -> Bool { x.lessThan(x) }
 println(f(3))

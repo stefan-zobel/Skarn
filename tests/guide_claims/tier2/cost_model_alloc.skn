@@ -1,7 +1,7 @@
-// CLAIM (§25 cost model): a lazy tuple-yielding combinator (enumerate) allocates an Option+tuple per
+// CLAIM (§26 cost model): a lazy tuple-yielding combinator (enumerate) allocates an Option+tuple per
 // element, while `for (k, v) in m` over a map is a ZERO-ALLOC fast path. Measured via gcStats():
 // over 50 elements the map fast path stays ~O(1) objects; enumerate allocates >100.
-// GUIDE: §25 (When do you allocate?) + §19 (enumerate/zip note)
+// GUIDE: §26 (When do you allocate?) + §19 (enumerate/zip note)
 // EXPECT: ok true
 let mut m: Map[Int, Int] = #{}
 let mut i = 0

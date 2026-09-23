@@ -5450,7 +5450,7 @@ void test_codegen_vec_bytes() {
     check_int_p("sort_inplace", "let mut v = toVec([3, 1, 2])\n sort(v)\n v[0]*100 + v[1]*10 + v[2]", 123);
     check_int_p("sort_dups",    "let s = sorted(toVec([3, 1, 3, 1, 2]))\n s[0]*10000 + s[1]*1000 + s[2]*100 + s[3]*10 + s[4]", 11233);
     check_int_p("sort_single",  "let s = sorted(toVec([7]))\n s[0]", 7);
-    // a USER struct/enum may impl Ord and be sorted (locks the guide's §5/§19/§23 claim; erasure types cannot).
+    // a USER struct/enum may impl Ord and be sorted (locks the guide's §5/§19/§24 claim; erasure types cannot).
     check_int_p("sorted_user_ord",
         "struct P { k: Int }\n impl Ord for P { fn lessThan(self, o: P) -> Bool { self.k < o.k } }\n"
         " let s = sorted(toVec([P{k:3}, P{k:1}, P{k:2}]))\n s[0].k * 100 + s[1].k * 10 + s[2].k", 123);
@@ -9256,6 +9256,21 @@ void test_std_actor() {
         "println(trySend(rx.pid(), 3))\n"
         "rx.close()\n"
         "println(\"${send(rx.pid(), 4)} ${trySend(rx.pid(), 5)}\")\n"), "Sent Full\n1\nSent\nfalse Gone\n");
+    // trySend is MUST-USE and send is not, deliberately: `Full` means nothing was queued, so dropping
+    // it loses a message while the caller believes it sent one, whereas `false` from `send` is the
+    // ordinary "the receiver has already ended" that Erlang-shaped code ignores on purpose.
+    check_true("try_send_discarded_warns", check_warn_has_p(U +
+        "let rx: Inbox[Int] = newBoundedInbox(1)\n"
+        "trySend(rx.pid(), 1)\n", "SendResult"));
+    check_true("try_send_used_is_quiet", check_warnc_p(U +
+        "let rx: Inbox[Int] = newBoundedInbox(1)\n"
+        "println(toString(trySend(rx.pid(), 1)))\n") == 0);
+    check_true("try_send_wildcard_is_quiet", check_warnc_p(U +
+        "let rx: Inbox[Int] = newBoundedInbox(1)\n"
+        "let _ = trySend(rx.pid(), 1)\n") == 0);
+    check_true("send_discarded_stays_quiet", check_warnc_p(U +
+        "let rx: Inbox[Int] = newInbox()\n"
+        "send(rx.pid(), 1)\n") == 0);
     // Back-pressure: a bounded actor (capacity 2) that has not started reading is full after two
     // messages. After "go" (through its own extra inbox) ten more blocking sends follow while it reads.
     check_str("actor_bounded_back_pressure", cg_run_native(U +
@@ -9659,7 +9674,17 @@ void test_std_actor() {
         "while i < 100 { send(a, i)\n i += 1 }\n", "deadlock"));
     // A JOIN names its target as exactly as a blocked send does, so a cycle through one is found.
     // Before this, std::thread::join() had no deadline and such a cycle was invisible.
-    check_true("deadlock_through_a_join", faults_with(
+    // A join cycle has TWO legitimate endings, and which one happens depends on who confirms first --
+    // so the test asserts the invariant (it is reported, and the program does not hang) rather than the
+    // mechanism. If the JOINER confirms first it faults, like any other participant. If the TASK
+    // confirms first it dies, its join returns, and the deadlock reaches the caller as the `Err` of a
+    // `Result`. That asymmetry is deliberate and needs no deadlock mark: unlike a dropped `send` Bool,
+    // a `Result` is must-use, so the checker will not let the caller drop it silently.
+    auto reports = [&](const std::string& src, const char* needle) {
+        try { return cg_run_native(src).find(needle) != std::string::npos; }
+        catch (const std::exception& e) { return std::string(e.what()).find(needle) != std::string::npos; }
+    };
+    check_true("deadlock_through_a_join", reports(
         "use std::actor::*\nuse std::task::*\n"
         "fn producer(back: Pid[Int]) -> Int {\n"
         "  let mut i = 0\n"

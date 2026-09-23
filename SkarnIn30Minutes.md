@@ -423,9 +423,9 @@ You now have enough to finish a program, not just start one. When you need more,
 - **Traits and methods** (§16) — give your own types behavior and a `.method()` API; the complete call-form picture.
 - **Generics** (§15) and **trait objects `dyn Trait`** (§17) — reusable code over many types.
 - **Iterators in full** (§19) — the remaining stages and terminals, and writing your own iterator.
-- **The standard library** (§20 and the reference in §26) — `std::json`, `std::time`, `std::random`,
+- **The standard library** (§20 and the reference in §27) — `std::json`, `std::time`, `std::random`,
   `std::regex`, `std::net`, and every function's signature.
-- **The numeric model** (§6), **strings as bytes** (§7), and **the memory & cost model** (§25) — the three
+- **The numeric model** (§6), **strings as bytes** (§7), and **the memory & cost model** (§26) — the three
   places the details actually bite.
 
 Skarn has a Rust-sized *feature* set, but it is layered: this page is the part you hold in your head, and the

@@ -128,12 +128,13 @@ static_vmrun.exe myprogram.skn
 18. [Option, Result, and the `?` operator](#18-option-result-and-the--operator)
 19. [Iterators](#19-iterators)
 20. [Modules](#20-modules)
-21. [Input, output, and the standard natives](#21-input-output-and-the-standard-natives)
-22. [Programming styles: imperative, functional, streaming](#22-programming-styles-imperative-functional-streaming)
-23. [The type system in one page](#23-the-type-system-in-one-page)
-24. [A complete little program](#24-a-complete-little-program)
-25. [The memory & cost model](#25-the-memory--cost-model)
-26. [Quick reference: the standard library](#26-quick-reference-the-standard-library)
+21. [Concurrency](#21-concurrency)
+22. [Input, output, and the standard natives](#22-input-output-and-the-standard-natives)
+23. [Programming styles: imperative, functional, streaming](#23-programming-styles-imperative-functional-streaming)
+24. [The type system in one page](#24-the-type-system-in-one-page)
+25. [A complete little program](#25-a-complete-little-program)
+26. [The memory & cost model](#26-the-memory--cost-model)
+27. [Quick reference: the standard library](#27-quick-reference-the-standard-library)
 
 ---
 
@@ -3903,6 +3904,13 @@ The rules are the ones from tasks, applied to what gets copied: the actor functi
 function**, and the message type and the start value must be **plain data**. An address (`Pid`) is plain data,
 so messages can carry the address to reply to; an `Inbox` is not — only its actor may read it:
 
+**About that second parameter.** An actor function always takes a start value, because it is the one thing
+that crosses into the new isolate with it — everything else an actor knows, it must be sent. An actor that
+needs no starting state still has to name the parameter, and the convention is `unused: Int` with a `0` at
+the call, as in the example just below. It is a wart with a reason: removing it would mean a second
+`spawnActor`, a second bounded one, a second function-value type, a second `Slot::spawn` and a second
+supervisor `child` — the whole start surface twice, so that the shorter form composes with the rest.
+
 ```rust fail
 use std::actor::*
 fn keeper(inbox: Inbox[Inbox[Int]], unused: Int) -> () {}
@@ -3978,7 +3986,7 @@ match watch.receive() {
 **Back-pressure.** A mailbox grows as long as messages come in faster than its actor reads them.
 `spawnActorBounded(f, init, n)` starts an actor whose mailbox holds at most `n` messages: a `send` to it then
 **waits** until the actor has taken one, so the sender slows down to the actor's pace instead of filling
-memory. `trySend(p, m)` never waits; it returns `SendResult::Sent`, `Full` or `Gone`. Crash reports and `Stop`
+memory. `trySend(p, m)` never waits; it returns `SendResult::Sent`, `Full` or `Gone`, and that result is **must-use** — `Full` means nothing was queued, so dropping it loses a message while you believe you sent one. (`send`s `false` is not must-use: it only says the receiver has already ended.) Crash reports and `Stop`
 always get through a full mailbox.
 
 ```rust
@@ -5146,7 +5154,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `newInbox()` / `newBoundedInbox(n)` | a further inbox of this actor (or of the main program), with its own address → `Inbox[M]` (free; annotate it: `let rx: Inbox[T] = newInbox()`; the bounded one holds at most `n` messages) |
 | `inbox.close()` | close an inbox made with `newInbox`: later sends answer `false`, what it holds is dropped. A main inbox cannot be closed |
 | `spawnActorBounded(f, init, n)` | as `spawnActor`, but its mailbox holds at most `n` messages; a `send` to it waits while it is full (free). A RING of such waits — including one through a `join` — is detected: every actor in it crashes with a fault naming the ring, because no message could have broken it |
-| `trySend(p, m)` | send without ever waiting → `SendResult`: `Sent`, `Full` (nothing was queued) or `Gone` (free) |
+| `trySend(p, m)` | send without ever waiting → `SendResult`: `Sent`, `Full` (nothing was queued) or `Gone` (free). MUST-USE: `Full` means nothing was queued |
 | `inbox.ref()` | this inbox as an entry for a `select` list → `InboxRef`. It carries no message type, which is what lets inboxes of different types be waited on together. Like an `Inbox`, it cannot be sent |
 | `select(boxes, ms)` | wait until one of several inboxes has something → `Option[Int]`, the INDEX into `boxes` (`None` = the timeout passed; a negative `ms` waits indefinitely) (free). Ties go to the LOWEST index, so the order is a priority order. It takes nothing out: the `receive()` that follows cannot wait. An empty list with a negative `ms` is a fault |
 | `actorFn(f)` / `a.spawn(init)` / `a.spawnBounded(init, n)` | `f` as a value that generic code can take and start actors from → `ActorFn[M, I]`, checked as `spawnActor` would check `f` / start an actor → `Pid[M]` (free). An `ActorFn` can itself be sent |

@@ -1,5 +1,5 @@
 // CLAIM: Hashable is a sealed compiler marker — a user impl Hashable is rejected.
-// GUIDE: §23 (Hashable sealed); Maps
+// GUIDE: §24 (Hashable sealed); Maps
 // EXPECT: fail cannot implement the built-in
 struct P { k: Int }
 impl Hashable for P {}

@@ -28,6 +28,10 @@
 //       for ask in inbox.messages() { send(ask.replyTo, ask.n * 2) }
 //     }
 //
+// The second parameter is the START VALUE, the one thing that crosses into the new isolate with the
+// actor; everything else it must be sent. An actor that needs no starting state still names it, by
+// convention `unused: Int`, and is started with `0`.
+//
 // MORE THAN ONE INBOX. An actor (or the main program) may make further inboxes with `newInbox()`,
 // each with its own message type and address -- typically one per request whose reply it waits
 // for, so the reply neither mixes with nor waits behind the rest of its mail. `ask(p, make, ms)`
@@ -181,6 +185,13 @@ pub fn stopActor[M](p: Pid[M]) -> Bool { rawStopActor(p) }
 // What `trySend` reports: the message was queued, the inbox is full (nothing was queued), or the
 // receiver no longer runs.
 pub enum SendResult { Sent, Full, Gone }
+
+// Ignoring this is always a mistake, so the checker says so -- `Full` means NOTHING was queued, and a
+// caller that drops it has lost a message while believing it sent one. That is why `trySend` is
+// must-use and `send` is not: `send` answers false only when the receiver has already ended, which is
+// the ordinary Erlang-shaped outcome many programs rightly ignore. Discard it on purpose with
+// `let _ = trySend(..)` where you mean to.
+impl MustUse for SendResult {}
 
 // Send `m` to `p` without ever waiting.
 pub fn trySend[M](p: Pid[M], m: M) -> SendResult {
