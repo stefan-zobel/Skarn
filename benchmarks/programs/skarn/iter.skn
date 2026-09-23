@@ -5,6 +5,18 @@ use std::env::*
 let n = 2000000
 gcResetStats()
 let t0 = nanoTime()
+// The pipeline is written NESTED, and annotated, to stand beside the Python and C++ versions:
+// `reduce(map(filter(..)))` there is `fold(map(filter(..)))` here, so a reader can see that the
+// three programs measure the same thing. Idiomatic Skarn writes it left to right instead, and lets
+// the call fix each lambda's types:
+//
+//     let total = range(0, n)
+//         |> filter(fn(x) { x % 2 == 0 })
+//         |> map(fn(x) { x + 1 })
+//         |> fold(0, fn(a, b) { a + b })
+//
+// `x |> f(a, b)` IS `f(x, a, b)`, and the stream is the first parameter of all three combinators,
+// so that form lowers to the very same call -- the two versions emit byte-identical bytecode.
 let total = fold(
     map(filter(range(0, n), fn(x: Int) -> Bool { x % 2 == 0 }),
         fn(x: Int) -> Int { x + 1 }),
