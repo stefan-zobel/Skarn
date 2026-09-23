@@ -33,6 +33,7 @@
 #include <unordered_map>        // the world registry: isolate id -> record
 #include <atomic>     // World::actors_started, read by the root's output buffer
 #include <optional>   // the world a root execute() owns
+#include <algorithm>  // std::find -- a mailbox's list of senders waiting for room
 #ifdef _WIN32
 // Winsock MUST precede <windows.h> to avoid winsock.h/winsock2.h redefinition errors.
 #  include <winsock2.h>
@@ -263,8 +264,23 @@ struct WaitPad {
 //     survives a restart. When its actor ends it is VACATED instead of closed -- it keeps its id and
 //     stays in the registry, so a send during the gap waits in it for the next actor. Only
 //     rawReleaseSlot ends it.
+// One send that is waiting for room, and the EVIDENCE a wait-for edge rests on. It is listed in the
+// TARGET mailbox from just before the wait until room (or death) is seen -- both transitions under
+// that mailbox's `m`, and the removal happens BEFORE the message is queued. So "this ticket is
+// listed", read under that mutex, means exactly: this send has NOT been accepted and cannot become
+// accepted without the list changing. The sender's own bookkeeping could not carry that weight: a
+// sender may be preempted between "room appeared" and "entry removed" for an unbounded time.
+struct SendWait {
+    int64_t  sender = 0;
+    uint64_t ticket = 0;      // world-wide unique, never reused; one per rawSend call
+    int64_t  target = -1;     // the box's owner, REFRESHED under the box's m on every pass
+    bool     listed = false;  // guarded by the target mailbox's m
+};
+
 struct Mailbox {
-    enum Offer { SENT, FULL, GONE };
+    // WAITING: the slice passed with no room. The Mail is untouched and the sender stays listed, so
+    // the caller can walk the wait-for graph and come back to the same wait.
+    enum Offer { SENT, FULL, GONE, WAITING };
     static constexpr int64_t NO_OWNER = -1;      // a slot between two actors
     std::mutex              m;
     std::condition_variable cv;                  // a receiver waits for mail
@@ -281,6 +297,21 @@ struct Mailbox {
     // The OWNER's wake pad, for rawSelect: copied out under `m` and woken after it is released, so
     // the two mutexes are only ever held in sequence. Null while a slot has no actor.
     std::shared_ptr<WaitPad> pad;
+    // The sends waiting for room here, for deadlock detection. Guarded by `m`, and never touched at
+    // all unless a send actually blocks -- an inbox with room costs nothing for it.
+    std::vector<SendWait*>  blocked;
+    // `owner`, read safely. Every other reader takes `m`; rawSend's self-send guard used to read it
+    // bare, which was a race.
+    bool owner_is(int64_t who) { std::lock_guard<std::mutex> lk(m); return owner == who; }
+    void unlist(SendWait* w) {                       // caller holds m; idempotent
+        if (!w->listed) return;
+        blocked.erase(std::find(blocked.begin(), blocked.end(), w));
+        w->listed = false;
+    }
+    bool lists(uint64_t ticket) {                    // caller holds m
+        for (const SendWait* w : blocked) if (w->ticket == ticket) return true;
+        return false;
+    }
     // System mail (MAIL_EXITED, MAIL_STOP): never waits, ignores the capacity.
     bool put(Mail&& mail) {
         std::shared_ptr<WaitPad> p;
@@ -296,12 +327,32 @@ struct Mailbox {
         return true;
     }
     // A message. `wait`: block while the inbox is full (rawSend); otherwise answer FULL (rawTrySend).
-    Offer offer(Mail&& mail, bool wait) {
+    // `mail` is consumed IFF the answer is SENT -- FULL, GONE and WAITING leave it for another try.
+    // `w` (rawSend on a bounded inbox): the sender's wait record. It makes the wait SLICED -- after
+    // `slice` with no room the answer is WAITING and the sender stays listed -- and keeps `target` in
+    // step with `owner`, so a slot that changes actor under a waiting sender is SEEN rather than
+    // remembered wrong. Without `w` the wait is the unbounded one it always was.
+    Offer offer(Mail& mail, bool wait, SendWait* w = nullptr,
+                std::chrono::milliseconds slice = std::chrono::milliseconds::zero()) {
         std::shared_ptr<WaitPad> p;
         {
             std::unique_lock<std::mutex> lk(m);
-            if (capacity != 0 && wait)
-                space.wait(lk, [&] { return dead || released || messages < capacity; });
+            auto room = [&] { return dead || released || messages < capacity; };
+            if (capacity != 0 && wait) {
+                if (w) {
+                    while (!room()) {
+                        // Listed only once there is established to be no room: a send that never
+                        // waits never touches the list.
+                        if (!w->listed) { blocked.push_back(w); w->listed = true; }
+                        w->target = owner;
+                        if (space.wait_for(lk, slice) == std::cv_status::timeout && !room())
+                            return WAITING;
+                    }
+                    unlist(w);          // on EVERY exit, and BEFORE the queue is touched
+                } else {
+                    space.wait(lk, room);
+                }
+            }
             if (dead) return GONE;
             if (capacity != 0 && messages >= capacity) return wait ? GONE : FULL;
             q.push_back(std::move(mail));
@@ -397,6 +448,41 @@ struct Isolate {
         if (!thread_joined && thread.joinable()) thread.join();
         thread_joined = true;
     }
+    // A join that can wait WITH A DEADLINE. std::thread::join() has none, so a joiner could not wake
+    // to look for a deadlock -- and "actor A joins task T while T blocks sending into A's full
+    // inbox" is the same family of bug as a send cycle. The thread is still joined afterwards; this
+    // only GATES that join, so no lifetime semantics change and ~World's join loop is untouched.
+    std::mutex               fin_m;
+    std::condition_variable  fin_cv;
+    bool                     finished = false;    // run_isolate has returned
+    std::vector<SendWait*>   join_blocked;        // joiners waiting here; guarded by fin_m
+    void finish() {
+        { std::lock_guard<std::mutex> lk(fin_m); finished = true; }
+        fin_cv.notify_all();
+    }
+    void unlist_join(SendWait* w) {               // caller holds fin_m; idempotent
+        if (!w->listed) return;
+        join_blocked.erase(std::find(join_blocked.begin(), join_blocked.end(), w));
+        w->listed = false;
+    }
+    bool lists_join(uint64_t ticket) {            // caller holds fin_m
+        for (const SendWait* w : join_blocked) if (w->ticket == ticket) return true;
+        return false;
+    }
+};
+
+// One entry of the wait-for index. Two kinds, both naming their target EXACTLY -- which is what a
+// receive and a select cannot do, and why only these two make edges:
+//   * a blocked SEND: waiting for room in `box` (address `box_id`), whose owner is `target`;
+//   * a blocked JOIN: waiting for isolate `iso` (= `target`) to finish.
+// The shared_ptr keeps its object alive for a walker that holds no world lock, which is what lets
+// the index be read without World::m.
+struct WaitEdge {
+    std::shared_ptr<Mailbox> box;          // exactly one of box / iso is set
+    std::shared_ptr<Isolate> iso;
+    int64_t                  box_id = 0;   // the ADDRESS, for the report
+    uint64_t                 ticket = 0;
+    int64_t                  target = Mailbox::NO_OWNER;
 };
 
 struct World;
@@ -446,6 +532,22 @@ struct World {
     // belongs to no isolate's NetRegistry; whatever is never taken is closed when the world ends.
     std::unordered_map<int64_t, socket_t> handoffs;
     int64_t                   next_ticket = 1;
+    // Deadlock detection. `wait_m` is a LEAF: nothing is acquired while it is held, and it is never
+    // held together with Mailbox::m or World::m. That is what recording the target ISOLATE (rather
+    // than a mailbox id, which would need a registry lookup) buys -- and it is load-bearing, because
+    // World::m -> Mailbox::m nesting already exists in three places, so taking wait_m under World::m
+    // would close a three-lock cycle.
+    //   * `send_waits` is a reverse INDEX, a place to look. The evidence is the target mailbox's
+    //     `blocked` list; a hop is only ever trusted after re-reading that.
+    //   * `deadlocked` holds the isolates of a confirmed cycle. Without it only ONE participant would
+    //     ever fault: the first to end closes its mailboxes, which releases everyone waiting on it
+    //     with GONE, i.e. a `send` answering false -- silently, since send is not must-use. A send
+    //     that comes back GONE therefore asks whether it is marked. Isolate ids are never reused, so
+    //     a mark cannot reach a restarted actor.
+    std::mutex                              wait_m;
+    std::unordered_map<int64_t, WaitEdge>   send_waits;
+    std::unordered_map<int64_t, std::string> deadlocked;
+    std::atomic<uint64_t>                   next_wait_ticket{ 1 };
 
     std::shared_ptr<Isolate> find(int64_t id) {
         std::lock_guard<std::mutex> lk(m);
@@ -2310,6 +2412,13 @@ static std::vector<uint32_t> task_code(const std::vector<uint32_t>& program, uin
 //     on a full inbox of it is let go); then, if it FAULTED, its starter gets MAIL_EXITED (v1 reports
 //     crashes only).
 static void run_isolate(World* world, std::shared_ptr<Isolate> iso, uint16_t fn_id) {
+    // Tell any joiner that this isolate is done, on EVERY exit of this function -- a task returns
+    // early, an actor falls through the reports. The thread is still joined afterwards; this only
+    // lets a joiner wait with a deadline instead of parking in std::thread::join() for ever.
+    struct FinishOnExit {
+        Isolate* i;
+        ~FinishOnExit() { i->finish(); }
+    } finish_on_exit{ iso.get() };
     std::ostringstream task_out;
     LineForwardBuf     actor_buf(world, /*always_lines=*/true);
     std::ostream       actor_out(&actor_buf);
@@ -2454,6 +2563,147 @@ static int64_t start_isolate(Value* args, uint8_t nargs, Context* ctx, bool acto
     return iso->id;
 }
 
+// How long a blocked send waits before it looks for a cycle, and the cap it doubles up to. Only a
+// send that ACTUALLY blocks pays this: back-pressure is a designed feature, and a sender woken by a
+// receive within the first slice never registers anything. A permanently stuck one wakes about once
+// a second. 50 ms was considered and rejected -- it would wake a healthy blocked sender twenty times
+// a second, and it would lose the race against a supervisor resolving the cycle with releaseSlot.
+static constexpr auto SEND_GRACE     = std::chrono::milliseconds(250);
+static constexpr auto SEND_MAX_SLICE = std::chrono::milliseconds(2000);
+static constexpr size_t CYCLE_MAX    = 4096;   // the walk's length cap; a cycle is far shorter
+
+// One rawSend's wait. Owns BOTH halves of the bookkeeping -- the listing in the target mailbox and
+// the world's index -- so neither can outlive the send when the deadlock fault (a throw, out of a
+// [[noreturn]] helper) unwinds this native. A leaked entry would be a permanent false-positive
+// generator: a node whose edge can never change again. The two locks are taken in SEQUENCE, never
+// nested.
+struct SendWaitGuard {
+    World*                   world;
+    std::shared_ptr<Mailbox> box;          // a send wait ...
+    std::shared_ptr<Isolate> iso;          // ... or a join wait
+    int64_t                  box_id;
+    SendWait                 w;
+    bool                     published = false;
+    SendWaitGuard(World* wd, std::shared_ptr<Mailbox> b, std::shared_ptr<Isolate> i,
+                  int64_t bid, int64_t self)
+        : world(wd), box(std::move(b)), iso(std::move(i)), box_id(bid) {
+        w.sender = self;
+        w.ticket = world->next_wait_ticket.fetch_add(1, std::memory_order_relaxed);
+    }
+    // The first slice has passed: make the edge visible to other walkers. Not done before that, so a
+    // wait that ends quickly never touches the index at all.
+    void publish() {
+        if (published) return;
+        int64_t target;
+        if (box) { std::lock_guard<std::mutex> lk(box->m); target = box->owner; }
+        else     { target = iso->id; }
+        { std::lock_guard<std::mutex> lk(world->wait_m);
+          world->send_waits[w.sender] = WaitEdge{ box, iso, box_id, w.ticket, target }; }
+        published = true;
+    }
+    ~SendWaitGuard() {
+        if (box) { std::lock_guard<std::mutex> lk(box->m);  box->unlist(&w); }
+        else     { std::lock_guard<std::mutex> lk(iso->fin_m); iso->unlist_join(&w); }
+        if (!published) return;
+        std::lock_guard<std::mutex> lk(world->wait_m);
+        const auto it = world->send_waits.find(w.sender);
+        if (it != world->send_waits.end() && it->second.ticket == w.ticket)
+            world->send_waits.erase(it);          // never erase a NEWER attempt of the same isolate
+    }
+};
+
+// One hop of a walk: "isolate `sender` is waiting to send into this edge's mailbox".
+struct Hop { int64_t sender; WaitEdge e; };
+
+// A hop is trusted only when the TARGET MAILBOX still lists the sender's ticket. The world's index
+// says where to look; it is never the evidence. Also refuses a box that is dying or a world that is
+// ending -- both resolve the wait legitimately -- and a slot whose owner changed under the sender.
+// Takes one Mailbox::m, nothing else.
+static bool still_waiting(const Hop& h) {
+    if (h.e.box) {
+        std::lock_guard<std::mutex> lk(h.e.box->m);
+        if (h.e.box->dead || h.e.box->released) return false;
+        if (h.e.box->owner != h.e.target)        return false;
+        return h.e.box->lists(h.e.ticket);
+    }
+    std::lock_guard<std::mutex> lk(h.e.iso->fin_m);      // a join wait: satisfied by `finished`
+    if (h.e.iso->finished) return false;
+    return h.e.iso->lists_join(h.e.ticket);
+}
+
+// The text of a confirmed cycle, as a chain the reader can follow. Each step names what it waits
+// FOR by ADDRESS -- an inbox, or a task -- as every other report names the address, so that it
+// survives a slot restart; and each step after the first says whose wait it is by naming the thing
+// the previous step was waiting for. No isolate ids appear, because a program never sees one.
+static std::string cycle_text(const std::vector<Hop>& cyc, bool contains_self) {
+    auto waits_for = [](const Hop& h) {
+        return h.e.box ? "waiting for room in inbox " + std::to_string(h.e.box_id)
+                       : "waiting for task " + std::to_string(h.e.box_id);
+    };
+    auto whose = [](const Hop& prev) {
+        return prev.e.box ? "inbox " + std::to_string(prev.e.box_id) + "'s owner"
+                          : "task " + std::to_string(prev.e.box_id);
+    };
+    std::string s = contains_self ? "deadlock -- " : "waiting on a deadlocked cycle -- ";
+    for (size_t i = 0; i < cyc.size(); ++i)
+        s += (i ? "; " + whose(cyc[i - 1]) + " is " : "") + waits_for(cyc[i]);
+    return s + "; and " + whose(cyc.back()) + " is the one this chain started at -- the ring is "
+               "closed, so no one in it can ever take the step the next one waits for";
+}
+
+// Walk the wait-for graph from `self` and CONFIRM what it finds; "" means no verdict.
+//
+// Two passes, and no sleep between them. Pass 1 collects the hops, each confirmed against its target
+// mailbox; pass 2 re-confirms the same hops after pass 1 has finished. A participant's "listed"
+// interval is contiguous, so both of its confirmations fall inside it -- and therefore the instant
+// pass 1 ended falls inside EVERY participant's interval. That is one real instant at which all of
+// them were unsatisfied claimants at once, which is what makes the verdict a proof rather than a
+// snapshot stitched together from different moments.
+//
+// Every participant is MARKED before the text is returned, so the ones that are released with GONE
+// when the first of them ends still report the deadlock instead of answering false.
+static std::string confirm_send_cycle(World* w, int64_t self) {
+    std::vector<Hop> path;
+    std::unordered_map<int64_t, size_t> seen;
+    for (int64_t id = self; path.size() < CYCLE_MAX; ) {
+        if (const auto at = seen.find(id); at != seen.end()) {
+            const std::vector<Hop> cyc(path.begin() + static_cast<ptrdiff_t>(at->second), path.end());
+            for (const Hop& h : cyc) if (!still_waiting(h)) return "";        // pass 2
+            const std::string text = cycle_text(cyc, at->second == 0);
+            {   // mark every participant, so that ALL of them report it
+                std::lock_guard<std::mutex> lk(w->wait_m);
+                for (const Hop& h : cyc) w->deadlocked.emplace(h.sender, text);
+            }
+            return text;
+        }
+        WaitEdge e;
+        {
+            std::lock_guard<std::mutex> lk(w->wait_m);
+            const auto it = w->send_waits.find(id);
+            if (it == w->send_waits.end()) return "";   // receiving, selecting, or running: no verdict
+            e = it->second;
+        }
+        // A vacated slot has no owner: whoever waits there waits for a SPAWN, an outside event like
+        // a receive, so the chain ends without a verdict.
+        if (e.target == Mailbox::NO_OWNER) return "";
+        const Hop h{ id, e };
+        if (!still_waiting(h)) return "";
+        seen.emplace(id, path.size());
+        path.push_back(h);
+        id = e.target;
+    }
+    return "";
+}
+
+// Has a cycle containing `self` already been confirmed (by self or by another participant)? Read
+// when a wait ends in GONE, because the first participant to fault closes its mailboxes and that is
+// what releases the others.
+static std::string taken_deadlock(World* w, int64_t self) {
+    std::lock_guard<std::mutex> lk(w->wait_m);
+    const auto it = w->deadlocked.find(self);
+    return it == w->deadlocked.end() ? std::string() : it->second;
+}
+
 // rawSpawn(fn, arg) -> Int, the task id.
 static Value native_task_spawn(Value* args, uint8_t nargs, Context* ctx) {
     return Value::fromSigned48(start_isolate(args, nargs, ctx, /*actor=*/false, "spawn"));
@@ -2479,7 +2729,33 @@ static Value native_task_join(Value* args, uint8_t nargs, Context* ctx) {
     if (iso->claimed)
         raise_located(ctx, "join: this task was already joined");
     iso->claimed = true;
-    iso->join_thread();
+    // Wait for the task in slices, so a cycle running THROUGH this join is found -- "an actor joins
+    // a task that is blocked sending into that actor's full inbox" is the same bug as a send cycle,
+    // and std::thread::join() alone could never notice it. The listing lives in the target isolate
+    // under its own mutex, with "satisfied" being `finished`, exactly as a send's listing lives in
+    // the target mailbox with "satisfied" being "queued".
+    {
+        IsolateLocal* local = ctx->vm->isolate;
+        SendWaitGuard g(local->world, nullptr, iso, iso->id, local->id);
+        auto slice = SEND_GRACE;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(iso->fin_m);
+                if (iso->finished) { iso->unlist_join(&g.w); break; }
+                if (!g.w.listed) { iso->join_blocked.push_back(&g.w); g.w.listed = true; }
+                g.w.target = iso->id;
+                if (iso->fin_cv.wait_for(lk, slice) != std::cv_status::timeout || iso->finished) {
+                    if (iso->finished) { iso->unlist_join(&g.w); break; }
+                    continue;
+                }
+            }
+            g.publish();
+            if (const std::string why = confirm_send_cycle(local->world, local->id); !why.empty())
+                raise_located(ctx, ("join: " + why).c_str());
+            if (slice < SEND_MAX_SLICE) slice *= 2;
+        }
+    }
+    iso->join_thread();   // it has finished, so this returns at once
     if (!iso->printed.empty()) {
         *ctx->vm->out << iso->printed;
         iso->printed.clear();
@@ -2775,20 +3051,53 @@ static std::shared_ptr<Mailbox> addressee(Value* args, uint8_t nargs, Context* c
     return local->world->mailbox_of(id.asSigned48());
 }
 
+
 // rawSend(pid, msg) -> Bool. False when the addressee no longer runs, its inbox was closed, or the
 // program is ending while the inbox is full; the message is then dropped, as in Erlang. To a FULL
 // bounded inbox it waits until there is room (back-pressure). Waiting on one's own full inbox could
-// never end -- only this isolate empties it -- so that is a located fault instead.
+// never end -- only this isolate empties it -- so that is a located fault instead; a CYCLE of such
+// waits over several isolates is the same fact and gets the same answer (confirm_send_cycle), which
+// is why the old note that "a cycle of two actors is not detected" is gone from the documentation.
 static Value native_send(Value* args, uint8_t nargs, Context* ctx) {
     auto box  = addressee(args, nargs, ctx, "send");
     Mail mail = encode_message(args, nargs, ctx, "send");
     if (!box) return Value::fromBool(false);
-    if (box->capacity != 0 && box->owner == ctx->vm->isolate->id) {
-        if (box->offer(std::move(mail), /*wait=*/false) == Mailbox::FULL)
+    IsolateLocal* local = ctx->vm->isolate;
+    if (box->capacity != 0 && box->owner_is(local->id)) {
+        if (box->offer(mail, /*wait=*/false) == Mailbox::FULL)
             raise_located(ctx, "send: this actor's own inbox is full, and waiting for room would never end");
         return Value::fromBool(true);   // SENT (GONE is impossible: the owner is running)
     }
-    return Value::fromBool(box->offer(std::move(mail), /*wait=*/true) == Mailbox::SENT);
+    // An unbounded inbox never blocks, so it keeps exactly the path it always had: the detection
+    // machinery below is not reached, not allocated and not locked.
+    if (box->capacity == 0)
+        return Value::fromBool(box->offer(mail, /*wait=*/true) == Mailbox::SENT);
+    // Bounded: try once without waiting. Only a send that really has to wait pays for any of the
+    // bookkeeping -- listing a sender that is about to be admitted anyway would put a push_back and
+    // an erase on every bounded send.
+    switch (box->offer(mail, /*wait=*/false)) {
+        case Mailbox::SENT: return Value::fromBool(true);
+        case Mailbox::GONE: return Value::fromBool(false);
+        default: break;                 // FULL: fall through to the waiting loop
+    }
+    const int64_t addr = handle_id(nargs >= 1 ? args[0] : Value::fromNil()).asSigned48();
+    SendWaitGuard g(local->world, box, nullptr, addr, local->id);
+    auto slice = SEND_GRACE;
+    for (;;) {
+        const Mailbox::Offer r = box->offer(mail, /*wait=*/true, &g.w, slice);
+        if (r == Mailbox::SENT) return Value::fromBool(true);
+        if (r != Mailbox::WAITING) {
+            // GONE: the inbox closed, or the world is ending. If a cycle WE are part of was
+            // confirmed, the closing is a consequence of it -- report it rather than answer false.
+            if (const std::string why = taken_deadlock(local->world, local->id); !why.empty())
+                raise_located(ctx, ("send: " + why).c_str());
+            return Value::fromBool(false);
+        }
+        g.publish();
+        if (const std::string why = confirm_send_cycle(local->world, local->id); !why.empty())
+            raise_located(ctx, ("send: " + why).c_str());
+        if (slice < SEND_MAX_SLICE) slice *= 2;
+    }
 }
 
 // rawTrySend(pid, msg) -> Int: 0 sent, 1 the inbox is full (nothing was queued), 2 the addressee is
@@ -2797,10 +3106,11 @@ static Value native_try_send(Value* args, uint8_t nargs, Context* ctx) {
     auto box  = addressee(args, nargs, ctx, "trySend");
     Mail mail = encode_message(args, nargs, ctx, "trySend");
     if (!box) return Value::fromSigned48(2);
-    switch (box->offer(std::move(mail), /*wait=*/false)) {
-        case Mailbox::SENT: return Value::fromSigned48(0);
-        case Mailbox::FULL: return Value::fromSigned48(1);
-        case Mailbox::GONE: return Value::fromSigned48(2);
+    switch (box->offer(mail, /*wait=*/false)) {
+        case Mailbox::SENT:    return Value::fromSigned48(0);
+        case Mailbox::FULL:    return Value::fromSigned48(1);
+        case Mailbox::GONE:    return Value::fromSigned48(2);
+        case Mailbox::WAITING: break;   // unreachable without a SendWait; listed so the switch is total
     }
     return Value::fromSigned48(2);
 }

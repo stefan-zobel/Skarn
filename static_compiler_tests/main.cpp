@@ -9615,6 +9615,116 @@ void test_std_actor() {
         "println(toString(select(toVec([forged]), 0)))\n",
         "an InboxRef can only be created by `inbox.ref()`"));
 
+    // ---- deadlock detection: a cycle of blocked sends (and joins) ----
+    // Two actors, each filling the other's capacity-1 inbox and then waiting for room. EVERY
+    // participant must report it: the first to fault closes its inbox, which releases the other with
+    // "gone", so without the world's deadlock mark only ONE of them would ever say anything.
+    check_str("deadlock_two_actors_both_report", cg_run_native(U +
+        "enum Msg { Peer(Pid[Msg]), Work(Int) }\n"
+        "fn side(inbox: Inbox[Msg], boss: Pid[Int]) -> () {\n"
+        "  let peer = match inbox.receive() {\n"
+        "    Mail::Msg(Msg::Peer(p)) => p,\n"
+        "    _                       => panic(\"no peer\")\n"
+        "  }\n"
+        "  send(boss, 1)\n"
+        "  let mut i = 0\n"
+        "  while i < 100 { send(peer, Msg::Work(i))\n i += 1 }\n"
+        "}\n"
+        "fn said(me: Inbox[Int]) -> String {\n"
+        "  match me.receive() {\n"
+        "    Mail::Exited(_, why) => if indexOf(why, \"deadlock\") >= 0 { \"reported\" } else { why },\n"
+        "    _                    => \"?\",\n"
+        "  }\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let a = spawnActorBounded(side, me.pid(), 1)\n"
+        "let b = spawnActorBounded(side, me.pid(), 1)\n"
+        "send(a, Msg::Peer(b))\n"
+        "send(b, Msg::Peer(a))\n"
+        "match me.receive() { Mail::Msg(_) => {}, _ => println(\"?\") }\n"
+        "match me.receive() { Mail::Msg(_) => {}, _ => println(\"?\") }\n"
+        "println(\"${said(me)} ${said(me)}\")\n"),
+        "reported reported\n");
+    // The main program is an ordinary participant: it gets the located fault, which is the right end
+    // for a program that would otherwise have hung with no output at all.
+    check_true("deadlock_root_is_a_participant", faults_with(U +
+        "fn filler(inbox: Inbox[Int], back: Pid[Int]) -> () {\n"
+        "  let mut i = 0\n"
+        "  while i < 100 { send(back, i)\n i += 1 }\n"
+        "}\n"
+        "let _me: Inbox[Int] = mainInbox()\n"
+        "let rx: Inbox[Int] = newBoundedInbox(1)\n"
+        "let a = spawnActorBounded(filler, rx.pid(), 1)\n"
+        "let mut i = 0\n"
+        "while i < 100 { send(a, i)\n i += 1 }\n", "deadlock"));
+    // A JOIN names its target as exactly as a blocked send does, so a cycle through one is found.
+    // Before this, std::thread::join() had no deadline and such a cycle was invisible.
+    check_true("deadlock_through_a_join", faults_with(
+        "use std::actor::*\nuse std::task::*\n"
+        "fn producer(back: Pid[Int]) -> Int {\n"
+        "  let mut i = 0\n"
+        "  while i < 50 { send(back, i)\n i += 1 }\n"
+        "  99\n"
+        "}\n"
+        "let _me: Inbox[Int] = mainInbox()\n"
+        "let rx: Inbox[Int] = newBoundedInbox(1)\n"
+        "let t = spawn(producer, rx.pid())\n"
+        "println(toString(t.join()))\n", "deadlock"));
+    // NEAR MISS, and the reason the walk stops at a receive: the addressee is not blocked SENDING,
+    // it is merely slow. It has no target, so no cycle exists and nothing may be reported -- the
+    // send simply goes through once the actor drains.
+    check_str("deadlock_a_slow_receiver_is_not_one", cg_run_native(
+        "use std::actor::*\nuse std::time::*\n"
+        "fn slow(inbox: Inbox[Int], back: Pid[Int]) -> () {\n"
+        "  sleep(800)\n"                            // well past the 250 ms first slice
+        "  let mut got = 0\n"
+        "  for _m in inbox.messages() {\n"
+        "    got += 1\n"
+        "    if got == 3 { send(back, got)\n break }\n"
+        "  }\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let a = spawnActorBounded(slow, me.pid(), 1)\n"
+        "let mut i = 0\n"
+        "while i < 3 { send(a, i)\n i += 1 }\n"
+        "match me.receive() { Mail::Msg(n) => println(\"delivered ${n}\"), _ => println(\"?\") }\n"),
+        "delivered 3\n");
+    // THE STALE-ENTRY FALSIFIER. A consumer that drains right around the grace boundary keeps the
+    // sender going in and out of the wait for seconds. A confirmation kept by the SENDER would see
+    // "still listed, generation unchanged" in that window and report a deadlock that never existed;
+    // the listing in the TARGET mailbox, removed before the message is queued, cannot.
+    check_str("deadlock_no_verdict_at_the_grace_boundary", cg_run_native(
+        "use std::actor::*\nuse std::time::*\n"
+        "fn dripping(inbox: Inbox[Int], back: Pid[Int]) -> () {\n"
+        "  let mut got = 0\n"
+        "  while got < 8 {\n"
+        "    sleep(300)\n"                          // just past the first slice, every time
+        "    match inbox.receive() { Mail::Msg(_) => { got += 1 }, _ => { got = 8 } }\n"
+        "  }\n"
+        "  send(back, got)\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let a = spawnActorBounded(dripping, me.pid(), 1)\n"
+        "let mut i = 0\n"
+        "while i < 8 { send(a, i)\n i += 1 }\n"
+        "match me.receive() { Mail::Msg(n) => println(\"drained ${n}\"), _ => println(\"?\") }\n"),
+        "drained 8\n");
+    // The END OF THE WORLD resolves a blocked send legitimately: every sender is released with
+    // false. That is not a deadlock and must never be reported as one.
+    check_str("deadlock_shutdown_releases_instead", cg_run_native(
+        "use std::actor::*\nuse std::time::*\n"
+        "fn filler(inbox: Inbox[Int], back: Pid[Int]) -> () {\n"
+        "  let mut sent = 0\n"
+        "  let mut i = 0\n"
+        "  while i < 50 { if send(back, i) { sent += 1 }\n i += 1 }\n"
+        "  println(\"the sender was released, ${sent} of 50 got through\")\n"
+        "}\n"
+        "let _rx: Inbox[Int] = newBoundedInbox(1)\n"
+        "let _a = spawnActorBounded(filler, _rx.pid(), 1)\n"
+        "sleep(700)\n"                              // let it block well past the first slice
+        "println(\"the program ends now\")\n"),
+        "the program ends now\nthe sender was released, 1 of 50 got through\n");
+
     // ---- Slot[M]: an address that outlives its actor ----
     const std::string WORKER =
         "fn worker(inbox: Inbox[Ask], factor: Int) -> () {\n"

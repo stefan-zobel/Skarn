@@ -489,7 +489,17 @@ A `rawSend` to a full inbox waits until the receiver has taken a message, so a f
 receiver's pace instead of filling memory; `rawTrySend` never waits and reports "full" instead. Crash
 reports and `Stop` always get through. A waiting sender is released with false when the receiver ends or
 when the world ends, so a full inbox cannot hold up the end of the program. Two actors waiting to send to
-each other's full inbox wait forever; the runtime does not detect that.
+each other's full inbox would wait forever — and **that is detected and reported**, see below.
+
+**Deadlock detection.** A blocked send and a blocked join are the only waits that name their target
+exactly: a receive could be answered by anyone, so it says nothing. A cycle over those two is therefore a
+proof rather than a guess, and it is one no message could break — `Stop` and crash reports ignore an
+inbox's capacity and never free a sender waiting for room. A sender that has waited past a grace period
+(250 ms, doubling to 2 s) looks for such a cycle; when one is confirmed, **every** participant ends with a
+located fault naming the ring, so each of their starters hears about it and a supervisor's strategy
+decides what follows. A send that never blocks pays nothing for this, and an unbounded inbox is untouched.
+What it does not claim: the verdict is that the *participants* cannot resolve the cycle — releasing a slot,
+closing an inbox, or the end of the program still can.
 
 Everything started under one call of `execute()` forms a **world**. Addresses are unique within it, so an
 actor's address can be sent inside a message. When that call returns, the world sends every actor `Stop`

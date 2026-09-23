@@ -397,8 +397,9 @@ A `Pid[M]` promises that the actor it names receives `M`. The checker keeps that
 
 A request that wants an answer does not need a selective receive: the answer goes to an inbox of its own,
 with its own type. A bounded inbox provides back-pressure — `send` waits while it is full, `trySend` reports
-`Full` instead — and exit reports and `Stop` always get through. None of this needs a checker rule beyond
-the ones above; the waiting is the runtime's.
+`Full` instead — and exit reports and `Stop` always get through. A RING of such waits, including one that
+runs through a `join`, is detected by the runtime and reported to every actor in it as an ordinary crash.
+None of this needs a checker rule beyond the ones above; the waiting is the runtime's.
 
 To serve several of those inboxes from one loop, `select(boxes, timeoutMs)` waits until any of them has
 something and answers WHICH — the index into the list, or `None` when the timeout passed. The list holds

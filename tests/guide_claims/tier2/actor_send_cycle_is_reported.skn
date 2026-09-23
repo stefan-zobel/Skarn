@@ -1,0 +1,47 @@
+// CLAIM: two actors each waiting for room in the other's full inbox are a deadlock that no message
+//        could break -- so it is reported, to EVERY participant, instead of waited out for ever.
+// GUIDE: 21 (Actors: long-lived, talking by messages)
+// EXPECT: ok reported, reported
+use std::actor::*
+
+
+// A peer address arrives first; after that this actor only sends, and never receives again. With a
+// mailbox that holds ONE message, the second send has to wait for room -- on both sides at once.
+enum Msg { Peer(Pid[Msg]), Work(Int) }
+
+
+fn side(inbox: Inbox[Msg], boss: Pid[Int]) -> () {
+  let peer = match inbox.receive() {
+    Mail::Msg(Msg::Peer(p)) => p,
+    _                       => panic("no peer"),
+  }
+  send(boss, 1)                       // "I have my peer": the program is ordered, not raced
+  let mut i = 0
+  while i < 100 {
+    send(peer, Msg::Work(i))
+    i += 1
+  }
+}
+
+
+// Both crashes are reported to this program, which started them.
+fn said(me: Inbox[Int]) -> String {
+  match me.receive() {
+    Mail::Exited(_, why) => if indexOf(why, "deadlock") >= 0 { "reported" } else { why },
+    _                    => "?",
+  }
+}
+
+
+let me: Inbox[Int] = mainInbox()
+let a = spawnActorBounded(side, me.pid(), 1)
+let b = spawnActorBounded(side, me.pid(), 1)
+send(a, Msg::Peer(b))
+send(b, Msg::Peer(a))
+
+let mut up = 0
+while up < 2 {
+  match me.receive() { Mail::Msg(_) => { up += 1 }, _ => { up = 2 } }
+}
+
+println("${said(me)}, ${said(me)}")

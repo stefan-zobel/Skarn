@@ -3353,6 +3353,18 @@ inline void task_fns(Assembler& as) {
     as.load_const(0, 0);
     as.J(OpCode::RET);
 
+    // afill(target_id): sends to the inbox its ARGUMENT names, for ever, and never receives. Two of
+    // these pointed at each other -- or one pointed at the main program, which points back -- is a
+    // cycle of blocked sends, which ends in a located fault rather than in a wait nobody can break.
+    as.label("afill");
+    as.R6(OpCode::MOV, 1, 0, 0);            // r1 = the target inbox id (the start value)
+    as.load_const(6, 1);
+    as.label("afill_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.R6(OpCode::MOV, 3, 6, 0);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.J(OpCode::J, "afill_loop");
+
     // aselect(_): parks in a SELECT over its own inbox and a second one, with no deadline. Whatever
     // wakes it, it receives that inbox and sends the mail KIND to the main program -- so a test can
     // see that Stop reaches an actor sleeping in a select, not only one sleeping in a receive.
@@ -3580,6 +3592,7 @@ inline void declare_task_fns(Assembler& as) {
     as.declare_fn("awatch", 8, 1);
     as.declare_fn("abusy",  8, 1);
     as.declare_fn("aselect", 8, 1);
+    as.declare_fn("afill",  8, 1);
     as.declare_fn("astop",  8, 1);
     as.declare_fn("aconn",  8, 1);
     as.declare_fn("areply", 8, 1);
@@ -4566,6 +4579,38 @@ inline void test_actor_select_stop() {
         std::cout << std::format("  Stop wakes a parked select:     {}{}\n", ok ? "PASS" : "FAIL",
                                  r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
         check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A send to one's OWN full inbox is already a located fault: only the waiting isolate could empty
+// it. A CYCLE of such waits over several isolates is the same fact, and gets the same answer -- no
+// in-band message can break it, since Stop and exit reports ignore the capacity and never touch the
+// `space` condition variable. Here the main program and one actor each fill the other's inbox.
+inline void test_actor_send_cycle() {
+    using namespace forkjoin;
+    std::cout << "=== actor_send_cycle ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(43, 1);  as.call_native_id(11, 42, 43, 1, NATIVE_NEW_INBOX);  // bounded to one
+        as.R6(OpCode::MOV, 44, 11, 0);                        // the actor sends back to it ...
+        spawn_actor_bounded(as, 12, "afill", 1);              // ... and its own inbox holds one
+        as.load_const(20, 7);
+        as.label("cycle_loop");                               // ... while we fill the actor's
+        as.R6(OpCode::MOV, 40, 12, 0);
+        as.R6(OpCode::MOV, 41, 20, 0);
+        as.call_native_id(21, 42, 40, 2, NATIVE_SEND);
+        as.J(OpCode::J, "cycle_loop");
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool named  = r.fault.find("deadlock") != std::string::npos;
+        const bool why    = r.fault.find("waiting for room in inbox") != std::string::npos;
+        std::cout << std::format("  a send cycle is a fault:    {}  (\"{}\")\n",
+                                 named ? "PASS" : "FAIL", r.fault);
+        std::cout << std::format("  and it names the cycle:     {}\n", why ? "PASS" : "FAIL");
+        check(named && why);
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 

@@ -3998,8 +3998,17 @@ while i <= 100 {
 }
 ```
 
-Two actors that each wait to send into the other's full mailbox wait forever; nothing detects that, so keep
-the messages of a bounded pair flowing in one direction.
+Two actors that each wait to send into the other's full mailbox would wait for ever — and **that is
+reported instead**. No message could break such a ring (`Stop` ignores the bound, so it frees nobody), so
+once it is confirmed every actor in it crashes with a fault naming the ring, and their starters hear of it
+like any other crash — a supervisor's strategy then decides what follows. A ring that runs through a
+`join` is found the same way. Two things worth knowing:
+
+- **Only a blocked `send` and a blocked `join` count**, because only they name what they are waiting for.
+  An actor sitting in `receive` could be answered by anyone, so a chain that reaches one ends without a
+  verdict — a program that waits for a message nobody will ever send is still your own to find.
+- **A slow receiver is not a deadlock.** Waiting for room is the point of a bounded mailbox; only a
+  genuine ring is reported, and a send that never blocks costs nothing for this.
 
 **Serving several inboxes from one loop.** `receive()` waits on ONE inbox. `select(boxes, timeoutMs)` waits
 on several and answers **which** of them has something — the index into the list, or `None` when the
@@ -5136,7 +5145,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `ask(p, make, ms)` | request and reply: sends `make(replyAddress)` to `p`, waits at most `ms` milliseconds for the answer on an inbox of its own → `Result[R, AskError]` (`Gone`, `Timeout`, `Stopped`, `Crashed(reason)`) (free). It monitors the receiver, so a crash ends the wait at once instead of after `ms`. The reply type `R` comes from the `Pid[R]` in the request, and must be plain data |
 | `newInbox()` / `newBoundedInbox(n)` | a further inbox of this actor (or of the main program), with its own address → `Inbox[M]` (free; annotate it: `let rx: Inbox[T] = newInbox()`; the bounded one holds at most `n` messages) |
 | `inbox.close()` | close an inbox made with `newInbox`: later sends answer `false`, what it holds is dropped. A main inbox cannot be closed |
-| `spawnActorBounded(f, init, n)` | as `spawnActor`, but its mailbox holds at most `n` messages; a `send` to it waits while it is full (free) |
+| `spawnActorBounded(f, init, n)` | as `spawnActor`, but its mailbox holds at most `n` messages; a `send` to it waits while it is full (free). A RING of such waits — including one through a `join` — is detected: every actor in it crashes with a fault naming the ring, because no message could have broken it |
 | `trySend(p, m)` | send without ever waiting → `SendResult`: `Sent`, `Full` (nothing was queued) or `Gone` (free) |
 | `inbox.ref()` | this inbox as an entry for a `select` list → `InboxRef`. It carries no message type, which is what lets inboxes of different types be waited on together. Like an `Inbox`, it cannot be sent |
 | `select(boxes, ms)` | wait until one of several inboxes has something → `Option[Int]`, the INDEX into `boxes` (`None` = the timeout passed; a negative `ms` waits indefinitely) (free). Ties go to the LOWEST index, so the order is a priority order. It takes nothing out: the `receive()` that follows cannot wait. An empty list with a negative `ms` is a fault |
