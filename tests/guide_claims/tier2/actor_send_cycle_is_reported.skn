@@ -1,6 +1,6 @@
 // CLAIM: two actors each waiting for room in the other's full inbox are a deadlock that no message
 //        could break -- so it is reported, to EVERY participant, instead of waited out for ever.
-// GUIDE: 21 (Actors: long-lived, talking by messages)
+// GUIDE: SkarnActors.md (Back-pressure)
 // EXPECT: ok reported, reported
 use std::actor::*
 

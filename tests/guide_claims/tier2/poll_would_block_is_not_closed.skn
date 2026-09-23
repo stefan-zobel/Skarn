@@ -1,7 +1,7 @@
 // CLAIM: on a non-blocking socket "nothing has arrived YET" and "the peer closed" are DIFFERENT
 //        answers -- Received::WouldBlock vs Received::Closed. Confusing them is what makes a server
 //        either drop live connections or keep dead ones forever, so recv reports which one it is.
-// GUIDE: 21 (Serving more than one connection)
+// GUIDE: SkarnGuide.md 21 (Serving more than one connection)
 // EXPECT: ok would-block then closed
 use std::net::*
 use std::poll::*

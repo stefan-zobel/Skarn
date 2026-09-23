@@ -1,6 +1,6 @@
 // CLAIM: `slot.release()` ends an address for good: a send to it answers false from then on, and the actor
 //        that was running there is told to stop.
-// GUIDE: 21 (Actors: long-lived, talking by messages)
+// GUIDE: SkarnActors.md (An address that survives a restart)
 // EXPECT: ok true then false
 use std::actor::*
 

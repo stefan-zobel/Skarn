@@ -1,6 +1,6 @@
 // CLAIM: `select` waits on SEVERAL inboxes at once and answers which one has something, so one loop
 //        serves an actor's own mail and a reply inbox of a different type. Ties go to the lowest index.
-// GUIDE: 21 (Actors: long-lived, talking by messages)
+// GUIDE: SkarnActors.md (Two queues in one loop)
 // EXPECT: ok job 4, rx hello, done
 use std::actor::*
 

@@ -1,6 +1,6 @@
 # `tests/guide_claims/` — executable guide-claim checker
 
-Every categorical promise the two guides — `SkarnGuide.md` (the full guide) and
+Every categorical promise the guides — `SkarnGuide.md` (the full guide), `SkarnActors.md` (actors) and
 `SkarnIn30Minutes.md` (the introduction) — make, from *"a struct compares structurally"* to
 *"`xs |> intoIter |> filter(p) |> collect`"*, is a claim about what the **compiler actually does**.
 Prose drifts silently: a guide goes on asserting behaviour after the compiler has changed. This
@@ -37,7 +37,7 @@ Options: `-Config Debug` (use the Debug `static_vmrun.exe`), `-Exe <path>` (an e
 ## Every guide example — `run_guide_examples.ps1`
 
 The claims above are written by hand, so a guide example nobody wrote a fixture for is unguarded. So a
-second runner checks **every** ```` ```rust ```` block of both guides. It extracts them **at run time** — the
+second runner checks **every** ```` ```rust ```` block of all three guides. It extracts them **at run time** — the
 guides are the single source of truth, and there are no copies in the repository that could drift from them.
 `run_guide_claims.ps1` calls it at the end (skip with `-NoExamples`), so the one command above runs both.
 
@@ -84,7 +84,7 @@ choice for output that differs between runs (a random roll, the environment).
 ## Example programs — `tests/run_examples.ps1`
 
 The third runner, also called at the end of `run_guide_claims.ps1` (and skipped by the same `-NoExamples`),
-checks the realistic programs under `examples/` — each a small real task written from the two guides alone
+checks the realistic programs under `examples/` — each a small real task written from the guides alone
 (see `examples/README.md`). Every example runs with `--strict` in a temporary copy of its directory and must
 exit `0`, print nothing to stderr, and print **exactly** its `expected.out`; an optional `args.txt` holds the
 command-line arguments. Where a guide block checks one feature in isolation, these catch what only shows up

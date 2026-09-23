@@ -1,6 +1,6 @@
 // CLAIM: a connection handed to an actor (c.handOff() -> h.take()) keeps the bytes the sender already
 //        read past a line boundary, and the sender's own TcpConn is dead afterwards.
-// GUIDE: 21 (Actors: long-lived, talking by messages)
+// GUIDE: SkarnActors.md (Handing over a connection)
 // EXPECT: ok root read one | got two | tcpSend: socket was handed to another actor
 use std::net::*
 use std::actor::*

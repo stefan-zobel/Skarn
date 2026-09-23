@@ -1,6 +1,6 @@
 // CLAIM: a bounded mailbox gives back-pressure -- trySend reports Full once it holds its capacity, and a
 //        plain send to it WAITS for room instead of failing, so every message arrives, in order.
-// GUIDE: 21 (Actors: long-lived, talking by messages)
+// GUIDE: SkarnActors.md (Back-pressure)
 // EXPECT: ok Sent Sent Full in order 78
 use std::actor::*
 

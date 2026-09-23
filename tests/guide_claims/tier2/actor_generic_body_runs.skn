@@ -1,6 +1,6 @@
 // CLAIM: a GENERIC function can be an actor's body where the call determines its type parameters -- one
 //        erased body serves every message type, and a generic starter can be written over it.
-// GUIDE: 21 (Actors: long-lived, talking by messages)
+// GUIDE: SkarnActors.md (Generic actor code)
 // EXPECT: ok int: 21, str: hi
 use std::actor::*
 

@@ -1,0 +1,30 @@
+// CLAIM: a `send` to a FULL bounded inbox waits for room instead of failing -- back-pressure, so a fast
+//        sender is slowed to its receiver's pace. (`trySend` is the one that reports Full and gives up.)
+// GUIDE: SkarnActors.md (Back-pressure, and the ring)
+// EXPECT: ok all 20 arrived, in order
+use std::actor::*
+
+
+// One message fits; the sender must wait for every one after that.
+fn slowly(inbox: Inbox[Int], boss: Pid[Int]) -> () {
+  let mut want = 1
+  let mut ok   = true
+  for n in inbox.messages() {
+    if n != want { ok = false }
+    want += 1
+    if want > 20 { break }
+  }
+  send(boss, if ok { want - 1 } else { 0 })
+}
+
+
+let me: Inbox[Int] = mainInbox()
+let a = spawnActorBounded(slowly, me.pid(), 1)
+
+let mut i = 1
+while i <= 20 { send(a, i)  i += 1 }
+
+match me.receive() {
+  Mail::Msg(n) => println("all ${n} arrived, in order"),
+  _            => println("?"),
+}

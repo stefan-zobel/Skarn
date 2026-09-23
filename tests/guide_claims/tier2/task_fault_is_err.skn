@@ -1,5 +1,5 @@
 // CLAIM: a task that faults does not take its parent down -- join returns Err and the parent goes on.
-// GUIDE: 21 (Running functions in parallel)
+// GUIDE: SkarnGuide.md 21 (Running functions in parallel)
 // EXPECT: ok failed, parent continues
 use std::task::*
 

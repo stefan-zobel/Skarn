@@ -1,7 +1,7 @@
 # run_guide_claims.ps1 -- the executable guide-claim checker.
 #
 # Each *.skn under this directory is a self-contained Skarn program that encodes ONE
-# categorical claim one of the two guides makes -- SkarnGuide.md (tier1/2/3) or
+# categorical claim one of the guides makes -- SkarnGuide.md and SkarnActors.md (tier1/2/3) or
 # SkarnIn30Minutes.md (intro/). A header comment declares the expected outcome; this runner
 # compiles+runs each program with static_vmrun and asserts the outcome matches. The point:
 # a guide claim that silently drifts from the compiler's actual behaviour fails here instead
@@ -18,8 +18,8 @@
 #   powershell -File tests/guide_claims/run_guide_claims.ps1 -Config Debug
 #   powershell -File tests/guide_claims/run_guide_claims.ps1 -Exe path\to\static_vmrun.exe
 #
-# After the claims it runs run_guide_examples.ps1 (every ```rust block of both guides), then
-# tests/run_examples.ps1 (every program under examples/, exact output), then check_anchors.ps1 over both
+# After the claims it runs run_guide_examples.ps1 (every ```rust block of the guides), then
+# tests/run_examples.ps1 (every program under examples/, exact output), then check_anchors.ps1 over all
 # guides (every internal link resolves), so one command is the whole doc gate.
 # -NoExamples skips all three, and so does a -Dir subset.
 #
@@ -135,7 +135,7 @@ if ($runExamples) {
     # longer existed, and every routine gate stayed green, because the anchor checks that run routinely
     # read the documents under docs/, not the guides. It runs here so that "the one command is the whole
     # doc gate" is true of the links as well.
-    foreach ($doc in @('SkarnGuide.md', 'SkarnIn30Minutes.md')) {
+    foreach ($doc in @('SkarnGuide.md', 'SkarnIn30Minutes.md', 'SkarnActors.md')) {
         Write-Host ''
         & (Join-Path $scriptDir 'check_anchors.ps1') -File (Join-Path $repoRoot $doc)
         $examplesFailed = $examplesFailed -or ($LASTEXITCODE -ne 0)

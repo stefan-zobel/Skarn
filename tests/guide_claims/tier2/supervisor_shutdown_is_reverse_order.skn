@@ -1,0 +1,49 @@
+// CLAIM: when a supervisor is stopped it stops its children in REVERSE start order, waiting for each to
+//        end before telling the next -- which is what a child that depends on an earlier one needs.
+// GUIDE: SkarnActors.md (Stopping)
+// EXPECT: ok child 2 ended, child 1 ended, child 0 ended, supervisor normal
+use std::actor::*
+use std::supervisor::*
+
+
+struct Kid { i: Int, boss: Pid[Int] }
+
+
+fn quiet(inbox: Inbox[Int], s: Kid) -> () {
+  send(s.boss, s.i)                       // announce, so the program is ordered and not raced
+  for _m in inbox.messages() {}
+  send(s.boss, 100 + s.i)                 // ... and announce the end, in the order it happens
+}
+
+
+fn keeper(inbox: Inbox[()], boss: Pid[Int]) -> () {
+  let mut kids: Vec[dyn Supervised] = vec()
+  push(kids, child(actorFn(quiet), Kid { i: 0, boss: boss }))
+  push(kids, child(actorFn(quiet), Kid { i: 1, boss: boss }))
+  push(kids, child(actorFn(quiet), Kid { i: 2, boss: boss }))
+  superviseWith(inbox, kids, SupervisorSpec { strategy: Strategy::OneForOne,
+    limit: RestartLimit { maxRestarts: 3, withinMs: 60000 }, stopTimeoutMs: 60000 })
+}
+
+
+fn heard(me: Inbox[Int]) -> Int {
+  match me.receive() { Mail::Msg(n) => n, _ => -1 }
+}
+
+
+let me: Inbox[Int] = mainInbox()
+let k = spawnActor(keeper, me.pid())
+
+let mut up = 0
+while up < 3 { let _n = heard(me)  up += 1 }      // all three are running
+
+let watch: Inbox[Int] = newInbox()
+let _w = monitor(k, watch)
+let _s = stopActor(k)
+
+let a = heard(me) - 100
+let b = heard(me) - 100
+let c = heard(me) - 100
+let why = match watch.receive() { Mail::Exited(_, r) => r, _ => "?" }
+
+println("child ${a} ended, child ${b} ended, child ${c} ended, supervisor ${why}")

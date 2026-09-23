@@ -1,6 +1,6 @@
 // CLAIM: a monitor is told of a NORMAL end too, with the reason "normal" -- which nothing else reports,
 //        and which is what lets a supervisor wait for a child it stopped.
-// GUIDE: 21 (Actors: long-lived, talking by messages)
+// GUIDE: SkarnActors.md (When an actor crashes)
 // EXPECT: ok stopped true, reason normal
 use std::actor::*
 

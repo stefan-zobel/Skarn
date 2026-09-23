@@ -1,6 +1,6 @@
 // CLAIM: an actor whose loop is its own work never reaches a receive, so stopActor's message would never
 //        be read -- inbox.stopRequested() is how it learns, and it ends itself.
-// GUIDE: 21 (Actors: long-lived, talking by messages)
+// GUIDE: SkarnActors.md (Stopping)
 // EXPECT: ok told: true, it ended itself: 1
 use std::actor::*
 

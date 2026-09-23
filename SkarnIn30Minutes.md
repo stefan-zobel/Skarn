@@ -425,6 +425,9 @@ You now have enough to finish a program, not just start one. When you need more,
 - **Iterators in full** (§19) — the remaining stages and terminals, and writing your own iterator.
 - **The standard library** (§20 and the reference in §27) — `std::json`, `std::time`, `std::random`,
   `std::regex`, `std::net`, and every function's signature.
+- **Doing several things at once** (§21) — one thread serving many connections, and one computation on
+  several cores. For long-lived workers that talk by messages there is a guide of its own,
+  [Actors in Skarn](SkarnActors.md).
 - **The numeric model** (§6), **strings as bytes** (§7), and **the memory & cost model** (§26) — the three
   places the details actually bite.
 

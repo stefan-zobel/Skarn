@@ -1,0 +1,17 @@
+// CLAIM: when two inboxes are ready at once, `select` answers the LOWEST index -- so the order of the
+//        list is a priority order, and a control queue put first is served before waiting work.
+// GUIDE: SkarnActors.md (Two queues in one loop)
+// EXPECT: ok Some(0) then Some(0)
+use std::actor::*
+
+
+let me: Inbox[Int]     = mainInbox()
+let rx: Inbox[String]  = newInbox()
+
+send(me.pid(), 1)                      // both are ready before either select runs
+send(rx.pid(), "x")
+
+let first  = select(toVec([me.ref(), rx.ref()]), 0)
+let second = select(toVec([rx.ref(), me.ref()]), 0)   // same two, other order
+
+println("${toString(first)} then ${toString(second)}")

@@ -1,6 +1,6 @@
 // CLAIM: `ask` makes an inbox for the reply, so the reply type must be plain data like any message type --
 //        a function value as the reply is a compile error.
-// GUIDE: 21 (Actors: long-lived, talking by messages)
+// GUIDE: SkarnActors.md (What may cross between actors)
 // EXPECT: fail the reply (fn(Int) -> Int) cannot be sent
 use std::actor::*
 

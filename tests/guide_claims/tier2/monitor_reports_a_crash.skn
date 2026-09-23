@@ -1,6 +1,6 @@
 // CLAIM: a monitor tells an actor that did NOT start another one that it has ended -- the starter's own
 //        crash report cannot do that -- and it arrives in the inbox the watcher named.
-// GUIDE: 21 (Actors: long-lived, talking by messages)
+// GUIDE: SkarnActors.md (When an actor crashes)
 // EXPECT: ok watching true, told about it true
 use std::actor::*
 

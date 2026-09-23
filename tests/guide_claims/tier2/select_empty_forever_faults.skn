@@ -1,0 +1,10 @@
+// CLAIM: `select` over an empty list with a negative timeout is refused -- no event could ever end that
+//        wait, so it is a located fault rather than a program that hangs with no output.
+// GUIDE: SkarnActors.md (Two queues in one loop)
+// EXPECT: fail a negative timeout with no inbox would wait forever
+use std::actor::*
+
+
+let _me: Inbox[Int] = mainInbox()
+let none: Vec[InboxRef] = vec()
+println(toString(select(none, -1)))

@@ -45,7 +45,7 @@ Concretely:
   the value representation need anyway), so it too costs nothing extra. See [§16](#16-traits)
   for how "erased" and "dispatch on the runtime type" fit together without contradiction.
 - **No shared memory between threads.** Multi-core work is fork-join tasks and share-nothing **actors**
-  with typed mailboxes, supervisors and back-pressure ([Actors](#actors-long-lived-talking-by-messages));
+  with typed mailboxes, supervisors and back-pressure ([Actors in Skarn](SkarnActors.md));
   each runs on its own heap and messages are copied, so there are no data races and no locks.
 
 ### Compared to the languages it borrows from
@@ -3683,6 +3683,26 @@ match httpGet("example.com", 80, "/") {
 }
 ```
 
+And `std::regex` matches, captures, and rewrites text with a linear-time engine (compile once, reuse):
+
+```rust
+use std::regex::*
+let re = match Regex::compile("(?<key>[a-z]+)=([0-9]+)") { Ok(r) => r, Err(e) => panic(e.message) }
+
+match re.captures("  port=8080;") {           // capture groups (0 = whole match)
+  Some(c) => {
+    match c.groupNamed("key") { Some(m) => println(m.text), None => () }   // => port
+    match c.group(2)          { Some(m) => println(m.text), None => () }   // => 8080
+  },
+  None => println("no match"),
+}
+
+println(toString(count(re.searchAll("a=1 b=22 c=333"))))   // => 3         (lazy)
+println(re.replaceAllRe("a=1 b=22", "$1:$2"))              // => a:1 b:22  (templates)
+```
+
+Any prelude name can also be reached explicitly as `std::name` (useful when a local definition shadows it).
+
 ## 21. Concurrency
 
 Three steps, each solving a different problem, and they compose:
@@ -3691,7 +3711,7 @@ Three steps, each solving a different problem, and they compose:
 |---|---|---|
 | `std::poll` | one thread serving **many connections** — waiting on several sockets at once | one core; a slow handler stalls every connection |
 | `std::task` | **several cores** for one computation — fork, compute, join | a task runs once and returns one value |
-| `std::actor` | **long-lived** workers that keep state and talk by messages | an actor is an OS thread, so hundreds are fine and millions are not |
+| `std::actor` | **long-lived** workers that keep state and talk by messages ([its own guide](SkarnActors.md)) | an actor is an OS thread, so hundreds are fine and millions are not |
 
 The rule underneath all three: **nothing is shared.** Every task and every actor has its own heap, and a
 value that crosses between them is copied, not referenced. That is what removes data races by
@@ -3844,584 +3864,15 @@ What a task prints appears when it is **joined**, in join order, so the output d
 task happened to run first. A task nobody joins is still waited for when the program ends; what it
 printed is dropped.
 
-### Actors: long-lived, talking by messages
-
-A task computes one result. An **actor** (`std::actor`) keeps running: it waits for messages, answers
-them, and keeps its own state between them.
-
-The model comes from **Erlang**: processes that share nothing, messages that are copied into a mailbox, and a
-crash that stays with the actor that crashed and is reported instead of spreading. Three things differ:
-- **Mailboxes are typed.** A `Pid[M]` says which messages its actor understands, closer to Gleam's typed
-  subjects than to Erlang's untyped ones.
-- **Every actor is an operating-system thread.** Erlang's lightweight processes run on a scheduler of their
-  own. Thousands of actors are fine; millions are not.
-- **There is no selective receive, and there are no links.** A reply goes to an inbox of its own instead
-  (see `ask` below), and `select` waits on several inboxes at once. Supervisors exist, as an ordinary
-  library (`std::supervisor`), not as a runtime feature.
-
-`spawnActor(f, init)` starts `f(inbox, init)` on a thread of its own and returns the actor's **address**, a
-`Pid[M]`. `send(pid, m)` puts a copy of `m` into its mailbox. The actor reads its mail with
-`inbox.messages()`, a lazy iterator that ends when the program ends, so an actor's whole life is a `for`
-loop:
-
-```rust
-use std::actor::*
-
-// Ask the counter for its total: the message carries the address to answer to.
-enum Cmd { Add(Int), Total(Pid[Int]) }
-
-fn counter(inbox: Inbox[Cmd], start: Int) -> () {
-  let mut total = start
-  for cmd in inbox.messages() {
-    match cmd {
-      Cmd::Add(n)     => { total = total + n },
-      Cmd::Total(ask) => { send(ask, total) },
-    }
-  }
-}
-
-let me: Inbox[Int] = mainInbox()          // the main program's own mailbox
-let c = spawnActor(counter, 100)
-send(c, Cmd::Add(5))
-send(c, Cmd::Add(7))
-send(c, Cmd::Total(me.pid()))
-match me.receive() {
-  Mail::Msg(t) => println(t),             // => 112
-  _ => println("no answer"),
-}
-```
-
-`inbox.receive()` is the full form. It returns a `Mail`:
-- `Msg(m)`, a message;
-- `Exited(id, reason)`, when an actor this one started has **crashed**. The crash does not spread; its
-  starter is told, and a `send` to the crashed actor returns `false` from then on;
-- `Stop`, when the program is ending. `messages()` stops there by itself.
-
-`inbox.receiveTimeout(ms)` gives up with `None` after `ms` milliseconds. The main program gets its one
-mailbox with `mainInbox()`, annotated with its message type.
-
-The rules are the ones from tasks, applied to what gets copied: the actor function is a **named top-level
-function**, and the message type and the start value must be **plain data**. An address (`Pid`) is plain data,
-so messages can carry the address to reply to; an `Inbox` is not — only its actor may read it:
-
-**About that second parameter.** An actor function always takes a start value, because it is the one thing
-that crosses into the new isolate with it — everything else an actor knows, it must be sent. An actor that
-needs no starting state still has to name the parameter, and the convention is `unused: Int` with a `0` at
-the call, as in the example just below. It is a wart with a reason: removing it would mean a second
-`spawnActor`, a second bounded one, a second function-value type, a second `Slot::spawn` and a second
-supervisor `child` — the whole start surface twice, so that the shorter form composes with the rest.
-
-```rust fail
-use std::actor::*
-fn keeper(inbox: Inbox[Inbox[Int]], unused: Int) -> () {}
-let k = spawnActor(keeper, 0)   // error: cannot be sent to an actor
-```
-
-**Asking for an answer.** The counter above answers into the main program's mailbox, so its answer arrives
-among whatever else comes in, and the answer's type has to be the mailbox's type. `ask` makes a separate
-inbox for the one answer instead: it sends a request built around that inbox's address, waits for the reply
-at most the given milliseconds, and closes the inbox again. The reply type comes from the address the
-request carries:
-
-```rust
-use std::actor::*
-
-enum Query { Square(Int, Pid[Int]) }
-
-fn squarer(inbox: Inbox[Query], unused: Int) -> () {
-  for q in inbox.messages() {
-    match q {
-      Query::Square(n, replyTo) => { send(replyTo, n * n) },
-    }
-  }
-}
-
-let s = spawnActor(squarer, 0)
-match ask(s, fn(me) { Query::Square(7, me) }, 1000) {
-  Ok(n)  => println(n),                   // => 49
-  Err(e) => println(e),                   // Gone, Timeout, Stopped or Crashed(reason)
-}
-```
-
-An actor may make more inboxes of its own with `newInbox()` — each with its own address and message type,
-annotated like `mainInbox()` — and `inbox.close()` one it no longer needs; the end of an actor closes all of
-its inboxes.
-
-**Watching another actor.** A crash is reported to the actor that *started* the crashed one, and a normal
-end is reported to nobody. Anyone else who needs to know sets a **monitor**: `monitor(p, rx)` promises
-exactly one `Mail::Exited(id, reason)` in your own inbox `rx` when that actor ends. The reason is the fault
-message if it crashed, `"normal"` if it returned, and `"gone"` if it had already ended — in which case the
-report arrives at once and the call answers `false`. A monitor watches *that actor*, not the address, so
-after a restart in a slot you monitor again if you want to keep watching. `ask` sets one itself, which is
-why it answers `Crashed` immediately instead of waiting out its timeout when the actor it asked dies.
-
-```rust
-use std::actor::*
-
-enum Query { Square(Int, Pid[Int]) }
-
-fn squarer(inbox: Inbox[Query], unused: Int) -> () {
-  for q in inbox.messages() {
-    match q {
-      Query::Square(n, replyTo) => { if n < 0 { panic("a negative square is beyond me") }
-        send(replyTo, n * n) },
-    }
-  }
-}
-
-let s = spawnActor(squarer, 0)
-let watch: Inbox[Int] = newInbox()
-println(monitor(s, watch))                  // => true
-match ask(s, fn(me) { Query::Square(-1, me) }, 60000) {
-  Ok(n) => println(n),
-  Err(AskError::Crashed(_)) => println("the service crashed"),   // => the service crashed
-  Err(e) => println(e),
-}
-match watch.receive() {
-  Mail::Exited(_, _) => println("the monitor was told too"),     // => the monitor was told too
-  _ => println("?"),
-}
-```
-
-**Back-pressure.** A mailbox grows as long as messages come in faster than its actor reads them.
-`spawnActorBounded(f, init, n)` starts an actor whose mailbox holds at most `n` messages: a `send` to it then
-**waits** until the actor has taken one, so the sender slows down to the actor's pace instead of filling
-memory. `trySend(p, m)` never waits; it returns `SendResult::Sent`, `Full` or `Gone`, and that result is **must-use** — `Full` means nothing was queued, so dropping it loses a message while you believe you sent one. (`send`s `false` is not must-use: it only says the receiver has already ended.) Crash reports and `Stop`
-always get through a full mailbox.
-
-```rust
-use std::actor::*
-
-fn adder(inbox: Inbox[Int], unused: Int) -> () {
-  let mut sum = 0
-  for n in inbox.messages() { sum = sum + n }
-  println(sum)                            // => 5050
-}
-
-let a = spawnActorBounded(adder, 0, 10)  // at most 10 messages wait for it
-let mut i = 1
-while i <= 100 {
-  send(a, i)                             // waits whenever the mailbox is full
-  i = i + 1
-}
-```
-
-Two actors that each wait to send into the other's full mailbox would wait for ever — and **that is
-reported instead**. No message could break such a ring (`Stop` ignores the bound, so it frees nobody), so
-once it is confirmed every actor in it crashes with a fault naming the ring, and their starters hear of it
-like any other crash — a supervisor's strategy then decides what follows. A ring that runs through a
-`join` is found the same way. Two things worth knowing:
-
-- **Only a blocked `send` and a blocked `join` count**, because only they name what they are waiting for.
-  An actor sitting in `receive` could be answered by anyone, so a chain that reaches one ends without a
-  verdict — a program that waits for a message nobody will ever send is still your own to find.
-- **A slow receiver is not a deadlock.** Waiting for room is the point of a bounded mailbox; only a
-  genuine ring is reported, and a send that never blocks costs nothing for this.
-
-**Serving several inboxes from one loop.** `receive()` waits on ONE inbox. `select(boxes, timeoutMs)` waits
-on several and answers **which** of them has something — the index into the list, or `None` when the
-timeout passed (a negative timeout waits indefinitely). The list is built from `inbox.ref()`, because
-inboxes of different message types are different types and cannot share a `Vec`:
-
-```rust
-use std::actor::*
-
-enum Ctl { Pause, Resume }
-
-fn worker(jobs: Inbox[Int], boss: Pid[String]) -> () {
-  let ctl: Inbox[Ctl] = newInbox()
-  send(boss, "ready")
-  let watching = toVec([ctl.ref(), jobs.ref()])   // control first: it wins a tie
-  let mut running = true
-  while running {
-    match select(watching, 1000) {
-      Some(0) => {
-        match ctl.receive() {
-          Mail::Msg(Ctl::Pause)  => { send(boss, "paused") },
-          Mail::Msg(Ctl::Resume) => { send(boss, "resumed") },
-          _                      => { running = false }
-        }
-      },
-      Some(1) => {
-        match jobs.receive() {
-          Mail::Msg(n) => { send(boss, "job ${n}") },
-          _            => { running = false }
-        }
-      },
-      _ => { running = false }             // a second with nothing to do
-    }
-  }
-}
-
-let me: Inbox[String] = mainInbox()
-let w = spawnActor(worker, me.pid())
-match me.receive() { Mail::Msg(s) => println(s), _ => println("?") }
-send(w, 7)
-match me.receive() { Mail::Msg(s) => println(s), _ => println("?") }
-// => ready
-// => job 7
-```
-
-The receive that follows a `select` **cannot wait**: only the owner of an inbox takes mail out of it, and
-the owner is you. Two more things worth knowing:
-
-- **Ties go to the lowest index**, so the order of the list is a priority order — and an inbox that is
-  always ready starves the ones after it.
-- **Watching nothing forever is refused.** `select(vec(), -1)` is a fault rather than a program that hangs
-  with no output; with a timeout, an empty list simply waits it out.
-
-An `InboxRef` names the same mailbox an `Inbox` does, so like an `Inbox` it cannot be sent to another
-actor, and only `inbox.ref()` makes one.
-
-**A generic actor body.** The function an actor runs may itself be generic, wherever the call fixes its
-type parameters — types are erased, so one compiled body serves every message type. That also lets you
-write a generic *starter*, where `T` is abstract and sendable through its bound alone:
-
-```rust
-use std::actor::*
-
-// One body, any sendable message type.
-fn relay[T: Sendable](inbox: Inbox[T], boss: Pid[T]) -> () {
-  for m in inbox.messages() { send(boss, m) }
-}
-
-fn start[T: Sendable](boss: Pid[T]) -> Pid[T] { spawnActor(relay, boss) }
-
-let me: Inbox[Int] = mainInbox()
-let sx: Inbox[String] = newInbox()
-let ints = start(me.pid())
-let strs = start(sx.pid())
-send(ints, 21)
-match me.receive() {
-  Mail::Msg(n) => println(n),          // => 21
-  _ => {},
-}
-send(strs, "hi")
-match sx.receive() {
-  Mail::Msg(s) => println(s),          // => hi
-  _ => {},
-}
-```
-
-What the call must fix is the type parameter: `spawnActor(relay, boss)` learns it from `boss`. Where
-nothing does — `actorFn(relay)` standing alone — annotate the result (`let a: ActorFn[Int, Int] =
-actorFn(relay)`), because a type nobody determines cannot be shown to be sendable. The address stays
-monomorphic either way: one `Pid` carries one message type.
-
-**Generic helpers.** `actorFn(f)` is the actor counterpart of `taskFn`. It checks `f` once, like
-`spawnActor` would, and returns an `ActorFn[M, I]`; `a.spawn(init)` and `a.spawnBounded(init, n)` start
-actors from it. An `ActorFn` is plain data, so it can travel in a message as well: a supervisor can be sent
-a child's function and start value and start the child itself. A helper that makes an inbox for a type
-parameter needs the bound `Sendable`:
-
-```rust
-use std::actor::*
-
-struct Ask { n: Int, replyTo: Pid[Int] }
-
-fn times(inbox: Inbox[Ask], factor: Int) -> () {
-  for a in inbox.messages() { send(a.replyTo, a.n * factor) }
-}
-
-// Start n actors that run the same function.
-fn pool[M, I](a: ActorFn[M, I], init: I, n: Int) -> Vec[Pid[M]] {
-  let mut pids: Vec[Pid[M]] = vec()
-  let mut i = 0
-  while i < n {
-    push(pids, a.spawn(init))
-    i = i + 1
-  }
-  pids
-}
-
-// An inbox for replies of any sendable type.
-fn replyInbox[R: Sendable]() -> Inbox[R] { newInbox() }
-
-let rx: Inbox[Int] = replyInbox()
-for p in pool(actorFn(times), 10, 3) { send(p, Ask { n: 2, replyTo: rx.pid() }) }
-let mut sum = 0
-let mut k = 0
-while k < 3 {
-  match rx.receive() {
-    Mail::Msg(v) => { sum = sum + v },
-    _ => {},
-  }
-  k = k + 1
-}
-println(sum)                              // => 60
-```
-
-Without the bound, `replyInbox` is rejected: the compiler cannot know that every `R` will be plain data.
-
-```rust fail
-use std::actor::*
-fn replyInbox[R]() -> Inbox[R] { newInbox() }   // error: a new inbox's messages (R) cannot be sent
-```
-
-Actors print a line at a time into the program's output, so lines from different actors never mix, but
-their order depends on scheduling. When the program ends, every actor gets `Stop` and the program waits for
-them to finish. `demo/actors/wordcount.skn` counts words with a reader, N counter actors and a collector.
-
-A connection is not plain data — its socket belongs to the actor that opened it — so it cannot be a message.
-To give one to another actor, **hand it off**: `c.handOff()` detaches the connection and returns a
-`SocketHandOff`, a ticket that *can* be sent, and the receiving actor turns it back into a `TcpConn` with
-`h.take()`, once. Bytes that `recvLine` had already read ahead travel with it. The sender's `TcpConn` is dead
-from then on: every operation on it returns an `Err`.
-
-```rust
-use std::net::*
-use std::actor::*
-
-// A worker answers on every connection it is handed.
-fn worker(inbox: Inbox[SocketHandOff], unused: Int) -> () {
-  for h in inbox.messages() {
-    match h.take() {
-      Ok(mut c) => {
-        match c.recvLine() {
-          Ok(Some(line)) => { let _ = c.sendStr("echo " + line + "\n") },
-          _ => {},
-        }
-        let _ = c.close()
-      },
-      Err(e) => println(e),
-    }
-  }
-}
-
-fn demo() -> Result[(), String] {
-  let lst = listen(0)?                                  // the system picks a free port
-  let mut client = connect("127.0.0.1", lst.localPort()?)?
-  let conn = lst.accept()?
-  let w = spawnActor(worker, 0)
-  send(w, conn.handOff()?)                              // the ticket travels; the socket follows
-  client.sendStr("hi\n")?
-  println(match client.recvLine()? { Some(s) => s, None => "<eof>" })   // => echo hi
-  match conn.sendStr("late") { Ok(_) => println("sent"), Err(e) => println(e) }   // => tcpSend: socket was handed to another actor
-  client.close()?
-  lst.close()?
-  Ok(())
-}
-match demo() { Ok(_) => {}, Err(e) => println(e) }
-```
-
-That is how a server spreads over several cores: one actor accepts and hands each connection to a worker.
-`demo/actor_server/` is one, with a load generator built on tasks.
-
-**Supervision.** `std::supervisor` keeps actors running. `supervise(inbox, children, limit)` starts every
-child and, when one crashes, starts it again with the same start value. More than `limit.maxRestarts`
-restarts within `limit.withinMs` milliseconds, and the supervisor gives up by crashing itself, so that its
-own starter learns of it. A supervisor is an ordinary actor, so supervisors nest into trees. `supervise` is
-a function that runs inside the supervising actor, with that actor's inbox, because a crash is reported to
-the actor that started the child. The children are built right there as a `Vec[dyn Supervised]`, so they
-may have different message types. A trait object cannot be sent, and this list never needs to be.
-
-```rust
-use std::actor::*
-use std::supervisor::*
-
-// Hands out 1, 2, 3, ... to whoever asks.
-fn counter(inbox: Inbox[Pid[Int]], unused: Int) -> () {
-  let mut n = 0
-  for replyTo in inbox.messages() {
-    n = n + 1
-    send(replyTo, n)
-  }
-}
-
-struct Job { counter: Pid[Pid[Int]], boss: Pid[String] }
-
-// Fails on its first two attempts, then reports to the boss.
-fn flaky(inbox: Inbox[Int], job: Job) -> () {
-  let attempt = match ask(job.counter, fn(me) { me }, 5000) { Ok(n) => n, Err(_) => 0 }
-  if attempt < 3 { panic("attempt ${attempt} failed") }
-  send(job.boss, "up at attempt ${attempt}")
-}
-
-// The supervisor: an actor that runs `supervise` over its children.
-fn keeper(inbox: Inbox[()], job: Job) -> () {
-  let mut kids: Vec[dyn Supervised] = vec()
-  push(kids, child(actorFn(flaky), job))
-  supervise(inbox, kids, RestartLimit { maxRestarts: 5, withinMs: 10000 })
-}
-
-let me: Inbox[String] = mainInbox()
-spawnActor(keeper, Job { counter: spawnActor(counter, 0), boss: me.pid() })
-match me.receive() {
-  Mail::Msg(s) => println(s),                     // => up at attempt 3
-  _ => {},
-}
-```
-
-**A fixed address across restarts.** A restarted child is a new actor with a new address, which is awkward
-for anyone holding the old one. A **slot** is an address made before its actor and kept across the actors
-started into it: `newSlot()` returns a `Slot[M]`, `slot.pid()` is the address to hand out, and
-`childIn(slot, a, init)` tells the supervisor to start the child there every time. A message sent while
-the child is being started again waits in the slot instead of being dropped — but what the crashed actor
-had not read is gone, because delivering the message that crashed it to its successor would crash that one
-too. `slot.release()` ends the address: later sends answer `false`, and an actor still running there is
-told to stop. A supervisor releases its children's addresses when it gives up.
-
-```rust
-use std::actor::*
-use std::supervisor::*
-
-struct Job { n: Int, replyTo: Pid[Int] }
-
-// Announces itself at every start, and cannot cope with 13.
-fn worker(inbox: Inbox[Job], boss: Pid[Int]) -> () {
-  send(boss, -1)
-  for j in inbox.messages() {
-    if j.n == 13 { panic("unlucky") }
-    send(j.replyTo, j.n * 2)
-  }
-}
-
-struct Setup { at: Slot[Job], boss: Pid[Int] }
-
-fn keeper(inbox: Inbox[Int], s: Setup) -> () {
-  let mut kids: Vec[dyn Supervised] = vec()
-  push(kids, childIn(s.at, actorFn(worker), s.boss))
-  supervise(inbox, kids, RestartLimit { maxRestarts: 3, withinMs: 10000 })
-}
-
-fn got(m: Mail[Int]) -> Int { match m { Mail::Msg(v) => v, _ => -2 } }
-
-let me: Inbox[Int] = mainInbox()
-let at: Slot[Job] = newSlot()
-spawnActor(keeper, Setup { at: at, boss: me.pid() })
-let p = at.pid()                          // one address, however often the worker is restarted
-// The first worker announces itself.
-println(got(me.receive()))                // => -1
-send(p, Job { n: 4, replyTo: me.pid() })
-println(got(me.receive()))                // => 8
-send(p, Job { n: 13, replyTo: me.pid() }) // it crashes on this one
-// Its successor, at the same address, announces itself in turn.
-println(got(me.receive()))                // => -1
-send(p, Job { n: 5, replyTo: me.pid() })
-println(got(me.receive()))                // => 10
-```
-
-**When a crash takes the siblings with it.** `supervise` restarts the child that crashed and nothing else.
-Where the children depend on one another, `superviseWith` takes a `SupervisorSpec` and says so:
-`Strategy::OneForAll` stops every other child, waits until they have all ended, and starts them all again;
-`Strategy::RestForOne` does the same for the children started *after* the crashed one, which is what
-children that build on the ones before them need. The wait is for an end report, which arrives only once
-that actor's address is free — so a child in a slot is started again exactly where it was. A group restart
-counts as one restart against the limit.
-
-```rust
-use std::actor::*
-use std::supervisor::*
-
-struct Note { i: Int, me: Pid[Int] }
-
-struct Kid { i: Int, boss: Pid[Note] }
-
-// Announces itself at every start; the message 0 makes it crash.
-fn member(inbox: Inbox[Int], k: Kid) -> () {
-  send(k.boss, Note { i: k.i, me: inbox.pid() })
-  for m in inbox.messages() { if m == 0 { panic("boom") } }
-}
-
-fn keeper(inbox: Inbox[()], boss: Pid[Note]) -> () {
-  let mut kids: Vec[dyn Supervised] = vec()
-  push(kids, child(actorFn(member), Kid { i: 0, boss: boss }))
-  push(kids, child(actorFn(member), Kid { i: 1, boss: boss }))
-  superviseWith(inbox, kids, SupervisorSpec {
-    strategy: Strategy::OneForAll,
-    limit: RestartLimit { maxRestarts: 3, withinMs: 10000 },
-    stopTimeoutMs: 1000
-  })
-}
-
-// How many announcements arrived.
-fn waitFor(me: Inbox[Note], n: Int) -> Int {
-  let mut seen = 0
-  while seen < n {
-    match me.receive() {
-      Mail::Msg(_) => { seen = seen + 1 },
-      _ => { seen = n },
-    }
-  }
-  seen
-}
-
-let me: Inbox[Note] = mainInbox()
-spawnActor(keeper, me.pid())
-match me.receive() {
-  Mail::Msg(first) => {
-    // the other child is up as well
-    println(waitFor(me, 1))            // => 1
-    send(first.me, 0)
-    // both start again, not only the one that crashed
-    println(waitFor(me, 2))            // => 2
-  },
-  _ => {},
-}
-```
-
-**Stopping an actor that never receives.** `stopActor(p)` is a *message*: the actor ends when it next
-receives. An actor whose loop is its own work never gets there, and there is no kill — so such an actor
-asks instead. `inbox.stopRequested()` is true once anyone has told it to end, and it takes no mail out of
-the inbox, so the rest of the loop is unaffected.
-
-```rust
-use std::actor::*
-
-// Its loop is its own work: it never receives, so it asks.
-fn grind(inbox: Inbox[Int], boss: Pid[Int]) -> () {
-  let mut i = 0
-  while !inbox.stopRequested() { i = i + 1 }
-  send(boss, 1)
-}
-
-let me: Inbox[Int] = mainInbox()
-let p = spawnActor(grind, me.pid())
-println(stopActor(p))                  // => true
-match me.receive() {
-  Mail::Msg(n) => println(n),          // => 1
-  _ => {},
-}
-```
-
-A child that neither receives nor asks is the one case a supervisor cannot resolve. `stopTimeoutMs` says
-what it does then: `0`, the default, waits — that group stands still, but the supervisor keeps receiving,
-so the program still ends. A deadline makes a *restart* give up and crash, naming the child, so the tree
-above is told rather than the group being restarted as if it were whole; during a *shutdown* the child is
-abandoned instead and the supervisor ends normally.
-
-At `Stop` a supervisor stops its children in reverse start order and releases every address; with a
-`stopTimeoutMs` it waits for each child to end before it tells the next.
-
-Limits of this supervisor:
-- **Crashes only.** A child is started again only after a crash; a child that returns stays ended.
-- **New addresses, unless a slot.** A child made with `child` has a new address after a restart, and must
-  announce it itself — for example by sending `inbox.pid()` to an address in its start value. A child made
-  with `childIn` keeps the slot's address.
-- **Not in the main program.** The main program cannot supervise, because it never receives `Stop`, so the
-  program would never end.
-
-`demo/actors/supervised.skn` keeps a pool of crashing workers busy until their work is done.
-
-And `std::regex` matches, captures, and rewrites text with a linear-time engine (compile once, reuse):
-
-```rust
-use std::regex::*
-let re = match Regex::compile("(?<key>[a-z]+)=([0-9]+)") { Ok(r) => r, Err(e) => panic(e.message) }
-
-match re.captures("  port=8080;") {           // capture groups (0 = whole match)
-  Some(c) => {
-    match c.groupNamed("key") { Some(m) => println(m.text), None => () }   // => port
-    match c.group(2)          { Some(m) => println(m.text), None => () }   // => 8080
-  },
-  None => println("no match"),
-}
-
-println(toString(count(re.searchAll("a=1 b=22 c=333"))))   // => 3         (lazy)
-println(re.replaceAllRe("a=1 b=22", "$1:$2"))              // => a:1 b:22  (templates)
-```
-
-Any prelude name can also be reached explicitly as `std::name` (useful when a local definition shadows it).
+### Actors: long-lived workers that talk by messages
+
+An actor is a function on a thread of its own, with a mailbox and state nobody else can reach. It is how
+Skarn keeps long-lived work on several cores: a pool of workers, a service that survives its own crashes,
+a server that hands each connection to whoever is free. Supervision, back-pressure and the rest of the
+model have a guide of their own:
+
+**[Actors in Skarn](SkarnActors.md)** — from the first `spawnActor` to supervisor trees, in 18 short
+sections. Start there if you have never used an actor system; it assumes nothing.
 
 ---
 
@@ -4694,7 +4145,7 @@ impls for `Int`/`Double`/`String`; add your own with `impl Ord` — the one exce
 |-------|---------------|---------|----------------|----------|
 | `Eq` | `==` / `!=` (see [§5](#5-operators)) | derived structurally: any type whose components are all `Eq` (immediates + `String` + erasure types are the leaves; a function-carrying type is **not** `Eq`) | no (auto-derived) | no |
 | `Hashable` | map keys / set elements (see [§14](#14-collections)) | `Int`, `Double`, `Bool`, `String`, and erasure types that wrap one of those (`Char`, integer-backed `enum`s, `transparent` newtypes over these) | no (fixed marker) | no |
-| `Sendable` | what may be copied to another task or actor, in generic code (see [§21](#21-concurrency), "Running functions in parallel") | derived structurally: plain data — scalars, `String`, `Bytes`, and collections, tuples, structs and enums of those; **not** a function value, a `dyn` value, a socket, a `Task` or an `Inbox` | no (auto-derived) | no |
+| `Sendable` | what may be copied to another task or actor, in generic code (see [§21](#21-concurrency) and [Actors in Skarn](SkarnActors.md)) | derived structurally: plain data — scalars, `String`, `Bytes`, and collections, tuples, structs and enums of those; **not** a function value, a `dyn` value, a socket, a `Task` or an `Inbox` | no (auto-derived) | no |
 | `Ord` | `sort` / `sorted` / `min` / `max` (ring, `std::iter`) and `minOf` / `maxOf` / `clamp` (opt-in `std::math` — needs `use std::math`); see [§19](#19-iterators) | `Int` / `Double` / `String` built in; **user types may `impl Ord`** (write `fn lessThan`). The one exception is **erasure types** (`Char` / `transparent` newtypes / integer-backed `enum`s) — a method trait can't dispatch on them; a `Char` compares with `<` but is not `Ord` | **yes** (like `Clone`; erasure types excepted) | no |
 | `Clone` | `clone(x)` (see [§14](#14-collections)) | built-in for the containers; **user-extensible** — write `impl Clone for MyType` | **yes** | no (returns `Self`) |
 | `MustUse` | the unused-value warning (see [Advisory warnings](#advisory-warnings)) | none built in; **any type the program owns**, erasure types included — write `impl MustUse for MyType {}` | **yes** (empty impl) | no |

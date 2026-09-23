@@ -1,6 +1,6 @@
 // CLAIM: `trySend`'s result is must-use -- `Full` means nothing was queued, so dropping it loses a
 //        message while the caller believes it sent one. (`send`'s Bool is deliberately NOT must-use.)
-// GUIDE: 21 (Actors: long-lived, talking by messages)
+// GUIDE: SkarnActors.md (Back-pressure)
 // EXPECT: warn unused std::actor::SendResult
 use std::actor::*
 

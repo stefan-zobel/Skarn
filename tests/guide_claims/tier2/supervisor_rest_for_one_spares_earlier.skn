@@ -1,6 +1,6 @@
 // CLAIM: with Strategy::RestForOne a crash costs only the children started AFTER the crashed one: with
 //        three children, the middle one's crash starts 1 and 2 again and leaves 0 running.
-// GUIDE: 21 (Actors: long-lived, talking by messages)
+// GUIDE: SkarnActors.md (When a crash costs the siblings)
 // EXPECT: ok started again: 1,2
 use std::actor::*
 use std::supervisor::*
