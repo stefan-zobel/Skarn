@@ -1,6 +1,6 @@
 // CLAIM: a supervisor whose child crashes more often than its restart limit allows gives up by crashing
 //        itself, so its own starter receives Mail::Exited, with the limit and the child's last reason.
-// GUIDE: 20 (Actors: long-lived, talking by messages)
+// GUIDE: 21 (Actors: long-lived, talking by messages)
 // EXPECT: ok gave up: true, last reason: true
 use std::actor::*
 use std::supervisor::*

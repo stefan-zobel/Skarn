@@ -4,7 +4,7 @@ Skarn is a sound, statically typed language in the ML/Rust tradition — checked
 compile time (generics compile to one shared body, not a copy per type) — that happens to target a compact
 bytecode VM (the vMachine interpreter). Its type system borrows from the functional world, but its **core is
 imperative**: statements, mutable bindings, loops, and in-place updates are ordinary Skarn, not an escape
-hatch ([§22](#22-programming-styles-imperative-functional-streaming) writes the same program three ways).
+hatch ([§23](#23-programming-styles-imperative-functional-streaming) writes the same program three ways).
 This guide is a complete, example-driven tour of the language for working programmers. It assumes you are
 comfortable with a mainstream statically typed language and have seen a few functional-programming ideas
 (closures, pattern matching, immutable-by-default values), but it does **not** assume you know any particular
@@ -44,15 +44,18 @@ Concretely:
   no vtables. Trait dispatch instead reads the coarse type tag every value already carries (the one the GC and
   the value representation need anyway), so it too costs nothing extra. See [§16](#16-traits)
   for how "erased" and "dispatch on the runtime type" fit together without contradiction.
+- **No shared memory between threads.** Multi-core work is fork-join tasks and share-nothing **actors**
+  with typed mailboxes, supervisors and back-pressure ([Actors](#actors-long-lived-talking-by-messages));
+  each runs on its own heap and messages are copied, so there are no data races and no locks.
 
 ### Compared to the languages it borrows from
 
 | | Shares with Skarn | What Skarn does differently |
 |---|---|---|
 | **Rust** | enums + `match`, `Option`/`Result` + `?`, traits + bounds, immutability, no null | **GC instead of a borrow checker** — no lifetimes/ownership/`&mut`; generics are *erased* (one body), not monomorphized |
-| **Gleam / OCaml / Elm (the ML family)** | sound static typing, sum types + exhaustive `match`, *erased* generics (one body), immutability by default | Rust-style traits + bounds + `dyn`; a C-family curly-brace surface with method syntax; inference for locals only (signatures are annotated); targets a compact bytecode VM |
+| **Gleam / OCaml / Elm (the ML family)** | sound static typing, sum types + exhaustive `match`, *erased* generics (one body), immutability by default; Gleam's share-nothing actors with typed mailboxes | Rust-style traits + bounds + `dyn`; a C-family curly-brace surface with method syntax; inference for locals only (signatures are annotated); targets a compact bytecode VM; an actor is an **OS thread** (BEAM's are lightweight and preemptively scheduled), and supervision is a library rather than OTP |
 | **Kotlin** | GC on a bytecode VM, *erased* generics, sealed types + exhaustive `when`, expression-oriented (`if`/`when`) | `Option` instead of nullable types (`T?`); `Result` + `?` instead of exceptions; no classes or subclassing (structs + traits only) |
-| **Swift** | enums with associated values + exhaustive `switch`, `Optional` as a real sum type (≈ `Option`), protocols + constraints (≈ traits + bounds), value-type structs | runs on a GC bytecode VM (Swift is native + ARC); errors as `Result`/`?` values rather than `throws`; no classes or subclassing |
+| **Swift** | enums with associated values + exhaustive `switch`, `Optional` as a real sum type (≈ `Option`), protocols + constraints (≈ traits + bounds), value-type structs, `actor`s with isolated state behind a `Sendable` bound | runs on a GC bytecode VM (Swift is native + ARC); errors as `Result`/`?` values rather than `throws`; no classes or subclassing; actors are isolated by having **separate heaps** and copied messages, not by compiler-checked isolation over one shared heap — and there is no `async`/`await` |
 | **Go** | GC, an application / CLI focus, errors as values (not exceptions) | real sum types + generics-with-traits + exhaustive `match` + `?` — deliberately *not* Go's minimal surface / `if err != nil` |
 
 ### Deliberate scope (what Skarn is *not*)
@@ -1295,7 +1298,7 @@ not the struct itself, so assigning it to another name or passing it to a functi
 copying it. What "immutable by default" gives you is that a plain binding cannot be mutated — there is no
 "mutate a field" statement unless the binding is `mut`. So structs *feel* value-like as long as you don't
 mutate, but that is a property of the default, not of copying: two `mut` names for the same struct see each
-other's changes. This matters enough that [§25](#25-the-memory--cost-model) treats it in full. The idiomatic
+other's changes. This matters enough that [§26](#26-the-memory--cost-model) treats it in full. The idiomatic
 "change" is therefore not to mutate in place but to build a new struct:
 
 ```rust group=point
@@ -2102,7 +2105,7 @@ match get(arr, 9) {
 `vec()` creates an empty, growable vector. `push(v, x)` appends and `pop(v)` removes the last element
 (returning an `Option`, since the vector might be empty). A vector is a reference value, so `push`/`pop` mutate
 the *shared* object in place — every name bound to it, and every function it was passed to, sees the change
-(see [§25](#25-the-memory--cost-model)). Because they mutate, the binding you push/pop through must be `mut`
+(see [§26](#26-the-memory--cost-model)). Because they mutate, the binding you push/pop through must be `mut`
 (Skarn's one mutation rule — see below).
 
 ```rust
@@ -2611,7 +2614,7 @@ You can also **implement the built-in traits for your own types**, not just your
 one you will reach for most often, because it unlocks `sorted` / `sort` / `min` / `max` on a type of your own.
 Just write `impl Ord for YourType { fn lessThan(self, other: YourType) -> Bool { … } }`; there is a worked
 example under [§19 sorting](#19-iterators). (`Clone` is the other user-implementable built-in; `Eq` and
-`Hashable` are sealed markers you never implement — see [§23](#built-in-traits-at-a-glance).)
+`Hashable` are sealed markers you never implement — see [§24](#built-in-traits-at-a-glance).)
 
 ### Mutating the receiver: `mut self`
 
@@ -3088,7 +3091,7 @@ println("sum=" + sum)   // => sum=10
 
 Stages take an iterator and return a new iterator, so you compose them. The element-wise stages are lazy and
 build no intermediate vectors — the two exceptions are `chunks` and `windows`, which necessarily materialize a
-`Vec` per pull (see their cost note in [§25](#25-the-memory--cost-model)).
+`Vec` per pull (see their cost note in [§26](#26-the-memory--cost-model)).
 
 - `map(it, f)` — apply `f` to each element
 - `filter(it, p)` — keep elements where `p` is true
@@ -3216,7 +3219,7 @@ This reads beautifully but is not free: each step allocates the tuple(s) *and* t
 tuple-yielding combinator is the most allocation-heavy *element-wise* loop shape (only `chunks`/`windows`, which
 build a whole `Vec` per pull, are heavier still). In a hot loop prefer a plain index, or the zero-allocation
 `for (k, v) in m` (over a map) and direct `for x in xs` (over a container), which bypass both. See
-[§25](#25-the-memory--cost-model) for the full cost model.
+[§26](#26-the-memory--cost-model) for the full cost model.
 
 ### Writing your own iterator
 
@@ -3490,7 +3493,7 @@ the filesystem, and one without `use std::process` cannot start a program.
 | `std::regex` | linear-time byte-level regular expressions (Thompson NFA / Pike VM) — no catastrophic backtracking, and therefore **no** backreferences or lookaround |
 
 This table says only what each module is *for*. **Every function of every module, with its signature, is listed
-in [§26](#26-quick-reference-the-standard-library).**
+in [§27](#27-quick-reference-the-standard-library).**
 
 You may define a function of your own named like a built-in, a native, or a trait method — `toInt`, `sqrt`,
 `next`. It wins wherever it is **visible**, which means your own module, and it does not reach any further: the
@@ -3678,6 +3681,22 @@ match httpGet("example.com", 80, "/") {
   Err(e) => println(e)
 }
 ```
+
+## 21. Concurrency
+
+Three steps, each solving a different problem, and they compose:
+
+| | what it buys | what it costs |
+|---|---|---|
+| `std::poll` | one thread serving **many connections** — waiting on several sockets at once | one core; a slow handler stalls every connection |
+| `std::task` | **several cores** for one computation — fork, compute, join | a task runs once and returns one value |
+| `std::actor` | **long-lived** workers that keep state and talk by messages | an actor is an OS thread, so hundreds are fine and millions are not |
+
+The rule underneath all three: **nothing is shared.** Every task and every actor has its own heap, and a
+value that crosses between them is copied, not referenced. That is what removes data races by
+construction rather than by discipline — there is no lock in this chapter, and no `async`/`await` either.
+The checker decides what may cross (the `Sendable` bound), so a program that would have shared something
+does not compile.
 
 ### Serving more than one connection
 
@@ -4389,7 +4408,7 @@ Any prelude name can also be reached explicitly as `std::name` (useful when a lo
 
 ---
 
-## 21. Input, output, and the standard natives
+## 22. Input, output, and the standard natives
 
 Beyond the language itself, a set of built-in functions ("natives") give you access to the outside world. They
 are ordinary functions; the fallible ones return `Result` or `Option`.
@@ -4521,7 +4540,7 @@ Silicon, and rather than guess at a third platform's name it puts them all in on
 
 ---
 
-## 22. Programming styles: imperative, functional, streaming
+## 23. Programming styles: imperative, functional, streaming
 
 Skarn is **multi-paradigm** and does not push you toward one way of writing code. You can write in a plain
 imperative style, in a functional style, or freely mix the two — the type system is happy with all of it, and
@@ -4601,7 +4620,7 @@ imperative loop for one hot inner routine; a streaming pipeline can end in a `fo
 
 ---
 
-## 23. The type system in one page
+## 24. The type system in one page
 
 A few properties that hold everywhere, gathered in one place:
 
@@ -4658,7 +4677,7 @@ impls for `Int`/`Double`/`String`; add your own with `impl Ord` — the one exce
 |-------|---------------|---------|----------------|----------|
 | `Eq` | `==` / `!=` (see [§5](#5-operators)) | derived structurally: any type whose components are all `Eq` (immediates + `String` + erasure types are the leaves; a function-carrying type is **not** `Eq`) | no (auto-derived) | no |
 | `Hashable` | map keys / set elements (see [§14](#14-collections)) | `Int`, `Double`, `Bool`, `String`, and erasure types that wrap one of those (`Char`, integer-backed `enum`s, `transparent` newtypes over these) | no (fixed marker) | no |
-| `Sendable` | what may be copied to another task or actor, in generic code (see [§20](#20-modules), "Running functions in parallel") | derived structurally: plain data — scalars, `String`, `Bytes`, and collections, tuples, structs and enums of those; **not** a function value, a `dyn` value, a socket, a `Task` or an `Inbox` | no (auto-derived) | no |
+| `Sendable` | what may be copied to another task or actor, in generic code (see [§21](#21-concurrency), "Running functions in parallel") | derived structurally: plain data — scalars, `String`, `Bytes`, and collections, tuples, structs and enums of those; **not** a function value, a `dyn` value, a socket, a `Task` or an `Inbox` | no (auto-derived) | no |
 | `Ord` | `sort` / `sorted` / `min` / `max` (ring, `std::iter`) and `minOf` / `maxOf` / `clamp` (opt-in `std::math` — needs `use std::math`); see [§19](#19-iterators) | `Int` / `Double` / `String` built in; **user types may `impl Ord`** (write `fn lessThan`). The one exception is **erasure types** (`Char` / `transparent` newtypes / integer-backed `enum`s) — a method trait can't dispatch on them; a `Char` compares with `<` but is not `Ord` | **yes** (like `Clone`; erasure types excepted) | no |
 | `Clone` | `clone(x)` (see [§14](#14-collections)) | built-in for the containers; **user-extensible** — write `impl Clone for MyType` | **yes** | no (returns `Self`) |
 | `MustUse` | the unused-value warning (see [Advisory warnings](#advisory-warnings)) | none built in; **any type the program owns**, erasure types included — write `impl MustUse for MyType {}` | **yes** (empty impl) | no |
@@ -4749,7 +4768,7 @@ The runner can be asked to treat these warnings as hard errors, which is useful 
 
 ---
 
-## 24. A complete little program
+## 25. A complete little program
 
 To close, here is a small program that ties many features together: an evaluator for arithmetic expressions
 with named variables. It uses an `enum` to model the expression tree, `match` with recursion to walk it, a
@@ -4811,7 +4830,7 @@ match eval(broken, env) {
 
 ---
 
-## 25. The memory & cost model
+## 26. The memory & cost model
 
 Skarn has no manual memory management — no `free`, no reference counting, no borrow checker. A **garbage
 collector** reclaims values once they are unreachable. To write efficient code (and to understand what `clone`
@@ -4933,7 +4952,7 @@ automatically when the heap needs room.
 
 ---
 
-## 26. Quick reference: the standard library
+## 27. Quick reference: the standard library
 
 The functions below are always in scope (no import needed). They are ordinary functions — remember that a
 trait method or a library function is called as `f(x)`, and `x |> f` is the same thing written left to right.

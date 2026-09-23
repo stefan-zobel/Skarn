@@ -1,6 +1,6 @@
 // CLAIM: `ask` monitors the actor it asks, so a crash ends the wait at once with `Crashed` and the reason
 //        -- it does not sit out the timeout, which here is a full minute.
-// GUIDE: 20 (Actors: long-lived, talking by messages)
+// GUIDE: 21 (Actors: long-lived, talking by messages)
 // EXPECT: ok crashed: the service cannot do that
 use std::actor::*
 

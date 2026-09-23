@@ -1,5 +1,5 @@
 // CLAIM: what spawn copies to another heap must be plain data -- a function value inside the argument is a compile error, not a run-time failure.
-// GUIDE: 20 (Running functions in parallel)
+// GUIDE: 21 (Running functions in parallel)
 // EXPECT: fail cannot be sent to a task: it contains a function value
 use std::task::*
 

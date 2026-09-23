@@ -1,6 +1,6 @@
 // CLAIM: `supervise` starts a crashed child again with the same start value, so a child that fails twice
 //        and then succeeds is up at its third attempt.
-// GUIDE: 20 (Actors: long-lived, talking by messages)
+// GUIDE: 21 (Actors: long-lived, talking by messages)
 // EXPECT: ok up at attempt 3
 use std::actor::*
 use std::supervisor::*

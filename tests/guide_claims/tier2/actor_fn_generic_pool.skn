@@ -1,6 +1,6 @@
 // CLAIM: an `ActorFn` lets generic code start actors -- a pool starts several from one value -- and it is
 //        plain data, so a child spec (function + start value) can be sent to an actor that starts it.
-// GUIDE: 20 (Actors: long-lived, talking by messages)
+// GUIDE: 21 (Actors: long-lived, talking by messages)
 // EXPECT: ok pool 60 child 50
 use std::actor::*
 

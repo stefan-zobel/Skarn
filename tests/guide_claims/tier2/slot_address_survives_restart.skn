@@ -1,6 +1,6 @@
 // CLAIM: an actor started into a `Slot` keeps that address across its restarts, so a client holding one
 //        `Pid` goes on being answered after the actor behind it has crashed and been started again.
-// GUIDE: 20 (Actors: long-lived, talking by messages)
+// GUIDE: 21 (Actors: long-lived, talking by messages)
 // EXPECT: ok 8 then 10, one address
 use std::actor::*
 use std::supervisor::*

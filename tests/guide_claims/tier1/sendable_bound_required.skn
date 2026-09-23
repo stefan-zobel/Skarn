@@ -1,6 +1,6 @@
 // CLAIM: a generic helper that makes an inbox for a type parameter needs the bound `Sendable` -- without it the
 //        compiler cannot know that every message type it is used with is plain data.
-// GUIDE: 20 (Actors: long-lived, talking by messages)
+// GUIDE: 21 (Actors: long-lived, talking by messages)
 // EXPECT: fail a type parameter (R) without the bound 'Sendable'
 use std::actor::*
 

@@ -1,6 +1,6 @@
 // CLAIM: `ask` waits for the answer on an inbox of its own, so the main inbox's other mail is neither
 //        taken for the answer nor lost; the reply type comes from the address the request carries.
-// GUIDE: 20 (Actors: long-lived, talking by messages)
+// GUIDE: 21 (Actors: long-lived, talking by messages)
 // EXPECT: ok reply 49 then 99
 use std::actor::*
 

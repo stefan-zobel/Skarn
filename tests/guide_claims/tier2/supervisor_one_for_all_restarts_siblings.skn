@@ -1,6 +1,6 @@
 // CLAIM: with Strategy::OneForAll a crash costs the SIBLINGS too -- every child is stopped, waited for,
 //        and started again, so both children announce themselves a second time.
-// GUIDE: 20 (Actors: long-lived, talking by messages)
+// GUIDE: 21 (Actors: long-lived, talking by messages)
 // EXPECT: ok the other one is up: 1, both again: 2
 use std::actor::*
 use std::supervisor::*
