@@ -152,7 +152,10 @@ enum NativeId : uint16_t {
     NATIVE_ACTIVE_CLOSE = 85,   // rawActiveClose(conn)    -> ()   (the I/O thread closes it; twice is fine)
     NATIVE_ACTIVATE_LISTENER = 86, // rawActivateListener(sock, inbox) -> Int | String (the listener's id; each
                                 //   accepted connection arrives as a hand-off ticket; the descriptor goes stale)
-    NATIVE_COUNT       = 87,
+    // A deadline for sending on an active connection: a send that cannot finish within it closes the
+    // connection (0 = none, the default). A send also ends when its actor is told to stop.
+    NATIVE_ACTIVE_SET_SEND_TIMEOUT = 87, // rawActiveSetSendTimeout(conn, ms) -> ()
+    NATIVE_COUNT       = 88,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -252,6 +255,7 @@ inline int native_id_of(const std::string& name) {
     if (name == "rawActiveSend") return NATIVE_ACTIVE_SEND;
     if (name == "rawActiveClose") return NATIVE_ACTIVE_CLOSE;
     if (name == "rawActivateListener") return NATIVE_ACTIVATE_LISTENER;
+    if (name == "rawActiveSetSendTimeout") return NATIVE_ACTIVE_SET_SEND_TIMEOUT;
     return -1;
 }
 
@@ -314,6 +318,7 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_NEW_SLOT: case NATIVE_SPAWN_INTO: case NATIVE_RELEASE_SLOT: case NATIVE_STOP_ACTOR:
         case NATIVE_MONITOR: case NATIVE_STOP_REQUESTED: case NATIVE_SLEEP: case NATIVE_SELECT:
         case NATIVE_ACTIVE_CLOSE:
+        case NATIVE_ACTIVE_SET_SEND_TIMEOUT:
         case NATIVE_READ_ALL_STDIN: return NRET_PLAIN;
         default:                 return NRET_RESULT;
     }
@@ -345,6 +350,7 @@ inline int native_arity(int id) {
         case NATIVE_MONITOR:
         case NATIVE_ACTIVE_SEND:
         case NATIVE_ACTIVATE_LISTENER:
+        case NATIVE_ACTIVE_SET_SEND_TIMEOUT:
         case NATIVE_RUN_PROCESS: return 2;
         case NATIVE_ACTOR_SPAWN_BOUNDED:
         case NATIVE_SPAWN_INTO:

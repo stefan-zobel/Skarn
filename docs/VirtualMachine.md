@@ -542,8 +542,9 @@ ticket itself is a plain integer; that a program cannot forge one is a rule of t
 **Active sockets — reading handed to the runtime.** An actor that owns a connection may also have to react to
 its inbox, and each wait covers only one kind of source. `rawActivate(fd, inbox, mode, maxLen, pending)`
 hands the READING of a connection to the runtime, which delivers what arrives into an inbox of the caller;
-the actor then waits on that inbox and its own with `rawSelect`. `rawActiveSend(id, data)` writes and
-`rawActiveClose(id)` closes. This is Erlang's "active mode".
+the actor then waits on that inbox and its own with `rawSelect`. `rawActiveSend(id, data)` writes,
+`rawActiveClose(id)` closes and `rawActiveSetSendTimeout(id, ms)` bounds how long a write may wait. This is
+Erlang's "active mode".
 - **One I/O thread per world**, started by the first activation, polls every active socket (`WSAPoll` /
   `poll`). It runs no program code and touches no heap: each event is posted as an encoded `Bytes` value
   whose first byte names the kind (data, line, end of stream, failure), and the owner decodes it like any
@@ -555,6 +556,11 @@ the actor then waits on that inbox and its own with `rawSelect`. `rawActiveSend(
   system could give the number to a new socket that is still being polled. The owner only asks, and its
   end asks for it. The descriptor of an activated connection is refused afterwards with "socket was
   activated".
+- **A send can always end.** An activated connection is non-blocking. A send that goes through at once
+  costs what it did before; one whose peer has stopped reading waits in `poll`, in short slices, and gives
+  up with an error when its actor is told to stop, or when nothing has gone out for the connection's send
+  deadline. The deadline also closes the connection, because the peer may have received half a message.
+  So a peer that stops reading can neither pin its actor nor keep the program from ending.
 - The thread is woken through a connected pair of loopback sockets on every platform, and the world stops
   it after every isolate has ended.
 - **A listener can be activated too** (`rawActivateListener(fd, inbox)`). The thread then accepts, makes

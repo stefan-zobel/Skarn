@@ -1289,6 +1289,7 @@ private:
                                    make_named(std_Result(), { ty_int(),   S }), STD_NET);
         add_native("rawActiveSend",{ ty_int(), B }, make_named(std_Result(), { ty_unit(),  S }), STD_NET);
         add_native("rawActiveClose",{ ty_int() },   ty_unit(),                                 STD_NET);
+        add_native("rawActiveSetSendTimeout", { ty_int(), ty_int() }, ty_unit(),                STD_NET);
         add_native("rawActivateListener", { ty_int(), make_named(std_Inbox(), { B }) },
                                    make_named(std_Result(), { ty_int(),   S }), STD_NET);
         // Hashing -- std::hash (opt-in; the pure-Skarn crc32 + hex helpers live in hash.skn, same module).

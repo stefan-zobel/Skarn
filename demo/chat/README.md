@@ -62,7 +62,7 @@ starts the server on a free port and three clients in the same process: alice an
 active connections, and carol as a plain blocking connection. They follow a fixed script: names, joining
 and switching topics, chat lines, `/topics`, `/leave`, an unknown command, the slow client below, and a
 `/quit`. The output is a transcript, `who > line` for what a client sends and `who < line` for what it
-receives, followed by `selftest: 23 steps ok` and exit code 0. A line that is missing, extra or different
+receives, followed by `selftest: 24 steps ok` and exit code 0. A line that is missing, extra or different
 ends the test with `selftest FAILED: ...` and exit code 1.
 
 The clients run concurrently, yet the transcript is the same on every run. After every step the script
@@ -112,13 +112,14 @@ inbox holds, and the next one starts only after alice and bob have both received
 previous one. A single burst larger than the inbox could drop a client that was just a moment slower. That
 would be the rule doing its job, but it would make the test depend on timing.
 
-**A limit this shows.** A session whose client never reads is stuck in its `send` until the connection
-ends: `stopActor` reaches it only when it next receives, and a write to an active connection has no time
-limit. The topic is protected (it has moved on), but the session's thread is not. When the program ends,
-the runtime waits for every actor, so such a session would keep the process from exiting. That is why the
-self-test closes carol's connection after the topic has dropped her. A send with a deadline would remove
-the problem; it does not exist yet.
+**The session is freed too.** When the topic drops carol, her session is waiting in a `send` to her,
+because her socket buffers are full. The topic's `stopActor` ends that wait: a send on an active
+connection gives up with an `Err` as soon as its actor is told to stop. The session then leaves its
+topics and closes the connection. The self-test shows this: afterwards carol reads again, gets what was
+still on its way, and then the end of the stream. For a client that stops reading while no topic drops
+it, each session also sets a deadline, `out.setSendTimeout(5000)`: a send that makes no progress for
+5 seconds fails, and the connection is closed.
 
-The client has a smaller limit of the same kind: `readLine` cannot be interrupted. When the server ends
+The client has a limit of its own: `readLine` cannot be interrupted. When the server ends
 the connection, the client says so at once but exits only after the next line you enter (or at the end of
 the input: Ctrl+Z on Windows, Ctrl+D elsewhere).

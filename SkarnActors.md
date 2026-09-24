@@ -789,6 +789,39 @@ written without their type in front.
 reading, and TCP slows the client down — the back-pressure of §13, for a socket. A slow actor therefore
 never gets buried under input it has not asked for yet.
 
+**A client that stops reading.** The other direction has the same problem. Once a client stops reading,
+the system's buffers fill and a `send` has to wait for room. Two things end that wait. First, the actor
+being told to stop (by `stopActor`, a supervisor or the end of the program): the send returns an `Err`,
+and the actor goes on to its end. Second, a deadline you set with `out.setSendTimeout(ms)`: when nothing
+has gone out for that long, the send returns an `Err` and the connection is **closed**. It has to be
+closed, because the client may have received half a message. Without a deadline a send waits as long as
+it takes:
+
+```rust
+use std::net::*
+
+fn demo() -> Result[(), String] {
+  let lst = listen(0)?
+  let _client = connect("127.0.0.1", lst.localPort()?)?   // connected, but it never reads
+  let (out, _) = lst.accept()?.activate(Framing::Raw, 4)?
+  out.setSendTimeout(200)
+  let mut sb = stringBuilder()
+  for _ in range(0, 1024) { sb = sb.append("xxxxxxxx") }
+  let block = toBytes(sb.build())
+  loop {
+    match out.send(block) {
+      Ok(_) => {}
+      Err(e) => {
+        println(e)   // => send: the peer has not read for 200 ms; the connection is closed
+        break
+      }
+    }
+  }
+  Ok(())
+}
+match demo() { Ok(_) => {}, Err(e) => println(e) }
+```
+
 **Who owns it.** Like a handed-off one, the `TcpConn` is dead once it is activated: every operation on it
 returns an `Err`. Neither half can be sent to another actor — the events are an inbox of *this* actor, and
 only this actor may write to the connection or close it. When the actor ends, crash or not, its active
@@ -1000,6 +1033,8 @@ This is the Erlang/OTP model, and the names match where the ideas do. Four diffe
 - `demo/actors/select.skn` — one worker, two queues, a priority order.
 - `demo/actors/wordcount.skn` — a reader, N counters and a collector, checked against a sequential count.
 - `demo/actor_server/` — an HTTP server on actors, with a load generator.
+- `demo/chat/` — a chat server with topics on active connections (§17), a terminal client, and a
+  self-test in which a client that stops reading is dropped.
 
 The [Skarn Guide](SkarnGuide.md)'s concurrency section covers the two simpler tools beside actors:
 `std::poll`, for many connections on one thread, and `std::task`, for one computation on several cores.

@@ -237,9 +237,10 @@ fn flood(mut t: Script) -> Result[(), String] {
     Ok(())
 }
 
-// carol joins #rust, stops reading, and is dropped. Her connection is closed afterwards in any case:
-// her session is stuck in a send to her until then (see README.md), and would keep the program from
-// ending.
+// carol joins #rust, stops reading, and is dropped. Then she reads again: what her session had sent
+// before it was told to stop, and then the end of the stream. That end proves the session really let
+// go of her -- it was waiting in a send to her when the topic told it to stop, and a stop ends such a
+// wait. If it did not, carol would wait here until WAIT_MS and the test would fail.
 fn slowClient(mut t: Script) -> Result[(), String] {
     println("carol connects")
     let mut carol = connect("127.0.0.1", t.port)?
@@ -258,7 +259,19 @@ fn slowClientWith(mut t: Script, mut carol: TcpConn) -> Result[(), String] {
     carolHears(carol, "* carol joined #rust")?
     t.steps += 3
     println("carol stops reading")
-    flood(t)
+    flood(t)?
+    println("carol reads again")
+    t.steps += 1
+    // Only flood lines are left for her, the last one possibly cut short where the session's send
+    // gave up; none of them is printed.
+    loop {
+        match carol.recvLine()? {
+            Some(_) => {},
+            None => { break }
+        }
+    }
+    println("  carol < <closed>")
+    Ok(())
 }
 
 fn runScript(mut t: Script) -> Result[(), String] {

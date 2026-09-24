@@ -194,6 +194,7 @@ int main(int argc, char** argv) {
     run("actor_socket_hand_off",    test_actor_socket_hand_off);
     run("active_socket",            test_active_socket);
     run("active_listener",          test_active_listener);
+    run("active_send_deadline",     test_active_send_deadline);
     run("actor_extra_inbox_reply",  test_actor_extra_inbox_reply);
     run("actor_bounded_backpressure", test_actor_bounded_backpressure);
     run("actor_bounded_shutdown",   test_actor_bounded_shutdown);

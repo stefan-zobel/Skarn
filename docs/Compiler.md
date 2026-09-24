@@ -422,7 +422,7 @@ socket was handed to another actor.
 
 An actor that owns a connection and must also react to its inbox cannot block in `recvLine`.
 `c.activate(framing, capacity)` hands the reading of the connection to the runtime and returns two halves:
-an `ActiveConn` to write with (`send`, `sendStr`, `close`) and the `SockEvents` to read from, an inbox of
+an `ActiveConn` to write with (`send`, `sendStr`, `close`, `setSendTimeout`) and the `SockEvents` to read from, an inbox of
 the actor into which the runtime delivers what arrives. `select` then waits on it and the actor's own
 inbox together.
 - **Events:** `Framing::Lines(max)` delivers `Line(text)` per line and `Framing::Raw` delivers `Chunk(bytes)`
@@ -430,6 +430,10 @@ inbox together.
   `Stopping` is the actor's own stop. The names differ from `Mail`'s and `std::poll`'s on purpose, so a
   program using all three may write each one bare.
 - **Back-pressure:** at most `capacity` events wait; while the inbox is full the runtime stops reading.
+- **A peer that stops reading:** a send waiting for room ends with an `Err` when its actor is told to
+  stop, or, after `out.setSendTimeout(ms)`, when nothing has gone out for that long. The deadline also
+  closes the connection, since half a message may have gone out. Without one a send waits as long as it
+  takes.
 - **Rules:** neither `ActiveConn` nor `SockEvents` can be sent to another actor, and a literal of either
   outside `std::net` is an error. As with a hand-off, the activated `TcpConn` still type-checks but every
   operation on it returns an `Err`; the connection is closed when its actor ends.

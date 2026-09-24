@@ -9700,6 +9700,108 @@ fn run() -> Result[(), String] {
         "let b: Inbox[Bytes] = newInbox()\nlet i = IncomingClients { box: b }\n0",
         "can only be created by `l.activate(...)`"));
 
+    // ---- sending to a peer that does not read (out.setSendTimeout(ms), and Stop) ----
+    // In each program the client never reads, so the socket buffers fill and a send has to wait. The
+    // flooder shared by the next two sends 8 KB at a time until a send fails, and reports why.
+    const std::string FLOODER = "use std::time::*\n" R"SKN(
+struct Start { ticket: SocketHandOff, boss: Pid[String] }
+fn flooder(inbox: Inbox[Int], s: Start) -> () {
+  let conn = match s.ticket.take() { Ok(c) => c, Err(e) => panic(e) }
+  let (out, _) = match conn.activate(Framing::Raw, 4) { Ok(p) => p, Err(e) => panic(e) }
+  let mut sb = stringBuilder()
+  for _ in range(0, 1024) { sb = sb.append("xxxxxxxx") }
+  let data = toBytes(sb.build())
+  send(s.boss, "flooding")
+  loop {
+    match out.send(data) {
+      Ok(_) => {},
+      Err(e) => {
+        send(s.boss, e)
+        return ()
+      }
+    }
+  }
+}
+)SKN";
+    // A deadline: the send gives up once the peer has taken nothing for 300 ms, and the connection is
+    // closed -- a message half written must not be followed by the next one.
+    check_str("active_send_timeout_closes", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let _client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let (out, _) = conn.activate(Framing::Raw, 4)?
+  out.setSendTimeout(300)
+  let mut sb = stringBuilder()
+  for _ in range(0, 1024) { sb = sb.append("xxxxxxxx") }
+  let data = toBytes(sb.build())
+  let mut n = 0
+  let mut why = ""
+  while n < 5000 && len(why) == 0 {
+    match out.send(data) {
+      Ok(_) => { n = n + 1 },
+      Err(e) => { why = e }
+    }
+  }
+  println(why)
+  match out.sendStr("more") { Ok(_) => println("sent"), Err(e) => println(e) }
+  Ok(())
+}
+)SKN" + RUN_END), "send: the peer has not read for 300 ms; the connection is closed\nsend: the connection is closed\n");
+    // No deadline, and the actor is told to stop while its send waits: the send ends with an Err, the
+    // actor reaches its end, and a monitor reports a normal one. Without this a peer that stops reading
+    // pinned its actor for ever.
+    check_str("active_send_stop_interrupts", cg_run_native(NET + FLOODER + R"SKN(
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let srv = listen(0)?
+  let _client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let a = spawnActor(flooder, Start { ticket: conn.handOff()?, boss: boss.pid() })
+  let _watching = monitor(a, boss)
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  sleep(300)
+  stopActor(a)
+  match boss.receiveTimeout(5000) { Some(Mail::Msg(m)) => println(m), _ => println("?") }
+  match boss.receiveTimeout(5000) { Some(Mail::Exited(_, why)) => println("ended: " + why), _ => println("?") }
+  Ok(())
+}
+)SKN" + RUN_END), "flooding\nsend: the actor was told to stop\nended: normal\n");
+    // The program ends while an actor waits in a send with no deadline. The end of the world is a Stop
+    // for every actor, so the send gives up and the world's final join returns -- this test HUNG before.
+    check_str("active_send_world_end", cg_run_native(NET + FLOODER + R"SKN(
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let srv = listen(0)?
+  let _client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let _a = spawnActor(flooder, Start { ticket: conn.handOff()?, boss: boss.pid() })
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  sleep(300)
+  println("ending")
+  Ok(())
+}
+)SKN" + RUN_END), "flooding\nending\n");
+    // A negative time is a fault in the caller.
+    check_str("active_send_timeout_misuse", cg_run_native(NET + R"SKN(
+fn bad(inbox: Inbox[Int], port: Int) -> () {
+  let c = match connect("127.0.0.1", port) { Ok(c) => c, Err(e) => panic(e) }
+  let (out, _) = match c.activate(Framing::Raw, 4) { Ok(p) => p, Err(e) => panic(e) }
+  out.setSendTimeout(-1)
+}
+fn run() -> Result[(), String] {
+  let boss: Inbox[Int] = mainInbox()
+  let srv = listen(0)?
+  let _a = spawnActor(bad, srv.localPort()?)
+  let _conn = srv.accept()?
+  match boss.receive() {
+    Mail::Exited(_, why) => println(if indexOf(why, "0 milliseconds or more") >= 0 { "refused" } else { why }),
+    _ => println("?")
+  }
+  Ok(())
+}
+)SKN" + RUN_END), "refused\n");
+
     // ---- the checker, where a Pid[M] is made ----
     check_true("actor_rejects_lambda", check_has_p(U +
         "let p = spawnActor(fn(i: Inbox[Int], u: Int) -> () {}, 0)\n0", "not a lambda"));
@@ -11492,7 +11594,10 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // are NOT listed:
 // they are socket natives (OS side effects) whose events a second thread delivers, so when an event
 // arrives depends on the network and the scheduler. Pinned by the active_* tests in both suites.
-static_assert(NATIVE_COUNT == 87,
+// rawActiveSetSendTimeout (id 87) is NOT listed either: its whole effect is on how long a send to a
+// peer that does not read may wait, i.e. time and the network. Pinned by active_send_deadline in
+// vm_tests and the active_send_* tests here.
+static_assert(NATIVE_COUNT == 88,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 
