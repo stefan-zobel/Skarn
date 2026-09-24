@@ -14,7 +14,7 @@
 // The strategy decides what a crash costs the OTHER workers. Pull dispatch makes all three work here:
 // a worker that is stopped mid-job simply stops asking, and the dispatcher hands that job out again.
 //
-//     static_vmrun demo/actors/supervised.skn [--strategy=one_for_one|one_for_all|rest_for_one]
+//     skarnvm demo/actors/supervised.skn [--strategy=one_for_one|one_for_all|rest_for_one]
 use std::actor::*
 use std::supervisor::*
 use std::cli::*

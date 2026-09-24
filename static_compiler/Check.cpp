@@ -864,14 +864,14 @@ private:
     }
 
     // Advisory diagnostic (must-use / unused). Never affects `ok()`; a future
-    // `static_vmrun --strict` escalates the collected list to fatal.
+    // `skarnvm --strict` escalates the collected list to fatal.
     void warn(uint32_t line, uint32_t col, std::string msg) {
         warnings_.push_back(TypeError{ display_name(std::move(msg)), line, col, cur_module_ });
     }
 
     // The twin of the 4-arg `error` above: an advisory diagnostic with secondary "note" carets.
     // A warning whose whole point is "this happened HERE because of something THERE" -- the lambda
-    // snapshot warning -- is unreadable without the second caret. `static_vmrun` already renders
+    // snapshot warning -- is unreadable without the second caret. `skarnvm` already renders
     // `w.labels` exactly as it renders an error's, so this needs no driver change.
     void warn(uint32_t line, uint32_t col, std::string msg, std::vector<DiagLabel> labels) {
         for (DiagLabel& l : labels) l.text = display_name(std::move(l.text));   // notes too

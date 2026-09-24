@@ -3,7 +3,7 @@
 # Embeds the SINGLE-SOURCE stdlib (static_compiler/std/*.skn, ordered by std/modules.manifest)
 # into prelude_embed.inc, which Compiler.cpp #includes as the initializer of the
 # std::vector<PreludeModule> svc::builtin_prelude() returns. The std/ files are the ONLY source
-# of truth: the baked-in prelude (used by the test suite and as static_vmrun's fallback) can never
+# of truth: the baked-in prelude (used by the test suite and as skarnvm's fallback) can never
 # drift from the editable files.
 #
 # The stdlib split: modules.manifest lists one `<prefix> <file>` per line, in EMBED ORDER (blank

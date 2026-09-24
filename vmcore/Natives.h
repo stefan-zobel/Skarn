@@ -23,6 +23,6 @@ struct Context;
 using NativeFunc = Value(*)(Value* args, uint8_t nargs, Context* ctx);
 
 // Builds the default native registry, indexed by NativeId (NativeRegistry.h).
-// The driver (static_vmrun) passes the result to execute(). Defined in vmcore.cpp,
+// The driver (skarnvm) passes the result to execute(). Defined in vmcore.cpp,
 // where the heap / bytes helpers are in scope.
 std::vector<NativeFunc> build_native_table();

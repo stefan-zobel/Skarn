@@ -9,7 +9,7 @@
 // Each service announces itself when it starts, which is what makes this program's output the same
 // under every schedule: a request goes out only once its receiver is known to be up.
 //
-//     static_vmrun demo/actors/stable_address.skn
+//     skarnvm demo/actors/stable_address.skn
 use std::actor::*
 use std::supervisor::*
 

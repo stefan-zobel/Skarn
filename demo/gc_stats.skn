@@ -9,7 +9,7 @@
 // 53-bit exact integer -- more than a 48-bit Int -- so byte/nanosecond counters
 // stay exact for any realistic run; the ".0" in a printed count is harmless).
 //
-// Run:  x64\Release\static_vmrun.exe demo\gc_stats.skn
+// Run:  x64\Release\skarnvm.exe demo\gc_stats.skn
 // ============================================================================
 
 // Measure a churn region: build a large retained Vec by pushing 300k elements

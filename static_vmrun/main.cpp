@@ -1,8 +1,8 @@
 // =============================================================================
-// static_vmrun -- the Skarn driver: read a script file, type-check + compile
-// it, run it.
+// skarnvm -- the Skarn driver: read a script file, type-check + compile it, run it.
+// (Built from the project static_vmrun; the program is skarnvm on every platform.)
 //
-//   static_vmrun [--no-prelude | --prelude <path>] [--strict] [--no-inline] <script-file>
+//   skarnvm [--no-prelude | --prelude <path>] [--strict] [--no-inline] <script-file>
 //
 // Reads the whole file, strips a UTF-8 BOM, compiles it with the static prelude (so
 // Option/Result + the typed combinators + the container builtins are available) and
@@ -79,10 +79,10 @@ std::string dir_of(const std::string& path) {
 }
 
 void print_usage() {
-    std::cerr << "usage: static_vmrun [--no-prelude | --prelude <path>] [--strict] [--no-inline]\n"
-                 "                    [--emit-bytecode <file>] [--strip-debug] <script-file> [args...]\n"
-                 "       static_vmrun --run-bytecode <file> [args...]\n"
-                 "       static_vmrun --dump-ast [--no-prelude | --prelude <path>] <script-file>\n"
+    std::cerr << "usage: skarnvm [--no-prelude | --prelude <path>] [--strict] [--no-inline]\n"
+                 "               [--emit-bytecode <file>] [--strip-debug] <script-file> [args...]\n"
+                 "       skarnvm --run-bytecode <file> [args...]\n"
+                 "       skarnvm --dump-ast [--no-prelude | --prelude <path>] <script-file>\n"
                  "\n"
                  "  --dump-ast   type-check only, print the type-annotated AST of the program\n"
                  "               (prelude items omitted) to stdout and exit; nothing is run\n"

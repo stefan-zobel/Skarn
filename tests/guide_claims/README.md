@@ -9,7 +9,7 @@ misleading a reader. The introduction is covered as thoroughly as the full guide
 first document a newcomer reads.
 
 Each `*.skn` is a self-contained Skarn program encoding **one** claim, run through
-`static_vmrun`. A header comment declares the expected outcome:
+`skarnvm`. A header comment declares the expected outcome:
 
 ```
 // CLAIM:  <one-line description of the guide claim>
@@ -30,7 +30,7 @@ With Python 3.9 or newer (standard library only), from any cwd, after building t
 python tests/guide_claims/run_guide_claims.py
 ```
 
-The driver is found on its own: `x64/Release/static_vmrun.exe` from the Visual Studio solution, or
+The driver is found on its own: `x64/Release/skarnvm.exe` from the Visual Studio solution, or
 `build/skarnvm` from the CMake build. Options: `--config Debug` (the Debug build), `--exe <path>` (an explicit
 driver), `--dir <path>` (a subset), `--timeout <s>` (per program, default 60). Exit code is `0` iff every
 claim held; a drifted claim prints `FAIL … <why>` and the script exits `1`, so this is CI-gateable. The CMake
@@ -63,7 +63,7 @@ them:
 | `group=<name>` | the blocks with this group (in one guide) are concatenated, in order, into one program — for an example that continues an earlier one |
 | `file=<path>` | with `group=`: this block is not program text but the module file `<path>` beside it (`file=geo.skn` for `import geo`) |
 | `fail` | the program must be rejected. Every line that should be rejected carries `// error: <text>`; the checker must report an error with its caret on that line whose message contains `<text>` (up to the first ` -- `, em dash or ` (`), and must report nothing else |
-| `check` | type-check only (`static_vmrun --dump-ast`), never run — for the network examples |
+| `check` | type-check only (`skarnvm --dump-ast`), never run — for the network examples |
 | `ignore=<reason>` | not a program; reported as skipped (no spaces in `<reason>`) |
 
 An unknown marker, a group with only `file=` blocks, `fail` inside a group, `// error:` without `fail`, or
@@ -165,7 +165,7 @@ every anchor resolves; a broken anchor prints `#slug (first at line N)` and the 
 
 - **`tier3/`** — **module-system rules**, which need more than one file. Each claim is its own
   **subdirectory**: one entry `.skn` carries the `// EXPECT:` directive, and the other `.skn` files
-  beside it are the imported modules (`static_vmrun` resolves `import foo` to `foo.skn` next to the
+  beside it are the imported modules (`skarnvm` resolves `import foo` to `foo.skn` next to the
   entry). Covered: `import` + `use` + qualified `mod::name` + glob `use mod::*`, cross-module `pub`
   types, **default-private** visibility (a non-`pub` item is unreachable), the **orphan rule**,
   binding precedence (a local def / explicit `use` beats a glob; two explicit `use`s of one name
@@ -192,5 +192,5 @@ claim is just a subdirectory whose entry file has the directive and whose siblin
 
 ## Scope note
 
-These fixtures run against the **sealed embedded prelude** via `static_vmrun`, exactly as a user
+These fixtures run against the **sealed embedded prelude** via `skarnvm`, exactly as a user
 runs a program — so they check the *shipping* surface, not an internal build.

@@ -4,7 +4,7 @@
 // Analyze.h -- run the Skarn front end over one entry program and turn every error
 // and warning it reports into editor diagnostics.
 //
-// One analysis = the front half of `static_vmrun` in its error-tolerant form:
+// One analysis = the front half of `skarnvm` in its error-tolerant form:
 // svc::load_modules_for_tools with a file-system resolver (a syntax error is reported and the
 // parser resumes after it, so a file being typed still has a tree), then
 // svc::check_modules_for_tools against the sealed built-in std, which keeps the checked program
@@ -15,7 +15,7 @@
 // whole program is re-checked every time; a full check including the std is a few tens of
 // milliseconds, so there is no incremental state.
 //
-// Module resolution matches static_vmrun: `import net::http` is `<entry-dir>/net/http.skn`.
+// Module resolution matches skarnvm: `import net::http` is `<entry-dir>/net/http.skn`.
 // An OPEN editor buffer wins over the file on disk, so a module being edited is checked
 // in its current, unsaved state.
 //

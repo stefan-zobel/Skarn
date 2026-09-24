@@ -1,6 +1,6 @@
-// bench.skn -- a tiny per-op microbenchmark for the Skarn VM (run with static_vmrun).
+// bench.skn -- a tiny per-op microbenchmark for the Skarn VM (run with skarnvm).
 //
-//   static_vmrun demo/bench/bench.skn
+//   skarnvm demo/bench/bench.skn
 //
 // Each workload times its own hot region with nanoTime() and prints the wall time plus the
 // per-unit cost (ns/iter, ns/call, ns/elem). To turn a per-unit figure into ns-per-BYTECODE-OP,

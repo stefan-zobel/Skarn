@@ -2,12 +2,12 @@
 
 Syntax highlighting, live type checking, an outline, hover types, go to definition, find
 references, rename, completion, signature help and formatting for the
-[Skarn](https://github.com/stefan-zobel/Skarn/blob/HEAD/SkarnGuide.md) language (`.skn` files, run by `static_vmrun`, on macOS `skarnvm`).
+[Skarn](https://github.com/stefan-zobel/Skarn/blob/HEAD/SkarnGuide.md) language (`.skn` files, run by `skarnvm`).
 
 - **Highlighting** comes from a TextMate grammar and works on its own.
 - **Diagnostics** come from `skarn_lsp`, the Skarn language server: type errors, parse
   errors and the checker's warnings appear while you type, with the same wording
-  `static_vmrun` prints. A note such as *"expected because of parameter 'n'"* shows up
+  `skarnvm` prints. A note such as *"expected because of parameter 'n'"* shows up
   as related information pointing at the parameter.
 - **Outline** (the Outline view, breadcrumbs, *Go to Symbol* `Ctrl+Shift+O`): functions,
   structs, enums with their variants, traits and impls with their methods, constants.
@@ -114,7 +114,7 @@ the PATH). Reload the window after changing the setting.
 How files are checked: every open `.skn` file that no other open file imports is
 checked as a program, together with everything it imports — so open the program's entry
 file, and errors inside its imported modules are reported on those modules. Imports
-resolve like `static_vmrun`: `import net::http` is `net/http.skn` next to the entry file.
+resolve like `skarnvm`: `import net::http` is `net/http.skn` next to the entry file.
 Unsaved edits count: an open module is checked in its current state.
 
 `skarn_lsp --selftest` runs the server's own test suite. How the server works is described in

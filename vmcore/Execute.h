@@ -106,7 +106,7 @@ VM_Resources execute(const std::vector<uint32_t>&    bytecode,
                      const std::vector<NativeFunc>*  native_table      = nullptr,
                      // Process context for the args() native: the script's command-line
                      // arguments (those after the script path). Non-owning, non-GC; set
-                     // by the driver (static_vmrun). Placed last, existing callers unaffected.
+                     // by the driver (skarnvm). Placed last, existing callers unaffected.
                      const std::vector<std::string>* script_args       = nullptr,
                      // Input sink for the stdin natives (readLine / readAllStdin): a
                      // caller-supplied std::istream, or std::cin by default. Non-owning,

@@ -2,7 +2,7 @@
 // parallel tasks (std::task). Every answer is CHECKED -- status line and expected body -- and every
 // request is timed.
 //
-// Run:   static_vmrun demo/actor_server/loadgen.skn --port=P [--clients=C] [--requests=R] [--path=/]
+// Run:   skarnvm demo/actor_server/loadgen.skn --port=P [--clients=C] [--requests=R] [--path=/]
 //                                                   [--expect=TEXT]
 //   --port=P       the server's port (required)
 //   --clients=C    clients running at the same time (default 16)

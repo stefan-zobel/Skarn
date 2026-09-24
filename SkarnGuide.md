@@ -103,7 +103,7 @@ when a problem asks for it.
 - Run any example by saving it to a `.skn` file and passing it to the runner:
 
 ```
-static_vmrun.exe myprogram.skn
+skarnvm myprogram.skn
 ```
 
 ### Table of contents

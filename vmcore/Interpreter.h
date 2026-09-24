@@ -72,7 +72,7 @@
 // (they are deterministic, so the two runs agree on what was executed).
 //
 // Remember to rebuild WITHOUT the define afterwards: leaving an instrumented
-// static_vmrun.exe in x64/Release is the stale-exe trap that has bitten before.
+// skarnvm.exe in x64/Release is the stale-exe trap that has bitten before.
 // -----------------------------------------------------------------------------
 #include <cstdio>
 
@@ -320,7 +320,7 @@ indexable_view(Value coll, Value*& out_elems, uint64_t& out_len) noexcept {
 // switch_alloc_array so the SEH __try function never unwinds a C++ object. The
 // caller SYNC_TO_CTX()s first (the receiver ops are not safepoints, so ctx->ip /
 // ctx->ret_stack_ptr would otherwise be stale) and then calls raise_located; a
-// single top-level handler (execute()'s caller / static_vmrun) prints ctx and terminates.
+// single top-level handler (execute()'s caller / skarnvm) prints ctx and terminates.
 // There is NO in-script recovery in this phase (that is deferred Phase 2). All the
 // diagnostics are cold-path: they add nothing to the error-free hot path.
 // =============================================================================

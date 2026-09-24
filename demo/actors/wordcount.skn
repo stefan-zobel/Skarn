@@ -10,7 +10,7 @@
 // The same count is also done sequentially, on the main thread, and the two results must agree --
 // the program checks itself and `panic`s otherwise. Then it prints both timings.
 //
-// Run:   static_vmrun demo/actors/wordcount.skn [file] [--counters=N] [--lines=N] [--batch=N]
+// Run:   skarnvm demo/actors/wordcount.skn [file] [--counters=N] [--lines=N] [--batch=N]
 //                                               [--capacity=N]
 //   file          count the words of this file instead of a generated text
 //   --counters=N  counter actors (default 4)

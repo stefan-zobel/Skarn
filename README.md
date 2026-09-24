@@ -122,7 +122,7 @@ Everything is built into `x64\Release\`. The Debug configuration works the same 
 
 **Windows:**
 ```bash
-x64\Release\static_vmrun.exe hello.skn
+x64\Release\skarnvm.exe hello.skn
 ```
 
 Arguments after the script are passed to the program. Useful flags:
@@ -169,7 +169,7 @@ TextMate-compatible editor (`docs/skarn.tmLanguage.json`).
 |---|---|
 | `vmcore/` | the VM: value representation, instruction set, interpreter, heap and GC, natives |
 | `static_compiler/` | the Skarn front end: lexer, parser, type checker, code generator, module loader; `std/` holds the standard library in Skarn |
-| `static_vmrun/` | the command-line driver |
+| `static_vmrun/` | the command-line driver, `skarnvm` |
 | `skarn_lsp/` | the language server (diagnostics, outline, hover, go to definition, references, rename, completion, signature help, formatting) |
 | `vm_tests/`, `static_compiler_tests/`, `tests/` | the test suites and the documentation harness |
 | `examples/`, `demo/` | Skarn programs |

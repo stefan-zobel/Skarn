@@ -380,7 +380,7 @@ limitation, not something the fault ladder can recover.
 ## Bytecode files (SKBC)
 
 A compiled program can be saved as a `.skbc` file and run later without recompiling
-(`static_vmrun --emit-bytecode` / `--run-bytecode`). `BytecodeIO.h` defines the format:
+(`skarnvm --emit-bytecode` / `--run-bytecode`). `BytecodeIO.h` defines the format:
 
 - a header with magic, two version numbers and a layout sentinel;
 - tagged chunks: code, constant pool, constant arrays, struct types, string literals, function table, trait

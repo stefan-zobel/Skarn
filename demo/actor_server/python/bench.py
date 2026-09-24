@@ -18,7 +18,7 @@ Four measurements, each in runs of its own so that one does not disturb the othe
   memory    private memory of the whole process tree, idle and at its peak under load
   work      the time of one work(8000) on a single thread, to separate interpreter speed from scaling
 
-Run:   python bench.py --vm=<static_vmrun> [--python=<python>] [--python-ft=<python3.14t>] [--rounds=5]
+Run:   python bench.py --vm=<skarnvm> [--python=<python>] [--python-ft=<python3.14t>] [--rounds=5]
                        [--contenders=a,b,...] [--out=DIR] [--smoke]
   --smoke   a quick functional check: one round, few requests, load only
 
@@ -395,7 +395,7 @@ def write_csv(path, rows):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--vm", required=True, help="the static_vmrun executable (a Release build)")
+    ap.add_argument("--vm", required=True, help="the skarnvm executable (a Release build)")
     ap.add_argument("--python", default=sys.executable, help="the Python that runs server.py")
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--out", default=".")

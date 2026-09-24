@@ -19,7 +19,7 @@
 //   /            a short greeting -- almost pure I/O
 //   /work/<n>    sums the digits of the numbers 1..n first -- work that more cores can share
 //
-// Run:   static_vmrun demo/actor_server/server.skn [--workers=N] [--dispatch=rr|pull] [--credits=C]
+// Run:   skarnvm demo/actor_server/server.skn [--workers=N] [--dispatch=rr|pull] [--credits=C]
 //                                                   [--port=P] [--requests=K] [--port-file=F]
 //   --workers=N    worker actors (default 4). 0 answers on the main thread itself: the baseline.
 //   --dispatch=D   how to choose the worker: rr (default) or pull, see above

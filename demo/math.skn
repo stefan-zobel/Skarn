@@ -1,5 +1,5 @@
 // std::math demo: libm natives, scalar helpers, and const items (PI / E).
-// Run: static_vmrun demo/math.skn
+// Run: skarnvm demo/math.skn
 use std::math::*
 
 // Constants (const items -- inlined at each use, no runtime cost).

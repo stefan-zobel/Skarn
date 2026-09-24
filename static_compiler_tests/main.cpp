@@ -1180,7 +1180,7 @@ void test_parser_errors() {
 // ---- multi-module loader -----------------------------------------------------
 // The loader is filesystem-free: it takes a resolver `path segments -> source`. These
 // tests drive it with an in-memory module map, so the DAG / cycle / topological-order
-// logic is exercised without touching disk (static_vmrun supplies the real FS resolver).
+// logic is exercised without touching disk (skarnvm supplies the real FS resolver).
 
 svc::ModuleResolver mem_resolver(const std::unordered_map<std::string, std::string>& mods) {
     return [mods](const std::vector<std::string>& path) -> std::optional<std::string> {
@@ -2189,7 +2189,7 @@ void test_structured_diagnostics() {
 
 // ---- typechecker: advisory warnings (must-use + unused bindings) ------------
 // These are the WARNING tier: they populate CheckResult::warnings, never ::errors,
-// and never affect ok(). A future `static_vmrun --strict` escalates them to fatal.
+// and never affect ok(). A future `skarnvm --strict` escalates them to fatal.
 void test_check_warnings() {
     std::cout << "[check: warnings]\n";
     const char* RES = "enum Result[T, E] { Ok(T), Err(E) }\nenum Option[T] { None, Some(T) }\n";
@@ -2555,7 +2555,7 @@ bool cg_faults_msg(const std::string& src, const char* needle) {
 
 // Compile+run WITH the prelude AND the real native registry, capturing the print/println sink.
 // Optional command-line `args` (-> args()) and piped `stdin_text` (-> readLine / readAllStdin) let
-// the file/time/env/stdin natives be exercised exactly as static_vmrun drives them.
+// the file/time/env/stdin natives be exercised exactly as skarnvm drives them.
 std::string cg_run_native(const std::string& src,
                           const std::vector<std::string>& args = {},
                           const std::string& stdin_text = "") {

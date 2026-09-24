@@ -118,7 +118,7 @@ struct VM {
     std::istream*     in                = nullptr;
     // Process context: the script's command-line arguments (those AFTER the script path),
     // for the args() native. Non-owning; NOT a GC root (host std::strings, copied into
-    // fresh heap strings on demand). Set by the driver (static_vmrun); null => no args (empty).
+    // fresh heap strings on demand). Set by the driver (skarnvm); null => no args (empty).
     const std::vector<std::string>* script_args = nullptr;
     // TCP socket registry for the std::net natives (tcpConnect / tcpListen / ...). An opaque,
     // per-execution table of open OS SOCKET handles (integers, NOT Values) -> NOT a GC root and

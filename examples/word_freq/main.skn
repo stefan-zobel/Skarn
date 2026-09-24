@@ -1,6 +1,6 @@
 // word_freq -- count the words of a text file and print the most frequent ones.
 //
-//   static_vmrun main.skn [--top=N] [--min-len=N] <file>
+//   skarnvm main.skn [--top=N] [--min-len=N] <file>
 //
 // Shows: command-line parsing with std::cli, reading a file, `?` in a `run` function,
 // a Map as a counter, sorting with a comparator, and format specifiers.

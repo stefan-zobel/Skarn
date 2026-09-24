@@ -6,7 +6,7 @@
 //   skarn_lsp --format <file>  print the file in Skarn's fixed format (Format.h) to stdout
 //
 // Type errors, parse errors and the checker's warnings appear in the editor while the
-// file is edited, with the same wording static_vmrun prints. Nothing is compiled to
+// file is edited, with the same wording skarnvm prints. Nothing is compiled to
 // bytecode or run: an analysis is the front half of the compiler only.
 //
 // stdout belongs to the protocol. Two things keep it clean: on Windows both standard

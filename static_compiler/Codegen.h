@@ -61,7 +61,7 @@ public:
 
     // Enable inlining of small non-recursive DIRECT calls. Off by default;
     // svc::compile / compile_modules set it from the process-wide svc::inline_calls() knob, which
-    // the drivers drive (`static_vmrun --inline`). A pure codegen transform: the same program
+    // the drivers drive (`skarnvm --inline`). A pure codegen transform: the same program
     // compiled either way must produce the same VALUES, which is what the differential sweep checks.
     void set_inlining(bool on) { inlining_ = on; }
     // Print the measure-vs-emit inline site tally to stderr after codegen (development only).

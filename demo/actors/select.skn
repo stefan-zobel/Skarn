@@ -20,8 +20,8 @@
 // an address it has not been told about -- which is what makes the output the same under every
 // schedule.
 //
-//     static_vmrun demo/actors/select.skn
-//     static_vmrun demo/actors/select.skn --jobs=8
+//     skarnvm demo/actors/select.skn
+//     skarnvm demo/actors/select.skn --jobs=8
 use std::actor::*
 use std::cli::*
 use std::env::*

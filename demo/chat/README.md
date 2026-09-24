@@ -16,8 +16,8 @@ on its connection and its inbox at once (see "A connection that also listens to 
 Start the server and a client in each of two or more terminals, from the repository root:
 
 ```
-x64\Release\static_vmrun.exe demo\chat\server.skn [--port=P] [--port-file=F]
-x64\Release\static_vmrun.exe demo\chat\chat_client.skn [--host=H] [--port=P]
+x64\Release\skarnvm.exe demo\chat\server.skn [--port=P] [--port-file=F]
+x64\Release\skarnvm.exe demo\chat\chat_client.skn [--host=H] [--port=P]
 ```
 
 The port is 7070 unless you name another one; `--port=0` lets the system pick a free one, which the server
@@ -55,7 +55,7 @@ A topic is written with or without `#`. Lines from the server start with `* `, a
 ## The self-test
 
 ```
-x64\Release\static_vmrun.exe demo\chat\server.skn --selftest
+x64\Release\skarnvm.exe demo\chat\server.skn --selftest
 ```
 
 starts the server on a free port and three clients in the same process: alice and bob as actors with

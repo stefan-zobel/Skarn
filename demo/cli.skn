@@ -1,6 +1,6 @@
 // std::cli -- a spec-free command-line argument parser (pure Skarn, native-free).
 // It classifies the REAL command line. Run it with arguments to see them sorted, e.g.:
-//   static_vmrun demo/cli.skn build --opt=O2 --output=out.bin -v main.skn -- --literal
+//   skarnvm demo/cli.skn build --opt=O2 --output=out.bin -v main.skn -- --literal
 use std::env::*
 use std::cli::*
 
@@ -32,5 +32,5 @@ while i < c.numPositionals() {
 
 // With no arguments every query above is empty/false -- pass some to watch them populate.
 if c.numPositionals() == 0 && !c.hasFlag("verbose") {
-  println("(no arguments -- try: static_vmrun demo/cli.skn build --opt=O2 -v main.skn)")
+  println("(no arguments -- try: skarnvm demo/cli.skn build --opt=O2 -v main.skn)")
 }

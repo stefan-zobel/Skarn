@@ -1,5 +1,5 @@
 // std::bytes demo: a little-endian binary reader/writer over Bytes (pure Skarn, no native).
-// Run: static_vmrun demo/bytes.skn
+// Run: skarnvm demo/bytes.skn
 use std::bytes::*
 
 // A tiny record: a 4-byte magic (u32 LE), a 2-byte version (u16 LE), a signed delta (i32 LE),

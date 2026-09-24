@@ -142,7 +142,7 @@ git worktree remove /tmp/skarn-release
 - [ ] All ten ctest entries green, totals match Windows
 - [ ] Archive unpacks to a single `Skarn-<version>-macos-arm64/` folder
 - [ ] Executable bit set on `skarnvm` and `skarn_lsp` (`.tar.gz` preserves it; `.zip` does not)
-- [ ] `README.txt` inside the archive is the macOS-specific one (Gatekeeper note, `./skarnvm` not `static_vmrun.exe`)
+- [ ] `README.txt` inside the archive is the macOS-specific one (Gatekeeper note, `./skarnvm` rather than `skarnvm.exe`)
 - [ ] `.vsix` is the same file as in the Windows zip (identical SHA256)
 - [ ] `.sha256` matches `shasum -a 256` output
 - [ ] Release title no longer says `windows-x64`

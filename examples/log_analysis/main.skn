@@ -1,6 +1,6 @@
 // log_analysis -- parse a web-server access log with regular expressions and summarize it.
 //
-//   static_vmrun main.skn <access.log>
+//   skarnvm main.skn <access.log>
 //
 // Shows: std::regex with named capture groups, `?` over `Result`s with different error types
 // (converted with `mapErr`), counting with Maps, `Option` chaining, and a time-bucketed histogram.

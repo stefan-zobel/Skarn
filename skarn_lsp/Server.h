@@ -22,7 +22,7 @@
 //
 // Which open documents are analyzed as ENTRY programs: every open document that no
 // other open document imports. A module is checked through its importer, because it
-// resolves its own imports relative to the ENTRY's directory (the static_vmrun rule)
+// resolves its own imports relative to the ENTRY's directory (the skarnvm rule)
 // and would report spurious "cannot resolve module" errors checked on its own. A
 // module opened WITHOUT its importer is checked as an entry -- the best available.
 //

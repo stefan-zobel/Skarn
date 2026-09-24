@@ -1,6 +1,6 @@
 // csv_stats -- read a CSV file and print per-column statistics and a grouped summary.
 //
-//   static_vmrun main.skn <file.csv>
+//   skarnvm main.skn <file.csv>
 //
 // Shows: `lines` / `split` over text, parsing numbers with `?` and a row number in the error,
 // a Double column model, grouping into a Map, sorting, and `${x:.2f}`-style formatting.

@@ -90,7 +90,7 @@ private:
 //
 // ON by default since the measurement: +8.7 % (full render) / +10.3 % (preview) on demo/raytracer
 // against a null control that read 0.00 %, and 0 % on demo/aes256, which gets exactly one
-// expansion -- the payoff is workload-shaped, never negative. `static_vmrun --no-inline` turns it
+// expansion -- the payoff is workload-shaped, never negative. `skarnvm --no-inline` turns it
 // off. The accepted cost is +27.5 % bytecode and a flatter fault trace: a trap inside an expanded
 // callee reports the CALL SITE, and the callee's frames are absent (decision D4).
 void set_inline_calls(bool on);
@@ -210,7 +210,7 @@ ToolCheck check_modules_for_tools(ModuleSet modules, const std::vector<PreludeMo
 // The built-in static prelude, as an ordered list of prelude modules (embedded from the
 // std/*.skn sources by the pre-build). Pre-split this is a single { "$prelude", <source> }
 // entry (mangles to bare = the old monolithic prelude); the stdlib split turns it into
-// std::core / std::iter / std::string / ... . static_vmrun may instead load these from disk;
+// std::core / std::iter / std::string / ... . skarnvm may instead load these from disk;
 // the test harness passes this embedded set to compile().
 const std::vector<PreludeModule>& builtin_prelude();
 

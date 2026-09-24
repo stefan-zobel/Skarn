@@ -18,7 +18,7 @@ most frequent words to the main program. The program also counts sequentially an
 agree.
 
 ```
-static_vmrun demo/actors/wordcount.skn [file] [--counters=N] [--lines=N] [--batch=N] [--capacity=N]
+skarnvm demo/actors/wordcount.skn [file] [--counters=N] [--lines=N] [--batch=N] [--capacity=N]
 ```
 
 | option | effect |
@@ -72,7 +72,7 @@ total, because pull dispatch hands out again every job whose result is missing â
 simply stops asking.
 
 ```
-static_vmrun demo/actors/supervised.skn [--strategy=one_for_one|one_for_all|rest_for_one]
+skarnvm demo/actors/supervised.skn [--strategy=one_for_one|one_for_all|rest_for_one]
 ```
 
 ## `select.skn`
@@ -97,7 +97,7 @@ which is back-pressure the program chooses rather than suffers. The run shows ex
 while paused says nothing has been done, although every job has already been sent.
 
 ```
-static_vmrun demo/actors/select.skn [--jobs=N]
+skarnvm demo/actors/select.skn [--jobs=N]
 ```
 
 | option | effect |
@@ -120,5 +120,5 @@ Each service announces itself when it starts, which is what makes the output the
 schedule: a request goes out only once its receiver is known to be up.
 
 ```
-static_vmrun demo/actors/stable_address.skn
+skarnvm demo/actors/stable_address.skn
 ```

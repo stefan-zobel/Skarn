@@ -549,7 +549,7 @@ std::string dump(const Program& p);
 // embedded std that is thousands of items, which would bury the program under inspection. Pass
 // include_prelude=true to render the whole combined program.
 //
-// Reached from `static_vmrun --dump-ast`. Its original consumer was the skarnc_diff differential,
+// Reached from `skarnvm --dump-ast`. Its original consumer was the skarnc_diff differential,
 // deleted with the self-hosting experiment; the driver flag replaced it so this path
 // keeps being executed instead of rotting uncalled.
 std::string dump_typed(const Program& p, bool include_prelude = false);

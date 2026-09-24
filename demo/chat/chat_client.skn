@@ -1,7 +1,7 @@
 // A terminal client for the chat server (server.skn): what you type goes to the server, and what the
 // server sends appears as soon as it arrives -- also while you are typing.
 //
-// Run:   static_vmrun demo/chat/chat_client.skn [--host=H] [--port=P]
+// Run:   skarnvm demo/chat/chat_client.skn [--host=H] [--port=P]
 //   --host=H   the server's host (default 127.0.0.1)
 //   --port=P   the server's port (default 7070)
 //

@@ -43,9 +43,9 @@ Everything lives in namespace `svc`.
 
 `docs/skarn_grammar.ebnf` describes the syntax; where it and the parser disagree, the parser is right.
 
-## The driver: `static_vmrun`
+## The driver: `skarnvm`
 
-`static_vmrun` reads the entry file, loads its imports from disk, compiles, and runs the program with the
+`skarnvm` reads the entry file, loads its imports from disk, compiles, and runs the program with the
 native functions attached:
 
 - `import net::http` loads `net/http.skn` relative to the entry file. A missing module or an import cycle is

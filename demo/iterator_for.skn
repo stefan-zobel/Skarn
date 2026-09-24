@@ -7,7 +7,7 @@
 // A `dyn Iterator[T]` value IS the plain cursor -- no box, no vtable pointer;
 // the combinators (range/map/filter/...) each return one.
 //
-// Run:  x64\Release\static_vmrun.exe demo\iterator_for.skn
+// Run:  x64\Release\skarnvm.exe demo\iterator_for.skn
 // ============================================================================
 
 // (1) for over a lazy stream expression -- the headline. Nothing is materialized;

@@ -3,12 +3,12 @@
 # Finding the driver, running it, colored PASS/FAIL, and the command-line options every runner takes.
 # Python 3.9 or newer, standard library only, so the runners work the same on Windows and macOS.
 #
-# The driver is `static_vmrun.exe` in the Visual Studio build and `skarnvm` in the CMake build. Without
-# --exe a runner looks, in this order, at
-#     x64/<config>/static_vmrun.exe       (the Visual Studio solution)
+# The driver is `skarnvm` (`skarnvm.exe` on Windows) in both builds. Without --exe a runner looks, in this
+# order, at
+#     x64/<config>/skarnvm.exe            (the Visual Studio solution)
 #     build/skarnvm                       (CMake, single-configuration generator)
 #     build/<config>/skarnvm              (CMake, multi-configuration generator)
-# each also with `.exe`, and takes the first that exists.
+# the build/ ones each also with `.exe`, and takes the first that exists.
 
 import os
 import subprocess
@@ -66,7 +66,7 @@ def say(text=""):
 # ---- the driver -------------------------------------------------------------------------------------
 
 def add_driver_options(parser, timeout=60):
-    parser.add_argument("--exe", default="", help="the driver (static_vmrun.exe / skarnvm)")
+    parser.add_argument("--exe", default="", help="the driver (skarnvm)")
     parser.add_argument("--config", default="Release", help="build configuration to look in (default Release)")
     parser.add_argument("--timeout", type=int, default=timeout, help="seconds per program (default %(default)s)")
 
@@ -80,7 +80,7 @@ def find_driver(exe, config):
         say(red("ERROR: the driver '{}' does not exist.".format(exe)))
         sys.exit(1)
     candidates = [
-        REPO_ROOT / "x64" / config / "static_vmrun.exe",
+        REPO_ROOT / "x64" / config / "skarnvm.exe",
         REPO_ROOT / "build" / "skarnvm",
         REPO_ROOT / "build" / "skarnvm.exe",
         REPO_ROOT / "build" / config / "skarnvm",

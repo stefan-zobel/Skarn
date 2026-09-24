@@ -16,7 +16,7 @@
 // driver that wants source context downcasts to VmFault and reads `frames`.
 //
 // Thrown out-of-line by raise_located (Interpreter.h); caught at the single top-level
-// handler in execute()'s caller / static_vmrun. There is NO in-script recovery in this phase.
+// handler in execute()'s caller / skarnvm. There is NO in-script recovery in this phase.
 // =============================================================================
 struct VmFault : std::runtime_error {
     struct Frame {

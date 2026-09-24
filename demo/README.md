@@ -7,7 +7,7 @@ the demos are not checked by the documentation harness, so their exact output is
 Run a demo from the repository root:
 
 ```bash
-x64\Release\static_vmrun.exe demo\json.skn
+x64\Release\skarnvm.exe demo\json.skn
 ```
 
 ## Language features

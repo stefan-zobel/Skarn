@@ -34,7 +34,7 @@ Two routes, so the load can be I/O or CPU:
 | `/work/<n>` | the digit sum of 1..n, computed first; `/work/8000` is about 1 ms of work |
 
 ```
-static_vmrun demo/actor_server/server.skn [--workers=N] [--dispatch=rr|pull] [--credits=C] [--port=P]
+skarnvm demo/actor_server/server.skn [--workers=N] [--dispatch=rr|pull] [--credits=C] [--port=P]
                                           [--requests=K] [--port-file=F]
 ```
 
@@ -55,7 +55,7 @@ C clients at once, each a task sending R requests one after another, one connect
 every answer (status line and expected body) and prints requests per second and the latency percentiles.
 
 ```
-static_vmrun demo/actor_server/loadgen.skn --port=P [--clients=C] [--requests=R] [--path=/] [--expect=TEXT]
+skarnvm demo/actor_server/loadgen.skn --port=P [--clients=C] [--requests=R] [--path=/] [--expect=TEXT]
 ```
 
 In Git Bash, set `MSYS_NO_PATHCONV=1` first: otherwise `--path=/work/8000` reaches the program as a Windows

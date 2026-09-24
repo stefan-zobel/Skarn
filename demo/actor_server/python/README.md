@@ -26,11 +26,11 @@ must not be put at a disadvantage.
 
 ```
 python server.py [--model=threads|subinterp|procs|prefork] [--workers=N] [--port=P] [--port-file=F]
-python bench.py --vm=<static_vmrun> [--python=<python>] [--python-ft=<python3.14t>]
+python bench.py --vm=<skarnvm> [--python=<python>] [--python-ft=<python3.14t>]
                 [--contenders=a,b,...] [--rounds=5] [--out=DIR] [--smoke]
 ```
 
-`bench.py` needs `psutil` and a Release build of `static_vmrun`. `--python-ft` adds `ft-threads`; the
+`bench.py` needs `psutil` and a Release build of `skarnvm`. `--python-ft` adds `ft-threads`; the
 script checks that its GIL is really off. `--contenders` measures only some. `--smoke` is a quick
 functional check. Without it, the script refuses to start while the CPU is busy.
 

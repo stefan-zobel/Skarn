@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <!--
     Notepad++ User-Defined Language for the Skarn scripting language (.skn files),
-    run by static_vmrun.
+    run by skarnvm.
 
     HOW TO IMPORT (Notepad++ v8.9.1):
       Language menu -> User Defined Language -> Define your language... -> Import...

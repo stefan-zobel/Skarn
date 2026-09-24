@@ -1,6 +1,6 @@
 // demo/regex.skn -- a tour of std::regex (pure-Skarn Pike-VM engine). Self-verifying: any mismatch
 // panics (non-zero exit); on success it prints its results and "all regex demo checks passed".
-// Run: static_vmrun demo/regex.skn
+// Run: skarnvm demo/regex.skn
 
 use std::regex::*
 

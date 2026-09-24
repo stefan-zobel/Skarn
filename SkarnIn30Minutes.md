@@ -9,7 +9,7 @@ If you know Java, C#, Kotlin, or a bit of Rust, almost everything below will loo
 saving it to a `.skn` file:
 
 ```
-static_vmrun.exe hello.skn
+skarnvm hello.skn
 ```
 
 Every example on this page is executed by the project's test harness, so what you read here is what the

@@ -57,8 +57,8 @@ struct TypeError {
 // The outcome of checking a whole program. `ok()` iff no errors were reported.
 //
 // `warnings` is an ADVISORY tier (must-use Result/Option + unused bindings): a logic-bug
-// nudge, never a soundness signal, so it does NOT affect `ok()`. A future `static_vmrun
-// --strict` can escalate a non-empty `warnings` list to fatal (mirroring `static_vmrun --strict`).
+// nudge, never a soundness signal, so it does NOT affect `ok()`. A future `skarnvm
+// --strict` can escalate a non-empty `warnings` list to fatal (mirroring `skarnvm --strict`).
 // An AMBIENT function -- a builtin or native, which belongs to no module's item list. `module` is
 // the opt-in module whose `use` makes a gated native reachable ("" = always reachable);
 // `signature` is `fn name(A, B) -> R`; a builtin typed per call (`len`, `get`, `print`) has a

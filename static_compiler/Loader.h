@@ -10,7 +10,7 @@
 // appears after all the modules it imports; the entry module is last).
 //
 // The loader is deliberately FILESYSTEM-FREE -- it keeps `static_compiler` pure, the
-// way `svc::compile` takes source text, not a path. A driver (static_vmrun, Slice 6)
+// way `svc::compile` takes source text, not a path. A driver (skarnvm, Slice 6)
 // supplies a std::filesystem-backed `ModuleResolver` that maps `net::http` to
 // `net/http.skn` under the entry directory; the tests supply an in-memory map. So
 // the DAG / cycle / topological logic is unit-testable without touching disk.

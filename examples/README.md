@@ -8,7 +8,7 @@ Run one from its directory, so relative paths find its data files:
 
 ```
 cd examples/word_freq
-..\..\x64\Release\static_vmrun.exe main.skn --top=6 --min-len=4 input.txt
+..\..\x64\Release\skarnvm.exe main.skn --top=6 --min-len=4 input.txt
 ```
 
 | example | what it does | what it shows |

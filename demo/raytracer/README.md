@@ -15,7 +15,7 @@ program is real.
 ## Running
 
 ```
-static_vmrun demo/raytracer/main.skn
+skarnvm demo/raytracer/main.skn
 ```
 
 | Flag | Effect |
@@ -38,7 +38,7 @@ which rows were rendered before it, and a given configuration produces one exact
 means a **non-zero exit code**. So this is gate-able:
 
 ```
-static_vmrun demo/raytracer/main.skn --preview
+skarnvm demo/raytracer/main.skn --preview
 ```
 
 is a ~2 second check that exits 0 only if all 40-odd self-tests pass *and* every pixel is
@@ -88,7 +88,7 @@ and sampled against separately hand-computed colours.
 ## What it measures
 
 Measured on an AMD Ryzen 5 5600H, Release x64, at the full size (470×264 × 16 samples ≈ 2.0 M
-primary rays), with inlining switched off (`static_vmrun --no-inline`). Your machine will
+primary rays), with inlining switched off (`skarnvm --no-inline`). Your machine will
 differ; the ratios are the interesting part.
 
 | | idiomatic `Sphere` | `--fast` `FastSphere` |

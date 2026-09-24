@@ -13,7 +13,7 @@
 // source produces the same file byte for byte -- whether it renders on one thread or on many
 // (--threads=N). That is what makes the renderer its own regression test.
 //
-// Run:  static_vmrun demo/raytracer/main.skn
+// Run:  skarnvm demo/raytracer/main.skn
 
 import vec3
 import bmp
@@ -492,6 +492,6 @@ if testsOk && imageOk {
     println("all self-checks passed")
 } else {
     // panic aborts with a located message and a non-zero exit code, which is what makes
-    // `static_vmrun demo/raytracer/main.skn --preview` usable as a build gate.
+    // `skarnvm demo/raytracer/main.skn --preview` usable as a build gate.
     panic("raytracer self-check FAILED -- see the report above")
 }
