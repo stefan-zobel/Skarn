@@ -876,6 +876,10 @@ reached the inbox is a different matter, because the runtime cannot tell whether
 `SocketHandOff` sent to an actor that dies before taking it, it is closed only when the program ends.
 Receive what arrived before you stop.
 
+[`demo/chat/`](demo/chat/README.md) puts both halves together: a chat server with topics, whose acceptor
+activates its listener and whose sessions activate their connections, a terminal client, and a self-test
+that also shows how a topic drops a client that has stopped reading.
+
 ## 18. Logging from several actors
 
 `println` is fine until there are actors. Then the output is interleaved by arrival, it is gone when the

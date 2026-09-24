@@ -1,0 +1,286 @@
+// The self-test: the chat server and a scripted conversation of three clients in ONE process.
+//
+// alice and bob are actors of their own, with active connections like the server's sessions: each hands
+// every line the server sends it to the main program. carol is a plain blocking TcpConn in the main
+// program, because she is the client that stops reading.
+//
+// The clients run concurrently, so the output could come in any order -- but the script waits after
+// every step until EACH line that step must cause has arrived at its client, and only then prints them,
+// in the order the script lists them. The transcript is therefore the same on every run, and a line
+// that is missing, extra or different ends the test with an error.
+//
+// The last part is the slow client: carol joins #rust and never reads again, alice writes a flood of
+// lines there, and the topic drops carol once her session falls behind -- while alice and bob go on.
+
+import hub
+use hub::*
+use std::net::*
+use std::actor::*
+
+
+// What a client actor hands the main program: who heard it, and the line.
+struct Heard { who: String, line: String }
+
+// What a client actor is told: a line to send.
+enum ClientCmd { Say(String) }
+
+struct ClientStart { who: String, port: Int, report: Pid[Heard] }
+
+// A scripted client: sends what it is told, reports what it hears. "<closed>" when the server ends
+// the connection.
+fn client(inbox: Inbox[ClientCmd], start: ClientStart) -> () {
+    let conn = match connect("127.0.0.1", start.port) {
+        Ok(c) => c,
+        Err(e) => {
+            send(start.report, Heard { who: start.who, line: "<cannot connect: ${e}>" })
+            return ()
+        }
+    }
+    let (out, events) = match conn.activate(Framing::Lines(1024), 64) {
+        Ok(pair) => pair,
+        Err(e) => {
+            send(start.report, Heard { who: start.who, line: "<cannot activate: ${e}>" })
+            return ()
+        }
+    }
+    let watching = toVec([inbox.ref(), events.ref()])
+    let mut running = true
+    while running {
+        match select(watching, -1) {
+            Some(0) => {
+                match inbox.receive() {
+                    Mail::Msg(ClientCmd::Say(text)) => {
+                        if isErr(out.sendStr(text + "\n")) {
+                            send(start.report, Heard { who: start.who, line: "<send failed>" })
+                            running = false
+                        }
+                    },
+                    _ => { running = false }
+                }
+            },
+            _ => {
+                match events.receive() {
+                    SockEvent::Line(l) => { send(start.report, Heard { who: start.who, line: l }) },
+                    SockEvent::Stopping => { running = false },
+                    _ => {
+                        send(start.report, Heard { who: start.who, line: "<closed>" })
+                        running = false
+                    }
+                }
+            }
+        }
+    }
+    out.close()
+}
+
+
+// --- the script ---
+
+const WELCOME: String = "* welcome -- /nick <name>, /join <topic>, /leave <topic>, /topics, /quit"
+const KICKED: String = "* carol was too slow and was disconnected"
+const WAIT_MS: Int = 5000
+
+struct Script {
+    inbox: Inbox[Heard],
+    port: Int,
+    clients: Map[String, Pid[ClientCmd]],
+    steps: Int
+}
+
+// A line of alice's flood, as the topic hands it on.
+fn isFlood(line: String) -> Bool { startsWith(line, "[#rust] <alice> flood ") }
+
+// Wait until every (client, line) in `want` has arrived, then print them in that order. A line
+// nobody expects, a crashed client or a silence of WAIT_MS fails the test.
+fn expect(t: Script, want: Vec[(String, String)]) -> Result[(), String] {
+    let mut pending = want
+    while len(pending) > 0 {
+        match t.inbox.receiveTimeout(WAIT_MS) {
+            Some(Mail::Msg(h)) => {
+                if !isFlood(h.line) {
+                    let mut rest: Vec[(String, String)] = vec()
+                    let mut found = false
+                    for (who, line) in pending {
+                        if !found && who == h.who && line == h.line {
+                            found = true
+                        } else {
+                            push(rest, (who, line))
+                        }
+                    }
+                    if !found { return Err("unexpected line for ${h.who}: ${h.line}") }
+                    pending = rest
+                }
+            },
+            Some(Mail::Exited(_, why)) => { return Err("a client crashed: ${why}") },
+            Some(Mail::Stop) => { return Err("stopped") },
+            None => {
+                let (who, line) = pending[0]
+                return Err("${who} never heard: ${line}")
+            }
+        }
+    }
+    for (who, line) in want {
+        println("  ${who} < ${line}")
+    }
+    Ok(())
+}
+
+// Start a client actor and wait for the server's welcome.
+fn arrive(mut t: Script, who: String) -> Result[(), String] {
+    println("${who} connects")
+    let p = spawnActor(client, ClientStart { who: who, port: t.port, report: t.inbox.pid() })
+    t.clients[who] = p
+    t.steps += 1
+    expect(t, toVec([(who, WELCOME)]))
+}
+
+// `who` sends `line`; then every line in `want` must arrive.
+fn step(mut t: Script, who: String, line: String, want: Vec[(String, String)]) -> Result[(), String] {
+    println("${who} > ${line}")
+    send(t.clients[who], ClientCmd::Say(line))
+    t.steps += 1
+    expect(t, want)
+}
+
+// carol is a blocking connection in this program: she reads only when the script says so.
+fn carolSays(mut c: TcpConn, line: String) -> Result[(), String] {
+    println("carol > ${line}")
+    c.sendStr(line + "\n")
+}
+
+fn carolHears(mut c: TcpConn, want: String) -> Result[(), String] {
+    match c.recvLine()? {
+        Some(line) => {
+            if line != want { return Err("carol heard '${line}', expected '${want}'") }
+            println("  carol < ${line}")
+            Ok(())
+        },
+        None => Err("carol's connection ended")
+    }
+}
+
+// The conversation of alice and bob.
+fn conversation(mut t: Script) -> Result[(), String] {
+    arrive(t, "alice")?
+    arrive(t, "bob")?
+    step(t, "alice", "/nick alice", toVec([("alice", "* you are now alice")]))?
+    step(t, "bob", "/nick bob", toVec([("bob", "* you are now bob")]))?
+    step(t, "alice", "hello?", toVec([("alice", "* join a topic first: /join <topic>")]))?
+    step(t, "alice", "/join #rust", toVec([("alice", "* alice joined #rust")]))?
+    step(t, "bob", "/join rust", toVec([("alice", "* bob joined #rust"), ("bob", "* bob joined #rust")]))?
+    step(t, "alice", "hi bob",
+         toVec([("alice", "[#rust] <alice> hi bob"), ("bob", "[#rust] <alice> hi bob")]))?
+    step(t, "bob", "/join go", toVec([("bob", "* bob joined #go")]))?
+    step(t, "bob", "anyone here?", toVec([("bob", "[#go] <bob> anyone here?")]))?
+    step(t, "alice", "/topics", toVec([("alice", "* topics: #go #rust")]))?
+    step(t, "bob", "/join rust", toVec([("bob", "* now talking in #rust")]))?
+    step(t, "bob", "back again",
+         toVec([("alice", "[#rust] <bob> back again"), ("bob", "[#rust] <bob> back again")]))?
+    step(t, "alice", "/leave go", toVec([("alice", "* you are not in #go")]))?
+    step(t, "bob", "/leave #go", toVec([("bob", "* bob left #go")]))?
+    step(t, "bob", "/shout", toVec([("bob", "* unknown command: /shout")]))
+}
+
+// alice floods #rust until the topic drops carol, in blocks of BLOCK lines. After each block the script
+// waits until alice AND bob have heard its last line, so neither of them is ever more than one block
+// behind -- and a block is smaller than a session's inbox (32, see hub.skn), so only carol, who does
+// not read at all, can fill hers. (A single burst larger than that inbox would drop any client that
+// happened to be a moment slower, which is the policy working, not failing.) How many blocks it takes
+// depends on the system's socket buffers, so the count is not printed.
+const BLOCK: Int = 24
+
+fn flood(mut t: Script) -> Result[(), String] {
+    println("alice > ... floods #rust until carol falls behind")
+    t.steps += 1
+    let mut pad = stringBuilder()
+    for _ in range(0, 800) {
+        pad.append(".")
+    }
+    let filler = pad.build()
+    let mut aliceSaw = false
+    let mut bobSaw = false
+    let mut block = 0
+    while !aliceSaw || !bobSaw {
+        if block == 2000 { return Err("carol was never dropped") }
+        let mut sb = stringBuilder()
+        for i in range(0, BLOCK) {
+            if i > 0 { sb.append("\n") }
+            sb.append("flood ${block}.${i} ${filler}")
+        }
+        send(t.clients["alice"], ClientCmd::Say(sb.build()))
+        let last = "[#rust] <alice> flood ${block}.${BLOCK - 1} ${filler}"
+        let mut aliceDone = false
+        let mut bobDone = false
+        while !aliceDone || !bobDone {
+            match t.inbox.receiveTimeout(WAIT_MS) {
+                Some(Mail::Msg(h)) => {
+                    if h.line == KICKED && h.who == "alice" {
+                        aliceSaw = true
+                    } else if h.line == KICKED && h.who == "bob" {
+                        bobSaw = true
+                    } else if h.line == last && h.who == "alice" {
+                        aliceDone = true
+                    } else if h.line == last && h.who == "bob" {
+                        bobDone = true
+                    } else if !isFlood(h.line) {
+                        return Err("unexpected line for ${h.who}: ${h.line}")
+                    }
+                },
+                Some(Mail::Exited(_, why)) => { return Err("a client crashed: ${why}") },
+                _ => { return Err("the flood stalled in block ${block}") }
+            }
+        }
+        block += 1
+    }
+    println("  alice < ${KICKED}")
+    println("  bob < ${KICKED}")
+    Ok(())
+}
+
+// carol joins #rust, stops reading, and is dropped. Her connection is closed afterwards in any case:
+// her session is stuck in a send to her until then (see README.md), and would keep the program from
+// ending.
+fn slowClient(mut t: Script) -> Result[(), String] {
+    println("carol connects")
+    let mut carol = connect("127.0.0.1", t.port)?
+    carol.setTimeout(WAIT_MS)?
+    let r = slowClientWith(t, carol)
+    let _ = carol.close()
+    r
+}
+
+fn slowClientWith(mut t: Script, mut carol: TcpConn) -> Result[(), String] {
+    carolHears(carol, WELCOME)?
+    carolSays(carol, "/nick carol")?
+    carolHears(carol, "* you are now carol")?
+    carolSays(carol, "/join rust")?
+    expect(t, toVec([("alice", "* carol joined #rust"), ("bob", "* carol joined #rust")]))?
+    carolHears(carol, "* carol joined #rust")?
+    t.steps += 3
+    println("carol stops reading")
+    flood(t)
+}
+
+fn runScript(mut t: Script) -> Result[(), String] {
+    conversation(t)?
+    slowClient(t)?
+    step(t, "bob", "still here?",
+         toVec([("alice", "[#rust] <bob> still here?"), ("bob", "[#rust] <bob> still here?")]))?
+    step(t, "alice", "/quit",
+         toVec([("alice", "* bye"), ("alice", "<closed>"), ("bob", "* alice left #rust")]))?
+    step(t, "bob", "/topics", toVec([("bob", "* topics: #go #rust")]))
+}
+
+// Start the server on a free port and run the script against it.
+pub fn run() -> Result[(), String] {
+    let inbox: Inbox[Heard] = mainInbox()
+    let port = startServer(0)?
+    let mut t = Script { inbox: inbox, port: port, clients: #{}, steps: 0 }
+    match runScript(t) {
+        Ok(_) => {
+            println("selftest: ${t.steps} steps ok")
+            Ok(())
+        },
+        Err(e) => Err("selftest FAILED: ${e}")
+    }
+}

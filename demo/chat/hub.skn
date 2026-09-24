@@ -1,0 +1,377 @@
+// The chat server's actors. server.skn starts them; selftest.skn starts them and talks to them.
+//
+//   acceptor --new client--> session (one per connection)
+//   session  --ask--> registry --starts on first use--> topic (one per topic)
+//   session  --join / leave / post--> topic --one line each--> every member's session
+//
+// A session is the actor this demo exists for. It owns one connection and has to wait for two things
+// at once: the next line its client types, and the next line a topic hands it to pass on. The
+// connection is ACTIVATED (`c.activate(...)`), so the runtime reads it and delivers each line into an
+// inbox of the session, and one `select` waits on that inbox and the session's own.
+//
+// A topic never waits for a session. It hands each line on with `trySend`, and a session whose inbox
+// is full -- because its client stopped reading, so its own writes block -- is dropped from the topic
+// and told to stop, and the others are told why. One slow client cannot hold up a topic.
+
+use std::net::*
+use std::actor::*
+
+
+// --- the protocol ---
+//
+// One command per line; anything that is not a command goes to the current topic.
+//   /nick <name>     choose a name
+//   /join <topic>    join a topic (or switch to it, if already joined); it becomes the current one
+//   /leave <topic>   leave a topic
+//   /topics          list the topics
+//   /quit            end the connection
+// The server answers with "* ..." lines, and chat lines look like "[#topic] <name> text".
+
+// What a topic is told. A member is named by its session's address; the name travels with every
+// message, so a /nick needs no bookkeeping in the topics.
+pub enum TopicMsg {
+    Join(Pid[String], String),
+    Leave(Pid[String], String),
+    Post(Pid[String], String, String)
+}
+
+// What the registry is asked: the address of a topic (started on first use), or all topic names.
+pub enum RegistryMsg {
+    Lookup(String, Pid[Pid[TopicMsg]]),
+    List(Pid[Vec[String]])
+}
+
+// "rust" and "#rust" name the same topic; it is always shown as "#rust".
+fn topicName(s: String) -> String {
+    let t = trim(s)
+    if startsWith(t, "#") { slice(t, 1, len(t)) } else { t }
+}
+
+
+// --- a topic ---
+
+struct Member { name: String, pid: Pid[String] }
+
+// Hand `line` to every member. A member whose inbox is full is dropped and told to stop, and the
+// rest hear why -- which may drop another one, so this repeats until a round drops nobody.
+fn broadcast(mut members: Map[Int, Member], line: String) -> () {
+    let mut pending: Vec[String] = toVec([line])
+    while len(pending) > 0 {
+        let mut next: Vec[String] = vec()
+        for text in pending {
+            for id in keys(members) {
+                let m = members[id]
+                match trySend(m.pid, text) {
+                    SendResult::Sent => {},
+                    SendResult::Full => {
+                        delete(members, id)
+                        stopActor(m.pid)
+                        push(next, "* ${m.name} was too slow and was disconnected")
+                    },
+                    SendResult::Gone => { delete(members, id) }
+                }
+            }
+        }
+        pending = next
+    }
+}
+
+// One topic: its members, and the lines between them. A member is also MONITORED, so a session that
+// ends without leaving (it crashed) is dropped as well.
+fn topic(inbox: Inbox[TopicMsg], name: String) -> () {
+    let mut members: Map[Int, Member] = #{}
+    loop {
+        match inbox.receive() {
+            Mail::Msg(TopicMsg::Join(p, who)) => {
+                if !has(members, p.id) {
+                    members[p.id] = Member { name: who, pid: p }
+                    let _watching = monitor(p, inbox)
+                    broadcast(members, "* ${who} joined #${name}")
+                }
+            },
+            Mail::Msg(TopicMsg::Leave(p, who)) => {
+                if has(members, p.id) {
+                    broadcast(members, "* ${who} left #${name}")
+                    delete(members, p.id)
+                }
+            },
+            Mail::Msg(TopicMsg::Post(p, who, text)) => {
+                if has(members, p.id) {
+                    broadcast(members, "[#${name}] <${who}> ${text}")
+                }
+            },
+            Mail::Exited(a, _) => {
+                if has(members, a.id) {
+                    let gone = members[a.id]
+                    delete(members, a.id)
+                    broadcast(members, "* ${gone.name} left #${name}")
+                }
+            },
+            Mail::Stop => { break }
+        }
+    }
+}
+
+
+// --- the registry ---
+
+// Knows every topic by name and starts one the first time it is asked for.
+fn registry(inbox: Inbox[RegistryMsg], unused: Int) -> () {
+    let mut topics: Map[String, Pid[TopicMsg]] = #{}
+    loop {
+        match inbox.receive() {
+            Mail::Msg(RegistryMsg::Lookup(name, replyTo)) => {
+                let p = match get(topics, name) {
+                    Some(known) => known,
+                    None => {
+                        let started = spawnActor(topic, name)
+                        topics[name] = started
+                        started
+                    }
+                }
+                send(replyTo, p)
+            },
+            Mail::Msg(RegistryMsg::List(replyTo)) => {
+                send(replyTo, sorted(toVec(keys(topics))))
+            },
+            Mail::Exited(_, why) => { println("a topic crashed: ${why}") },
+            Mail::Stop => { break }
+        }
+    }
+}
+
+
+// --- a session ---
+
+// What a session starts with: its connection, as a ticket, and where to find the topics.
+pub struct SessionStart { ticket: SocketHandOff, registry: Pid[RegistryMsg] }
+
+// A session's own state. `joined` maps a topic's name to its address.
+struct Session {
+    me: Pid[String],
+    out: ActiveConn,
+    registry: Pid[RegistryMsg],
+    name: String,
+    current: String,
+    joined: Map[String, Pid[TopicMsg]]
+}
+
+// Write one line to the client; false once the connection is gone.
+fn tell(s: Session, line: String) -> Bool {
+    match s.out.sendStr(line + "\n") {
+        Ok(_) => true,
+        Err(_) => false
+    }
+}
+
+fn joinTopic(mut s: Session, topicArg: String) -> Bool {
+    let t = topicName(topicArg)
+    if len(t) == 0 {
+        tell(s, "* usage: /join <topic>")
+    } else if has(s.joined, t) {
+        s.current = t
+        tell(s, "* now talking in #${t}")
+    } else {
+        match ask(s.registry, fn(r) { RegistryMsg::Lookup(t, r) }, 5000) {
+            Ok(p) => {
+                s.joined[t] = p
+                s.current = t
+                send(p, TopicMsg::Join(s.me, s.name))
+                true
+            },
+            Err(_) => tell(s, "* cannot reach the topics")
+        }
+    }
+}
+
+fn leaveTopic(mut s: Session, topicArg: String) -> Bool {
+    let t = topicName(topicArg)
+    match get(s.joined, t) {
+        Some(p) => {
+            send(p, TopicMsg::Leave(s.me, s.name))
+            delete(s.joined, t)
+            if s.current == t {
+                s.current = ""
+            }
+            true
+        },
+        None => tell(s, "* you are not in #${t}")
+    }
+}
+
+fn listTopics(s: Session) -> Bool {
+    match ask(s.registry, fn(r) { RegistryMsg::List(r) }, 5000) {
+        Ok(names) => {
+            if len(names) == 0 {
+                tell(s, "* no topics yet")
+            } else {
+                tell(s, "* topics: " + join(intoIter(names) |> map(fn(n) { "#" + n }), " "))
+            }
+        },
+        Err(_) => tell(s, "* cannot reach the topics")
+    }
+}
+
+// The rest of the line after a command word, trimmed.
+fn argOf(line: String, cmd: String) -> String {
+    trim(slice(line, len(cmd), len(line)))
+}
+
+// Answer one line from the client. False ends the session.
+fn handle(mut s: Session, line: String) -> Bool {
+    if line == "/quit" {
+        let _ = tell(s, "* bye")
+        false
+    } else if startsWith(line, "/nick ") {
+        let n = argOf(line, "/nick")
+        if len(n) == 0 || indexOf(n, " ") >= 0 {
+            tell(s, "* a name is one word")
+        } else {
+            s.name = n
+            tell(s, "* you are now ${n}")
+        }
+    } else if startsWith(line, "/join ") {
+        joinTopic(s, argOf(line, "/join"))
+    } else if startsWith(line, "/leave ") {
+        leaveTopic(s, argOf(line, "/leave"))
+    } else if line == "/topics" {
+        listTopics(s)
+    } else if startsWith(line, "/") {
+        tell(s, "* unknown command: ${line}")
+    } else if len(trim(line)) == 0 {
+        true
+    } else if len(s.current) == 0 {
+        tell(s, "* join a topic first: /join <topic>")
+    } else {
+        send(s.joined[s.current], TopicMsg::Post(s.me, s.name, line))
+        true
+    }
+}
+
+// One client, from its first line to its last. The session's own inbox holds the lines the topics
+// hand it; it is BOUNDED (the acceptor starts it with spawnActorBounded), which is what lets a topic
+// notice a session that falls behind.
+fn session(inbox: Inbox[String], start: SessionStart) -> () {
+    let conn = match start.ticket.take() {
+        Ok(c) => c,
+        Err(e) => {
+            println("session: ${e}")
+            return ()
+        }
+    }
+    let (out, events) = match conn.activate(Framing::Lines(1024), 16) {
+        Ok(pair) => pair,
+        Err(e) => {
+            println("session: ${e}")
+            return ()
+        }
+    }
+    let mut s = Session {
+        me: inbox.pid(), out: out, registry: start.registry,
+        name: "guest${inbox.pid().id}", current: "", joined: #{}
+    }
+    let _ = tell(s, "* welcome -- /nick <name>, /join <topic>, /leave <topic>, /topics, /quit")
+
+    // The inbox comes first: a topic's lines win a tie, so a client that writes without pause
+    // still hears the others.
+    let watching = toVec([inbox.ref(), events.ref()])
+    let mut running = true
+    while running {
+        match select(watching, -1) {
+            Some(0) => {
+                match inbox.receive() {
+                    Mail::Msg(line) => { running = tell(s, line) },
+                    _ => { running = false }
+                }
+            },
+            _ => {
+                match events.receive() {
+                    SockEvent::Line(line) => { running = handle(s, line) },
+                    _ => { running = false }
+                }
+            }
+        }
+    }
+
+    for (_, p) in s.joined {
+        send(p, TopicMsg::Leave(s.me, s.name))
+    }
+    out.close()
+}
+
+
+// --- the acceptor ---
+
+// What the acceptor starts with: the port to listen on (0: any free one), and where to report the
+// port it got -- or why it could not listen.
+pub struct AcceptorStart { port: Int, reply: Pid[Result[Int, String]] }
+
+// Accepts clients and starts a session for each, until it is told to stop. The listener is ACTIVATED
+// too, so a stop reaches the acceptor while it waits for clients.
+fn acceptor(inbox: Inbox[Int], start: AcceptorStart) -> () {
+    let lst = match listen(start.port) {
+        Ok(l) => l,
+        Err(e) => {
+            send(start.reply, Err(e))
+            return ()
+        }
+    }
+    let port = match lst.localPort() {
+        Ok(p) => p,
+        Err(e) => {
+            send(start.reply, Err(e))
+            return ()
+        }
+    }
+    let (active, incoming) = match lst.activate(8) {
+        Ok(pair) => pair,
+        Err(e) => {
+            send(start.reply, Err(e))
+            return ()
+        }
+    }
+    let reg = spawnActor(registry, 0)
+    send(start.reply, Ok(port))
+
+    let watching = toVec([inbox.ref(), incoming.ref()])
+    let mut running = true
+    while running {
+        match select(watching, -1) {
+            Some(0) => {
+                match inbox.receive() {
+                    Mail::Exited(_, why) => { println("a session crashed: ${why}") },
+                    Mail::Msg(_) => {},
+                    Mail::Stop => { running = false }
+                }
+            },
+            _ => {
+                match incoming.receive() {
+                    Incoming::NewClient(ticket) => {
+                        let start = SessionStart { ticket: ticket, registry: reg }
+                        spawnActorBounded(session, start, 32)
+                    },
+                    Incoming::AcceptFailed(why) => {
+                        println("accept failed: ${why}")
+                        running = false
+                    },
+                    Incoming::ListenerStopping => { running = false }
+                }
+            }
+        }
+    }
+    active.close()
+}
+
+// Start the server on `port` (0: any free one) and return the port it listens on. It runs until the
+// program ends: then every actor is told to stop, and the acceptor, the sessions and their
+// connections close.
+pub fn startServer(port: Int) -> Result[Int, String] {
+    let reply: Inbox[Result[Int, String]] = newInbox()
+    spawnActor(acceptor, AcceptorStart { port: port, reply: reply.pid() })
+    let answer = match reply.receiveTimeout(5000) {
+        Some(Mail::Msg(r)) => r,
+        _ => Err("the acceptor did not report")
+    }
+    reply.close()
+    answer
+}

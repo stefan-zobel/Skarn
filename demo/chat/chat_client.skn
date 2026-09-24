@@ -1,0 +1,121 @@
+// A terminal client for the chat server (server.skn): what you type goes to the server, and what the
+// server sends appears as soon as it arrives -- also while you are typing.
+//
+// Run:   static_vmrun demo/chat/chat_client.skn [--host=H] [--port=P]
+//   --host=H   the server's host (default 127.0.0.1)
+//   --port=P   the server's port (default 7070)
+//
+// Two things happen at once here, and they are split between two threads. The main program reads the
+// keyboard: only the main program may read stdin, and `readLine` blocks. An actor owns the connection:
+// it activates it and waits with `select` on the server's lines and on the lines the main program hands
+// it to send.
+//
+// One limit comes from that split: `readLine` cannot be interrupted, so when the server ends the
+// connection the client says so at once but exits only after the next line you enter (or Ctrl+Z / Ctrl+D).
+
+use std::net::*
+use std::actor::*
+use std::cli::*
+use std::env::*
+use std::io::*
+
+
+// What the connection actor tells the main program.
+enum NetNews { Connected, CannotConnect(String), Closed }
+
+struct NetStart { host: String, port: Int, main: Pid[NetNews] }
+
+// Owns the connection: prints every line from the server, sends every line from the main program.
+fn connection(inbox: Inbox[String], start: NetStart) -> () {
+    let conn = match connect(start.host, start.port) {
+        Ok(c) => c,
+        Err(e) => {
+            send(start.main, NetNews::CannotConnect(e))
+            return ()
+        }
+    }
+    let (out, events) = match conn.activate(Framing::Lines(4096), 64) {
+        Ok(pair) => pair,
+        Err(e) => {
+            send(start.main, NetNews::CannotConnect(e))
+            return ()
+        }
+    }
+    send(start.main, NetNews::Connected)
+
+    let watching = toVec([events.ref(), inbox.ref()])
+    let mut running = true
+    while running {
+        match select(watching, -1) {
+            Some(0) => {
+                match events.receive() {
+                    SockEvent::Line(line) => println(line),
+                    SockEvent::Eof => {
+                        println("* the server closed the connection")
+                        running = false
+                    },
+                    SockEvent::Failed(why) => {
+                        println("* the connection failed: ${why}")
+                        running = false
+                    },
+                    _ => { running = false }
+                }
+            },
+            _ => {
+                match inbox.receive() {
+                    Mail::Msg(line) => {
+                        match out.sendStr(line + "\n") {
+                            Ok(_) => {},
+                            Err(e) => {
+                                println("* ${e}")
+                                running = false
+                            }
+                        }
+                    },
+                    _ => { running = false }
+                }
+            }
+        }
+    }
+    out.close()
+    send(start.main, NetNews::Closed)
+}
+
+fn run() -> Result[(), String] {
+    let opts = CliArgs::parse(args())
+    let host = opts.getOptOr("host", "127.0.0.1")
+    let port = match parseInt(opts.getOptOr("port", "7070")) {
+        Ok(p) => p,
+        Err(_) => { return Err("--port needs a whole number") }
+    }
+    let news: Inbox[NetNews] = mainInbox()
+    let net = spawnActor(connection, NetStart { host: host, port: port, main: news.pid() })
+    match news.receiveTimeout(10000) {
+        Some(Mail::Msg(NetNews::Connected)) => {},
+        Some(Mail::Msg(NetNews::CannotConnect(e))) => { return Err(e) },
+        _ => { return Err("no connection to ${host}:${port}") }
+    }
+
+    // Hand every line to the connection actor. A send that answers false means the actor has ended,
+    // i.e. the connection is gone. At the end of the input, say goodbye as /quit would.
+    let mut typing = true
+    while typing {
+        match readLine() {
+            Some(line) => {
+                typing = send(net, line) && trim(line) != "/quit"
+            },
+            None => {
+                send(net, "/quit")
+                typing = false
+            }
+        }
+    }
+    // Give the server's last lines (its "* bye") time to arrive before the program ends.
+    let _ = news.receiveTimeout(2000)
+    Ok(())
+}
+
+match run() {
+    Ok(_) => {},
+    Err(e) => println("chat client: ${e}")
+}
