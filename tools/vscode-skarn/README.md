@@ -2,7 +2,7 @@
 
 Syntax highlighting, live type checking, an outline, hover types, go to definition, find
 references, rename, completion, signature help and formatting for the
-[Skarn](https://github.com/stefan-zobel/Skarn/blob/HEAD/SkarnGuide.md) language (`.skn` files, run by `static_vmrun`).
+[Skarn](https://github.com/stefan-zobel/Skarn/blob/HEAD/SkarnGuide.md) language (`.skn` files, run by `static_vmrun`, on macOS `skarnvm`).
 
 - **Highlighting** comes from a TextMate grammar and works on its own.
 - **Diagnostics** come from `skarn_lsp`, the Skarn language server: type errors, parse
@@ -61,7 +61,7 @@ warnings of that file. Rename waits until the syntax errors are fixed.
 - Raw strings `r"…"`, `r#"…"#`, `r##"…"##`, … (verbatim, no escapes/interpolation)
 - Char literals `'A'` / `'\n'`
 - Numbers: decimal, float, `0x` / `0o` / `0b`
-- Keywords, storage modifiers, built-in and prelude types, ~350 built-in / prelude
+- Keywords, storage modifiers, built-in and prelude types, ~430 built-in / prelude
   functions
 - Case-based identifiers: `UIdent` → type, `fn name` → function name
 - Operators and punctuation (`|>`, `->`/`=>`, `>>>`, `..`, `?`, `::`, …)
@@ -69,28 +69,41 @@ warnings of that file. Rename waits until the syntax errors are fixed.
 ## Installing the extension and the server
 
 This extension is pure JavaScript and works on every platform; it carries no binary. What it
-needs is the language server `skarn_lsp`, which it starts. On Windows the release zip contains
-both, this extension (`skarn-language-<version>.vsix`) and `skarn_lsp.exe`; elsewhere the server
-is built from source with CMake and ends up as `build/skarn_lsp`.
+needs is the language server `skarn_lsp`, which it starts. Each release of
+[Skarn](https://github.com/stefan-zobel/Skarn/releases) contains both, this extension
+(`skarn-language-<version>.vsix`) and the server:
+
+- **Windows x64**: `Skarn-<version>-windows-x64.zip`, with `skarn_lsp.exe`.
+- **macOS on Apple Silicon**: `Skarn-<version>-macos-arm64.tar.gz`, with `skarn_lsp`.
+
+The `.vsix` in the two archives is the same file. On any other system, build the server from
+source (see below).
 
 1. Install the extension: in the Extensions view choose **…** → **Install from VSIX…** and
    pick the `.vsix`, or run `code --install-extension skarn-language-0.3.0.vsix`.
 2. Tell it where the server is: open the Settings, search for `skarn`, and set
-   **Skarn › Server: Path** to the full path of the server binary — in `settings.json`:
+   **Skarn › Server: Path** to the full path of the server binary — in `settings.json`, on
+   Windows:
 
    ```json
-   "skarn.server.path": "C:/path/to/skarn-0.2.0/skarn_lsp.exe"
+   "skarn.server.path": "C:/Tools/skarn-0.3.0/skarn_lsp.exe"
    ```
 
+   on macOS:
+
    ```json
-   "skarn.server.path": "/path/to/vMachine/build/skarn_lsp"
+   "skarn.server.path": "/Users/you/skarn-0.3.0/skarn_lsp"
    ```
 
    Or put that folder on the PATH; the default value is just `skarn_lsp`.
 3. Reload the window (*Developer: Reload Window*).
 
 On Windows, `skarn_lsp.exe` needs the Visual C++ runtime DLLs that lie next to it in the release
-folder; keep them together. A server built from source has no such companions.
+folder; keep them together. On macOS the binaries are not signed or notarized: clear the
+quarantine flag once for the release folder (`xattr -dr com.apple.quarantine .`), or macOS
+refuses to start the server. A server built from source needs neither.
+
+The key bindings above are the Windows ones; on macOS read `Cmd` for `Ctrl` and `Option` for `Alt`.
 
 ## The language server
 
