@@ -9227,6 +9227,479 @@ void test_std_actor() {
     check_true("actor_hand_off_in_message_ok", !p_fails(NET +
         "fn f(inbox: Inbox[SocketHandOff], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0"));
 
+    // ---- active connections (std::net: c.activate(framing, capacity)) ----
+    // The world's I/O thread reads an activated connection and delivers SockEvents into an inbox of its
+    // owner. Every program below has ONE possible output: events of one connection arrive in order,
+    // and each waits for what it depends on. A client that must see EOF has a 5 s timeout, so a lost
+    // close fails the test instead of hanging the suite.
+    const std::string RUN_END = "match run() { Ok(_) => {}, Err(e) => println(\"error: \" + e) }\n";
+    // The point of the feature: one actor serves its socket AND its inbox, waiting on both with select.
+    check_str("active_select_socket_and_inbox", cg_run_native(NET + R"SKN(
+struct Start { ticket: SocketHandOff, boss: Pid[String] }
+fn session(inbox: Inbox[String], s: Start) -> () {
+  let conn = match s.ticket.take() { Ok(c) => c, Err(e) => panic(e) }
+  let (out, events) = match conn.activate(Framing::Lines(100), 4) { Ok(p) => p, Err(e) => panic(e) }
+  let watching = toVec([events.ref(), inbox.ref()])
+  loop {
+    match select(watching, -1) {
+      Some(0) => match events.receive() {
+        SockEvent::Line(l) => { send(s.boss, "line:" + l) }
+        SockEvent::Eof => {
+          send(s.boss, "closed")
+          return ()
+        }
+        _ => return ()
+      },
+      _ => match inbox.receive() {
+        Mail::Msg(m) => { let _ = out.sendStr(m + "\n") }
+        _ => return ()
+      }
+    }
+  }
+}
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  client.setTimeout(5000)?
+  let conn = srv.accept()?
+  let pid = spawnActor(session, Start { ticket: conn.handOff()?, boss: boss.pid() })
+  client.sendStr("hello\n")?
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  send(pid, "pushed")
+  match client.recvLine()? { Some(l) => println("client got " + l), None => println("EOF") }
+  client.sendStr("bye\n")?
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  client.close()?
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  Ok(())
+}
+)SKN" + RUN_END), "line:hello\nclient got pushed\nline:bye\nclosed\n");
+    // Lines: "\n" and "\r\n" both end a line, a last line without one still arrives at the end of the
+    // stream, and Eof comes after it. Raw: the chunks, joined, are exactly what was sent.
+    check_str("active_lines_and_raw", cg_run_native(NET + R"SKN(
+fn show(e: SockEvent) -> String {
+  match e {
+    SockEvent::Line(l) => "Line(" + l + ")",
+    SockEvent::Chunk(b) => "Chunk(" + fromBytes(b) + ")",
+    SockEvent::Eof => "Eof",
+    SockEvent::Failed(w) => "Failed(" + w + ")",
+    SockEvent::Stopping => "Stopping"
+  }
+}
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let (_, ev) = conn.activate(Framing::Lines(100), 8)?
+  client.sendStr("a\r\nb\nc")?
+  client.close()?
+  let mut line = ""
+  loop {
+    let s = show(ev.receive())
+    line = line + s + " "
+    if s == "Eof" { break }
+  }
+  println(line)
+  let mut c2 = connect("127.0.0.1", srv.localPort()?)?
+  let conn2 = srv.accept()?
+  let (_, ev2) = conn2.activate(Framing::Raw, 8)?
+  c2.sendStr("raw ")?
+  c2.sendStr("bytes")?
+  c2.close()?
+  let mut got = ""
+  loop {
+    match ev2.receive() {
+      SockEvent::Chunk(b) => { got = got + fromBytes(b) }
+      other => {
+        println(got + " then " + show(other))
+        break
+      }
+    }
+  }
+  Ok(())
+}
+)SKN" + RUN_END), "Line(a) Line(b) Line(c) Eof \nraw bytes then Eof\n");
+    // Bytes recvLine had already read past a line come first, before anything read afterwards.
+    check_str("active_keeps_recvline_buffer", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  client.sendStr("one\ntwo\n")?
+  let mut conn = srv.accept()?
+  match conn.recvLine()? { Some(l) => println("read " + l), None => println("EOF") }
+  let (_, ev) = conn.activate(Framing::Lines(100), 4)?
+  client.sendStr("three\n")?
+  match ev.receive() { SockEvent::Line(l) => println("event " + l), _ => println("?") }
+  match ev.receive() { SockEvent::Line(l) => println("event " + l), _ => println("?") }
+  Ok(())
+}
+)SKN" + RUN_END), "read one\nevent two\nevent three\n");
+    // A line longer than the bound ends the stream with Failed -- the bound is what keeps a peer that
+    // never sends a newline from growing the buffer without end.
+    check_str("active_line_too_long", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let (_, ev) = conn.activate(Framing::Lines(4), 4)?
+  client.sendStr("ok\nabcdefgh\n")?
+  match ev.receive() { SockEvent::Line(l) => println(l), _ => println("?") }
+  match ev.receive() { SockEvent::Failed(w) => println(w), _ => println("?") }
+  Ok(())
+}
+)SKN" + RUN_END), "ok\nline too long (more than 4 bytes)\n");
+    // Back-pressure: an inbox of ONE event, and a thousand lines sent at once. The I/O thread must pause
+    // and be resumed by every receive -- a lost wake-up hangs here, a lost event breaks the order.
+    check_str("active_flow_control", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let (_, ev) = conn.activate(Framing::Lines(100), 1)?
+  let mut sb = stringBuilder()
+  for i in range(0, 1000) { sb = sb.append(toString(i)).append("\n") }
+  client.sendStr(sb.build())?
+  client.close()?
+  let mut next = 0
+  let mut bad = 0
+  loop {
+    match ev.receive() {
+      SockEvent::Line(l) => {
+        if l != toString(next) { bad = bad + 1 }
+        next = next + 1
+      }
+      other => {
+        println("${next} lines, ${bad} out of order, then " + (if other == SockEvent::Eof { "Eof" } else { "?" }))
+        break
+      }
+    }
+  }
+  Ok(())
+}
+)SKN" + RUN_END), "1000 lines, 0 out of order, then Eof\n");
+    // The owner's end closes the connection (Erlang: a socket belongs to its owning process): the actor
+    // activates, reports, and crashes; the client then sees EOF.
+    check_str("active_owner_end_closes", cg_run_native(NET + R"SKN(
+struct Start { ticket: SocketHandOff, boss: Pid[String] }
+fn doomed(inbox: Inbox[Int], s: Start) -> () {
+  let conn = match s.ticket.take() { Ok(c) => c, Err(e) => panic(e) }
+  let _ = match conn.activate(Framing::Lines(100), 4) { Ok(p) => p, Err(e) => panic(e) }
+  send(s.boss, "active")
+  panic("boom")
+}
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  client.setTimeout(5000)?
+  let conn = srv.accept()?
+  let _pid = spawnActor(doomed, Start { ticket: conn.handOff()?, boss: boss.pid() })
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  match boss.receive() {
+    Mail::Exited(_, why) => println(if indexOf(why, "boom") == 0 { "crashed: boom" } else { why }),
+    _ => println("?")
+  }
+  match client.recvLine()? { Some(l) => println("got " + l), None => println("EOF") }
+  Ok(())
+}
+)SKN" + RUN_END), "active\ncrashed: boom\nEOF\n");
+    // The actor's own Stop reaches the events inbox too, so a loop that only watches its socket still
+    // ends when the actor is told to.
+    check_str("active_stop_event", cg_run_native(NET + R"SKN(
+struct Start { ticket: SocketHandOff, boss: Pid[String] }
+fn listener(inbox: Inbox[Int], s: Start) -> () {
+  let conn = match s.ticket.take() { Ok(c) => c, Err(e) => panic(e) }
+  let (_, ev) = match conn.activate(Framing::Lines(100), 4) { Ok(p) => p, Err(e) => panic(e) }
+  send(s.boss, "active")
+  match ev.receive() { SockEvent::Stopping => send(s.boss, "stopped"), _ => send(s.boss, "?") }
+  ()
+}
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let srv = listen(0)?
+  let _client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let pid = spawnActor(listener, Start { ticket: conn.handOff()?, boss: boss.pid() })
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  stopActor(pid)
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  Ok(())
+}
+)SKN" + RUN_END), "active\nstopped\n");
+    // After activation the TcpConn is dead, and after close so is the ActiveConn.
+    check_str("active_old_conn_and_close_refused", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let (out, _) = conn.activate(Framing::Raw, 4)?
+  match conn.sendStr("x") { Ok(_) => println("old conn worked"), Err(e) => println(e) }
+  out.sendStr("hi\n")?
+  match client.recvLine()? { Some(l) => println("client got " + l), None => println("EOF") }
+  out.close()
+  out.close()
+  match out.sendStr("x") { Ok(_) => println("closed conn worked"), Err(e) => println(e) }
+  Ok(())
+}
+)SKN" + RUN_END),
+        "tcpSend: socket was activated\nclient got hi\nsend: the connection is closed\n");
+    // One I/O thread, a hundred connections, one select over all of them.
+    check_str("active_many_connections", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let port = srv.localPort()?
+  let mut evs: Vec[SockEvents] = vec()
+  let mut refs: Vec[InboxRef] = vec()
+  for k in range(1, 101) {
+    let c = connect("127.0.0.1", port)?
+    let conn = srv.accept()?
+    let (_, ev) = conn.activate(Framing::Lines(100), 2)?
+    push(evs, ev)
+    push(refs, ev.ref())
+    c.sendStr(toString(k) + "\n")?
+    c.close()?
+  }
+  let mut sum = 0
+  let mut closed = 0
+  while closed < 100 {
+    match select(refs, 5000) {
+      Some(i) => match evs[i].receive() {
+        SockEvent::Line(l) => { sum = sum + parseInt(l).unwrapOr(0) }
+        SockEvent::Eof => { closed = closed + 1 }
+        _ => { closed = 1000 }
+      },
+      None => {
+        println("timeout")
+        closed = 1000
+      }
+    }
+  }
+  println("sum ${sum}, closed ${closed}")
+  Ok(())
+}
+)SKN" + RUN_END), "sum 5050, closed 100\n");
+    // A task has no inbox, so it cannot activate a connection: the fault reaches its joiner as an Err.
+    check_str("active_in_task_faults", cg_run_native(NET + "use std::task::*\n" + R"SKN(
+fn tryIt(port: Int) -> String {
+  let c = match connect("127.0.0.1", port) { Ok(c) => c, Err(e) => panic(e) }
+  match c.activate(Framing::Raw, 4) { Ok(_) => "activated", Err(e) => e }
+}
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let t = spawn(tryIt, srv.localPort()?)
+  let _conn = srv.accept()?
+  match t.join() {
+    Ok(s) => println("ok: " + s),
+    Err(e) => println(if indexOf(e, "only an actor or the main program") >= 0 { "refused" } else { e })
+  }
+  Ok(())
+}
+)SKN" + RUN_END), "refused\n");
+    check_true("active_conn_not_sendable", check_has_p(NET +
+        "fn f(inbox: Inbox[ActiveConn], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0", "a socket handle"));
+    check_true("active_events_not_sendable", check_has_p(NET +
+        "fn f(inbox: Inbox[SockEvents], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0",
+        "an active connection's events"));
+    check_true("active_no_conn_literal", check_has_p(NET +
+        "let c = ActiveConn { id: 1 }\n0", "can only be created by `c.activate(...)`"));
+    check_true("active_no_events_literal", check_has_p(NET +
+        "let b: Inbox[Bytes] = newInbox()\nlet e = SockEvents { box: b }\n0",
+        "can only be created by `c.activate(...)`"));
+    check_true("active_natives_gated", check_has_p(U + "let r = rawActiveClose(1)\n0", "rawActiveClose"));
+    // SockEvent's variants are named apart from Mail's (Stop) and std::poll's (Data, Closed): with all
+    // three modules globbed, every variant may still be written bare. A shared name would resolve to
+    // one module silently, and a bare `Stop` in a Mail match would become a type error.
+    check_true("active_variants_bare_with_actor_and_poll", !p_fails(NET + "use std::poll::*\n" +
+        "fn m(x: Mail[Int]) -> Int { match x { Msg(n) => n, Exited(_, _) => 1, Stop => 2 } }\n"
+        "fn r(x: Received) -> Int { match x { Data(_) => 3, Received::WouldBlock => 4, Closed => 5 } }\n"
+        "fn s(x: SockEvent) -> Int { match x { Chunk(_) => 6, Line(_) => 7, Eof => 8, Failed(_) => 9, Stopping => 10 } }\n"
+        "fn i(x: Incoming) -> Int { match x { NewClient(_) => 11, AcceptFailed(_) => 12, ListenerStopping => 13 } }\n"
+        "m(Mail::Stop) + r(Received::Closed) + s(SockEvent::Eof) + i(Incoming::ListenerStopping)\n"));
+
+    // ---- active listeners (std::net: l.activate(capacity)) ----
+    // The runtime accepts, and each new connection arrives as a SocketHandOff ticket. The helper below is
+    // shared: a listener is closed by the I/O thread a moment after it is asked to, so "refused" is
+    // waited for (at most 100 tries), not assumed at once.
+    const std::string REFUSED_SOON = "use std::time::*\n" R"SKN(
+fn refusedSoon(port: Int) -> Bool {
+  let mut i = 0
+  while i < 100 {
+    match connect("127.0.0.1", port) {
+      Ok(c) => { let _ = c.close() }
+      Err(_) => return true
+    }
+    sleep(20)
+    i = i + 1
+  }
+  false
+}
+)SKN";
+    // The point: an acceptor waits on new clients AND its inbox with one select, so a message reaches it
+    // and a Stop ends it -- which a blocking accept() could not offer. The listener closes with it.
+    check_str("active_listener_select_and_stop", cg_run_native(NET + REFUSED_SOON + R"SKN(
+fn acceptor(inbox: Inbox[String], boss: Pid[String]) -> () {
+  let srv = match listen(0) { Ok(s) => s, Err(e) => panic(e) }
+  let port = match srv.localPort() { Ok(p) => p, Err(e) => panic(e) }
+  let (_, incoming) = match srv.activate(4) { Ok(p) => p, Err(e) => panic(e) }
+  send(boss, toString(port))
+  let watching = toVec([incoming.ref(), inbox.ref()])
+  loop {
+    match select(watching, -1) {
+      Some(0) => match incoming.receive() {
+        NewClient(t) => match t.take() {
+          Ok(c) => {
+            let _ = c.sendStr("welcome\n")
+            let _ = c.close()
+          }
+          Err(e) => { send(boss, e) }
+        },
+        _ => {
+          send(boss, "stopped")
+          return ()
+        }
+      },
+      _ => match inbox.receive() {
+        Mail::Msg(m) => { send(boss, "got " + m) }
+        _ => {
+          send(boss, "stopped")
+          return ()
+        }
+      }
+    }
+  }
+}
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let a = spawnActor(acceptor, boss.pid())
+  let port = match boss.receive() { Mail::Msg(m) => parseInt(m).unwrapOr(0), _ => 0 }
+  let mut c = connect("127.0.0.1", port)?
+  c.setTimeout(5000)?
+  match c.recvLine()? { Some(l) => println(l), None => println("EOF") }
+  send(a, "ping")
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  stopActor(a)
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  println(if refusedSoon(port) { "refused afterwards" } else { "still listening" })
+  Ok(())
+}
+)SKN" + RUN_END), "welcome\ngot ping\nstopped\nrefused afterwards\n");
+    // A ticket goes on to a worker unchanged, and the worker takes it -- the hand-off of §16, without
+    // accept() and handOff() in between.
+    check_str("active_listener_to_workers", cg_run_native(NET + R"SKN(
+fn worker(inbox: Inbox[SocketHandOff], n: Int) -> () {
+  for h in inbox.messages() {
+    match h.take() {
+      Ok(mut c) => {
+        match c.recvLine() { Ok(Some(l)) => { let _ = c.sendStr("worker ${n}: " + l + "\n") }, _ => {} }
+        let _ = c.close()
+      },
+      Err(e) => println(e)
+    }
+  }
+}
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let port = srv.localPort()?
+  let (_, incoming) = srv.activate(4)?
+  let mut workers: Vec[Pid[SocketHandOff]] = vec()
+  for n in range(1, 4) { push(workers, spawnActor(worker, n)) }
+  for n in range(1, 4) {
+    let mut c = connect("127.0.0.1", port)?
+    c.setTimeout(5000)?
+    c.sendStr("hello ${n}\n")?
+    match incoming.receive() {
+      NewClient(t) => { send(workers[n - 1], t) }
+      _ => println("?")
+    }
+    match c.recvLine()? { Some(l) => println(l), None => println("EOF") }
+  }
+  Ok(())
+}
+)SKN" + RUN_END), "worker 1: hello 1\nworker 2: hello 2\nworker 3: hello 3\n");
+    // Back-pressure on accepting: an inbox of ONE event, and fifty clients before the first receive. The
+    // rest wait in the operating system's queue and are accepted as room appears; none is lost.
+    check_str("active_listener_flow_control", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let port = srv.localPort()?
+  let (_, incoming) = srv.activate(1)?
+  let mut clients: Vec[TcpConn] = vec()
+  for n in range(1, 51) {
+    let c = connect("127.0.0.1", port)?
+    c.sendStr("${n}\n")?
+    push(clients, c)
+  }
+  let mut sum = 0
+  let mut got = 0
+  while got < 50 {
+    match incoming.receiveTimeout(5000) {
+      Some(NewClient(t)) => {
+        let mut c = t.take()?
+        match c.recvLine()? { Some(l) => { sum = sum + parseInt(l).unwrapOr(0) }, None => {} }
+        got = got + 1
+      }
+      _ => { got = 1000 }
+    }
+  }
+  println("${got} clients, sum ${sum}")
+  Ok(())
+}
+)SKN" + RUN_END), "50 clients, sum 1275\n");
+    // The owner's end closes the listener, and a connection accepted but NOT yet delivered (the inbox was
+    // full) is closed with it rather than left waiting. The first client's ticket WAS delivered and dies
+    // with the inbox; its socket, like any undelivered hand-off, is closed when the program ends -- so it is
+    // not read here. Client 2 was pending or still queued in the OS: either way it must see the end.
+    check_str("active_listener_owner_end_closes", cg_run_native(NET + REFUSED_SOON + R"SKN(
+fn doomed(inbox: Inbox[String], boss: Pid[String]) -> () {
+  let srv = match listen(0) { Ok(s) => s, Err(e) => panic(e) }
+  let port = match srv.localPort() { Ok(p) => p, Err(e) => panic(e) }
+  let _ = match srv.activate(1) { Ok(p) => p, Err(e) => panic(e) }
+  send(boss, toString(port))
+  match inbox.receive() { _ => panic("boom") }
+}
+fn ended(r: Result[Option[String], String]) -> String {
+  match r {
+    Ok(Some(l)) => "got " + l,
+    Ok(None) => "closed",
+    Err(e) => if indexOf(e, "timeout") >= 0 { "timeout" } else { "closed" }
+  }
+}
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let a = spawnActor(doomed, boss.pid())
+  let port = match boss.receive() { Mail::Msg(m) => parseInt(m).unwrapOr(0), _ => 0 }
+  let _c1 = connect("127.0.0.1", port)?
+  let mut c2 = connect("127.0.0.1", port)?
+  c2.setTimeout(5000)?
+  send(a, "crash now")
+  match boss.receive() { Mail::Exited(_, _) => println("crashed"), _ => println("?") }
+  println("client 2: " + ended(c2.recvLine()))
+  println(if refusedSoon(port) { "refused afterwards" } else { "still listening" })
+  Ok(())
+}
+)SKN" + RUN_END), "crashed\nclient 2: closed\nrefused afterwards\n");
+    check_str("active_listener_old_refused", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let (lst, _) = srv.activate(1)?
+  match srv.accept() { Ok(_) => println("old listener worked"), Err(e) => println(e) }
+  lst.close()
+  lst.close()
+  Ok(())
+}
+)SKN" + RUN_END), "tcpAccept: socket was activated\n");
+    check_true("active_listener_not_sendable", check_has_p(NET +
+        "fn f(inbox: Inbox[ActiveListener], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0", "a socket handle"));
+    check_true("active_listener_clients_not_sendable", check_has_p(NET +
+        "fn f(inbox: Inbox[IncomingClients], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0",
+        "an active listener's new clients"));
+    check_true("active_listener_no_literal", check_has_p(NET +
+        "let l = ActiveListener { id: 1 }\n0", "can only be created by `l.activate(...)`"));
+    check_true("active_listener_no_clients_literal", check_has_p(NET +
+        "let b: Inbox[Bytes] = newInbox()\nlet i = IncomingClients { box: b }\n0",
+        "can only be created by `l.activate(...)`"));
+
     // ---- the checker, where a Pid[M] is made ----
     check_true("actor_rejects_lambda", check_has_p(U +
         "let p = spawnActor(fn(i: Inbox[Int], u: Int) -> () {}, 0)\n0", "not a lambda"));
@@ -11015,7 +11488,11 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // not model. Pinned by std_time_sleep_waits.
 // rawSelect (id 82) is NOT listed either: it answers which of several inboxes has mail, which depends on
 // how the isolates interleave. Pinned by the select_* tests here and by actor_select_* in vm_tests.
-static_assert(NATIVE_COUNT == 83,
+// The active-socket four (ids 83-86: rawActivate / rawActiveSend / rawActiveClose / rawActivateListener)
+// are NOT listed:
+// they are socket natives (OS side effects) whose events a second thread delivers, so when an event
+// arrives depends on the network and the scheduler. Pinned by the active_* tests in both suites.
+static_assert(NATIVE_COUNT == 87,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 

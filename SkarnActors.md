@@ -720,7 +720,163 @@ thing you do with that connection.
 That is how a server spreads over cores: one actor accepts, and hands each connection to whichever worker
 is free. `demo/actor_server/` is the worked version, with a pool and two ways of dispatching work to it.
 
-## 17. Logging from several actors
+## 17. A connection that also listens to its inbox
+
+The worker above reads one line, answers, and is done. Many servers are not like that. A chat room sends
+a line to a user *because somebody else wrote one*, and a message broker delivers whenever something is
+published. Such an actor has to wait for two things at once: the next line from its client, and the next
+message in its inbox. `recvLine` waits for only one of them.
+
+`c.activate(framing, capacity)` hands the **reading** of a connection to the runtime. From then on, what
+arrives comes as **events** into an inbox of the actor, and `select` (§14) waits on that inbox and the
+actor's own together. You get two halves back: an `ActiveConn` to write with, and the `SockEvents` to read
+from.
+
+```rust
+use std::net::*
+use std::actor::*
+
+struct Start { ticket: SocketHandOff, boss: Pid[String] }
+
+fn session(inbox: Inbox[String], s: Start) -> () {
+  let conn = match s.ticket.take() { Ok(c) => c, Err(e) => panic(e) }
+  let (out, events) = match conn.activate(Framing::Lines(1024), 16) { Ok(p) => p, Err(e) => panic(e) }
+  let watching = toVec([events.ref(), inbox.ref()])
+  loop {
+    match select(watching, -1) {
+      Some(0) => match events.receive() {
+        Line(l) => { send(s.boss, "client said " + l) }
+        _ => return ()                                 // Eof, Failed(why) or Stopping
+      },
+      _ => match inbox.receive() {
+        Mail::Msg(m) => { let _ = out.sendStr(m + "\n") }
+        _ => return ()
+      }
+    }
+  }
+}
+
+fn demo() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let lst = listen(0)?
+  let mut client = connect("127.0.0.1", lst.localPort()?)?
+  let conn = lst.accept()?
+  let s = spawnActor(session, Start { ticket: conn.handOff()?, boss: boss.pid() })
+  client.sendStr("hello\n")?
+  match boss.receive() { Mail::Msg(m) => println(m), _ => {} }          // => client said hello
+  send(s, "news for you")                                               // pushed, not asked for
+  println(match client.recvLine()? { Some(l) => l, None => "<eof>" })   // => news for you
+  client.close()?
+  lst.close()?
+  Ok(())
+}
+match demo() { Ok(_) => {}, Err(e) => println(e) }
+```
+
+The session does not know which comes first, a line from its client or a message from the rest of the
+program, and it does not have to: `select` answers with whichever is there.
+
+**What arrives.** With `Framing::Lines(max)` every line is a `Line(text)`, without its `"\n"` or `"\r\n"`;
+with `Framing::Raw` the bytes come as `Chunk(bytes)`, in pieces of whatever size the network delivered.
+`Eof` says the client closed the connection, and `Failed(why)` that it broke — or, with `Lines`, that a
+line was longer than `max`, which keeps a client that never sends a newline from filling your memory.
+Nothing comes after either of the two. `Stopping` is the actor's own `Stop` (§12): an actor gets one in
+every inbox, this one included, so a loop over events alone still ends when it is told to. The names are
+deliberately different from `Mail`'s `Stop` and from the ones `std::poll` uses, so all of them can be
+written without their type in front.
+
+**How much may wait.** At most `capacity` events wait in the inbox. While it is full the runtime stops
+reading, and TCP slows the client down — the back-pressure of §13, for a socket. A slow actor therefore
+never gets buried under input it has not asked for yet.
+
+**Who owns it.** Like a handed-off one, the `TcpConn` is dead once it is activated: every operation on it
+returns an `Err`. Neither half can be sent to another actor — the events are an inbox of *this* actor, and
+only this actor may write to the connection or close it. When the actor ends, crash or not, its active
+connections are closed with it.
+
+One thread of the runtime reads every active connection of the program. It starts with the first
+`activate`, so a program that never calls it has no such thread at all.
+
+### A listener that stays reachable
+
+The acceptor in §16 has the same problem one step earlier: while it waits in `accept()`, it cannot see its
+inbox — not a message, and not a `Stop`. A listener can be activated too. `l.activate(capacity)` hands the
+**accepting** to the runtime, and every new connection arrives as `NewClient(ticket)`: the same
+`SocketHandOff` as in §16, ready to be sent on to a worker unchanged.
+
+```rust
+use std::net::*
+use std::actor::*
+
+fn worker(inbox: Inbox[SocketHandOff], unused: Int) -> () {
+  for h in inbox.messages() {
+    match h.take() {
+      Ok(mut c) => {
+        match c.recvLine() { Ok(Some(l)) => { let _ = c.sendStr("echo " + l + "\n") }, _ => {} }
+        let _ = c.close()
+      },
+      Err(e) => println(e)
+    }
+  }
+}
+
+fn acceptor(inbox: Inbox[String], boss: Pid[String]) -> () {
+  let w = spawnActor(worker, 0)
+  let srv = match listen(0) { Ok(s) => s, Err(e) => panic(e) }
+  let port = match srv.localPort() { Ok(p) => p, Err(e) => panic(e) }
+  let (_, incoming) = match srv.activate(16) { Ok(p) => p, Err(e) => panic(e) }
+  send(boss, toString(port))
+  let watching = toVec([incoming.ref(), inbox.ref()])
+  loop {
+    match select(watching, -1) {
+      Some(0) => match incoming.receive() {
+        NewClient(ticket) => { send(w, ticket) }
+        _ => {                                         // ListenerStopping, or AcceptFailed(why)
+          send(boss, "acceptor stopped")
+          return ()
+        }
+      },
+      _ => match inbox.receive() {
+        Mail::Msg(m) => { send(boss, "acceptor got " + m) }
+        _ => {
+          send(boss, "acceptor stopped")
+          return ()
+        }
+      }
+    }
+  }
+}
+
+fn demo() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let a = spawnActor(acceptor, boss.pid())
+  let port = match boss.receive() { Mail::Msg(m) => parseInt(m).unwrapOr(0), _ => 0 }
+  let mut c = connect("127.0.0.1", port)?
+  c.sendStr("hi\n")?
+  println(match c.recvLine()? { Some(l) => l, None => "<eof>" })   // => echo hi
+  send(a, "status?")
+  match boss.receive() { Mail::Msg(m) => println(m), _ => {} }     // => acceptor got status?
+  stopActor(a)
+  match boss.receive() { Mail::Msg(m) => println(m), _ => {} }     // => acceptor stopped
+  Ok(())
+}
+match demo() { Ok(_) => {}, Err(e) => println(e) }
+```
+
+The acceptor answers a message between two clients and ends when it is told to. A `Stop` reaches both of
+its inboxes, which is why both branches end the loop. `Incoming` has three cases:
+- `NewClient(ticket)`: a new connection.
+- `AcceptFailed(why)`: accepting stopped working. Nothing comes after it.
+- `ListenerStopping`: the actor's own `Stop`, as `Stopping` is for a connection.
+
+At most `capacity` new clients wait to be received. While the inbox is full the runtime accepts nothing,
+and further clients wait in the operating system's queue. When the actor ends, crash or not, the listener
+is closed, and so is every connection it had accepted but not yet delivered. A ticket that has already
+reached the inbox is a different matter, because the runtime cannot tell whether it was passed on. Like a
+`SocketHandOff` sent to an actor that dies before taking it, it is closed only when the program ends.
+Receive what arrived before you stop.
+
+## 18. Logging from several actors
 
 `println` is fine until there are actors. Then the output is interleaved by arrival, it is gone when the
 window closes, and there is no way to turn the noisy parts off. `std::log` is the small answer: a line is
@@ -821,7 +977,7 @@ written in one call, so a message with newlines in it arrives as several lines a
 timestamp. If you want any of that, `Log` is forty lines of ordinary Skarn — read `std/log.skn` and write
 the one you want.
 
-## 18. What Skarn does not have
+## 19. What Skarn does not have
 
 This is the Erlang/OTP model, and the names match where the ideas do. Four differences are deliberate:
 
@@ -833,7 +989,7 @@ This is the Erlang/OTP model, and the names match where the ideas do. Four diffe
 - **No links and no kill.** A crash is reported, never propagated, and an actor is asked to stop rather
   than forced. Supervision is a library on top of those reports.
 
-## 19. Where to look next
+## 20. Where to look next
 
 - `demo/actors/stable_address.skn` — a service behind a slot, restarted under one address.
 - `demo/actors/supervised.skn` — a pool of crashing workers that pull their jobs, all three strategies.

@@ -34,6 +34,7 @@
 #include <atomic>     // World::actors_started, read by the root's output buffer
 #include <optional>   // the world a root execute() owns
 #include <algorithm>  // std::find -- a mailbox's list of senders waiting for room
+#include <utility>    // std::exchange -- a receive takes the I/O thread's pause mark
 #ifdef _WIN32
 // Winsock MUST precede <windows.h> to avoid winsock.h/winsock2.h redefinition errors.
 #  include <winsock2.h>
@@ -134,15 +135,18 @@ static constexpr int SOCK_SEND_FLAGS = 0;             // Windows: no signal; mac
 // descriptor -- a TcpConn kept after close(), or after handOff() -- no longer matches and is refused,
 // instead of silently reaching whatever connection took the slot next. (Before generations, the
 // next accept() reused the slot at once, which made "a socket used after it was handed off" an
-// alias of a stranger's connection rather than an error.) The slot keeps one bit about how its
-// previous generation ended, for the message.
+// alias of a stranger's connection rather than an error.) The slot keeps how its previous
+// generation ended, for the message.
 struct NetRegistry {
     static constexpr int     SLOT_BITS = 24;
     static constexpr int64_t SLOT_MASK = (int64_t{1} << SLOT_BITS) - 1;
+    // How a slot's previous generation ended: closed, handed to another isolate, or activated (its
+    // reading moved to the world's I/O thread -- see IoHub).
+    enum class Ended : uint8_t { closed, handed, activated };
     struct Slot {
-        socket_t s           = INVALID_SOCK;
-        int64_t  gen         = 0;
-        bool     prev_handed = false;   // the previous generation ended by a hand-off
+        socket_t s        = INVALID_SOCK;
+        int64_t  gen      = 0;
+        Ended    prev_end = Ended::closed;
     };
     std::vector<Slot> slots;
     ~NetRegistry() {
@@ -165,19 +169,20 @@ struct NetRegistry {
         return &slots[i];
     }
     socket_t get(int64_t fd) { Slot* sl = live(fd); return sl ? sl->s : INVALID_SOCK; }
-    void release(Slot& sl, bool handed) {
+    void release(Slot& sl, Ended how) {
         sl.s = INVALID_SOCK;
-        sl.prev_handed = handed;
+        sl.prev_end = how;
         sl.gen = (sl.gen + 1) & ((int64_t{1} << 23) - 1);   // stays within a positive 48-bit Int
     }
-    void drop(int64_t fd) { if (Slot* sl = live(fd)) release(*sl, false); }
-    // Detach a socket for a hand-off to another isolate: the socket leaves this registry (it is not
-    // closed), and the descriptor goes stale. INVALID_SOCK if `fd` is not a live descriptor.
-    socket_t hand_off(int64_t fd) {
+    void drop(int64_t fd) { if (Slot* sl = live(fd)) release(*sl, Ended::closed); }
+    // Detach a socket, for a hand-off to another isolate or for activation: the socket leaves this
+    // registry (it is not closed), and the descriptor goes stale. INVALID_SOCK if `fd` is not a live
+    // descriptor.
+    socket_t detach(int64_t fd, Ended how) {
         Slot* sl = live(fd);
         if (!sl) return INVALID_SOCK;
         const socket_t s = sl->s;
-        release(*sl, true);
+        release(*sl, how);
         return s;
     }
     // Why a descriptor is refused -- the text after "tcpX: ".
@@ -185,9 +190,10 @@ struct NetRegistry {
         if (fd >= 0) {
             const auto i = static_cast<size_t>(fd & SLOT_MASK);
             const int64_t gen = fd >> SLOT_BITS;
-            if (i < slots.size() && slots[i].prev_handed &&
-                ((gen + 1) & ((int64_t{1} << 23) - 1)) == slots[i].gen)
-                return "socket was handed to another actor";
+            if (i < slots.size() && ((gen + 1) & ((int64_t{1} << 23) - 1)) == slots[i].gen) {
+                if (slots[i].prev_end == Ended::handed)    return "socket was handed to another actor";
+                if (slots[i].prev_end == Ended::activated) return "socket was activated";
+            }
         }
         return "invalid socket";
     }
@@ -294,6 +300,10 @@ struct Mailbox {
     bool                    released  = false;   // the world is ending: a full inbox refuses
     bool                    stopped   = false;   // Stop has been queued
     bool                    stop_seen = false;   // ... and received
+    // The world's I/O thread found this inbox full and stopped reading its socket (IoHub). The receive
+    // that makes room clears it and wakes that thread. Set and cleared under `m`, so a receive between
+    // "full" and "paused" cannot be missed.
+    bool                    io_paused = false;
     // The OWNER's wake pad, for rawSelect: copied out under `m` and woken after it is released, so
     // the two mutexes are only ever held in sequence. Null while a slot has no actor.
     std::shared_ptr<WaitPad> pad;
@@ -355,6 +365,23 @@ struct Mailbox {
             }
             if (dead) return GONE;
             if (capacity != 0 && messages >= capacity) return wait ? GONE : FULL;
+            q.push_back(std::move(mail));
+            ++messages;
+            p = pad;
+        }
+        cv.notify_one();
+        if (p) p->wake();
+        return SENT;
+    }
+    // The I/O thread's send (IoHub): never waits. On FULL it marks the inbox paused in the same
+    // critical section in which it found it full, so the receive that makes room is certain to see
+    // the mark and wake the thread -- there is no window between the two.
+    Offer offer_or_pause(Mail& mail) {
+        std::shared_ptr<WaitPad> p;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            if (dead) return GONE;
+            if (capacity != 0 && messages >= capacity) { io_paused = true; return FULL; }
             q.push_back(std::move(mail));
             ++messages;
             p = pad;
@@ -485,7 +512,86 @@ struct WaitEdge {
     int64_t                  target = Mailbox::NO_OWNER;
 };
 
+// =============================================================================
+// Active sockets -- Erlang's active mode (rawActivate / rawActiveSend / rawActiveClose).
+//
+// An actor that owns a connection often has to react to two sources at once: input on the socket,
+// and messages in its inbox. Each has a wait of its own, and none covers both. Activating a
+// connection hands its READING to the world's one I/O thread, which delivers what arrives as
+// messages into an inbox of the owner; the owner then waits on that inbox and its own with the
+// ordinary select. Writing stays with the owner.
+//   * ONE thread per world, running WSAPoll / poll over every active socket, started by the first
+//     activation. It copies bytes and posts mail; it runs no Skarn code and touches no heap -- an
+//     event is a value-codec buffer of a Bytes value (vcodec::encode_bytes), decoded in the
+//     owner's heap by the ordinary rawMailMsg. The first byte says what it is (ACTIVE_*).
+//   * It NEVER waits on an inbox: a full one is marked paused (Mailbox::offer_or_pause) and its
+//     socket is not polled until the receive that makes room wakes the thread. With a bounded inbox
+//     that is Erlang's {active, once}: TCP throttles the peer while the owner is behind.
+//   * ONLY this thread closes an active socket, and never while it is inside poll. The owner asks
+//     (rawActiveClose, or its end), and it sends only from its own thread; an ActiveConn cannot be
+//     sent, so a send and a close are never in flight together. Closing from another thread would
+//     let the OS hand the number to a new socket while poll still watches it.
+//   * It is woken through a connected pair of loopback TCP sockets -- WSAPoll waits on sockets
+//     only, and one code path on every platform lets the Windows run check the POSIX one.
+//   * A LISTENER can be activated too (rawActivateListener). The thread then accepts, parks each new
+//     connection in the world's hand-off table like rawHandOff does, and delivers its TICKET -- which
+//     is sendable, so the owner can pass it on to a worker unchanged.
+// =============================================================================
+enum : uint8_t { ACTIVE_DATA = 0, ACTIVE_LINE = 1, ACTIVE_CLOSED = 2, ACTIVE_FAILED = 3, ACTIVE_TICKET = 4 };
+
 struct World;
+
+struct ActiveSock {
+    int64_t                  id        = 0;
+    socket_t                 s         = INVALID_SOCK;
+    int64_t                  owner     = 0;       // the isolate that activated it: it alone sends and closes
+    std::shared_ptr<Mailbox> box;                 // where its events go
+    bool                     listener  = false;   // accept connections (else read the stream)
+    bool                     lines     = false;   // frame into lines (else deliver the chunks as read)
+    size_t                   max_line  = 0;
+    bool                     close_req = false;   // guarded by IoHub::m: the owner asked to close, or ended
+    // The fields below belong to the I/O thread alone -- and, before the entry is published, to the
+    // activating thread; IoHub::m orders the two.
+    std::string              partial;             // an unfinished line
+    std::deque<Mail>         pending;             // events read but not delivered yet (the inbox was full)
+    // A listener only, index-parallel to `pending`: the hand-off ticket each event carries, -1 for none.
+    // An event dropped undelivered takes its connection out of the hand-off table and closes it, so no
+    // client waits on a connection nobody will ever get.
+    std::deque<int64_t>      pending_tickets;
+    bool                     paused    = false;   // the inbox was full: not polled until a receive makes room
+    bool                     done      = false;   // end of stream, an error, an overlong line, or a closed inbox
+};
+
+class IoHub {
+public:
+    explicit IoHub(World* w) : world(w) {}
+    ~IoHub() { stop(); }
+    bool     start(std::string* err);                        // the wake line and the thread
+    int64_t  add(std::shared_ptr<ActiveSock> e);             // publish an activated socket; its id
+    // The socket rawActiveSend may write to, or INVALID_SOCK and why not.
+    socket_t sending_socket(int64_t id, int64_t caller, std::string* why);
+    // Ask for a close. False (with `why`) only for a connection of another isolate; closing twice is fine.
+    bool     request_close(int64_t id, int64_t caller, std::string* why);
+    void     close_owned_by(int64_t owner);                  // the owner has ended
+    void     wake();
+    void     stop();                                         // the world ends: join, close everything
+private:
+    void loop();
+    void read_once(ActiveSock& e);
+    void accept_some(ActiveSock& e);
+    void flush(ActiveSock& e);
+    void drop_tickets(ActiveSock& e);
+    void drain_wake();
+    World*                                                    world;      // the hand-off table, for listeners
+    std::mutex                                                m;          // guards socks, next_id, stopping
+    std::unordered_map<int64_t, std::shared_ptr<ActiveSock>> socks;
+    int64_t                                                   next_id  = 1;
+    bool                                                      stopping = false;
+    socket_t                                                  wake_rd  = INVALID_SOCK;
+    socket_t                                                  wake_wr  = INVALID_SOCK;
+    std::thread                                               thread;
+    std::vector<char>                                         buf;        // the I/O thread's read buffer
+};
 
 // The output of the root and of every actor goes to the ROOT's stream, a LINE at a time: PRINTLN
 // is two stream calls (text, newline), so unsynchronized writers would split each other's lines.
@@ -532,6 +638,9 @@ struct World {
     // belongs to no isolate's NetRegistry; whatever is never taken is closed when the world ends.
     std::unordered_map<int64_t, socket_t> handoffs;
     int64_t                   next_ticket = 1;
+    // The I/O thread of the active sockets, made by the first rawActivate (so a program that never
+    // activates one runs exactly as before). Stopped by ~World after every isolate has been joined.
+    std::shared_ptr<IoHub>    io;
     // Deadlock detection. `wait_m` is a LEAF: nothing is acquired while it is held, and it is never
     // held together with Mailbox::m or World::m. That is what recording the target ISOLATE (rather
     // than a mailbox id, which would need a registry lookup) buys -- and it is load-bearing, because
@@ -577,6 +686,21 @@ struct World {
             mailboxes.erase(it);
         }
         box->close();
+    }
+    // The active-socket hub, if one was ever started.
+    std::shared_ptr<IoHub> hub() {
+        std::lock_guard<std::mutex> lk(m);
+        return io;
+    }
+    // ... or started now. Null (with `err`) if its thread or wake line could not be made.
+    std::shared_ptr<IoHub> hub_or_start(std::string* err) {
+        std::lock_guard<std::mutex> lk(m);
+        if (!io) {
+            auto h = std::make_shared<IoHub>(this);
+            if (!h->start(err)) return nullptr;
+            io = std::move(h);
+        }
+        return io;
     }
     // Every inbox an isolate owns, right now (rawStopActor: an actor may be waiting on any of them).
     std::vector<std::shared_ptr<Mailbox>> mailboxes_of(int64_t owner) {
@@ -626,6 +750,10 @@ struct World {
             if (!next) break;
             next->join_thread();
         }
+        // Every actor has ended, so no active socket is being written to any more, and the I/O thread
+        // -- which never waits -- can be stopped. BEFORE the root's inboxes close, so it never posts
+        // into a mailbox that is being torn down (it would only get GONE, but there is nothing to gain).
+        if (io) io->stop();
         close_mailboxes_of(0);   // the root's own inboxes: every actor has ended, nobody sends
         // Every isolate has ended, so nobody can take these any more.
         for (auto& [ticket, s] : handoffs) sock_close(s);
@@ -2485,6 +2613,9 @@ static void run_isolate(World* world, std::shared_ptr<Isolate> iso, uint16_t fn_
         return;
     }
     actor_buf.flush_partial();
+    // Its active sockets are closed with it, as in Erlang, where a socket belongs to its owning
+    // process. Only a request: the I/O thread does the closing (see IoHub).
+    if (auto h = world->hub()) h->close_owned_by(iso->id);
     world->close_mailboxes_of(iso->id);   // the main inbox and every extra one (a slot is vacated)
     // Every report names the ADDRESS, which for an actor in a slot outlives it -- so a supervisor's
     // comparison survives a restart.
@@ -3164,7 +3295,13 @@ static Value native_receive(Value* args, uint8_t nargs, Context* ctx) {
     if (local->current.kind == MAIL_STOP) box.stop_seen = true;
     if (local->current.kind == MAIL_MSG) {
         --box.messages;
+        // The I/O thread stopped reading into this inbox when it was full; this receive made room.
+        const bool resume = std::exchange(box.io_paused, false);
         if (box.capacity != 0) { lk.unlock(); box.space.notify_one(); }   // room for one sender
+        if (resume) {
+            if (lk.owns_lock()) lk.unlock();     // never hold a mailbox while taking World::m
+            if (auto h = local->world->hub()) h->wake();
+        }
     }
     return Value::fromSigned48(local->current.kind);
 }
@@ -3297,7 +3434,7 @@ static Value native_hand_off(Value* args, uint8_t nargs, Context* ctx) {
     IsolateLocal* local = vm->isolate;
     if (!local || !local->world) return native_make_error(ctx, "handOff: this execution has no world");
     const int64_t fd = args[0].asSigned48();
-    const socket_t s = vm->net->hand_off(fd);
+    const socket_t s = vm->net->detach(fd, NetRegistry::Ended::handed);
     if (s == INVALID_SOCK)
         return native_make_error(ctx, std::string("handOff: ") + vm->net->invalid_reason(fd));
     std::lock_guard<std::mutex> lk(local->world->m);
@@ -3325,6 +3462,454 @@ static Value native_take(Value* args, uint8_t nargs, Context* ctx) {
     }
     if (s == INVALID_SOCK) return native_make_error(ctx, "take: this connection was already taken");
     return Value::fromSigned48(vm->net->add(s));
+}
+
+// ---- Active sockets: the I/O thread (see IoHub, next to World) ------------------------------------
+
+// One event onto `e.pending`: the tag byte, then the payload.
+static void active_event(ActiveSock& e, uint8_t tag, const char* p, size_t n) {
+    e.pending.push_back(Mail{ MAIL_MSG, vcodec::encode_bytes(tag, p, n), 0, {} });
+}
+static void active_fail(ActiveSock& e, const std::string& why) {
+    active_event(e, ACTIVE_FAILED, why.data(), why.size());
+    e.partial.clear();
+    e.done = true;
+}
+
+// What was read, as events: the chunk itself, or every complete line in it ("\n" or "\r\n" ends
+// one, and is not part of it). A line longer than max_line ends the stream with a failure: without
+// the bound, a peer that never sends a newline would grow the buffer without end. Also called by
+// rawActivate, before the entry is published, for the bytes recvLine had already buffered.
+static void active_frame(ActiveSock& e, const char* p, size_t n) {
+    if (e.done || n == 0) return;
+    if (!e.lines) { active_event(e, ACTIVE_DATA, p, n); return; }
+    size_t start = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (p[i] != '\n') continue;
+        e.partial.append(p + start, i - start);
+        start = i + 1;
+        if (!e.partial.empty() && e.partial.back() == '\r') e.partial.pop_back();
+        if (e.partial.size() > e.max_line) {
+            active_fail(e, "line too long (more than " + std::to_string(e.max_line) + " bytes)");
+            return;
+        }
+        active_event(e, ACTIVE_LINE, e.partial.data(), e.partial.size());
+        e.partial.clear();
+    }
+    e.partial.append(p + start, n - start);
+    if (e.partial.size() > e.max_line + 1)          // + 1: room for the '\r' of a "\r\n" still to come
+        active_fail(e, "line too long (more than " + std::to_string(e.max_line) + " bytes)");
+}
+
+// Deliver what is pending, in order, until the inbox is full (paused) or closed (done). A listener's
+// undelivered tickets go with a closed inbox: their connections are dropped, not left waiting.
+void IoHub::flush(ActiveSock& e) {
+    while (!e.pending.empty()) {
+        switch (e.box->offer_or_pause(e.pending.front())) {
+            case Mailbox::SENT:
+                e.pending.pop_front();
+                if (e.listener) e.pending_tickets.pop_front();
+                break;
+            case Mailbox::FULL:
+                e.paused = true;
+                return;
+            default:                                             // GONE: the inbox was closed
+                drop_tickets(e);
+                e.pending.clear();
+                e.paused = false;
+                e.done   = true;
+                return;
+        }
+    }
+    e.paused = false;
+}
+
+// Take the connections of a listener's undelivered events out of the hand-off table and close them.
+void IoHub::drop_tickets(ActiveSock& e) {
+    for (const int64_t t : e.pending_tickets) {
+        if (t < 0) continue;
+        socket_t s = INVALID_SOCK;
+        {
+            std::lock_guard<std::mutex> lk(world->m);
+            auto it = world->handoffs.find(t);
+            if (it != world->handoffs.end()) { s = it->second; world->handoffs.erase(it); }
+        }
+        if (s != INVALID_SOCK) sock_close(s);
+    }
+    e.pending_tickets.clear();
+}
+
+// A connection the client gave up on before it was accepted: skip it, the listener is fine.
+static bool accept_aborted() {
+#ifdef _WIN32
+    const int e = WSAGetLastError();
+    return e == WSAECONNRESET || e == WSAEINTR;
+#else
+    return errno == ECONNABORTED || errno == EINTR || errno == EPROTO;
+#endif
+}
+
+// Accept what is waiting on a ready listener. Each connection is made blocking -- Windows and BSD pass
+// the listener's non-blocking mode on, and every descriptor Skarn gets from std::net blocks -- parked in
+// the world's hand-off table like a rawHandOff, and its ticket delivered. At most a batch per readiness,
+// so a busy listener cannot starve the other sockets; the next poll comes back for the rest. Any error but
+// "nothing waiting" or "the client already left" ends the listener with a failure: repeating `accept`
+// on, say, a full descriptor table would only spin.
+void IoHub::accept_some(ActiveSock& e) {
+    for (int k = 0; k < 64 && !e.paused && !e.done; ++k) {
+        const socket_t c = accept(e.s, nullptr, nullptr);
+        if (c == INVALID_SOCK) {
+            if (sock_would_block()) return;
+            if (accept_aborted()) continue;
+            active_fail(e, net_error_msg("accept"));
+            e.pending_tickets.push_back(-1);
+            flush(e);
+            return;
+        }
+        sock_suppress_sigpipe(c);
+        set_nonblocking(c, false);
+        int64_t ticket;
+        {
+            std::lock_guard<std::mutex> lk(world->m);
+            ticket = world->next_ticket++;
+            world->handoffs.emplace(ticket, c);
+        }
+        const std::string text = std::to_string(ticket);
+        active_event(e, ACTIVE_TICKET, text.data(), text.size());
+        e.pending_tickets.push_back(ticket);
+        flush(e);
+    }
+}
+
+// A connected pair of loopback sockets: `wr` writes a byte, `rd` becomes readable. The accepted peer
+// is checked to be `wr` itself, since another local process could connect to the listener first.
+static bool make_wake_pair(socket_t* rd, socket_t* wr, std::string* err) {
+    if (!ensure_wsa()) { *err = "WSAStartup failed"; return false; }
+    socket_t l = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (l == INVALID_SOCK) { *err = net_error_msg("socket"); return false; }
+    sockaddr_in a{};
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port        = 0;
+    socklen_t alen    = sizeof(a);
+    if (bind(l, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || listen(l, 4) != 0 ||
+        getsockname(l, reinterpret_cast<sockaddr*>(&a), &alen) != 0) {
+        *err = net_error_msg("bind");
+        sock_close(l);
+        return false;
+    }
+    socket_t w = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (w == INVALID_SOCK || connect(w, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+        *err = net_error_msg("connect");
+        if (w != INVALID_SOCK) sock_close(w);
+        sock_close(l);
+        return false;
+    }
+    sockaddr_in mine{};
+    socklen_t   mlen = sizeof(mine);
+    getsockname(w, reinterpret_cast<sockaddr*>(&mine), &mlen);
+    socket_t r = INVALID_SOCK;
+    for (int tries = 0; tries < 8 && r == INVALID_SOCK; ++tries) {
+        sockaddr_in peer{};
+        socklen_t   plen = sizeof(peer);
+        socket_t    c    = accept(l, reinterpret_cast<sockaddr*>(&peer), &plen);
+        if (c == INVALID_SOCK) break;
+        if (peer.sin_port == mine.sin_port && peer.sin_addr.s_addr == mine.sin_addr.s_addr) r = c;
+        else sock_close(c);                      // not ours
+    }
+    sock_close(l);
+    if (r == INVALID_SOCK) {
+        *err = "could not connect the wake line";
+        sock_close(w);
+        return false;
+    }
+    set_nonblocking(r, true);
+    set_nonblocking(w, true);
+    sock_suppress_sigpipe(w);
+    int one = 1;
+    setsockopt(w, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
+    *rd = r;
+    *wr = w;
+    return true;
+}
+
+bool IoHub::start(std::string* err) {
+    if (!make_wake_pair(&wake_rd, &wake_wr, err)) return false;
+    buf.resize(64 * 1024);
+    try {
+        thread = std::thread([this] { loop(); });
+    } catch (const std::system_error& e) {
+        *err = std::string("could not start the I/O thread: ") + e.what();
+        sock_close(wake_rd); sock_close(wake_wr);
+        wake_rd = wake_wr = INVALID_SOCK;
+        return false;
+    }
+    return true;
+}
+
+int64_t IoHub::add(std::shared_ptr<ActiveSock> e) {
+    int64_t id;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        id    = next_id++;
+        e->id = id;
+        socks.emplace(id, std::move(e));
+    }
+    wake();
+    return id;
+}
+
+socket_t IoHub::sending_socket(int64_t id, int64_t caller, std::string* why) {
+    std::lock_guard<std::mutex> lk(m);
+    auto it = socks.find(id);
+    if (it == socks.end() || it->second->close_req) { *why = "the connection is closed"; return INVALID_SOCK; }
+    if (it->second->owner != caller) { *why = "this connection belongs to another actor"; return INVALID_SOCK; }
+    if (it->second->listener) { *why = "not a connection (an active listener)"; return INVALID_SOCK; }
+    return it->second->s;
+}
+
+bool IoHub::request_close(int64_t id, int64_t caller, std::string* why) {
+    {
+        std::lock_guard<std::mutex> lk(m);
+        auto it = socks.find(id);
+        if (it == socks.end() || it->second->close_req) return true;   // closed already
+        if (it->second->owner != caller) { *why = "this connection belongs to another actor"; return false; }
+        it->second->close_req = true;
+    }
+    wake();
+    return true;
+}
+
+void IoHub::close_owned_by(int64_t owner) {
+    bool any = false;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        for (auto& [id, e] : socks)
+            if (e->owner == owner && !e->close_req) { e->close_req = true; any = true; }
+    }
+    if (any) wake();
+}
+
+// One byte down the wake line. Non-blocking: if the line is full, a byte is already waiting, which
+// is all a wake needs.
+void IoHub::wake() {
+    if (wake_wr == INVALID_SOCK) return;
+    const char b = 1;
+    (void)::send(wake_wr, &b, 1, SOCK_SEND_FLAGS);
+}
+
+void IoHub::drain_wake() {
+    char tmp[256];
+    while (::recv(wake_rd, tmp, sizeof(tmp), 0) > 0) {}
+}
+
+// One read of a socket poll called ready. Non-blocking where the platform allows it per call, so a
+// spurious readiness cannot stall every other connection.
+void IoHub::read_once(ActiveSock& e) {
+#ifdef MSG_DONTWAIT
+    constexpr int flags = MSG_DONTWAIT;
+#else
+    constexpr int flags = 0;
+#endif
+    const int n = ::recv(e.s, buf.data(), static_cast<int>(buf.size()), flags);
+    if (n > 0) { active_frame(e, buf.data(), static_cast<size_t>(n)); return; }
+    if (n < 0 && sock_would_block()) return;
+    if (n == 0) {
+        if (e.lines && !e.partial.empty()) {            // a last line without a newline, as recvLine
+            if (e.partial.back() == '\r') e.partial.pop_back();
+            active_event(e, ACTIVE_LINE, e.partial.data(), e.partial.size());
+            e.partial.clear();
+        }
+        active_event(e, ACTIVE_CLOSED, nullptr, 0);
+        e.done = true;
+        return;
+    }
+    active_fail(e, net_error_msg("recv"));
+}
+
+void IoHub::loop() {
+    std::vector<std::shared_ptr<ActiveSock>> live, polled, closing;
+    std::vector<pollfd_t>                    pfds;
+    for (;;) {
+        live.clear();
+        closing.clear();
+        {
+            std::lock_guard<std::mutex> lk(m);
+            if (stopping) return;
+            for (auto it = socks.begin(); it != socks.end();) {
+                if (it->second->close_req) { closing.push_back(it->second); it = socks.erase(it); }
+                else { live.push_back(it->second); ++it; }
+            }
+        }
+        for (auto& e : closing) {                           // here only: never while inside poll
+            drop_tickets(*e);                               // a listener's accepted-but-undelivered ones
+            sock_close(e->s);
+        }
+        for (auto& e : live)
+            if (e->paused || !e->pending.empty()) flush(*e);
+        pfds.clear();
+        polled.clear();
+        pollfd_t w{};
+        w.fd     = wake_rd;
+        w.events = POLL_READ;
+        pfds.push_back(w);
+        for (auto& e : live) {
+            if (e->paused || e->done) continue;
+            pollfd_t p{};
+            p.fd     = e->s;
+            p.events = POLL_READ;
+            pfds.push_back(p);
+            polled.push_back(e);
+        }
+        if (sock_poll(pfds.data(), static_cast<unsigned>(pfds.size()), -1) < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));   // EINTR and friends: look again
+            continue;
+        }
+        if (pfds[0].revents != 0) drain_wake();
+        for (size_t i = 0; i < polled.size(); ++i) {
+            if (pfds[i + 1].revents == 0) continue;
+            if (polled[i]->listener) {
+                accept_some(*polled[i]);                    // delivers as it goes
+            } else {
+                read_once(*polled[i]);
+                flush(*polled[i]);
+            }
+        }
+    }
+}
+
+// A listener's undelivered tickets need no dropping here: they are in the world's hand-off table, which
+// ~World closes right after this.
+void IoHub::stop() {
+    {
+        std::lock_guard<std::mutex> lk(m);
+        stopping = true;
+    }
+    wake();
+    if (thread.joinable()) thread.join();
+    for (auto& [id, e] : socks) sock_close(e->s);
+    socks.clear();
+    if (wake_rd != INVALID_SOCK) sock_close(wake_rd);
+    if (wake_wr != INVALID_SOCK) sock_close(wake_wr);
+    wake_rd = wake_wr = INVALID_SOCK;
+}
+
+// rawActivate(fd, inbox, mode, maxLen, pending) -> Int id | String. Hands the READING of a connection
+// to the world's I/O thread, which delivers into `inbox` (one of the caller's own): mode 0 the chunks
+// as read, mode 1 lines of at most maxLen bytes. `pending` are bytes recvLine had already read past a
+// line; they come first. The descriptor goes stale ("socket was activated"); rawActiveSend and
+// rawActiveClose take the returned id. Only an actor or the main program can: a task has no inbox.
+static Value native_activate(Value* args, uint8_t nargs, Context* ctx) {
+    VM* vm = ctx->vm;
+    if (!vm->net) return native_make_error(ctx, "activate: networking unavailable");
+    if (nargs < 5 || !args[0].isInt() || !args[2].isInt() || !args[3].isInt())
+        return native_make_error(ctx, "activate: expected (sock, inbox, mode, maxLen, pending)");
+    Mailbox&      box   = own_mailbox(args[1], ctx, "activate");
+    IsolateLocal* local = vm->isolate;
+    std::shared_ptr<Mailbox> into;
+    for (const auto& [id, b] : local->inboxes) if (b.get() == &box) into = b;
+    if (!into) raise_located(ctx, "activate: this execution has no inbox (mainInbox first?)");
+    const int64_t mode    = args[2].asSigned48();
+    const int64_t max_len = args[3].asSigned48();
+    if (mode != 0 && mode != 1) return native_make_error(ctx, "activate: unknown framing");
+    if (mode == 1 && max_len < 1) return native_make_error(ctx, "activate: the longest line must be 1 byte or more");
+    std::string pending;
+    if (args[4].isPtr() && GcObject::from_slots(args[4].asPtr())->kind == GcObject::KIND_BYTES) {
+        GcObject* hdr     = GcObject::from_slots(args[4].asPtr());
+        GcObject* backing = GcObject::from_slots(hdr->slots()[BYTES_SLOT_BACKING].asPtr());
+        pending.assign(backing->bytes(), static_cast<size_t>(hdr->slots()[BYTES_SLOT_COUNT].asSigned48()));
+    }
+    // The hub first: if it cannot start, the connection stays as it was.
+    std::string herr;
+    auto hub = local->world->hub_or_start(&herr);
+    if (!hub) return native_make_error(ctx, "activate: " + herr);
+    const int64_t  fd = args[0].asSigned48();
+    const socket_t s  = vm->net->detach(fd, NetRegistry::Ended::activated);
+    if (s == INVALID_SOCK)
+        return native_make_error(ctx, std::string("activate: ") + vm->net->invalid_reason(fd));
+    auto e = std::make_shared<ActiveSock>();
+    e->s        = s;
+    e->owner    = local->id;
+    e->box      = std::move(into);
+    e->lines    = (mode == 1);
+    e->max_line = static_cast<size_t>(max_len);
+    active_frame(*e, pending.data(), pending.size());   // not published yet: still this thread's
+    return Value::fromSigned48(hub->add(std::move(e)));
+}
+
+// rawActivateListener(fd, inbox) -> Int id | String. Hands a LISTENER to the world's I/O thread, which
+// accepts and delivers each new connection into `inbox` (one of the caller's own) as a hand-off ticket
+// -- the one rawTake redeems, so the owner may pass it on to a worker unchanged. The descriptor goes
+// stale ("socket was activated"); rawActiveClose takes the returned id and closes the listener.
+static Value native_activate_listener(Value* args, uint8_t nargs, Context* ctx) {
+    VM* vm = ctx->vm;
+    if (!vm->net) return native_make_error(ctx, "activate: networking unavailable");
+    if (nargs < 2 || !args[0].isInt())
+        return native_make_error(ctx, "activate: expected (listener, inbox)");
+    Mailbox&      box   = own_mailbox(args[1], ctx, "activate");
+    IsolateLocal* local = vm->isolate;
+    std::shared_ptr<Mailbox> into;
+    for (const auto& [id, b] : local->inboxes) if (b.get() == &box) into = b;
+    if (!into) raise_located(ctx, "activate: this execution has no inbox (mainInbox first?)");
+    const int64_t fd = args[0].asSigned48();
+    const socket_t live = vm->net->get(fd);
+    if (live == INVALID_SOCK)
+        return native_make_error(ctx, std::string("activate: ") + vm->net->invalid_reason(fd));
+    std::string herr;
+    auto hub = local->world->hub_or_start(&herr);
+    if (!hub) return native_make_error(ctx, "activate: " + herr);
+    // Non-blocking BEFORE it is detached, so a failure leaves the listener as it was. The I/O thread
+    // accepts only on readiness, and a client that left in between must not make it wait.
+    if (set_nonblocking(live, true) != 0) return native_make_error(ctx, "activate: " + net_error_msg("ioctl"));
+    const socket_t s = vm->net->detach(fd, NetRegistry::Ended::activated);
+    auto e = std::make_shared<ActiveSock>();
+    e->s        = s;
+    e->owner    = local->id;
+    e->box      = std::move(into);
+    e->listener = true;
+    return Value::fromSigned48(hub->add(std::move(e)));
+}
+
+// rawActiveSend(id, data) -> () | String. Sends the whole buffer on an active connection of the caller.
+static Value native_active_send(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world) return native_make_error(ctx, "send: this execution has no world");
+    if (nargs < 2 || !args[0].isInt())
+        return native_make_error(ctx, "send: expected (conn: Int, data: Bytes)");
+    if (!args[1].isPtr() || GcObject::from_slots(args[1].asPtr())->kind != GcObject::KIND_BYTES)
+        return native_make_error(ctx, "send: data must be a byte buffer");
+    auto hub = local->world->hub();
+    std::string why = "the connection is closed";
+    const socket_t s = hub ? hub->sending_socket(args[0].asSigned48(), local->id, &why) : INVALID_SOCK;
+    if (s == INVALID_SOCK) return native_make_error(ctx, "send: " + why);
+    std::string data;
+    {
+        GcObject*      hdr     = GcObject::from_slots(args[1].asPtr());
+        GcObject*      backing = GcObject::from_slots(hdr->slots()[BYTES_SLOT_BACKING].asPtr());
+        const uint32_t count   = static_cast<uint32_t>(hdr->slots()[BYTES_SLOT_COUNT].asSigned48());
+        data.assign(backing->bytes(), count);
+    }
+    size_t sent = 0;
+    while (sent < data.size()) {
+        const int n = ::send(s, data.data() + sent, static_cast<int>(data.size() - sent), SOCK_SEND_FLAGS);
+        if (n < 0) return native_make_error(ctx, "send: " + net_error_msg("send"));
+        sent += static_cast<size_t>(n);
+    }
+    return Value::fromNil();
+}
+
+// rawActiveClose(id) -> (). Asks the I/O thread to close the connection; later sends are refused and
+// events not received yet are dropped. Closing twice is fine; another isolate's connection is a fault.
+static Value native_active_close(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world || nargs < 1 || !args[0].isInt())
+        raise_located(ctx, "close: not an active connection");
+    if (auto hub = local->world->hub()) {
+        std::string why;
+        if (!hub->request_close(args[0].asSigned48(), local->id, &why))
+            raise_located(ctx, ("close: " + why).c_str());
+    }
+    return Value::fromNil();
 }
 
 std::vector<NativeFunc> build_native_table() {
@@ -3400,5 +3985,9 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_STOP_REQUESTED] = native_stop_requested;
     t[NATIVE_SLEEP]        = native_sleep;
     t[NATIVE_SELECT]       = native_select;
+    t[NATIVE_ACTIVATE]     = native_activate;
+    t[NATIVE_ACTIVE_SEND]  = native_active_send;
+    t[NATIVE_ACTIVE_CLOSE] = native_active_close;
+    t[NATIVE_ACTIVATE_LISTENER] = native_activate_listener;
     return t;
 }

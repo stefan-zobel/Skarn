@@ -2828,6 +2828,40 @@ inline void test_value_codec_refusals() {
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 
+// The live bytes of a KIND_BYTES value, or a marker when it is not one.
+inline std::string bytes_of(Value v) {
+    if (!v.isPtr()) return "<not bytes>";
+    const GcObject* hdr = GcObject::from_slots(v.asPtr());
+    if (hdr->kind != GcObject::KIND_BYTES) return "<not bytes>";
+    const GcObject* backing = GcObject::from_slots(hdr->slots()[BYTES_SLOT_BACKING].asPtr());
+    return std::string(backing->bytes(), static_cast<size_t>(hdr->slots()[BYTES_SLOT_COUNT].asSigned48()));
+}
+
+// encode_bytes builds, without a heap, the buffer the active-socket I/O thread posts. It must be
+// EXACTLY what encode() makes for that value -- so decode() needs no second path -- which the round
+// trip checks byte for byte.
+inline void test_value_codec_encode_bytes() {
+    std::cout << "=== value_codec_encode_bytes ===\n";
+    try {
+        auto round = [](uint8_t tag, const std::string& data, bool* same) {
+            const auto      buf = vcodec::encode_bytes(tag, data.data(), data.size());
+            Heap            dst(16 * 1024);
+            RootedValuePool pool;
+            const Value     v = vcodec::decode(buf.data(), buf.size(), dst, nullptr, pool, nullptr, 0);
+            *same = vcodec::encode(v) == buf;
+            return bytes_of(v);
+        };
+        bool same1 = false, same2 = false;
+        const bool content1 = round(1, "a line", &same1) == std::string("\x01" "a line");
+        const bool content2 = round(2, "", &same2) == std::string("\x02");
+        std::cout << std::format("  decodes to tag + data:            {} {}\n",
+                                 content1 ? "PASS" : "FAIL", content2 ? "PASS" : "FAIL");
+        std::cout << std::format("  identical to encode()'s buffer:   {} {}\n",
+                                 same1 ? "PASS" : "FAIL", same2 ? "PASS" : "FAIL");
+        check(content1 && content2 && same1 && same2);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
 // =============================================================================
 // test_value_codec_malformed -- decode() refuses every object the VM could not have built.
 //
@@ -4039,6 +4073,147 @@ inline void test_actor_socket_hand_off() {
                                  reused ? "" : "  (the slot was not reused -- the test no longer proves it)");
         std::cout << std::format("  a second take refused:                 {}\n", twice_ok ? "PASS" : "FAIL");
         check(moved_ok && stale_ok && stale2_ok && reused && twice_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// Active sockets: the world's I/O thread reads an activated connection and delivers LINES into an
+// inbox of capacity 2 -- three are ready at once, so the thread must pause and be resumed by the
+// receives. Bytes recvLine had buffered come first; a line split across two sends is joined; "\r\n"
+// ends a line too; the end of the stream arrives as its own event. Writing goes through the id; after
+// close it is refused, and so is the old descriptor. A second connection is still active when the
+// program ends: the world has to stop the I/O thread (the test would hang otherwise).
+inline void test_active_socket() {
+    using namespace forkjoin;
+    std::cout << "=== active_socket ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        as.load_const(20, 0);          call1(as, 21, NATIVE_TCP_LISTEN, 20);        // listener
+        call1(as, 22, NATIVE_TCP_LOCAL_PORT, 21);
+        as.load_str(23, "127.0.0.1");  call2(as, 24, NATIVE_TCP_CONNECT, 23, 22);   // client
+        call1(as, 25, NATIVE_TCP_ACCEPT, 21);                                       // server side
+        as.load_const(20, 2);          call1(as, 26, NATIVE_NEW_INBOX, 20);         // capacity 2
+        as.load_str(27, "ab\r\ncd\nef"); as.BYTES_FROM_STR(28, 27);
+        call2(as, 29, NATIVE_TCP_SEND, 24, 28);
+        as.load_str(30, "pre\n");      as.BYTES_FROM_STR(31, 30);                   // "already buffered"
+        auto activate = [&](uint8_t rd, uint8_t rsock, int64_t mode, uint8_t rpending) {
+            as.R6(OpCode::MOV, 43, rsock, 0);
+            as.R6(OpCode::MOV, 44, 26, 0);
+            as.load_const(45, mode);
+            as.load_const(46, 100);
+            as.R6(OpCode::MOV, 47, rpending, 0);
+            as.call_native_id(rd, 42, 43, 5, NATIVE_ACTIVATE);
+        };
+        activate(32, 25, 1, 31);
+        auto next = [&](uint8_t rd) {                   // at most 5 s: a lost event fails, never hangs
+            as.load_const(20, 5000);
+            call2(as, 19, NATIVE_RECEIVE, 26, 20);
+            call1(as, rd, NATIVE_MAIL_MSG, 26);
+        };
+        next(1); next(2); next(3);
+        as.load_str(27, "hi");         as.BYTES_FROM_STR(28, 27);
+        call2(as, 33, NATIVE_ACTIVE_SEND, 32, 28);                                  // server -> client
+        as.load_const(20, 16);         call2(as, 34, NATIVE_TCP_RECV, 24, 20);
+        as.load_str(27, "gh\n");       as.BYTES_FROM_STR(28, 27);
+        call2(as, 29, NATIVE_TCP_SEND, 24, 28);
+        call1(as, 29, NATIVE_TCP_CLOSE, 24);
+        next(4); next(5);
+        call1(as, 35, NATIVE_ACTIVE_CLOSE, 32);
+        call2(as, 36, NATIVE_ACTIVE_SEND, 32, 28);                                  // after close
+        call2(as, 37, NATIVE_TCP_SEND, 25, 28);                                     // the old descriptor
+        call2(as, 38, NATIVE_TCP_CONNECT, 23, 22);
+        call1(as, 39, NATIVE_TCP_ACCEPT, 21);
+        activate(18, 39, 0, 28);                                                    // left active
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool lines_ok  = r.fault.empty() && bytes_of(r.regs[1]) == "\x01pre" &&
+                               bytes_of(r.regs[2]) == "\x01" "ab" && bytes_of(r.regs[3]) == "\x01" "cd" &&
+                               bytes_of(r.regs[4]) == "\x01" "efgh";
+        const bool closed_ok = r.fault.empty() && bytes_of(r.regs[5]) == "\x02";
+        const bool send_ok   = r.fault.empty() && r.regs[33].isNil() && bytes_of(r.regs[34]) == "hi";
+        const bool after_ok  = r.fault.empty() && r.regs[35].isNil() &&
+                               str_of(r.regs[36]).find("closed") != std::string::npos;
+        const bool stale_ok  = r.fault.empty() && str_of(r.regs[37]).find("activated") != std::string::npos;
+        const bool second_ok = r.fault.empty() && r.regs[18].isInt();
+        std::cout << std::format("  lines in order, paused and resumed:    {}{}\n", lines_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  end of stream is an event:             {}\n", closed_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  writing through the id:                {}\n", send_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  refused after close:                   {}  (\"{}\")\n", after_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[36]));
+        std::cout << std::format("  the old descriptor refused:            {}  (\"{}\")\n", stale_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[37]));
+        std::cout << std::format("  the world ends with one still active:  {}\n", second_ok ? "PASS" : "FAIL");
+        check(lines_ok && closed_ok && send_ok && after_ok && stale_ok && second_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// An activated LISTENER: the I/O thread accepts, parks each connection in the world's hand-off table and
+// delivers its ticket. Three clients connect while the inbox holds ONE event, so the thread must pause
+// and be resumed; nothing else in this program makes tickets, so they are 1, 2, 3 in order. A taken
+// connection must be BLOCKING (the listener was switched to non-blocking, and Windows and BSD pass that
+// on): a 200 ms receive with nothing sent must time out, not fail at once. The old descriptor and a send
+// to the listener's id are refused; after close a new client is refused; a second active listener is
+// still open when the program ends.
+inline void test_active_listener() {
+    using namespace forkjoin;
+    std::cout << "=== active_listener ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        as.load_const(20, 0);          call1(as, 21, NATIVE_TCP_LISTEN, 20);
+        call1(as, 22, NATIVE_TCP_LOCAL_PORT, 21);
+        as.load_str(23, "127.0.0.1");
+        as.load_const(20, 1);          call1(as, 26, NATIVE_NEW_INBOX, 20);         // capacity 1
+        call2(as, 30, NATIVE_ACTIVATE_LISTENER, 21, 26);
+        call2(as, 24, NATIVE_TCP_CONNECT, 23, 22);
+        call2(as, 25, NATIVE_TCP_CONNECT, 23, 22);
+        call2(as, 27, NATIVE_TCP_CONNECT, 23, 22);
+        auto next = [&](uint8_t rd) {                   // at most 5 s: a lost event fails, never hangs
+            as.load_const(20, 5000);
+            call2(as, 19, NATIVE_RECEIVE, 26, 20);
+            call1(as, rd, NATIVE_MAIL_MSG, 26);
+        };
+        next(1); next(2); next(3);
+        as.load_const(20, 1);          call1(as, 31, NATIVE_TAKE, 20);              // the first client
+        as.load_const(20, 200);        call2(as, 32, NATIVE_TCP_SET_TIMEOUT, 31, 20);
+        as.load_const(20, 16);         call2(as, 33, NATIVE_TCP_RECV, 31, 20);      // blocking: a timeout
+        as.load_str(34, "hi");         as.BYTES_FROM_STR(35, 34);
+        call2(as, 36, NATIVE_TCP_SEND, 24, 35);
+        as.load_const(20, 16);         call2(as, 37, NATIVE_TCP_RECV, 31, 20);      // "hi"
+        call1(as, 38, NATIVE_TCP_ACCEPT, 21);                                       // the old descriptor
+        call2(as, 39, NATIVE_ACTIVE_SEND, 30, 35);                                  // not a connection
+        call1(as, 4, NATIVE_ACTIVE_CLOSE, 30);
+        as.load_const(20, 300);        call1(as, 5, NATIVE_SLEEP, 20);              // the thread closes it
+        call2(as, 6, NATIVE_TCP_CONNECT, 23, 22);                                   // refused now
+        as.load_const(20, 0);          call1(as, 7, NATIVE_TCP_LISTEN, 20);
+        call2(as, 8, NATIVE_ACTIVATE_LISTENER, 7, 26);                              // left active
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool tickets_ok = r.fault.empty() && bytes_of(r.regs[1]) == "\x04" "1" &&
+                                bytes_of(r.regs[2]) == "\x04" "2" && bytes_of(r.regs[3]) == "\x04" "3";
+        const bool block_ok   = r.fault.empty() && r.regs[32].isNil() &&
+                                str_of(r.regs[33]).find("timeout") != std::string::npos &&
+                                bytes_of(r.regs[37]) == "hi";
+        const bool stale_ok   = r.fault.empty() && str_of(r.regs[38]).find("activated") != std::string::npos;
+        const bool nosend_ok  = r.fault.empty() && str_of(r.regs[39]).find("not a connection") != std::string::npos;
+        const bool closed_ok  = r.fault.empty() && r.regs[4].isNil() &&
+                                str_of(r.regs[6]).find("could not connect") != std::string::npos;
+        const bool second_ok  = r.fault.empty() && r.regs[8].isInt();
+        std::cout << std::format("  tickets 1, 2, 3 through an inbox of 1:  {}{}\n", tickets_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  the taken connection blocks:           {}  (\"{}\")\n", block_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[33]));
+        std::cout << std::format("  the old descriptor refused:            {}  (\"{}\")\n", stale_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[38]));
+        std::cout << std::format("  a send to the listener refused:        {}  (\"{}\")\n", nosend_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[39]));
+        std::cout << std::format("  closed: a new client is refused:       {}  (\"{}\")\n", closed_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[6]));
+        std::cout << std::format("  the world ends with one still active:  {}\n", second_ok ? "PASS" : "FAIL");
+        check(tickets_ok && block_ok && stale_ok && nosend_ok && closed_ok && second_ok);
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 

@@ -1,0 +1,59 @@
+// CLAIM: an activated listener delivers each new connection as a ticket into an inbox of the acceptor, so one select serves new clients AND the acceptor's own inbox -- a message reaches it, and a Stop ends it.
+// GUIDE: SkarnActors.md (A connection that also listens to its inbox)
+// EXPECT: ok echo hi | acceptor got status? | acceptor stopped
+use std::net::*
+use std::actor::*
+
+fn worker(inbox: Inbox[SocketHandOff], unused: Int) -> () {
+  for h in inbox.messages() {
+    match h.take() {
+      Ok(mut c) => {
+        match c.recvLine() { Ok(Some(l)) => { let _ = c.sendStr("echo " + l + "\n") }, _ => {} }
+        let _ = c.close()
+      },
+      Err(e) => print(e)
+    }
+  }
+}
+
+fn acceptor(inbox: Inbox[String], boss: Pid[String]) -> () {
+  let w = spawnActor(worker, 0)
+  let srv = match listen(0) { Ok(s) => s, Err(e) => panic(e) }
+  let port = match srv.localPort() { Ok(p) => p, Err(e) => panic(e) }
+  let (_, incoming) = match srv.activate(16) { Ok(p) => p, Err(e) => panic(e) }
+  send(boss, toString(port))
+  let watching = toVec([incoming.ref(), inbox.ref()])
+  loop {
+    match select(watching, -1) {
+      Some(0) => match incoming.receive() {
+        NewClient(ticket) => { send(w, ticket) }
+        _ => {
+          send(boss, "acceptor stopped")
+          return ()
+        }
+      },
+      _ => match inbox.receive() {
+        Mail::Msg(m) => { send(boss, "acceptor got " + m) }
+        _ => {
+          send(boss, "acceptor stopped")
+          return ()
+        }
+      }
+    }
+  }
+}
+
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let a = spawnActor(acceptor, boss.pid())
+  let port = match boss.receive() { Mail::Msg(m) => parseInt(m).unwrapOr(0), _ => 0 }
+  let mut c = connect("127.0.0.1", port)?
+  c.sendStr("hi\n")?
+  match c.recvLine()? { Some(l) => print(l), None => print("<eof>") }
+  send(a, "status?")
+  match boss.receive() { Mail::Msg(m) => print(" | ${m}"), _ => {} }
+  stopActor(a)
+  match boss.receive() { Mail::Msg(m) => print(" | ${m}"), _ => {} }
+  Ok(())
+}
+match run() { Ok(_) => {}, Err(e) => print("error: ${e}") }

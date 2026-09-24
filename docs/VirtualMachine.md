@@ -539,6 +539,30 @@ handed to another actor" after a hand-off — and never reaches a later connecti
 ticket itself is a plain integer; that a program cannot forge one is a rule of the language (see "Actors" in
 [Compiler.md](Compiler.md)). Only connections move; listeners stay with the isolate that opened them.
 
+**Active sockets — reading handed to the runtime.** An actor that owns a connection may also have to react to
+its inbox, and each wait covers only one kind of source. `rawActivate(fd, inbox, mode, maxLen, pending)`
+hands the READING of a connection to the runtime, which delivers what arrives into an inbox of the caller;
+the actor then waits on that inbox and its own with `rawSelect`. `rawActiveSend(id, data)` writes and
+`rawActiveClose(id)` closes. This is Erlang's "active mode".
+- **One I/O thread per world**, started by the first activation, polls every active socket (`WSAPoll` /
+  `poll`). It runs no program code and touches no heap: each event is posted as an encoded `Bytes` value
+  whose first byte names the kind (data, line, end of stream, failure), and the owner decodes it like any
+  other message. Lines are cut on the I/O thread, with a maximum length.
+- **It never waits.** When the inbox is full it marks it and stops reading that socket; the receive that
+  makes room clears the mark and wakes the thread. Both happen under the mailbox's lock, so no wake-up is
+  lost. With a bounded inbox, a slow owner makes TCP hold the peer back.
+- **Only the I/O thread closes an active socket**, and never while it is polling — otherwise the operating
+  system could give the number to a new socket that is still being polled. The owner only asks, and its
+  end asks for it. The descriptor of an activated connection is refused afterwards with "socket was
+  activated".
+- The thread is woken through a connected pair of loopback sockets on every platform, and the world stops
+  it after every isolate has ended.
+- **A listener can be activated too** (`rawActivateListener(fd, inbox)`). The thread then accepts, makes
+  each new connection blocking again, parks it in the world's hand-off table exactly as `rawHandOff`
+  would, and delivers its ticket — which the owner may send on to a worker. Connections accepted but not
+  yet delivered are closed when the inbox closes, the listener is closed or its owner ends, so no client is
+  left waiting; a ticket already in the inbox is closed, like any untaken ticket, when the world ends.
+
 ## Embedding the VM
 
 A compiler's entire contract with the VM is the instruction set plus the `Assembler` that emits it. It never

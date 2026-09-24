@@ -420,6 +420,27 @@ ticket for someone else's connection. After the hand-off the sender's `TcpConn` 
 rule of the runtime, not of the type system, that every operation on it now returns an `Err` saying the
 socket was handed to another actor.
 
+An actor that owns a connection and must also react to its inbox cannot block in `recvLine`.
+`c.activate(framing, capacity)` hands the reading of the connection to the runtime and returns two halves:
+an `ActiveConn` to write with (`send`, `sendStr`, `close`) and the `SockEvents` to read from, an inbox of
+the actor into which the runtime delivers what arrives. `select` then waits on it and the actor's own
+inbox together.
+- **Events:** `Framing::Lines(max)` delivers `Line(text)` per line and `Framing::Raw` delivers `Chunk(bytes)`
+  as read; `Eof` ends the stream, `Failed(why)` reports an error or a line longer than `max`, and
+  `Stopping` is the actor's own stop. The names differ from `Mail`'s and `std::poll`'s on purpose, so a
+  program using all three may write each one bare.
+- **Back-pressure:** at most `capacity` events wait; while the inbox is full the runtime stops reading.
+- **Rules:** neither `ActiveConn` nor `SockEvents` can be sent to another actor, and a literal of either
+  outside `std::net` is an error. As with a hand-off, the activated `TcpConn` still type-checks but every
+  operation on it returns an `Err`; the connection is closed when its actor ends.
+
+A listener can be activated the same way. `l.activate(capacity)` returns an `ActiveListener` (`close`)
+and `IncomingClients` (`ref`, `receive`, `receiveTimeout`), and every new connection arrives as
+`Incoming::NewClient(ticket)` — a `SocketHandOff`, ready to be sent on to a worker. `AcceptFailed(why)`
+ends the listener and `ListenerStopping` is the actor's own stop, so an acceptor waiting with `select`
+can be messaged and stopped. Neither half can be sent, a literal of either outside `std::net` is an
+error, and the listener is closed when its actor ends.
+
 `std::supervisor` keeps actors running, written in Skarn over `std::actor`, with no rule and no native of
 its own.
 - **What it does:** `supervise(inbox, children, limit)` starts every child and starts again each one that

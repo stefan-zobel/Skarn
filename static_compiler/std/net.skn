@@ -15,6 +15,13 @@
 // connection to another actor, on another thread); PLAINTEXT only (no TLS -> HTTP yes,
 // HTTPS no); a socket must be closed explicitly (execute() teardown is only the safety net). Both
 // IPv4 and IPv6 are supported (the client tries every resolved address; the server is dual-stack).
+//
+// ACTIVE CONNECTIONS. An actor that owns a connection and must also react to its inbox cannot block in
+// recvLine. `c.activate(framing, capacity)` hands the READING to the runtime, which delivers what
+// arrives as SockEvents into an inbox of the actor; `select` then waits on that and the actor's own
+// inbox at once. See the ActiveConn section below.
+
+use std::actor::*
 
 // A connected TCP stream. `fd` is the OS socket descriptor; `buf` holds bytes read past a line
 // boundary by recvLine (it stays empty for a purely byte-oriented user of send/recv).
@@ -116,6 +123,25 @@ impl TcpConn {
     let token = rawHandOff(self.fd)?
     Ok(SocketHandOff { token: token, buf: self.buf })
   }
+
+  // Hand the READING of this connection to the runtime (see ActiveConn below). What arrives comes as
+  // SockEvents, cut by `framing`, into an inbox of at most `capacity` events; while it is full the
+  // runtime stops reading and TCP holds the peer back. Write through the returned ActiveConn. This
+  // TcpConn is dead from now on: every operation on it returns Err("... socket was activated").
+  // Bytes recvLine had already read past a line come first. Only an actor or the main program can.
+  fn activate(self, framing: Framing, capacity: Int) -> Result[(ActiveConn, SockEvents), String] {
+    if capacity < 1 { return Err("activate: the capacity must be 1 or more") }
+    let mode = match framing { Framing::Raw => 0, Framing::Lines(_) => 1 }
+    let maxLen = match framing { Framing::Raw => 0, Framing::Lines(n) => n }
+    let box: Inbox[Bytes] = newBoundedInbox(capacity)
+    match rawActivate(self.fd, box, mode, maxLen, self.buf) {
+      Ok(id) => Ok((ActiveConn { id: id }, SockEvents { box: box })),
+      Err(e) => {
+        box.close()
+        Err(e)
+      }
+    }
+  }
 }
 
 // --- a listener's own API ---
@@ -133,6 +159,22 @@ impl TcpListener {
 
   // Stop listening (server self-shutdown).
   fn close(self) -> Result[(), String] { tcpClose(self.fd) }
+
+  // Hand the ACCEPTING to the runtime (see ActiveListener below). Every new connection arrives as
+  // Incoming::NewClient(ticket) in an inbox of at most `capacity` events; while it is full the runtime
+  // accepts nothing and new clients wait in the operating system's queue. Close through the returned
+  // ActiveListener. This TcpListener is dead from now on. Only an actor or the main program can.
+  fn activate(self, capacity: Int) -> Result[(ActiveListener, IncomingClients), String] {
+    if capacity < 1 { return Err("activate: the capacity must be 1 or more") }
+    let box: Inbox[Bytes] = newBoundedInbox(capacity)
+    match rawActivateListener(self.fd, box) {
+      Ok(id) => Ok((ActiveListener { id: id }, IncomingClients { box: box })),
+      Err(e) => {
+        box.close()
+        Err(e)
+      }
+    }
+  }
 }
 
 // --- handing a connection to another actor ---
@@ -150,6 +192,158 @@ impl SocketHandOff {
   fn take(self) -> Result[TcpConn, String] {
     let fd = rawTake(self.token)?
     Ok(TcpConn { fd: fd, buf: self.buf })
+  }
+}
+
+// --- active connections (Erlang's active mode) ---
+//
+// A connection whose READING the runtime has taken over (`c.activate(framing, capacity)`). One thread
+// per program reads every active connection and delivers what arrives into an inbox of its owner, as
+// SockEvents; the owner waits on them and on its own inbox with `select`:
+//
+//     let (out, events) = conn.activate(Framing::Lines(4096), 64)?
+//     let watching = toVec([events.ref(), inbox.ref()])
+//     loop {
+//       match select(watching, -1) {
+//         Some(0) => match events.receive() {
+//           Line(s) => ...,                // a line from the peer
+//           _ => return ()                 // Eof, Failed(why) or Stopping
+//         },
+//         _ => match inbox.receive() { ... }   // a message; answer with out.sendStr(...)
+//       }
+//     }
+//
+// Neither half can be sent to another actor: the events are an inbox of this one, and only the actor
+// that activated a connection may write to it or close it. The runtime closes it when that actor ends.
+
+// How the input is cut into events: Raw delivers the chunks as they are read (SockEvent::Chunk);
+// Lines(max) delivers every line (SockEvent::Line, without its "\n" or "\r\n"), and a line longer than
+// `max` bytes ends the stream with SockEvent::Failed.
+pub enum Framing { Raw, Lines(Int) }
+
+// What an active connection delivers. Eof is the end of the stream (the peer closed it); after Eof or
+// Failed nothing more comes. Stopping is the actor's own Stop: every inbox of an actor gets one when it
+// is told to end. The names are deliberately none of Mail's (Stop) or std::poll's (Data, Closed), so a
+// program importing all three may write every variant bare.
+pub enum SockEvent { Chunk(Bytes), Line(String), Eof, Failed(String), Stopping }
+
+// The writing half. Only `c.activate(...)` makes one.
+pub struct ActiveConn { id: Int }
+
+impl ActiveConn {
+  // Send a whole byte buffer.
+  fn send(self, data: Bytes) -> Result[(), String] { rawActiveSend(self.id, data) }
+
+  // Send a whole string's bytes.
+  fn sendStr(self, s: String) -> Result[(), String] { rawActiveSend(self.id, toBytes(s)) }
+
+  // Close the connection. Later sends return an Err, and events not received yet are dropped.
+  // Closing twice is fine.
+  fn close(self) -> () { rawActiveClose(self.id) }
+}
+
+// The reading half: an inbox the runtime delivers into. Only `c.activate(...)` makes one.
+pub struct SockEvents { box: Inbox[Bytes] }
+
+impl SockEvents {
+  // This inbox, for `select`.
+  fn ref(self) -> InboxRef { self.box.ref() }
+
+  // The next event; waits for one.
+  fn receive(self) -> SockEvent { _sockEvent(self.box.receive()) }
+
+  // The next event, or None if none came within `ms` milliseconds.
+  fn receiveTimeout(self, ms: Int) -> Option[SockEvent] {
+    match self.box.receiveTimeout(ms) {
+      Some(m) => Some(_sockEvent(m)),
+      None => None
+    }
+  }
+}
+
+// The runtime's event -- a tag byte, then the payload -- as a SockEvent. An inbox of this kind never
+// gets an exit report (nothing can monitor into it), so anything but a message is the actor's Stop,
+// which it passes on as Stopping.
+fn _sockEvent(m: Mail[Bytes]) -> SockEvent {
+  match m {
+    Mail::Msg(b) => {
+      let tag = b[0]
+      let rest = _sub(b, 1, len(b))
+      if tag == 0 { SockEvent::Chunk(rest) }
+      else if tag == 1 { SockEvent::Line(fromBytes(rest)) }
+      else if tag == 2 { SockEvent::Eof }
+      else { SockEvent::Failed(fromBytes(rest)) }
+    }
+    _ => SockEvent::Stopping
+  }
+}
+
+// --- active listeners ---
+//
+// A listener whose ACCEPTING the runtime has taken over (`l.activate(capacity)`). The same thread that
+// reads active connections accepts, and delivers each new connection as a SocketHandOff ticket -- which
+// can be sent on to a worker unchanged, where `take()` turns it into a TcpConn as usual. So an acceptor
+// waits on new clients AND its own inbox with `select`, and a Stop reaches it:
+//
+//     let (lst, incoming) = srv.activate(16)?
+//     let watching = toVec([incoming.ref(), inbox.ref()])
+//     loop {
+//       match select(watching, -1) {
+//         Some(0) => match incoming.receive() {
+//           NewClient(ticket) => { send(worker, ticket) }
+//           _ => return ()                         // AcceptFailed(why) or ListenerStopping
+//         },
+//         _ => match inbox.receive() { ... }
+//       }
+//     }
+//
+// Neither half can be sent to another actor, and the runtime closes the listener when its actor ends.
+// Connections accepted but not received yet are closed with it, so no client waits on one nobody gets.
+
+// What an active listener delivers. AcceptFailed ends it (nothing more comes); ListenerStopping is the
+// actor's own Stop. The names are none of SockEvent's, Mail's or std::poll's, so all may be written bare.
+pub enum Incoming { NewClient(SocketHandOff), AcceptFailed(String), ListenerStopping }
+
+// The listener. Only `l.activate(...)` makes one.
+pub struct ActiveListener { id: Int }
+
+impl ActiveListener {
+  // Stop listening. Connections accepted but not received yet are closed; closing twice is fine.
+  fn close(self) -> () { rawActiveClose(self.id) }
+}
+
+// The new clients: an inbox the runtime delivers into. Only `l.activate(...)` makes one.
+pub struct IncomingClients { box: Inbox[Bytes] }
+
+impl IncomingClients {
+  // This inbox, for `select`.
+  fn ref(self) -> InboxRef { self.box.ref() }
+
+  // The next event; waits for one.
+  fn receive(self) -> Incoming { _incoming(self.box.receive()) }
+
+  // The next event, or None if none came within `ms` milliseconds.
+  fn receiveTimeout(self, ms: Int) -> Option[Incoming] {
+    match self.box.receiveTimeout(ms) {
+      Some(m) => Some(_incoming(m)),
+      None => None
+    }
+  }
+}
+
+// The runtime's event as an Incoming: tag 4 carries a hand-off ticket as decimal text, tag 3 a failure.
+fn _incoming(m: Mail[Bytes]) -> Incoming {
+  match m {
+    Mail::Msg(b) => {
+      let rest = fromBytes(_sub(b, 1, len(b)))
+      if b[0] == 4 {
+        let token = match parseInt(rest) { Ok(t) => t, Err(_) => -1 }
+        Incoming::NewClient(SocketHandOff { token: token, buf: bytes() })
+      } else {
+        Incoming::AcceptFailed(rest)
+      }
+    }
+    _ => Incoming::ListenerStopping
   }
 }
 

@@ -144,7 +144,15 @@ enum NativeId : uint16_t {
     // Waiting on SEVERAL inboxes: answers WHICH one has something, so the receive that follows is an
     // ordinary typed one. The wait is on the isolate's WaitPad, not on any one mailbox.
     NATIVE_SELECT      = 82,    // rawSelect(boxes, timeoutMs) -> Int (the index, or -1 on the timeout)
-    NATIVE_COUNT       = 83,
+    // Active sockets (Erlang's active mode): the world's I/O thread reads an activated connection and
+    // delivers what arrives into an inbox of its owner, which then waits on it with select.
+    NATIVE_ACTIVATE    = 83,    // rawActivate(sock, inbox, mode, maxLen, pending) -> Int | String
+                                //   (the connection's id; mode 0 raw chunks, 1 lines; the descriptor goes stale)
+    NATIVE_ACTIVE_SEND = 84,    // rawActiveSend(conn, data) -> nil | String
+    NATIVE_ACTIVE_CLOSE = 85,   // rawActiveClose(conn)    -> ()   (the I/O thread closes it; twice is fine)
+    NATIVE_ACTIVATE_LISTENER = 86, // rawActivateListener(sock, inbox) -> Int | String (the listener's id; each
+                                //   accepted connection arrives as a hand-off ticket; the descriptor goes stale)
+    NATIVE_COUNT       = 87,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -240,6 +248,10 @@ inline int native_id_of(const std::string& name) {
     if (name == "rawStopRequested") return NATIVE_STOP_REQUESTED;
     if (name == "rawSleep") return NATIVE_SLEEP;
     if (name == "rawSelect") return NATIVE_SELECT;
+    if (name == "rawActivate") return NATIVE_ACTIVATE;
+    if (name == "rawActiveSend") return NATIVE_ACTIVE_SEND;
+    if (name == "rawActiveClose") return NATIVE_ACTIVE_CLOSE;
+    if (name == "rawActivateListener") return NATIVE_ACTIVATE_LISTENER;
     return -1;
 }
 
@@ -270,6 +282,9 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_ACCEPT_NB:
         case NATIVE_RECV_NB:
         case NATIVE_SEND_NB:
+        case NATIVE_ACTIVATE:
+        case NATIVE_ACTIVE_SEND:
+        case NATIVE_ACTIVATE_LISTENER:
         case NATIVE_RUN_PROCESS: return NRET_RESULT;
         case NATIVE_GET_ENV:
         case NATIVE_READ_LINE:   return NRET_OPTION;
@@ -298,6 +313,7 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_NEW_INBOX: case NATIVE_CLOSE_INBOX: case NATIVE_TRY_SEND: case NATIVE_ACTOR_SPAWN_BOUNDED:
         case NATIVE_NEW_SLOT: case NATIVE_SPAWN_INTO: case NATIVE_RELEASE_SLOT: case NATIVE_STOP_ACTOR:
         case NATIVE_MONITOR: case NATIVE_STOP_REQUESTED: case NATIVE_SLEEP: case NATIVE_SELECT:
+        case NATIVE_ACTIVE_CLOSE:
         case NATIVE_READ_ALL_STDIN: return NRET_PLAIN;
         default:                 return NRET_RESULT;
     }
@@ -327,10 +343,13 @@ inline int native_arity(int id) {
         case NATIVE_SELECT:
         case NATIVE_TRY_SEND:
         case NATIVE_MONITOR:
+        case NATIVE_ACTIVE_SEND:
+        case NATIVE_ACTIVATE_LISTENER:
         case NATIVE_RUN_PROCESS: return 2;
         case NATIVE_ACTOR_SPAWN_BOUNDED:
         case NATIVE_SPAWN_INTO:
         case NATIVE_POLL:        return 3;
+        case NATIVE_ACTIVATE:    return 5;
         case NATIVE_READ_FILE:
         case NATIVE_GET_ENV:
         case NATIVE_FILE_EXISTS:
@@ -365,6 +384,7 @@ inline int native_arity(int id) {
         case NATIVE_STOP_ACTOR:
         case NATIVE_STOP_REQUESTED:
         case NATIVE_SLEEP:
+        case NATIVE_ACTIVE_CLOSE:
         case NATIVE_SHA256:
         case NATIVE_F64_TO_BYTES: return 1;
         case NATIVE_NANO_TIME:

@@ -1282,6 +1282,15 @@ private:
         // (see SocketHandOff in net.skn, and the literal rule in infer_struct_lit).
         add_native("rawHandOff",   { ty_int() },    make_named(std_Result(), { ty_int(),   S }), STD_NET);
         add_native("rawTake",      { ty_int() },    make_named(std_Result(), { ty_int(),   S }), STD_NET);
+        // Activating a connection: the world's I/O thread reads it and delivers tagged Bytes into an
+        // inbox of the caller (see ActiveConn / SockEvents in net.skn, and the literal rule in
+        // infer_struct_lit). The id is what rawActiveSend / rawActiveClose take.
+        add_native("rawActivate",  { ty_int(), make_named(std_Inbox(), { B }), ty_int(), ty_int(), B },
+                                   make_named(std_Result(), { ty_int(),   S }), STD_NET);
+        add_native("rawActiveSend",{ ty_int(), B }, make_named(std_Result(), { ty_unit(),  S }), STD_NET);
+        add_native("rawActiveClose",{ ty_int() },   ty_unit(),                                 STD_NET);
+        add_native("rawActivateListener", { ty_int(), make_named(std_Inbox(), { B }) },
+                                   make_named(std_Result(), { ty_int(),   S }), STD_NET);
         // Hashing -- std::hash (opt-in; the pure-Skarn crc32 + hex helpers live in hash.skn, same module).
         // sha256 is a native (32-bit modular arithmetic is awkward in a 48-bit-Int language) returning the
         // raw 32-byte digest as Bytes; the prelude sha256Hex/sha256HexStr render it.
@@ -4530,8 +4539,15 @@ private:
             return send_blocker_in(t->args[1], active);
         }
         if (t->name == mangle_name(STD_NET, "TcpConn") || t->name == mangle_name(STD_NET, "TcpListener") ||
-            t->name == mangle_name(STD_POLL, "NbConn") || t->name == mangle_name(STD_POLL, "NbListener"))
+            t->name == mangle_name(STD_POLL, "NbConn") || t->name == mangle_name(STD_POLL, "NbListener") ||
+            t->name == mangle_name(STD_NET, "ActiveConn") || t->name == mangle_name(STD_NET, "ActiveListener"))
             return "a socket handle (" + r(t) + ")";
+        // An active connection's events arrive in an inbox of its owner; elsewhere it would be a reading
+        // end of someone else's connection. (Its Inbox field would bar it too -- this names the cause.)
+        if (t->name == mangle_name(STD_NET, "SockEvents"))
+            return "an active connection's events (" + r(t) + ")";
+        if (t->name == mangle_name(STD_NET, "IncomingClients"))
+            return "an active listener's new clients (" + r(t) + ")";
         if (t->name == std_Task()) return "a task handle (" + r(t) + ")";
         // An Inbox is the RECEIVING end of one actor's mailbox; a copy in another isolate could read
         // that actor's mail. Its address (Pid) is plain data and may travel.
@@ -5987,6 +6003,18 @@ private:
         // somebody else's connection. Only `c.handOff()` makes one.
         if (e.name == mangle_name(STD_NET, "SocketHandOff") && cur_module_ != STD_NET)
             error(e.line, e.col, "a SocketHandOff can only be created by `c.handOff()`");
+        // An ActiveConn names an activated connection by a guessable Int, and a SockEvents built around
+        // any Inbox[Bytes] would read ordinary mail as socket events. Only `c.activate(...)` makes them.
+        if ((e.name == mangle_name(STD_NET, "ActiveConn") || e.name == mangle_name(STD_NET, "SockEvents")) &&
+            cur_module_ != STD_NET)
+            error(e.line, e.col, "an " + std::string(e.name == mangle_name(STD_NET, "ActiveConn")
+                                         ? "ActiveConn" : "SockEvents") + " can only be created by `c.activate(...)`");
+        // The same for an activated listener: its id is a guessable Int, and an IncomingClients around any
+        // Inbox[Bytes] would read ordinary mail as new clients. Only `l.activate(...)` makes them.
+        if ((e.name == mangle_name(STD_NET, "ActiveListener") || e.name == mangle_name(STD_NET, "IncomingClients")) &&
+            cur_module_ != STD_NET)
+            error(e.line, e.col, "an " + std::string(e.name == mangle_name(STD_NET, "ActiveListener")
+                                         ? "ActiveListener" : "IncomingClients") + " can only be created by `l.activate(...)`");
         // An ActorFn / a TaskFn is sendable because its function is a named one; a literal could hold a
         // closure, which cannot cross heaps.
         if (e.name == std_ActorFn() && cur_module_ != STD_ACTOR)

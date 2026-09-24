@@ -1,0 +1,9 @@
+// CLAIM: neither half of an activated connection can be sent to another actor -- a message type that contains an ActiveConn is a compile error.
+// GUIDE: SkarnActors.md (A connection that also listens to its inbox)
+// EXPECT: fail cannot be sent to an actor: they contain a socket handle (std::net::ActiveConn)
+use std::actor::*
+use std::net::*
+
+fn writer(inbox: Inbox[ActiveConn], unused: Int) -> () {}
+
+let w = spawnActor(writer, 0)

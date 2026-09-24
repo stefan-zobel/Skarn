@@ -175,6 +175,7 @@ int main(int argc, char** argv) {
     run("value_codec_sharing",      test_value_codec_sharing_and_cycles);
     run("value_codec_refusals",     test_value_codec_refusals);
     run("value_codec_malformed",    test_value_codec_malformed);
+    run("value_codec_encode_bytes", test_value_codec_encode_bytes);
     run("rooted_pool_release",      test_rooted_pool_release);
     run("value_codec_collects",     test_value_codec_collects);
     run("thread_slot_table",        test_thread_slot_table);
@@ -191,6 +192,8 @@ int main(int argc, char** argv) {
     run("actor_many",               test_actor_many);
     run("actor_misuse",             test_actor_misuse);
     run("actor_socket_hand_off",    test_actor_socket_hand_off);
+    run("active_socket",            test_active_socket);
+    run("active_listener",          test_active_listener);
     run("actor_extra_inbox_reply",  test_actor_extra_inbox_reply);
     run("actor_bounded_backpressure", test_actor_bounded_backpressure);
     run("actor_bounded_shutdown",   test_actor_bounded_shutdown);
