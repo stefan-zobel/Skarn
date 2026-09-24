@@ -35,9 +35,16 @@ set(GEN_SCRIPT "${CMAKE_SOURCE_DIR}/static_compiler/gen_prelude_embed.py")
 
 file(GLOB SKN_FILES "${STD_DIR}/*.skn")
 
+# MSVC refuses a string literal longer than about 16 KB (C2026), so there each module is
+# embedded as adjacent literals of about 4 KB, which the compiler concatenates.
+set(EMBED_OPTIONS)
+if(MSVC)
+    set(EMBED_OPTIONS --chunk 4096)
+endif()
+
 add_custom_command(
     OUTPUT  "${EMBED_INC}"
-    COMMAND "${Python3_EXECUTABLE}" "${GEN_SCRIPT}"
+    COMMAND "${Python3_EXECUTABLE}" "${GEN_SCRIPT}" ${EMBED_OPTIONS}
             "${MANIFEST}" "${STD_DIR}" "${EMBED_INC}"
     DEPENDS "${GEN_SCRIPT}" "${MANIFEST}" ${SKN_FILES}
     COMMENT "Generating prelude_embed.inc from std/*.skn"
