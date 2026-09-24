@@ -74,7 +74,7 @@ both, this extension (`skarn-language-<version>.vsix`) and `skarn_lsp.exe`; else
 is built from source with CMake and ends up as `build/skarn_lsp`.
 
 1. Install the extension: in the Extensions view choose **…** → **Install from VSIX…** and
-   pick the `.vsix`, or run `code --install-extension skarn-language-0.2.0.vsix`.
+   pick the `.vsix`, or run `code --install-extension skarn-language-0.3.0.vsix`.
 2. Tell it where the server is: open the Settings, search for `skarn`, and set
    **Skarn › Server: Path** to the full path of the server binary — in `settings.json`:
 
@@ -121,8 +121,8 @@ To install it permanently, package it with [`vsce`](https://github.com/microsoft
 npm install -g @vscode/vsce
 cd tools/vscode-skarn
 npm ci
-vsce package          # produces skarn-language-0.2.0.vsix
-code --install-extension skarn-language-0.2.0.vsix
+vsce package          # produces skarn-language-0.3.0.vsix
+code --install-extension skarn-language-0.3.0.vsix
 ```
 
 The package contains the extension, its `vscode-languageclient` dependency, this README,

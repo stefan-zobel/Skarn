@@ -4795,6 +4795,9 @@ case), `m` (multiline), `s` (dotall) — as `Regex::compileWith(pattern, "ims")`
 
 ### Where to go next
 
+- [Actors in Skarn](SkarnActors.md) — long-lived workers that share nothing and talk by messages:
+  mailboxes, supervisors and back-pressure, in 19 short sections. It is the guide of its own that §21
+  points at.
 - The grammar in `docs/skarn_grammar.ebnf` is the precise reference for the syntax.
 - [docs/Compiler.md](docs/Compiler.md) and [docs/VirtualMachine.md](docs/VirtualMachine.md) describe how the
   compiler and the virtual machine work inside.

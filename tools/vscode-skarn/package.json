@@ -2,7 +2,7 @@
   "name": "skarn-language",
   "displayName": "Skarn",
   "description": "Syntax highlighting, live type checking, outline, hover, go to definition, references, rename, completion, signature help and formatting for the Skarn language (.skn files).",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "vmachine",
   "license": "MIT",
   "repository": {
