@@ -93,6 +93,10 @@ a program with one module.
   enum variants follow their item, and methods follow their type or trait.
 - A glob import is **weak**: a local definition or an explicit `use` wins over it, while two explicit imports
   of the same name are an error.
+- **Two globs that provide the same name differently** make it ambiguous: the imports are fine, but using
+  the name bare is an error that names both modules. A qualified path, an explicit `use` or a local
+  definition decides. A glob the program writes beats the names the standard library makes available
+  everywhere, as a prelude does in Rust.
 - **Orphan rule:** `impl Trait for Type` requires the trait or the type to be defined in the same module.
 - **Uppercase and lowercase decide** what a `::` path means: a lowercase head is a module, an uppercase head a
   type, trait or enum (`Enum::Variant`, `Type::method`, `Trait::method`).

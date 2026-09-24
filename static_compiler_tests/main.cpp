@@ -2993,6 +2993,64 @@ void test_modules() {
                cg_modules_check_fails("use util::add\n fn add(a: Int, b: Int) -> Int { a + b }\n add(1, 2)",
                    M{{"util", "pub fn add(a: Int, b: Int) -> Int { a + b }"}}));
 
+    // --- two globs providing one name (fix_glob_collision) ---
+    // The imports are fine; a BARE use of a name two globs provide differently is an error at the use,
+    // naming both modules (Rust's rule). Before, the LAST `use` won silently: f() was 2 in one order and
+    // 1 in the other, and a bare variant resolved to the wrong enum.
+    {
+        const M AB{{"ma", "pub enum A { X, Y }\npub struct P { n: Int }\npub trait T { fn t(self) -> Int }\n"
+                          "pub fn f() -> Int { 1 }\npub fn onlyA() -> Int { 10 }"},
+                   {"mb", "pub enum B { X, Z }\npub struct P { n: Int }\npub trait T { fn t(self) -> Int }\n"
+                          "pub fn f() -> Int { 2 }"}};
+        const std::string HEAD = "import ma\nimport mb\nuse ma::*\nuse mb::*\n";
+        auto errors_of = [](const std::string& entry, const M& mods) -> std::string {   // every message
+            try {
+                svc::compile_modules(svc::load_modules(entry.c_str(), mem_resolver(mods)), nullptr);
+                return "";
+            } catch (const svc::CheckFailure& e) {
+                std::string all;
+                for (const svc::TypeError& te : e.errors()) all += te.message + "\n";
+                return all;
+            } catch (const std::exception& e) { return e.what(); }
+        };
+        auto count_of = [](const std::string& s, const std::string& what) {
+            size_t n = 0;
+            for (size_t p = s.find(what); p != std::string::npos; p = s.find(what, p + 1)) ++n;
+            return n;
+        };
+        const std::string fn_err = errors_of(HEAD + "f()", AB);
+        check_true("mod_glob_collision_fn_error",
+                   fn_err.find("'f' is ambiguous: it is provided by both `use ma::*` and `use mb::*` -- "
+                               "write ma::f or mb::f") != std::string::npos);
+        check_true("mod_glob_collision_variant_error",
+                   errors_of(HEAD + "fn g(a: A) -> Int { match a { X => 1, Y => 2 } }\ng(A::Y)", AB)
+                       .find("'X' is ambiguous") != std::string::npos);
+        check_true("mod_glob_collision_type_error",
+                   errors_of(HEAD + "fn g(p: P) -> Int { 0 }\n0", AB).find("'P' is ambiguous") != std::string::npos);
+        check_true("mod_glob_collision_trait_error",
+                   errors_of(HEAD + "fn g[Q: T](q: Q) -> Int { 0 }\n0", AB).find("'T' is ambiguous") != std::string::npos);
+        // A name that nobody uses is no error, and a name only one glob provides resolves as before.
+        check_int_modules("mod_glob_collision_unused_ok", HEAD + "onlyA()", AB, 10);
+        // An explicit `use`, an own declaration or a qualified path decides.
+        check_int_modules("mod_glob_collision_explicit_resolves", HEAD + "use mb::f\nf()", AB, 2);
+        check_int_modules("mod_glob_collision_local_resolves", HEAD + "fn f() -> Int { 7 }\nf()", AB, 7);
+        check_int_modules("mod_glob_collision_qualified_ok", HEAD + "ma::f() + mb::f()", AB, 3);
+        // One target reached two ways is not a collision.
+        check_int_modules("mod_glob_same_key_twice_ok",
+                          "import ma\nuse ma::*\nuse ma::A::*\nmatch Y { X => 1, Y => 2 }", AB, 2);
+        // Reported once per use: two uses, two errors -- and not more, although the checker may look at
+        // the same node more than once.
+        check_true("mod_glob_collision_error_once",
+                   count_of(errors_of(HEAD + "f() + f()", AB), "'f' is ambiguous") == 2);
+    }
+    // A glob beats the implicit ring (Rust's prelude rule): a module's own `trim` wins where it is
+    // glob-imported. It used to lose silently to std::string's -- here that would be a type error, since
+    // the ring's returns a String. Without such a glob, the ring's name is still there.
+    check_int_modules("mod_glob_beats_ring", "import ma\nuse ma::*\ntrim(\" x \")",
+                      M{{"ma", "pub fn trim(s: String) -> Int { 42 }"}}, 42, svc::builtin_prelude());
+    check_int_modules("mod_glob_ring_still_bare", "import ma\nuse ma::*\nlen(trim(\" ab \"))",
+                      M{{"ma", "pub fn other() -> Int { 1 }"}}, 2, svc::builtin_prelude());
+
     // --- qualified `mod::name` calls + values (case split: lident qualifier = module) ---
     // A module-qualified fn CALL.
     check_int_modules("mod_qual_fn",

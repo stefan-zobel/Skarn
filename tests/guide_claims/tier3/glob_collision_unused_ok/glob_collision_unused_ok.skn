@@ -1,0 +1,8 @@
+// CLAIM: two globs that both provide a name are fine as long as the name is not used bare; a qualified path picks either one.
+// GUIDE: §Modules (binding precedence)
+// EXPECT: ok 10 3
+import a
+import b
+use a::*
+use b::*
+println(onlyA(), " ", a::foo() + b::foo())

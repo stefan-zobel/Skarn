@@ -1,0 +1,2 @@
+pub fn foo() -> Int { 1 }
+pub fn onlyA() -> Int { 10 }

@@ -1,0 +1,8 @@
+// CLAIM: two globs that provide the same name make it ambiguous; the bare name is an error where it is used, naming both modules (no silent pick of either).
+// GUIDE: §Modules (binding precedence)
+// EXPECT: fail 'foo' is ambiguous: it is provided by both `use a::*` and `use b::*`
+import a
+import b
+use a::*
+use b::*
+println(foo())

@@ -30,6 +30,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <set>
 #include <unordered_set>
 #include <vector>
 
@@ -438,7 +439,19 @@ private:
     std::string cur_module_;
     std::unordered_map<std::string, std::unordered_set<std::string>> module_declared_;   // prefix -> its bare decl names
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> use_map_;   // prefix -> (bare -> mangled): explicit `use` (STRONG)
-    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> use_glob_;  // prefix -> (bare -> mangled): `use m::*` (WEAK)
+    // prefix -> (bare -> the mangled names every explicit glob of that module brings in for it): `use m::*`
+    // and `use m::Enum::*` (WEAK). A SET, because two globs of one module may name the same thing (then
+    // nothing is ambiguous) or two different things (then the bare name is ambiguous, an error where it is
+    // USED -- see report_glob_ambiguity). A map that one glob could overwrite made the last `use` win,
+    // silently, and handed a program the wrong function with no diagnostic.
+    std::unordered_map<std::string, std::unordered_map<std::string, std::set<std::string>>> use_glob_;
+    // prefix -> (bare -> mangled): the implicit ring (std::core / iter / string), below every explicit glob
+    // (Rust's prelude rule). It used to share one map with the explicit globs and was filled AFTER them, so
+    // a ring name silently beat a module's own export of the same name.
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> ring_glob_;
+    // Ambiguous glob names already reported, as "module\x1fline\x1fcol\x1fname": a node checked twice
+    // (speculatively, then for real) must not report twice.
+    std::unordered_set<std::string> reported_ambiguous_;
     std::unordered_map<std::string, std::unordered_set<std::string>> imported_prefixes_;  // prefix -> module prefixes it imports
     // prefix -> the modules it glob-imports (`use m::*`). Kept apart from imported_prefixes_, which any
     // `import`/`use` of a module fills: a gated native is reachable through a glob or its own name only.
@@ -467,18 +480,72 @@ private:
     // source module's mangled name; a `use m::*` glob name -> likewise; otherwise the bare name
     // (a prelude / ambient name). Identity in a bare scope.
     std::string mangle_ref(const std::string& name) const {
-        // Priority (Rust's weak-glob rule): own declaration > explicit `use` (both STRONG) >
-        // `use m::*` glob (WEAK) > a bare ambient/prelude/root name.
+        // Priority (Rust's rules): own declaration > explicit `use` (both STRONG) > an explicit glob
+        // `use m::*` (WEAK) > the implicit ring > a bare ambient/prelude/root name. Two explicit globs
+        // naming DIFFERENT things make the name ambiguous: the first in sort order is returned so that
+        // checking can go on deterministically, and the use site reports it (mangle_ref_at).
         if (auto dit = module_declared_.find(cur_module_);
             dit != module_declared_.end() && dit->second.count(name))
             return mangle(cur_module_, name);
         if (auto uit = use_map_.find(cur_module_); uit != use_map_.end())
             if (auto nit = uit->second.find(name); nit != uit->second.end())
                 return nit->second;
-        if (auto git = use_glob_.find(cur_module_); git != use_glob_.end())
-            if (auto nit = git->second.find(name); nit != git->second.end())
+        if (const std::set<std::string>* keys = glob_keys(name)) return *keys->begin();
+        if (auto rit = ring_glob_.find(cur_module_); rit != ring_glob_.end())
+            if (auto nit = rit->second.find(name); nit != rit->second.end())
                 return nit->second;
         return name;
+    }
+
+    // What the explicit globs of the current module bring in for `name`, or null for none. Only the
+    // glob tier: callers ask it after the own declaration and the explicit `use`.
+    const std::set<std::string>* glob_keys(const std::string& name) const {
+        auto git = use_glob_.find(cur_module_);
+        if (git == use_glob_.end()) return nullptr;
+        auto nit = git->second.find(name);
+        return nit == git->second.end() || nit->second.empty() ? nullptr : &nit->second;
+    }
+
+    // mangle_ref for a name WRITTEN at line:col. Resolves it the same way, and if the name reaches the
+    // glob tier with two or more different targets, reports it there -- Rust's rule: the imports are
+    // fine, the bare use of a name two of them provide is not. Every place that resolves a name the
+    // program wrote goes through here; mangle_ref alone is for names the checker itself looks up.
+    std::string mangle_ref_at(const std::string& name, uint32_t line, uint32_t col) {
+        report_glob_ambiguity(name, line, col);
+        return mangle_ref(name);
+    }
+
+    void report_glob_ambiguity(const std::string& name, uint32_t line, uint32_t col) {
+        if (quiet_depth_ > 0) return;                              // a speculative pass: the real one reports
+        if (auto dit = module_declared_.find(cur_module_);
+            dit != module_declared_.end() && dit->second.count(name))
+            return;                                                // an own declaration decides
+        if (auto uit = use_map_.find(cur_module_); uit != use_map_.end() && uit->second.count(name))
+            return;                                                // an explicit `use` decides
+        const std::set<std::string>* keys = glob_keys(name);
+        if (!keys || keys->size() < 2) return;
+        const std::string site = cur_module_ + '\x1f' + std::to_string(line) + '\x1f' + std::to_string(col) +
+                                 '\x1f' + name;
+        if (!reported_ambiguous_.insert(site).second) return;      // this node was reported already
+        std::string mods, spellings;
+        size_t i = 0;
+        for (const std::string& k : *keys) {
+            const bool last = i + 1 == keys->size();
+            mods      += (i == 0 ? "" : last ? " and " : ", ") + ("`use " + module_prefix_of(k) + "::*`");
+            spellings += (i == 0 ? "" : last ? " or " : ", ") + qualified_spelling(k);
+            ++i;
+        }
+        error(line, col, "'" + name + "' is ambiguous: it is provided by " + (keys->size() == 2 ? "both " : "") +
+                         mods + " -- write " + spellings + ", or import one of them by name (`use " +
+                         module_prefix_of(*keys->begin()) + "::" + name + "`)");
+    }
+
+    // How a program writes the thing a mangled key names, qualified: `ma::f` for an item, `A::X` for an
+    // enum variant (whose key is `ma::X`, or `ma::A::X` when the short name collides inside its module).
+    std::string qualified_spelling(const std::string& key) const {
+        if (auto vit = variants_.find(key); vit != variants_.end())
+            return display_name(short_name(vit->second.enum_name)) + "::" + short_name(key);
+        return display_name(key);
     }
 
     // ----- shadowing an ambient name is MODULE-SCOPED -------------------------------------
@@ -624,7 +691,7 @@ private:
     // CALL resolution in `call_module_member`.
     std::string resolve_qualified_ref(std::string& qualifier, const std::string& name,
                                       uint32_t line, uint32_t col) {
-        if (qualifier.empty()) return mangle_ref(name);
+        if (qualifier.empty()) return mangle_ref_at(name, line, col);
         if (!is_module_qualifier(qualifier)) {           // `Enum::Variant`: uppercase enum head
             std::string vk = resolve_qualified_variant(qualifier, name, line, col);
             qualifier.clear();
@@ -650,7 +717,7 @@ private:
     // not an enum / private / has no such variant) it reports a precise diagnostic and returns "".
     std::string resolve_qualified_variant(const std::string& enum_qual, const std::string& variant,
                                           uint32_t line, uint32_t col) {
-        const std::string ekey = mangle_ref(enum_qual);
+        const std::string ekey = mangle_ref_at(enum_qual, line, col);
         auto eit = enums_.find(ekey);
         if (eit == enums_.end()) {
             // A head that is a real type of another kind is "not an enum"; a head that names NOTHING in
@@ -973,7 +1040,7 @@ private:
                     for (const auto& n : dit->second) {
                         const std::string key = mangle(src, n);
                         if (src != P && !visible_across(key)) continue;   // a glob SKIPS non-pub names (Rust)
-                        use_glob_[P][n] = key;                            // overridden by own-decl / explicit use
+                        use_glob_[P][n].insert(key);                          // overridden by own-decl / explicit use
                     }
             } else {                                                 // explicit `use` may not shadow a local decl
                 for (const auto& n : u.names)
@@ -1007,7 +1074,7 @@ private:
                 continue;
             }
             if (u.glob) {                                             // `use mod::Enum::*` -- all variants, WEAK
-                for (const auto& vk : eit->second) use_glob_[P][short_name(vk)] = vk;
+                for (const auto& vk : eit->second) use_glob_[P][short_name(vk)].insert(vk);
             } else {                                                  // `use mod::Enum::{X, Y}` -- STRONG
                 for (const auto& n : u.names) {
                     std::string found;
@@ -1025,11 +1092,13 @@ private:
 
         // Third pass: the implicit auto-import RING. Every module behaves as if it wrote
         // `use std::core::*; use std::iter::*; use std::string::*`, so the ring modules' names
-        // resolve BARE everywhere (WEAK, like any glob -- a local def or an explicit `use` still
-        // wins via mangle_ref's own-decl > use_map_ > use_glob_ priority). This is what keeps the
+        // resolve BARE everywhere -- WEAKER than any glob the module writes itself, as Rust's prelude is:
+        // mangle_ref's order is own-decl > use_map_ > use_glob_ > ring_glob_. So a module's own export
+        // named like a ring function wins where it is glob-imported, instead of silently losing to the
+        // ring (which it did while both shared one map, filled ring-last). This is what keeps the
         // stdlib split ergonomically identical to a flat prelude. A ring module does not glob-import
         // itself (own decls win regardless). module_declared_[R] holds BARE names (inserted before
-        // the decl was mangled), so use_glob_[P][bare] = R::bare -- the canonical mangled name.
+        // the decl was mangled), so ring_glob_[P][bare] = R::bare -- the canonical mangled name.
         {
             const char* const kRing[] = { STD_CORE, STD_ITER, STD_STRING };
             std::unordered_set<std::string> modules;                 // every distinct module prefix present
@@ -1042,7 +1111,7 @@ private:
                     for (const auto& n : dit->second) {
                         const std::string key = mangle(R, n);
                         if (!pub_items_.count(key)) continue;        // only EXPORTED ring names go bare
-                        use_glob_[P][n] = key;
+                        ring_glob_[P][n] = key;
                     }
                 }
         }
@@ -1781,7 +1850,7 @@ private:
         out.reserve(brs.size());
         for (const auto& br : brs) {
             Bound b;
-            b.trait = mangle_ref(br.trait);   // resolve the bound trait through module/ring scope
+            b.trait = mangle_ref_at(br.trait, br.line, br.col);   // resolve the bound trait through module/ring scope
                                               // (e.g. `I: Iterable` in std::iter -> std::iter::Iterable)
             // ...and write it back onto the AST, mirroring the impl-target writeback below: CODEGEN
             // reads `BoundRef::trait` straight from the AST (Codegen.cpp, BlanketDef::bound_traits)
@@ -1866,7 +1935,7 @@ private:
                     if (!is_std && !visible_across(key))              // default private
                         error(t.line, t.col, "trait '" + dt.trait + "' is private in module '" + dt.qualifier + "'");
                 } else {
-                    key = mangle_ref(dt.trait);
+                    key = mangle_ref_at(dt.trait, t.line, t.col);
                 }
                 auto it = traits_.find(key);
                 if (it == traits_.end()) {
@@ -1943,7 +2012,7 @@ private:
                     check_arity(t, nt.name, static_cast<size_t>(ar), args.size());
                     return make_named(nt.name, std::move(args));
                 }
-                const std::string key = mangle_ref(nt.name);   // module-qualify a user type ref
+                const std::string key = mangle_ref_at(nt.name, t.line, t.col);   // module-qualify a user type ref
                 if (auto it = structs_.find(key); it != structs_.end()) {
                     check_arity(t, nt.name, it->second.generics.size(), args.size());
                     return make_named(key, std::move(args));
@@ -2219,7 +2288,11 @@ private:
         TraitInfo& ti = it->second;
         // Module-qualify supertrait references (+ writeback for codegen / the tree-shaker).
         auto& td = const_cast<TraitDecl&>(t);
-        for (auto& s : td.supertraits) s = mangle_ref(s);
+        for (size_t i = 0; i < td.supertraits.size(); ++i) {
+            const bool at = i < td.supertrait_pos.size() && td.supertrait_pos[i].first != 0;
+            td.supertraits[i] = mangle_ref_at(td.supertraits[i], at ? td.supertrait_pos[i].first : t.line,
+                                              at ? td.supertrait_pos[i].second : t.col);
+        }
         ti.supertraits = td.supertraits;
         TyPtr self = tc_.rigid_var("Self");
         ti.self_id = self->var_id;
@@ -2236,7 +2309,8 @@ private:
         ImplInfo info;
         info.ast = &im;
         info.module = im.module_prefix;   // for the orphan rule
-        const_cast<ImplDecl&>(im).trait_name = mangle_ref(im.trait_name);   // module-qualify (+ writeback)
+        const_cast<ImplDecl&>(im).trait_name = mangle_ref_at(im.trait_name, im.trait_line ? im.trait_line : im.line,
+                                                               im.trait_line ? im.trait_col : im.col);   // module-qualify (+ writeback)
         info.trait_name = im.trait_name;
         info.line = im.line; info.col = im.col;
         for (const auto& a : im.trait_args)              // `impl[X] Iterable[X] for …`
@@ -2248,7 +2322,7 @@ private:
             // NamedType so codegen reads the mangled head too. A generic-param target (blanket `for T`) is
             // unaffected (mangle_ref of a non-declared name is identity). cur_module_ is the impl's module.
             auto& nt = const_cast<NamedType&>(static_cast<const NamedType&>(*im.target));
-            nt.name = mangle_ref(nt.name);
+            nt.name = mangle_ref_at(nt.name, nt.line, nt.col);
             info.head = nt.name;
             info.target = resolve_type(*im.target, env);
             // Blanket impl: the target head is one of the impl's own generic params (`for T`),
@@ -3501,7 +3575,7 @@ private:
         if (e.kind == ExprKind::Ident) {
             auto& id = static_cast<IdentExpr&>(e);
             if (id.qualifier.empty() && !id.upper && !lookup(id.name)) {
-                const std::string key = mangle_ref(id.name);
+                const std::string key = mangle_ref_at(id.name, id.line, id.col);
                 if (const FnSig* sig = user_fn(key, &id)) {
                     bool bounded = false;
                     for (const auto& g : sig->generics) if (!g.bounds.empty()) { bounded = true; break; }
@@ -3671,7 +3745,7 @@ private:
         }
         if (e.upper) {
             // An uppercase name is a constructor OR an uppercase const (`PI`); check const first.
-            const std::string ckey = mangle_ref(e.name);
+            const std::string ckey = mangle_ref_at(e.name, e.line, e.col);
             if (auto cit = consts_.find(ckey); cit != consts_.end() && cit->second) {
                 e.name = ckey; return const_ref_type(e, cit->second);
             }
@@ -3686,7 +3760,7 @@ private:
             note_capture(e.name, e.line, e.col);
             return v->ty;
         }
-        const std::string key = mangle_ref(e.name);   // a local shadows; else module-qualify
+        const std::string key = mangle_ref_at(e.name, e.line, e.col);   // a local shadows; else module-qualify
         if (const FnSig* usig = user_fn(key, &e)) {
             // `spawn`'s rules (a named task function, sendable types) are checked at its CALL; a
             // `spawn` passed around as a value would be called where nothing checks them.
@@ -3765,7 +3839,7 @@ private:
     }
 
     TyPtr infer_ctor_value(IdentExpr& e) {
-        const std::string key = mangle_ref(e.name);   // module-qualify the constructor ref
+        const std::string key = mangle_ref_at(e.name, e.line, e.col);   // module-qualify the constructor ref
         if (auto it = variants_.find(key); it != variants_.end()) {
             e.name = key;   // writeback for codegen (the enum/variant is registered mangled)
             const VariantInfo& vi = it->second;
@@ -3956,7 +4030,7 @@ private:
                 // (a qualified INHERENT call). Both resolve the head with the same `mangle_ref`, and
                 // a trait and a type MAY share that key (`trait Foo` + `struct Foo` is legal), so the
                 // choice is made HERE, once, and written back for codegen + the oracle to obey.
-                id.qualifier = mangle_ref(id.qualifier);   // module-qualify the head (+ writeback)
+                id.qualifier = mangle_ref_at(id.qualifier, id.line, id.col);   // module-qualify the head (+ writeback)
                 const bool as_trait    = trait_has_method(id.qualifier, id.name);
                 const bool as_inherent = inherent_has_method(id.qualifier, id.name);
                 if (as_trait && as_inherent) {
@@ -3995,7 +4069,7 @@ private:
                 return call_trait_method(id.qualifier, id.name, args, node);
             }
             if (id.upper) {                            // `V(...)` / `S(...)` constructor call
-                const std::string key = mangle_ref(id.name);   // module-qualify the ctor ref
+                const std::string key = mangle_ref_at(id.name, id.line, id.col);   // module-qualify the ctor ref
                 bool is_variant = variants_.count(key) > 0;
                 bool is_tuple_struct = false;
                 if (auto sit = structs_.find(key); sit != structs_.end())
@@ -4014,7 +4088,7 @@ private:
             if (id.qualifier.empty() && !id.upper && !lookup(id.name)) {
                 // A direct call to a top-level fn (not shadowed) -> instantiate + bounds. A user
                 // fn is module-qualified; a builtin (checked below on the bare name) stays ambient.
-                const std::string key = mangle_ref(id.name);
+                const std::string key = mangle_ref_at(id.name, id.line, id.col);
                 if (const FnSig* sig = user_fn(key, &id)) {
                     id.name = key;   // writeback for codegen
                     callee.ty = ty_error();
@@ -4716,7 +4790,8 @@ private:
         if (!id.qualifier.empty() || lookup(id.name)) return false;   // a local binding, not a fn name
         // By the NAME THIS MODULE SEES: `fns_` is keyed by the mangled name, and the ident still carries
         // the written one here -- check_expr rewrites it only when it checks it, which is the very thing
-        // being ordered.
+        // being ordered. (Unlocated on purpose: an ambiguous name is reported when the argument itself
+        // is checked, at its own position.)
         const auto it = fns_.find(mangle_ref(id.name));
         return it != fns_.end() && !it->second.generics.empty();
     }
