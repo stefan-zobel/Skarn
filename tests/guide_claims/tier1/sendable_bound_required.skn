@@ -1,0 +1,10 @@
+// CLAIM: a generic helper that makes an inbox for a type parameter needs the bound `Sendable` -- without it the
+//        compiler cannot know that every message type it is used with is plain data.
+// GUIDE: SkarnActors.md (Generic actor code)
+// EXPECT: fail a type parameter (R) without the bound 'Sendable'
+use std::actor::*
+
+fn replyInbox[R]() -> Inbox[R] { newInbox() }
+
+let rx: Inbox[Int] = replyInbox()
+println("unreachable")

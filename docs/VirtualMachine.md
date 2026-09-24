@@ -254,6 +254,13 @@ standard library turns that into an ordinary enum before a program sees it. Pick
 system can already describe keeps this out of the compiler; a heterogeneous array would need a special
 case in code generation, as the process-spawning native does.
 
+`appendFile` is atomic per call, which matters because it is the one file native several isolates may
+legitimately aim at the same target: they share no heap, so they share no handle and no lock, and nothing
+in the VM can serialize them. It opens with `FILE_APPEND_DATA` on Windows and `O_APPEND` on POSIX, both of
+which position at the end of the file **as part of** the write, so the offset cannot go stale between
+finding it and using it. What that does not cover is a write larger than the operating system's atomic-append
+size, and it says nothing about `writeFile` or a read-modify-write, neither of which is one call.
+
 The socket natives work on small integer descriptors into a per-execution table, never on raw OS handles,
 and close whatever is still open when the execution ends. `tcpConnect` gives up after 10 seconds: on POSIX
 through a non-blocking connect and `select()`, on Windows through a blocking connect bounded by `TCP_MAXRT`,
@@ -436,7 +443,70 @@ and stacks, sharing the program with its starter read-only. Values cross between
     report that an actor this isolate started has faulted, or `Stop`. `rawMailMsg`, `rawMailFrom` and
     `rawMailReason` read it.
   - The main program gets a mailbox of its own through `rawMainInbox()`, once.
+  - `rawNewInbox(capacity)` gives an actor or the main program a further inbox with an address of its own,
+    typically for a reply; `rawCloseInbox(inbox)` closes one again, and later sends to it answer false. The
+    end of an actor closes all of its inboxes.
+  - `rawStopActor(pid)` tells an actor to end: `Stop` goes into every inbox it owns, so it stops wherever
+    it waits. It is a message, so an actor that never receives is not ended by it, and there is no kill.
+  - `rawStopRequested(inbox)` answers whether anyone has told this actor to end. It reads the flag that
+    every queued `Stop` sets and consumes no mail, so an actor whose loop is its own work — one that never
+    reaches a receive — can ask and end itself. Any one of its inboxes answers: a stop reaches them all.
+  - `rawMonitor(pid, inbox)` asks to be told when that actor ends. Exactly one report follows, into an
+    inbox of the caller's own, as the same mail a crash report uses: the address plus a reason — the
+    fault message, `"normal"` when the actor returned, or `"gone"` when it had already ended, in which
+    case the report comes at once and the call answers false. It watches that one actor, not the address,
+    so an actor started into the same slot afterwards is not watched. The automatic report to the starter
+    is unaffected and stays crash-only. A report also means the ADDRESS IS FREE: the actor's mailboxes are
+    closed, and a slot vacated, before either report goes out, so an actor started into that slot on the
+    strength of the report never meets an address its predecessor still holds.
+  - `rawSelect(boxes, ms)` waits until one of SEVERAL inboxes has something and answers which — the index
+    into the list, or `-1` when the timeout passed. It takes nothing out; the `rawReceive` that follows
+    reads the inbox that index names and cannot wait, because only the owner takes mail out of an inbox.
+    Ties go to the lowest index, so the order of the list is a priority order. Every inbox must belong to
+    the caller, and watching nothing with no deadline is refused — no event could ever end that wait.
 - `rawTaskInput()` and `rawSelfId()` are internal: an isolate reads its argument and its own id with them.
+
+**An address that outlives its actor.** A restarted actor is a new actor, so anyone holding the old
+address would have to learn the new one. A **slot** is a mailbox made before its actor: `rawNewSlot(capacity)`
+returns its address, and `rawSpawnInto(slot, fn, arg)` starts an actor that receives on it instead of on a
+mailbox of its own. When that actor ends, the slot keeps its address, so another actor can be started into
+it and answers where its predecessor did.
+- What the ended actor had not read is dropped: delivering the message that crashed it to its successor is
+  the classic crash loop.
+- What arrives while the slot has no actor waits in it for the next one, instead of being refused.
+- The report of a crash names the slot, so a supervisor recognizes its child across restarts.
+- `rawReleaseSlot(slot)` ends the address: later sends answer false, and an actor still running in it is
+  told to stop — also when it had been told once already, because releasing drops whatever was queued.
+
+**Waiting.** `rawSleep(ms)` makes this isolate wait, and only this one: every isolate has a thread of its
+own. It is what a loop that must poll uses — once an actor has received `Stop`, every further receive
+answers `Stop` at once, so an actor winding down can no longer wait on its inbox.
+
+**Waiting on several inboxes.** A receive waits on one mailbox's condition variable, which is why
+`rawSelect` cannot use it. Instead every isolate has a **wake pad**, and every mailbox wakes its owner's
+pad in addition to its own condition variable — so one wait covers all of an actor's inboxes. A send pays
+for this only while somebody is actually parked on a pad: with nobody waiting, waking is a single atomic
+read and no lock. The two locks are never nested — a mailbox is released before its owner's pad is woken —
+so the select scans the mailboxes holding no pad lock, and a counter bumped on every wake is what catches
+mail that arrives during the scan.
+
+**Back-pressure.** An inbox may be **bounded** — `rawSpawnActorBounded(fn, arg, capacity)` starts an actor
+whose mailbox holds at most `capacity` messages, and `rawNewInbox` takes a capacity too (0 = unbounded).
+A `rawSend` to a full inbox waits until the receiver has taken a message, so a fast sender is slowed to its
+receiver's pace instead of filling memory; `rawTrySend` never waits and reports "full" instead. Crash
+reports and `Stop` always get through. A waiting sender is released with false when the receiver ends or
+when the world ends, so a full inbox cannot hold up the end of the program. Two actors waiting to send to
+each other's full inbox would wait forever — and **that is detected and reported**, see below.
+
+**Deadlock detection.** A blocked send and a blocked join are the only waits that name their target
+exactly: a receive could be answered by anyone, so it says nothing. A cycle over those two is therefore a
+proof rather than a guess, and it is one no message could break — `Stop` and crash reports ignore an
+inbox's capacity and never free a sender waiting for room. A sender that has waited past a grace period
+(250 ms, doubling to 2 s) looks for such a cycle; when one is confirmed, **every** participant ends with a
+located fault naming the ring, so each of their starters hears about it and a supervisor's strategy
+decides what follows. A send that never blocks pays nothing for this, and an unbounded inbox is untouched.
+What it does not claim: the verdict is that the *participants* cannot resolve the cycle — releasing a slot,
+closing an inbox, or the end of the program still can.
 
 Everything started under one call of `execute()` forms a **world**. Addresses are unique within it, so an
 actor's address can be sent inside a message. When that call returns, the world sends every actor `Stop`
@@ -468,6 +538,30 @@ closed or handed off. A descriptor kept after either is therefore refused — wi
 handed to another actor" after a hand-off — and never reaches a later connection that reuses the slot. The
 ticket itself is a plain integer; that a program cannot forge one is a rule of the language (see "Actors" in
 [Compiler.md](Compiler.md)). Only connections move; listeners stay with the isolate that opened them.
+
+**Active sockets — reading handed to the runtime.** An actor that owns a connection may also have to react to
+its inbox, and each wait covers only one kind of source. `rawActivate(fd, inbox, mode, maxLen, pending)`
+hands the READING of a connection to the runtime, which delivers what arrives into an inbox of the caller;
+the actor then waits on that inbox and its own with `rawSelect`. `rawActiveSend(id, data)` writes and
+`rawActiveClose(id)` closes. This is Erlang's "active mode".
+- **One I/O thread per world**, started by the first activation, polls every active socket (`WSAPoll` /
+  `poll`). It runs no program code and touches no heap: each event is posted as an encoded `Bytes` value
+  whose first byte names the kind (data, line, end of stream, failure), and the owner decodes it like any
+  other message. Lines are cut on the I/O thread, with a maximum length.
+- **It never waits.** When the inbox is full it marks it and stops reading that socket; the receive that
+  makes room clears the mark and wakes the thread. Both happen under the mailbox's lock, so no wake-up is
+  lost. With a bounded inbox, a slow owner makes TCP hold the peer back.
+- **Only the I/O thread closes an active socket**, and never while it is polling — otherwise the operating
+  system could give the number to a new socket that is still being polled. The owner only asks, and its
+  end asks for it. The descriptor of an activated connection is refused afterwards with "socket was
+  activated".
+- The thread is woken through a connected pair of loopback sockets on every platform, and the world stops
+  it after every isolate has ended.
+- **A listener can be activated too** (`rawActivateListener(fd, inbox)`). The thread then accepts, makes
+  each new connection blocking again, parks it in the world's hand-off table exactly as `rawHandOff`
+  would, and delivers its ticket — which the owner may send on to a worker. Connections accepted but not
+  yet delivered are closed when the inbox closes, the listener is closed or its owner ends, so no client is
+  left waiting; a ticket already in the inbox is closed, like any untaken ticket, when the world ends.
 
 ## Embedding the VM
 

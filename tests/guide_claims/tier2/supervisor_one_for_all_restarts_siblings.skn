@@ -1,0 +1,51 @@
+// CLAIM: with Strategy::OneForAll a crash costs the SIBLINGS too -- every child is stopped, waited for,
+//        and started again, so both children announce themselves a second time.
+// GUIDE: SkarnActors.md (When a crash costs the siblings)
+// EXPECT: ok the other one is up: 1, both again: 2
+use std::actor::*
+use std::supervisor::*
+
+struct Note { i: Int, me: Pid[Int] }
+
+struct Kid { i: Int, boss: Pid[Note] }
+
+// Announces itself at every start; the message 0 makes it crash.
+fn member(inbox: Inbox[Int], k: Kid) -> () {
+  send(k.boss, Note { i: k.i, me: inbox.pid() })
+  for m in inbox.messages() { if m == 0 { panic("boom") } }
+}
+
+fn keeper(inbox: Inbox[()], boss: Pid[Note]) -> () {
+  let mut kids: Vec[dyn Supervised] = vec()
+  push(kids, child(actorFn(member), Kid { i: 0, boss: boss }))
+  push(kids, child(actorFn(member), Kid { i: 1, boss: boss }))
+  superviseWith(inbox, kids, SupervisorSpec {
+    strategy: Strategy::OneForAll,
+    limit: RestartLimit { maxRestarts: 3, withinMs: 60000 },
+    stopTimeoutMs: 0
+  })
+}
+
+// How many announcements arrived. Which child announces first is up to the schedule, so only the
+// COUNT is checked -- either order proves the same thing.
+fn waitFor(me: Inbox[Note], n: Int) -> Int {
+  let mut seen = 0
+  while seen < n {
+    match me.receive() {
+      Mail::Msg(_) => { seen = seen + 1 },
+      _ => { seen = n },
+    }
+  }
+  seen
+}
+
+let me: Inbox[Note] = mainInbox()
+spawnActor(keeper, me.pid())
+match me.receive() {
+  Mail::Msg(first) => {
+    let other = waitFor(me, 1)
+    send(first.me, 0)
+    println("the other one is up: ${other}, both again: ${waitFor(me, 2)}")
+  },
+  _ => println("nothing started"),
+}

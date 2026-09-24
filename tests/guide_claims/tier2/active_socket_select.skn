@@ -1,0 +1,45 @@
+// CLAIM: an activated connection delivers its lines as events into an inbox of the actor, so one select waits on the client AND the actor's own inbox; Eof arrives when the client closes.
+// GUIDE: SkarnActors.md (A connection that also listens to its inbox)
+// EXPECT: ok client said hello | news for you | eof seen
+use std::net::*
+use std::actor::*
+
+struct Start { ticket: SocketHandOff, boss: Pid[String] }
+
+fn session(inbox: Inbox[String], s: Start) -> () {
+  let conn = match s.ticket.take() { Ok(c) => c, Err(e) => panic(e) }
+  let (out, events) = match conn.activate(Framing::Lines(1024), 16) { Ok(p) => p, Err(e) => panic(e) }
+  let watching = toVec([events.ref(), inbox.ref()])
+  loop {
+    match select(watching, -1) {
+      Some(0) => match events.receive() {
+        Line(l) => { send(s.boss, "client said " + l) }
+        Eof => {
+          send(s.boss, "eof seen")
+          return ()
+        }
+        _ => return ()
+      },
+      _ => match inbox.receive() {
+        Mail::Msg(m) => { let _ = out.sendStr(m + "\n") }
+        _ => return ()
+      }
+    }
+  }
+}
+
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let lst = listen(0)?
+  let mut client = connect("127.0.0.1", lst.localPort()?)?
+  let conn = lst.accept()?
+  let s = spawnActor(session, Start { ticket: conn.handOff()?, boss: boss.pid() })
+  client.sendStr("hello\n")?
+  match boss.receive() { Mail::Msg(m) => print(m), _ => {} }
+  send(s, "news for you")
+  match client.recvLine()? { Some(l) => print(" | ${l}"), None => print(" | <eof>") }
+  client.close()?
+  match boss.receive() { Mail::Msg(m) => print(" | ${m}"), _ => {} }
+  Ok(())
+}
+match run() { Ok(_) => {}, Err(e) => print("error: ${e}") }

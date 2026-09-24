@@ -1,0 +1,18 @@
+// CLAIM: a monitor is told of a NORMAL end too, with the reason "normal" -- which nothing else reports,
+//        and which is what lets a supervisor wait for a child it stopped.
+// GUIDE: SkarnActors.md (When an actor crashes)
+// EXPECT: ok stopped true, reason normal
+use std::actor::*
+
+fn idle(inbox: Inbox[Int], unused: Int) -> () {
+  for _n in inbox.messages() {}
+}
+
+let a = spawnActor(idle, 0)
+let watch: Inbox[Int] = newInbox()
+let watching = monitor(a, watch)
+let stopped = stopActor(a)
+match watch.receive() {
+  Mail::Exited(_, reason) => println("stopped ${stopped && watching}, reason ${reason}"),
+  _ => println("?"),
+}

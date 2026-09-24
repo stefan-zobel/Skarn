@@ -1,0 +1,24 @@
+// CLAIM: `ask` monitors the actor it asks, so a crash ends the wait at once with `Crashed` and the reason
+//        -- it does not sit out the timeout, which here is a full minute.
+// GUIDE: SkarnActors.md (When an actor crashes)
+// EXPECT: ok crashed: the service cannot do that
+use std::actor::*
+
+struct Req { n: Int, replyTo: Pid[Int] }
+
+fn service(inbox: Inbox[Req], unused: Int) -> () {
+  for r in inbox.messages() {
+    if r.n < 0 { panic("the service cannot do that") }
+    send(r.replyTo, r.n)
+  }
+}
+
+let s = spawnActor(service, 0)
+match ask(s, fn(me) { Req { n: -1, replyTo: me } }, 60000) {
+  Ok(v) => println(v),
+  Err(AskError::Crashed(reason)) => {
+    let k = indexOf(reason, " at line ")
+    println("crashed: ${if k < 0 { reason } else { slice(reason, 0, k) }}")
+  },
+  Err(e) => println(e),
+}

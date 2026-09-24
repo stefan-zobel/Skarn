@@ -18,7 +18,7 @@ most frequent words to the main program. The program also counts sequentially an
 agree.
 
 ```
-static_vmrun demo/actors/wordcount.skn [file] [--counters=N] [--lines=N] [--batch=N]
+static_vmrun demo/actors/wordcount.skn [file] [--counters=N] [--lines=N] [--batch=N] [--capacity=N]
 ```
 
 | option | effect |
@@ -27,6 +27,7 @@ static_vmrun demo/actors/wordcount.skn [file] [--counters=N] [--lines=N] [--batc
 | `--counters=N` | counter actors (default 4) |
 | `--lines=N` | lines of generated text (default 40 000; ignored with a file) |
 | `--batch=N` | lines per message (default 250) |
+| `--capacity=N` | each counter's mailbox holds at most N messages (default: no limit) |
 
 On a six-core laptop, with 40 000 generated lines, counting sequentially takes about 545 ms. With actors:
 
@@ -44,3 +45,80 @@ On a six-core laptop, with 40 000 generated lines, counting sequentially takes a
   twelve counters single lines no longer keep them busy. Batches of lines do, and scale to ~4.7×.
 - **One counter costs about 5 % more than no actor at all**: the copies, and a collector that has nothing
   to merge.
+
+**Back-pressure.** With one or two counters the reader sends faster than they count, and without a limit
+the rest of the text piles up in their mailboxes. `--capacity=N` starts the counters with
+`spawnActorBounded`, so a send to a full mailbox waits until the counter has taken a message. With a million
+generated lines and two counters, `--capacity=2` lowers the peak working set from ~349 MB to ~265 MB at the
+same speed (~10.2 s for the actor phase either way).
+
+## `supervised.skn`
+
+A pool of workers that crash, kept running by a supervisor (`std::supervisor`):
+
+```
+main --> dispatcher <--pull-- worker 1..4  (children of the keeper, restarted when they crash)
+```
+
+The workers pull their jobs from a dispatcher and report each result back to it. A worker crashes the first
+time it is handed a multiple of 5. The keeper starts it again, and the dispatcher hands out again every job
+whose result is missing once its queue is empty. The main program checks the total against a sequential
+sum. Because the workers pull, a restarted worker's new address does no harm: nobody needs to reach it.
+
+`--strategy=` picks what a crash costs the other workers: `one_for_one` (the default) restarts only the
+worker that crashed, `one_for_all` stops all of them, waits until they have ended and starts them all
+again, and `rest_for_one` does that for the workers started after the crashed one. All three give the same
+total, because pull dispatch hands out again every job whose result is missing — a worker stopped mid-job
+simply stops asking.
+
+```
+static_vmrun demo/actors/supervised.skn [--strategy=one_for_one|one_for_all|rest_for_one]
+```
+
+## `select.skn`
+
+One worker serving TWO queues from one loop (`std::actor`'s `select`):
+
+```
+main --jobs----> [ jobs inbox ] --\
+                                   >-- one worker, one loop
+main --control-> [ ctl inbox  ] --/
+```
+
+A `receive` waits on one inbox, so a worker could otherwise block on only one of its queues at a time.
+`select(boxes, timeoutMs)` waits on several and answers WHICH one has something; the receive that follows
+is an ordinary typed one on the inbox that index names, and cannot wait. The list is built from
+`inbox.ref()`, because inboxes of different message types cannot share a `Vec` — here a job is an `Int` and
+a control message is a `Ctl`, and neither has to be squeezed into a case of the other.
+
+Ties go to the lowest index, so the order of the list is a priority order. The worker puts control first,
+and while it is paused it watches the control queue alone — so the jobs sit untouched in their own inbox,
+which is back-pressure the program chooses rather than suffers. The run shows exactly that: a report taken
+while paused says nothing has been done, although every job has already been sent.
+
+```
+static_vmrun demo/actors/select.skn [--jobs=N]
+```
+
+| option | effect |
+|---|---|
+| `--jobs=N` | jobs queued while the worker is paused (default 4) |
+
+## `stable_address.skn`
+
+A service that keeps ONE address across its restarts (`std::actor`'s `Slot` plus `std::supervisor`):
+
+```
+main --requests--> [ slot ] <-- the supervisor starts a service here, again after every crash
+```
+
+The service squares the numbers it is sent, and one request makes it crash. The supervisor starts a new
+service at the same address, and the main program goes on using the `Pid` it has had from the start — it
+never learns a new one. At the end the address is released, and a send to it answers `false`.
+
+Each service announces itself when it starts, which is what makes the output the same under every
+schedule: a request goes out only once its receiver is known to be up.
+
+```
+static_vmrun demo/actors/stable_address.skn
+```

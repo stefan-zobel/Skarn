@@ -1,7 +1,7 @@
 // CLAIM: currentOs() reports the running platform as the int-backed enum Os, and it is TOTAL --
 //        every platform maps to one of Windows / MacOS / Other, so a match on the three is
 //        exhaustive. The fixture asserts what holds on every machine, not which one it ran on.
-// GUIDE: 21 (Which platform am I on?)
+// GUIDE: 22 (Which platform am I on?)
 // EXPECT: ok true
 use std::process::{Os, currentOs}
 

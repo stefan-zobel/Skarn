@@ -1,0 +1,21 @@
+// CLAIM: `receiveTimeout(ms)` gives up with None when nothing arrives, and the inbox is unharmed -- a
+//        message sent afterwards is still there to be read.
+// GUIDE: SkarnActors.md (The mail an actor gets)
+// EXPECT: ok nothing yet, then 7
+use std::actor::*
+
+
+let me: Inbox[Int] = mainInbox()
+
+let empty = match me.receiveTimeout(20) {
+  None    => "nothing yet",
+  Some(_) => "?",
+}
+
+send(me.pid(), 7)
+let then = match me.receive() {
+  Mail::Msg(n) => toString(n),
+  _            => "?",
+}
+
+println("${empty}, then ${then}")

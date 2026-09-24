@@ -1,6 +1,6 @@
 # Skarn examples
 
-Small but complete programs, written the way a newcomer would write them after reading the two guides
+Small but complete programs, written the way a newcomer would write them after reading the guides
 ([Skarn in 30 minutes](../SkarnIn30Minutes.md) and the [Skarn Guide](../SkarnGuide.md)). Where `demo/` shows
 one feature at a time, each program here solves a small real task and uses whatever it needs.
 

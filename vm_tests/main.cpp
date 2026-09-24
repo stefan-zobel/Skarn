@@ -175,6 +175,7 @@ int main(int argc, char** argv) {
     run("value_codec_sharing",      test_value_codec_sharing_and_cycles);
     run("value_codec_refusals",     test_value_codec_refusals);
     run("value_codec_malformed",    test_value_codec_malformed);
+    run("value_codec_encode_bytes", test_value_codec_encode_bytes);
     run("rooted_pool_release",      test_rooted_pool_release);
     run("value_codec_collects",     test_value_codec_collects);
     run("thread_slot_table",        test_thread_slot_table);
@@ -191,6 +192,21 @@ int main(int argc, char** argv) {
     run("actor_many",               test_actor_many);
     run("actor_misuse",             test_actor_misuse);
     run("actor_socket_hand_off",    test_actor_socket_hand_off);
+    run("active_socket",            test_active_socket);
+    run("active_listener",          test_active_listener);
+    run("actor_extra_inbox_reply",  test_actor_extra_inbox_reply);
+    run("actor_bounded_backpressure", test_actor_bounded_backpressure);
+    run("actor_bounded_shutdown",   test_actor_bounded_shutdown);
+    run("actor_slot_restart",       test_actor_slot_restart);
+    run("actor_slot_drops_pending", test_actor_slot_drops_pending);
+    run("actor_stop_actor",         test_actor_stop_actor);
+    run("actor_slot_misuse",        test_actor_slot_misuse);
+    run("actor_monitor",            test_actor_monitor);
+    run("actor_monitor_others",     test_actor_monitor_others);
+    run("actor_stop_requested",     test_actor_stop_requested);
+    run("actor_select",             test_actor_select);
+    run("actor_select_stop",        test_actor_select_stop);
+    run("actor_send_cycle",         test_actor_send_cycle);
     // Registered LAST on purpose: on the switch dispatcher a runaway loop can no
     // longer overflow the native stack, but the canary still guards its ~10M-instr
     // survival + r0 == 0 invariant (Release only; Debug prints SKIPPED).

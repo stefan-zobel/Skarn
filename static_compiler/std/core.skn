@@ -68,6 +68,15 @@ pub trait Eq {}
 // Compile-time only -- no methods, no runtime cost, not a trait object, and not a blanket-impl bound.
 pub trait MustUse {}
 
+// A method-less MARKER trait naming the types whose values can be SENT to another task or actor: they are
+// copied into the other heap, so they must be plain data -- scalars, String, Bytes, and tuples, containers,
+// structs and enums built from sendable parts. NOT sendable: a function value, a trait object, and a
+// handle (a socket, a task, an inbox). Like Eq, membership is DERIVED by the checker, so it has no impls;
+// the declaration exists so that a generic helper can write `M: Sendable` and make inboxes or send values
+// of type M. SEALED: a user `impl Sendable for X` is rejected, `dyn Sendable` does not exist, and it cannot
+// select a blanket impl. Compile-time only.
+pub trait Sendable {}
+
 // Map ergonomics -- pure helpers over the `get` builtin + the `m[k] = v` index-assign. `getOr`/`getOrElse`
 // are non-mutating (a fallback for an absent key); `getOrPut`/`upsert` mutate `m` in place (caller-visible,
 // since a Map is a heap object and `mut m` is a valid assignment root). The element V must match the map's

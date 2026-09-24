@@ -1,6 +1,6 @@
 // CLAIM: an actor that crashes does not take the program down -- its starter receives Mail::Exited with
 //        its id, and a send to it returns false from then on.
-// GUIDE: 20 (Actors: long-lived, talking by messages)
+// GUIDE: SkarnActors.md (When an actor crashes)
 // EXPECT: ok exited true, send false
 use std::actor::*
 

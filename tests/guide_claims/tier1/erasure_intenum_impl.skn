@@ -1,5 +1,5 @@
 // CLAIM: an integer-backed enum erases at runtime and cannot implement a trait.
-// GUIDE: Representation erasure; §23
+// GUIDE: Representation erasure; §24
 // EXPECT: fail cannot implement trait
 trait Greet { fn greet(self) -> String }
 enum Color : Int { Red, Green }

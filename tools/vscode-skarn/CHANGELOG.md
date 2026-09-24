@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0
+
+- Syntax highlighting for the concurrency half of the standard library: `std::task`, `std::actor`,
+  `std::supervisor` and `std::log`, together with the socket hand-off in `std::net` — 70 further
+  function names and 22 further types, among them `spawnActor`, `trySend`, `select`, `ask`,
+  `supervise`, `startLogger`, `Pid`, `Inbox`, `Task`, `Sendable` and `Supervised`.
+- Syntax highlighting for active connections and listeners in `std::net`: `activate` and the types
+  `ActiveConn`, `SockEvents`, `SockEvent`, `Framing`, `ActiveListener`, `IncomingClients` and `Incoming`.
+
 ## 0.2.0
 
 - The Skarn language server `skarn_lsp` (installed separately, found through the setting

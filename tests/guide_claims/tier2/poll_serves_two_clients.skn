@@ -1,7 +1,7 @@
 // CLAIM: std::poll serves MANY connections from one thread. A non-blocking socket answers
 //        "would block" instead of waiting, poll() reports which sockets can move, and the program
 //        advances each one a step -- so a second client is not ignored until the first one leaves.
-// GUIDE: 21 (Serving more than one connection)
+// GUIDE: SkarnGuide.md 21 (Serving more than one connection)
 // EXPECT: ok alpha beta
 use std::net::*
 use std::poll::*

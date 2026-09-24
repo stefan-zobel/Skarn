@@ -69,6 +69,8 @@ total 15.07
 
 - [Skarn in 30 minutes](SkarnIn30Minutes.md): the working core, enough to write a real program.
 - [The Skarn Language Guide](SkarnGuide.md): the whole language, the standard library and the cost model.
+- [Actors in Skarn](SkarnActors.md): long-lived workers that share nothing and talk by messages —
+  supervision, back-pressure and the rest, for readers who have never used an actor system.
 - [`examples/`](examples/README.md): small but complete programs, such as a word counter, a JSON todo list, a
   calculator, a log analyzer, and Dijkstra over a generic heap.
 - [`demo/`](demo/README.md): one program per feature or standard-library module, plus a
@@ -79,7 +81,7 @@ total 15.07
 - [`docs/skarn_grammar.ebnf`](docs/skarn_grammar.ebnf): the grammar, also rendered as
   [syntax-highlighted text](docs/skarn_grammar.svg) and as [railroad diagrams](docs/skarn_grammar_railroad.svg).
 
-Every code block in both guides and every program under `examples/` is run by the test harness, and each
+Every code block in the guides and every program under `examples/` is run by the test harness, and each
 must print exactly the output shown.
 
 ## Building

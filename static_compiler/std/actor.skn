@@ -27,6 +27,52 @@
 //     fn echo(inbox: Inbox[Ask], unused: Int) -> () {
 //       for ask in inbox.messages() { send(ask.replyTo, ask.n * 2) }
 //     }
+//
+// The second parameter is the START VALUE, the one thing that crosses into the new isolate with the
+// actor; everything else it must be sent. An actor that needs no starting state still names it, by
+// convention `unused: Int`, and is started with `0`.
+//
+// MORE THAN ONE INBOX. An actor (or the main program) may make further inboxes with `newInbox()`,
+// each with its own message type and address -- typically one per request whose reply it waits
+// for, so the reply neither mixes with nor waits behind the rest of its mail. `ask(p, make, ms)`
+// is exactly that: it makes a reply inbox, sends `make(replyAddress)`, waits at most `ms` and
+// closes the inbox again. Close an inbox you made yourself with `inbox.close()` when you are done;
+// the end of the actor closes all of them.
+//
+// WAITING ON SEVERAL OF THEM. A `receive` waits on ONE inbox. To serve several from one loop,
+// `select(boxes, timeoutMs)` waits until any of them has something and answers WHICH -- the index
+// into the list, which is built from `inbox.ref()` because inboxes of different message types
+// cannot share a Vec. The receive that follows is an ordinary typed one and cannot wait. Ties go to
+// the lowest index, so the order of the list is a priority order.
+//
+// BACK-PRESSURE. An inbox may be BOUNDED: `spawnActorBounded(f, init, n)` starts an actor whose main
+// inbox holds at most n messages, and `newBoundedInbox(n)` makes such an extra inbox. A `send` to a
+// full inbox WAITS until the receiver has taken a message, so a fast sender is slowed to the pace
+// of its receiver instead of filling its memory; `trySend` never waits and reports Full instead.
+// Exit reports and Stop always get through. Two actors that each wait to send to the other's full
+// inbox could wait for ever -- and that is DETECTED: no message can break such a ring (Stop ignores
+// the bound and frees nobody), so every actor in it ends with a fault naming the ring, and their
+// starters hear of it like any other crash. The same holds for a ring that runs through a `join`.
+//
+// GENERIC CODE. `actorFn(f)` checks `f` once, as `spawnActor` would, and returns an `ActorFn` that a
+// pool or a supervisor can take as a value, send in a message, and start with `a.spawn(init)`. Inside
+// a generic function, a new inbox or `ask` may use a type parameter bounded `Sendable` (std::core).
+//
+// AN ADDRESS THAT OUTLIVES ITS ACTOR. A restarted actor is a NEW actor, with a new address, which is
+// awkward for anyone holding the old one. A `Slot[M]` is made first and keeps its address across the
+// actors started into it: `s.spawn(actorFn(f), init)` starts one, `s.pid()` is the address to hand
+// out, and after a crash another actor can be started into the same slot. A send while the slot has no
+// actor WAITS in it and reaches the next one; what an actor left unread when it crashed is dropped.
+// `s.release()` ends the address for good (and tells an actor still running in it to stop).
+// `stopActor(p)` tells any actor to end -- it ends when it next receives. An actor whose loop is its own
+// work never reaches a receive, and ASKS instead: `inbox.stopRequested()` is true once anyone has told it
+// to end, so such an actor can end itself. Nothing can end one that neither receives nor asks.
+//
+// WATCHING ANOTHER ACTOR. A crash is reported to the STARTER only, and a normal end to nobody. Whoever
+// else wants to know sets a monitor: `monitor(p, rx)` puts one `Exited(id, reason)` into the inbox `rx`
+// when that actor ends -- for a crash, for a normal end ("normal"), and at once if it had already ended
+// ("gone"). `ask` uses this itself, which is why it answers `Crashed` instead of waiting out its timeout
+// when the actor it asked dies.
 
 // An actor's address. Only `spawnActor` and `inbox.pid()` make one.
 pub struct Pid[M] { id: Int }
@@ -34,8 +80,18 @@ pub struct Pid[M] { id: Int }
 // The receiving end of an actor's mailbox: only the actor itself holds it (it cannot be sent).
 pub struct Inbox[M] { id: Int }
 
+// An address that exists before its actor and outlives it. Only `newSlot` / `newBoundedSlot` make one;
+// it is plain data, so a supervisor can be handed the slots of the actors it keeps running.
+pub struct Slot[M] { id: Int }
+
 // Names an actor regardless of its message type -- what an exit report carries.
 pub struct ActorId { id: Int }
+
+// An inbox in a `select` list. Inboxes of different message types are different types and cannot
+// share a Vec, so the list holds these instead: an InboxRef names a mailbox and says nothing else,
+// which is exactly what a readiness question needs. Only `inbox.ref()` makes one, and like an Inbox
+// it cannot be sent -- only its owner may read the mailbox behind it.
+pub struct InboxRef { id: Int }
 
 // What `receive` hands back.
 pub enum Mail[M] { Msg(M), Exited(ActorId, String), Stop }
@@ -62,9 +118,178 @@ pub fn send[M](p: Pid[M], m: M) -> Bool { rawSend(p, m) }
 // The main program's own inbox. Once per program.
 pub fn mainInbox[M]() -> Inbox[M] { Inbox { id: rawMainInbox() } }
 
+// Start `f(inbox, init)` as an actor whose inbox holds at most `capacity` messages: a `send` to it
+// waits while it is full.
+pub fn spawnActorBounded[M, I](f: fn(Inbox[M], I) -> (), init: I, capacity: Int) -> Pid[M] {
+  Pid { id: rawSpawnActorBounded(_actorMain, ActorStart { f: f, init: init }, capacity) }
+}
+
+// An actor function as a VALUE that can start actors later, pass through generic code and travel in a
+// message -- what a worker pool or a supervisor that restarts its children needs. Only `actorFn(f)`
+// makes one, from a named top-level function, and checks it there as `spawnActor` would.
+pub struct ActorFn[M, I] { f: fn(Inbox[M], I) -> () }
+
+// The checked value of `f`.
+pub fn actorFn[M, I](f: fn(Inbox[M], I) -> ()) -> ActorFn[M, I] { ActorFn { f: f } }
+
+impl[M, I] ActorFn[M, I] {
+  // Start an actor running this function with the start value `init`.
+  fn spawn(self, init: I) -> Pid[M] {
+    Pid { id: rawSpawnActor(_actorMain, ActorStart { f: self.f, init: init }) }
+  }
+
+  // Start one whose inbox holds at most `capacity` messages.
+  fn spawnBounded(self, init: I, capacity: Int) -> Pid[M] {
+    Pid { id: rawSpawnActorBounded(_actorMain, ActorStart { f: self.f, init: init }, capacity) }
+  }
+}
+
+// What the runtime starts when an actor takes over a slot: the same as ActorStart, plus the address
+// it receives on -- which is the slot's, not the actor's own id.
+struct SlotStart[M, I] { f: fn(Inbox[M], I) -> (), init: I, box: Int }
+
+// The trampoline of an actor in a slot: its inbox is the slot it was started into.
+fn _slotMain[M, I](s: SlotStart[M, I]) -> () {
+  let f = s.f
+  f(Inbox { id: s.box }, s.init)
+}
+
+// A new address with no actor yet. Annotate it: `let s: Slot[Job] = newSlot()`.
+pub fn newSlot[M]() -> Slot[M] { Slot { id: rawNewSlot(0) } }
+
+// A new address whose mailbox holds at most `capacity` messages (back-pressure, as for an inbox).
+pub fn newBoundedSlot[M](capacity: Int) -> Slot[M] {
+  if capacity < 1 { panic("newBoundedSlot: the capacity must be at least 1") }
+  Slot { id: rawNewSlot(capacity) }
+}
+
+impl[M] Slot[M] {
+  // The address to hand out. It stays the same however often the actor behind it is restarted.
+  fn pid(self) -> Pid[M] { Pid { id: self.id } }
+
+  // Start an actor at this address, running `a` with the start value `init`. It is an error if one is
+  // running there already, or if the slot was released. Returns the id its exit report will carry.
+  fn spawn[I](self, a: ActorFn[M, I], init: I) -> ActorId {
+    let _started = rawSpawnInto(self, _slotMain, SlotStart { f: a.f, init: init, box: self.id })
+    ActorId { id: self.id }
+  }
+
+  // End this address: later sends answer false, and an actor still running here is told to stop.
+  fn release(self) -> () { rawReleaseSlot(self) }
+}
+
+// Tell the actor at `p` to end: it stops when it next receives. False if it no longer runs. An actor
+// that never receives (a loop of its own) cannot be stopped from outside.
+pub fn stopActor[M](p: Pid[M]) -> Bool { rawStopActor(p) }
+
+// What `trySend` reports: the message was queued, the inbox is full (nothing was queued), or the
+// receiver no longer runs.
+pub enum SendResult { Sent, Full, Gone }
+
+// Ignoring this is always a mistake, so the checker says so -- `Full` means NOTHING was queued, and a
+// caller that drops it has lost a message while believing it sent one. That is why `trySend` is
+// must-use and `send` is not: `send` answers false only when the receiver has already ended, which is
+// the ordinary Erlang-shaped outcome many programs rightly ignore. Discard it on purpose with
+// `let _ = trySend(..)` where you mean to.
+impl MustUse for SendResult {}
+
+// Send `m` to `p` without ever waiting.
+pub fn trySend[M](p: Pid[M], m: M) -> SendResult {
+  let r = rawTrySend(p, m)
+  if r == 0 { SendResult::Sent } else if r == 1 { SendResult::Full } else { SendResult::Gone }
+}
+
+// A further inbox of this actor (or of the main program), with its own message type and address.
+// Annotate it: `let rx: Inbox[Reply] = newInbox()`.
+pub fn newInbox[M]() -> Inbox[M] { Inbox { id: rawNewInbox(0) } }
+
+// A further inbox that holds at most `capacity` messages.
+pub fn newBoundedInbox[M](capacity: Int) -> Inbox[M] {
+  if capacity < 1 { panic("newBoundedInbox: the capacity must be at least 1") }
+  Inbox { id: rawNewInbox(capacity) }
+}
+
+// Wait until one of several inboxes has something to read, and answer WHICH -- the index into
+// `boxes`, or None when `timeoutMs` passed without anything arriving. A negative timeout waits
+// indefinitely; a zero one asks and returns at once. Every inbox must be one of yours.
+//
+// It takes nothing out. Call `receive()` on the inbox the index names; that receive cannot wait,
+// because only the owner takes mail out of an inbox and the owner is you. The mail it then gets may
+// be a message, an exit report or Stop, exactly as any other receive.
+//
+// TIES GO TO THE LOWEST INDEX, so the order of the list is a priority order: put a control inbox
+// before a work inbox and the control mail is served first when both are ready. Beware the other
+// side of that -- an inbox that is always ready starves the ones after it.
+//
+//     let jobs: Inbox[Job]  = mainInbox()
+//     let ctl:  Inbox[Ctl]  = newInbox()
+//     let boxes = toVec([ctl.ref(), jobs.ref()])    // control first: it wins a tie
+//     match select(boxes, -1) {
+//       Some(0) => handle(ctl.receive()),
+//       Some(1) => work(jobs.receive()),
+//       _       => {}
+//     }
+//
+// An empty list with a negative timeout is a fault: nothing could ever end that wait.
+pub fn select(boxes: Vec[InboxRef], timeoutMs: Int) -> Option[Int] {
+  let i = rawSelect(boxes, timeoutMs)
+  if i < 0 { None } else { Some(i) }
+}
+
+// Be told when the actor at `p` ends: an `Exited(id, reason)` arrives in `rx`, one of YOUR inboxes. It
+// watches that one actor and reports exactly once -- an actor started into the same slot afterwards is
+// not watched, so monitor again if you want to go on watching. The reason is "normal" if it returned,
+// "gone" if it had already ended when the monitor was set (the report then comes at once), and otherwise
+// the message of the fault that ended it. False means it was no longer running.
+pub fn monitor[M, R](p: Pid[M], rx: Inbox[R]) -> Bool { rawMonitor(p, rx) }
+
+// Why an `ask` got no reply: the receiver no longer runs, it crashed while we waited (with the message
+// of its fault), no reply came in time, or the program is ending.
+pub enum AskError { Gone, Timeout, Stopped, Crashed(String) }
+
+// Request and reply. `make` builds the request from the address to reply to; the reply is awaited
+// on an inbox of its own for at most `timeoutMs` (the wait for room in a full receiver comes on
+// top), and that inbox is closed again whatever happens, so a late reply is dropped.
+//
+// It also MONITORS the receiver on that same inbox, so a crash ends the wait at once, with the reason,
+// instead of sitting out the whole timeout.
+//
+//     let r = ask(counter, fn(me) { Query::Total(me) }, 1000)
+pub fn ask[M, R](p: Pid[M], make: fn(Pid[R]) -> M, timeoutMs: Int) -> Result[R, AskError] {
+  let rx: Inbox[R] = newInbox()
+  let result = if !send(p, make(rx.pid())) {
+    Err(AskError::Gone)
+  } else {
+    let _watching = monitor(p, rx)
+    match rx.receiveTimeout(timeoutMs) {
+      Some(Mail::Msg(reply)) => Ok(reply),
+      Some(Mail::Exited(_, why)) => Err(AskError::Crashed(why)),
+      Some(Mail::Stop) => Err(AskError::Stopped),
+      None => Err(AskError::Timeout)
+    }
+  }
+  rx.close()
+  result
+}
+
 impl[M] Pid[M] {
   // This actor's id, to compare with the one in an exit report.
   fn actorId(self) -> ActorId { ActorId { id: self.id } }
+}
+
+impl ActorId {
+  // Tell this actor to end -- `stopActor` by id, for a supervisor holding children whose message types
+  // it cannot name. False if it no longer runs.
+  fn stop(self) -> Bool {
+    let p: Pid[Int] = Pid { id: self.id }
+    stopActor(p)
+  }
+
+  // Be told when this actor ends -- `monitor` by id: one report in `rx`, exactly once.
+  fn watch[R](self, rx: Inbox[R]) -> Bool {
+    let p: Pid[Int] = Pid { id: self.id }
+    monitor(p, rx)
+  }
 }
 
 impl[M] Inbox[M] {
@@ -79,6 +304,19 @@ impl[M] Inbox[M] {
 
   // The address of the actor this inbox belongs to -- to hand out, e.g. inside a message.
   fn pid(self) -> Pid[M] { Pid { id: self.id } }
+
+  // This inbox as an entry for a `select` list. It carries no message type, which is what lets
+  // inboxes of different types be waited on together.
+  fn ref(self) -> InboxRef { InboxRef { id: self.id } }
+
+  // Has this actor been told to end? For an actor whose loop is its OWN work and which therefore never
+  // reaches a receive: it asks, and ends itself. It consumes no mail, so a later receive is unaffected,
+  // and asking any one of an actor's inboxes is enough -- a stop reaches them all.
+  fn stopRequested(self) -> Bool { rawStopRequested(self) }
+
+  // Close an inbox made with `newInbox`: later sends to it answer false (trySend: Gone), and what
+  // it still holds is dropped. The main inbox cannot be closed; it ends with its actor.
+  fn close(self) -> () { rawCloseInbox(self) }
 
   // The messages, one by one, as a lazy iterator that ends at Stop -- so an actor's whole loop can be
   // `for m in inbox.messages() { .. }`. Exit reports are SKIPPED; an actor that needs them (because it

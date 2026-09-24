@@ -1,6 +1,6 @@
 // CLAIM: a task works on a COPY of its argument taken when it starts -- the parent's later change
 //        does not reach it, and nothing the task does reaches the parent.
-// GUIDE: 20 (Running functions in parallel)
+// GUIDE: SkarnGuide.md 21 (Running functions in parallel)
 // EXPECT: ok task saw 2, parent has 3
 use std::task::*
 

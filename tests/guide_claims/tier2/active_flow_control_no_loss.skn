@@ -1,0 +1,35 @@
+// CLAIM: an activated connection's inbox holds at most `capacity` events; while it is full the runtime stops reading, and nothing is lost -- a thousand lines through an inbox of one arrive complete and in order.
+// GUIDE: SkarnActors.md (A connection that also listens to its inbox)
+// EXPECT: ok 1000 lines | 0 out of order | then Eof
+use std::net::*
+
+fn run() -> Result[(), String] {
+  let lst = listen(0)?
+  let mut client = connect("127.0.0.1", lst.localPort()?)?
+  let conn = lst.accept()?
+  let (_, events) = conn.activate(Framing::Lines(100), 1)?
+  let mut sb = stringBuilder()
+  for i in range(0, 1000) { sb = sb.append("${i}\n") }
+  client.sendStr(sb.build())?
+  client.close()?
+  let mut next = 0
+  let mut bad = 0
+  loop {
+    match events.receive() {
+      Line(l) => {
+        if l != "${next}" { bad = bad + 1 }
+        next = next + 1
+      }
+      Eof => {
+        print("${next} lines | ${bad} out of order | then Eof")
+        break
+      }
+      _ => {
+        print("unexpected event after ${next} lines")
+        break
+      }
+    }
+  }
+  Ok(())
+}
+match run() { Ok(_) => {}, Err(e) => print("error: ${e}") }

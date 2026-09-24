@@ -1,0 +1,13 @@
+// CLAIM: the main program is never told to stop -- nothing puts Stop into its inbox. That is why a
+//        supervisor must be its own actor: `supervise` returns at Stop, which the main program never gets.
+// GUIDE: SkarnActors.md (Supervisors: keeping them alive)
+// EXPECT: ok asked to stop: false, mail waiting: false
+use std::actor::*
+
+
+let me: Inbox[Int] = mainInbox()
+
+let asked = me.stopRequested()
+let mail  = match me.receiveTimeout(20) { Some(_) => true, None => false }
+
+println("asked to stop: ${asked}, mail waiting: ${mail}")

@@ -50,6 +50,7 @@ x64\Release\static_vmrun.exe demo\json.skn
 | [`raytracer/`](raytracer/README.md) | a path tracer spread over several modules that writes a BMP; `--preview` renders in about two seconds, `--threads=N` renders on N tasks |
 | [`actors/`](actors/README.md) | actors: a word count by a reader, N counter actors and a collector, checked against a sequential count |
 | [`actor_server/`](actor_server/README.md) | an HTTP server whose acceptor hands each connection to one of N worker actors, and a load generator on tasks |
+| [`chat/`](chat/README.md) | a chat server with topics on active sockets, a terminal client, and `--selftest`, a scripted conversation that checks itself |
 
 ## Benchmark
 

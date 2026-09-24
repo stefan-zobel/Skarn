@@ -1,0 +1,62 @@
+// CLAIM: `select` waits on SEVERAL inboxes at once and answers which one has something, so one loop
+//        serves an actor's own mail and a reply inbox of a different type. Ties go to the lowest index.
+// GUIDE: SkarnActors.md (Two queues in one loop)
+// EXPECT: ok job 4, rx hello, done
+use std::actor::*
+
+
+// Answers whoever asks, on the address inside the message.
+fn helper(inbox: Inbox[Pid[String]], unused: Int) -> () {
+  for to in inbox.messages() { send(to, "hello") }
+}
+
+
+// Two queues, one loop: jobs arrive in the actor's own inbox, replies in a second one of its own
+// making. Neither can starve the other, and neither has to be a case of the other's type.
+fn serve(inbox: Inbox[Int], boss: Pid[String]) -> () {
+  let rx: Inbox[String] = newInbox()
+  let h = spawnActor(helper, 0)
+  let boxes = toVec([rx.ref(), inbox.ref()])     // replies first: they win a tie
+  let mut running = true
+  while running {
+    match select(boxes, 10000) {
+      Some(0) => {
+        match rx.receive() {
+          Mail::Msg(s) => { send(boss, "rx ${s}") },
+          _            => { running = false }
+        }
+      },
+      Some(1) => {
+        match inbox.receive() {
+          Mail::Msg(n) => {
+            if n == 0 { send(h, rx.pid()) } else { send(boss, "job ${n}") }
+          },
+          _ => { running = false }
+        }
+      },
+      _ => { running = false }
+    }
+  }
+  send(boss, "done")
+}
+
+
+let me: Inbox[String] = mainInbox()
+let p = spawnActor(serve, me.pid())
+
+fn answer(me: Inbox[String]) -> String {
+  match me.receive() {
+    Mail::Msg(s) => s,
+    _            => "?",
+  }
+}
+
+send(p, 4)                     // a job: the actor's own inbox
+let a = answer(me)
+send(p, 0)                     // makes the helper answer in the OTHER inbox
+let b = answer(me)
+// Stop reaches BOTH inboxes, so the select ends too -- one answer per step, because Stop wins a tie
+// against a job that has not been taken yet.
+stopActor(p)
+let c = answer(me)
+println("${a}, ${b}, ${c}")

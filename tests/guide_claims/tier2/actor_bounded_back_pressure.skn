@@ -1,0 +1,31 @@
+// CLAIM: a bounded mailbox gives back-pressure -- trySend reports Full once it holds its capacity, and a
+//        plain send to it WAITS for room instead of failing, so every message arrives, in order.
+// GUIDE: SkarnActors.md (Back-pressure)
+// EXPECT: ok Sent Sent Full in order 78
+use std::actor::*
+
+// Reads nothing until the main program says go, through a second inbox of its own.
+fn gated(inbox: Inbox[Int], boss: Pid[Pid[Int]]) -> () {
+  let gate: Inbox[Int] = newInbox()
+  send(boss, gate.pid())
+  match gate.receive() { _ => {} }
+  let mut next = 1
+  let mut sum = 0
+  for v in inbox.messages() {
+    if v != next { print(" out of order") }
+    next = next + 1
+    sum = sum + v
+    if v == 12 { print(" in order ${sum}") }
+  }
+}
+
+let me: Inbox[Pid[Int]] = mainInbox()
+let g = spawnActorBounded(gated, me.pid(), 2)
+let gate = match me.receive() { Mail::Msg(p) => p, _ => panic("no gate") }
+print("${trySend(g, 1)} ${trySend(g, 2)} ${trySend(g, 3)}")
+send(gate, 0)
+let mut i = 3
+while i <= 12 {
+  send(g, i)
+  i = i + 1
+}

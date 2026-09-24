@@ -1,0 +1,15 @@
+// CLAIM: an inbox made with `newInbox` can be closed by hand, and a send to a closed inbox answers
+//        false -- the end of an actor closes every inbox it made, for the same effect.
+// GUIDE: SkarnActors.md (Asking for an answer)
+// EXPECT: ok open true, closed false
+use std::actor::*
+
+
+let _me: Inbox[Int] = mainInbox()
+let rx: Inbox[Int]  = newInbox()
+
+let before = send(rx.pid(), 1)
+rx.close()
+let after  = send(rx.pid(), 2)
+
+println("open ${before}, closed ${after}")

@@ -10,6 +10,10 @@
 // function with one parameter, and both that parameter and the result must be SENDABLE -- plain
 // data, with no function value, trait object, socket or task handle anywhere inside.
 //
+// GENERIC CODE cannot name the function it was given, so it takes a `TaskFn` instead: `taskFn(f)` checks
+// `f` once, as `spawn` would, and `t.spawn(x)` starts tasks from it. A type parameter whose values are
+// copied between heaps needs the bound `Sendable` (std::core).
+//
 // FAILURE IS A VALUE. A task that faults does not stop its parent: `join` returns `Err` with the
 // fault message. What a task prints appears when it is joined, in join order. A task nobody joins
 // is still waited for when the program ends, and what it printed is dropped.
@@ -31,4 +35,17 @@ impl[R] Task[R] {
     fn join(self) -> Result[R, String] {
         if rawJoin(self) { Ok(rawTaskTake(self)) } else { Err(rawTaskError(self)) }
     }
+}
+
+// A task function as a VALUE that can start tasks later and pass through generic code (a parallel
+// map, say) -- which `spawn(f, x)` cannot, since it needs the NAME of the function. Only `taskFn(f)`
+// makes one, from a named top-level function, and checks it there as `spawn` would.
+pub struct TaskFn[A, R] { f: fn(A) -> R }
+
+// The checked value of `f`.
+pub fn taskFn[A, R](f: fn(A) -> R) -> TaskFn[A, R] { TaskFn { f: f } }
+
+impl[A, R] TaskFn[A, R] {
+    // Start a task running this function on `arg`.
+    fn spawn(self, arg: A) -> Task[R] { Task { id: rawSpawn(self.f, arg) } }
 }

@@ -2415,13 +2415,13 @@ void test_check_bounded_fn_values() {
     check_true("unannotated_still_rejected",
         check_has(std::string(DISP) + "fn g() -> String { let f = describe\n \"x\" }",
             "first-class value"));
-    // Documented safe limitation: a combinator with the fn parameter BEFORE the element
-    // parameter leaves `A` unsolved when `describe` is checked -> over-rejected.
-    check_true("reversed_order_rejected",
-        check_has(std::string(DISP) +
+    // A combinator with the fn parameter BEFORE the element parameter used to leave `A` unsolved when
+    // `describe` was checked, and over-rejected. It no longer does: the name of a generic function is
+    // checked in the SECOND argument pass, like a lambda, so `5` has fixed `A` by then.
+    check_true("reversed_order_now_solved",
+        check_errc(std::string(DISP) +
             "fn ap2[A, B](f: fn(A) -> B, x: A) -> B { f(x) }\n"
-            "fn g() -> String { ap2(describe, 5) }",
-            "is not determined by the expected type"));
+            "fn g() -> String { ap2(describe, 5) }") == 0);
 }
 
 // ---- typechecker: parametric traits + bounds with OUTPUT inference ----------
@@ -2562,7 +2562,18 @@ std::string cg_run_native(const std::string& src,
     // The I/O / env / process natives live in opt-in modules. A native-exercising
     // test program pulls all three in; an unused `use` is harmless.
     const std::string full = "use std::io::*\nuse std::env::*\nuse std::process::*\n" + src;
-    svc::Module m = svc::compile(full.c_str(), svc::builtin_prelude());
+    // A test program that does not COMPILE is a broken test, not a result. Returning the message
+    // makes it one WRONG line naming the test; letting it out would end the whole suite in
+    // std::terminate -- and with stdout block-buffered into a file, the lines saying which test it
+    // was are lost with it. Only the COMPILE is caught: a RUNTIME fault must still escape, because
+    // `faults_with` and the socket tests read it as the outcome under test.
+    std::unique_ptr<svc::Module> compiled;
+    try {
+        compiled = std::make_unique<svc::Module>(svc::compile(full.c_str(), svc::builtin_prelude()));
+    } catch (const std::exception& e) {
+        return std::string("[the test program does not compile] ") + e.what();
+    }
+    svc::Module& m = *compiled;
     Heap heap;
     StringInterner interner;
     std::ostringstream out;
@@ -2748,6 +2759,9 @@ void test_import_matrix() {
         // std::poll is the one module that `use`s another (std::net). This row pins that its own
         // items still travel every import form -- and, via the `_other` cell, that a const does too.
         { "std_poll",    "std::poll",    "READABLE",     "WRITABLE",     "READABLE | 6", 7 },
+        // std::log builds on THREE modules (std::io, std::time, std::actor) and re-exports none of
+        // them; this row pins that its own items still travel every import form.
+        { "std_log",     "std::log",     "Level",        "Log",          "match Level::Warn { Level::Warn => 2, _ => 0 }", 2 },
     };
     for (const auto& r : std_rows) {
         const std::string id = std::string("imx_") + r.id;
@@ -5439,7 +5453,7 @@ void test_codegen_vec_bytes() {
     check_int_p("sort_inplace", "let mut v = toVec([3, 1, 2])\n sort(v)\n v[0]*100 + v[1]*10 + v[2]", 123);
     check_int_p("sort_dups",    "let s = sorted(toVec([3, 1, 3, 1, 2]))\n s[0]*10000 + s[1]*1000 + s[2]*100 + s[3]*10 + s[4]", 11233);
     check_int_p("sort_single",  "let s = sorted(toVec([7]))\n s[0]", 7);
-    // a USER struct/enum may impl Ord and be sorted (locks the guide's §5/§19/§23 claim; erasure types cannot).
+    // a USER struct/enum may impl Ord and be sorted (locks the guide's §5/§19/§24 claim; erasure types cannot).
     check_int_p("sorted_user_ord",
         "struct P { k: Int }\n impl Ord for P { fn lessThan(self, o: P) -> Bool { self.k < o.k } }\n"
         " let s = sorted(toVec([P{k:3}, P{k:1}, P{k:2}]))\n s[0].k * 100 + s[1].k * 10 + s[2].k", 123);
@@ -5492,6 +5506,42 @@ void test_codegen_natives() {
             "let _ = deleteFile(\"" + f + "\")\n"
             "println(toString(fileExists(\"" + f + "\")))\n";
         check_true("native_file_exists", cg_run_native(src) == "true\nfalse\n");
+    }
+    // appendFile is ATOMIC per call, so several actors may append to one file without losing or
+    // tearing a line. It was not: as `std::ofstream(path, app)` it found the end when it OPENED and
+    // wrote at that remembered offset, so concurrent appends overwrote each other -- measured at 496
+    // of 800 lines from four actors, and silently, with no error anywhere. This test is the guard on
+    // the fix (FILE_APPEND_DATA / O_APPEND, which position at the end AS PART OF the write).
+    {
+        const std::string src =
+            "use std::actor::*\n"
+            "struct Job { path: String, who: Int }\n"
+            "fn writer(inbox: Inbox[Int], j: Job) -> () {\n"
+            "  let mut i = 0\n"
+            "  while i < 150 { let _r = appendTextFile(j.path, \"w${j.who} n${i}|\\n\")\n i += 1 }\n"
+            "  for _m in inbox.messages() {}\n"
+            "}\n"
+            "let _d = deleteFile(\"" + f + "\")\n"
+            "let mut kids: Vec[Pid[Int]] = vec()\n"
+            "let mut w = 0\n"
+            "while w < 4 { push(kids, spawnActor(writer, Job { path: \"" + f + "\", who: w }))\n w += 1 }\n"
+            // Stop each writer and wait for its end, so every write is done before the file is read.
+            "let watch: Inbox[Int] = newInbox()\n"
+            "for k in kids { let _m = k.actorId().watch(watch)\n let _s = stopActor(k) }\n"
+            "let mut ended = 0\n"
+            "while ended < 4 {\n"
+            "  match watch.receive() { Mail::Exited(_, _) => { ended += 1 }, _ => { ended = 4 } }\n"
+            "}\n"
+            "let text = match readTextFile(\"" + f + "\") { Ok(s) => s, Err(e) => panic(e) }\n"
+            "let mut n = 0\n"
+            "let mut bad = 0\n"
+            "for ln in lines(text) {\n"
+            "  if len(ln) > 0 { n += 1\n"
+            "    if indexOf(ln, \"|\") != len(ln) - 1 { bad += 1 } }\n"
+            "}\n"
+            "let _d2 = deleteFile(\"" + f + "\")\n"
+            "println(\"${n} ${bad}\")\n";
+        check_true("native_append_is_atomic", cg_run_native(src) == "600 0\n");
     }
     // mkdir + listDir: exactly one file in a fresh dir -> len 1.
     {
@@ -8222,6 +8272,12 @@ void test_std_time() {
         cg_run_native(U + "let t = now()\n if t.toEpochMillis() > 0 { println(\"ok\") } else { println(\"bad\") }"), "ok\n");
     check_str("time_stopwatch_smoke",
         cg_run_native(U + "let sw = startStopwatch()\n let e = sw.elapsedNanos()\n if e >= 0 { println(\"ok\") } else { println(\"bad\") }"), "ok\n");
+    // sleep waits at least the time asked for (it never returns early), and 0 is allowed.
+    check_str("std_time_sleep_waits",
+        cg_run_native(U + "let sw = startStopwatch()\n sleep(0)\n sleep(30)\n"
+                          "if sw.elapsedMillis() >= 25 { println(\"ok\") } else { println(\"early\") }"), "ok\n");
+    check_true("std_time_sleep_not_negative",
+        cg_faults_msg(U + "sleep(0 - 1)\n", "must not be negative"));
 
     // Differentials -- VM == RefEval on the pure, deterministic calendar/duration math.
     check_same("diff_time_roundtrip", U + "fromDateTime(instantFromMillis(1784644215123).toDateTime()).toEpochMillis()", true);
@@ -8881,8 +8937,17 @@ void test_std_task() {
         "let t = spawn(fn(x: Int) -> Int { x }, 1)\n0", "not a lambda"));
     check_true("task_rejects_fn_value", check_has_p(U + SQ +
         "let g = sq\nlet t = spawn(g, 1)\n0", "not a computed function value"));
-    check_true("task_rejects_generic_fn", check_has_p(U +
-        "fn ident[T](x: T) -> T { x }\nlet t = spawn(ident, 1)\n0", "generic function 'ident'"));
+    // A generic function IS allowed where the call determines its type parameters: types are erased, so
+    // one body serves every use and the id that travels is that body's. Here `1` fixes T.
+    check_str("task_generic_fn_determined_ok", cg_run_native(U +
+        "fn ident[T](x: T) -> T { x }\n"
+        "let t = spawn(ident, 1)\n"
+        "println(match t.join() { Ok(v) => v, Err(_) => 0 })\n"), "1\n");
+    // Nothing fixes T, so it cannot be proven sendable -- the soundness guard, in the type parameter's
+    // own name.
+    check_true("task_rejects_undetermined_generic_fn", check_has_p(U +
+        "fn ident[T](x: T) -> T { x }\nlet t = taskFn(ident)\n0",
+        "a type parameter (T) without the bound 'Sendable'"));
     // Two parameters already fail spawn's own type (fn(A) -> R); that is the first error reported.
     check_true("task_rejects_two_params", check_has_p(U +
         "fn add(a: Int, b: Int) -> Int { a + b }\nlet t = spawn(add, 1)\n0", "found fn(Int, Int) -> Int"));
@@ -8912,6 +8977,74 @@ void test_std_task() {
         "let t = spawn(sq, 2)\nlet u: Task[String] = Task { id: t.id }\n0", "can only be created by `spawn`"));
     check_true("task_no_task_record_update", check_has_p(U + SQ +
         "let t = spawn(sq, 2)\nlet u = Task { ..t }\n0", "can only be created by `spawn`"));
+
+    // ---- taskFn(f): a checked task function as a value, for generic code ----
+    const std::string PARMAP =
+        "fn parMap[A, R](t: TaskFn[A, R], xs: Vec[A]) -> Vec[Result[R, String]] {\n"
+        "  let mut ts: Vec[Task[R]] = vec()\n"
+        "  for x in xs { push(ts, t.spawn(x)) }\n"
+        "  let mut out: Vec[Result[R, String]] = vec()\n"
+        "  for t2 in ts { push(out, t2.join()) }\n"
+        "  out\n"
+        "}\n";
+    check_int_p("task_fn_generic_par_map", U + SQ + UNWRAP + PARMAP +
+        "let mut xs: Vec[Int] = vec()\npush(xs, 1)\npush(xs, 2)\npush(xs, 3)\n"
+        "let mut s = 0\nfor r in parMap(taskFn(sq), xs) { s = s + got(r) }\ns", 14);
+    // A TaskFn is sendable (its function is a named one): it can be the argument of a task.
+    check_int_p("task_fn_travels", U + SQ + UNWRAP +
+        "fn run(t: TaskFn[Int, Int]) -> Int { got(t.spawn(6).join()) }\n"
+        "got(spawn(run, taskFn(sq)).join())", 36);
+    check_true("task_fn_rejects_lambda", check_has_p(U +
+        "let t = taskFn(fn(x: Int) -> Int { x })\n0", "taskFn needs the name of a top-level function here, not a lambda"));
+    check_true("task_fn_rejects_fn_param", check_has_p(U +
+        "fn wrap(g: fn(Int) -> Int) -> TaskFn[Int, Int] { taskFn(g) }\n0", "not a computed function value"));
+    // taskFn has ONE argument, so nothing at the call fixes T: refused, in T's own name.
+    check_true("task_fn_rejects_undetermined_generic_fn", check_has_p(U +
+        "fn ident[T](x: T) -> T { x }\nlet t = taskFn(ident)\n0",
+        "a type parameter (T) without the bound 'Sendable'"));
+    check_true("task_fn_checks_sendable", check_has_p(U +
+        "fn mk(n: Int) -> fn(Int) -> Int { fn(x: Int) -> Int { x + n } }\nlet t = taskFn(mk)\n0",
+        "cannot be sent back from a task"));
+    check_true("task_fn_not_a_value", check_has_p(U + "let f = taskFn\n0", "can only be called"));
+    check_true("task_fn_no_literal", check_has_p(U +
+        "let t = TaskFn { f: fn(x: Int) -> Int { x } }\n0", "a TaskFn can only be created by `taskFn(f)`"));
+
+    // ---- the Sendable marker (std::core) ----
+    const std::string NEED = "fn need[T: Sendable](x: T) -> Int { 1 }\n";
+    check_int_p("sendable_plain_data_ok", NEED +
+        "struct P { a: Int, b: Vec[String] }\n"
+        "enum Tree { Leaf, Node(Tree, Int, Tree) }\n"
+        "let m: Map[String, (Int, Bool)] = #{}\n"
+        "need(1) + need(P { a: 1, b: vec() }) + need(Tree::Leaf) + need(m) + need(bytes())", 5);
+    check_true("sendable_rejects_fn_with_reason", check_has_p(NEED +
+        "struct H { f: fn(Int) -> Int }\nneed(H { f: fn(x: Int) -> Int { x } })",
+        "does not satisfy the bound 'std::core::Sendable': it contains a function value"));
+    check_true("sendable_rejects_socket", check_has_p("use std::net::*\n" + NEED +
+        "fn f(c: TcpConn) -> Int { need(c) }\n0", "it contains a socket handle"));
+    check_true("sendable_rejects_task", check_has_p(U + SQ + NEED + "need(spawn(sq, 1))", "it contains a task handle"));
+    check_true("sendable_rejects_dyn_value", check_has_p(NEED +
+        "trait Shape { fn area(self) -> Int }\nfn f(s: dyn Shape) -> Int { need(s) }\n0", "it contains a trait object"));
+    // A type fixed only AFTER the call (the deferred-generic-arguments path).
+    check_true("sendable_checked_on_late_type", check_has_p(
+        "fn mk[T: Sendable]() -> Vec[T] { vec() }\nlet v = mk()\nlet w: Vec[fn(Int) -> Int] = v\n0",
+        "does not satisfy the bound 'std::core::Sendable'"));
+    // A type parameter is sendable only through its own bound.
+    check_true("sendable_param_needs_bound", check_has_p(NEED +
+        "fn outer[T](x: T) -> Int { need(x) }\n0", "a type parameter (T) without the bound 'Sendable'"));
+    check_true("sendable_param_with_bound_ok", !p_fails(NEED +
+        "fn outer[T: Sendable](x: T) -> Int { need(x) }\nouter(3)"));
+    check_true("sendable_through_supertrait_ok", !p_fails(NEED +
+        "trait Msg: Sendable {}\nfn outer[T: Msg](x: T) -> Int { need(x) }\n0"));
+    check_true("sendable_mutual_recursion", check_has_p(NEED +
+        "struct A { b: Option[B] }\nstruct B { a: Option[A], f: fn(Int) -> Int }\nneed(A { b: None })",
+        "it contains a function value"));
+    check_true("sendable_is_sealed", check_has_p(
+        "struct X { a: Int }\nimpl Sendable for X {}\n0", "cannot implement the built-in 'Sendable' marker"));
+    check_true("sendable_no_dyn", check_has_p("fn g(d: dyn Sendable) -> Int { 1 }\n0",
+        "'Sendable' is a compile-time marker"));
+    check_true("sendable_no_blanket", check_has_p(
+        "trait Show { fn show(self) -> Int }\nimpl[T: Sendable] Show for T { fn show(self) -> Int { 1 } }\n0",
+        "cannot select a blanket impl"));
 }
 
 // =============================================================================
@@ -9094,6 +9227,479 @@ void test_std_actor() {
     check_true("actor_hand_off_in_message_ok", !p_fails(NET +
         "fn f(inbox: Inbox[SocketHandOff], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0"));
 
+    // ---- active connections (std::net: c.activate(framing, capacity)) ----
+    // The world's I/O thread reads an activated connection and delivers SockEvents into an inbox of its
+    // owner. Every program below has ONE possible output: events of one connection arrive in order,
+    // and each waits for what it depends on. A client that must see EOF has a 5 s timeout, so a lost
+    // close fails the test instead of hanging the suite.
+    const std::string RUN_END = "match run() { Ok(_) => {}, Err(e) => println(\"error: \" + e) }\n";
+    // The point of the feature: one actor serves its socket AND its inbox, waiting on both with select.
+    check_str("active_select_socket_and_inbox", cg_run_native(NET + R"SKN(
+struct Start { ticket: SocketHandOff, boss: Pid[String] }
+fn session(inbox: Inbox[String], s: Start) -> () {
+  let conn = match s.ticket.take() { Ok(c) => c, Err(e) => panic(e) }
+  let (out, events) = match conn.activate(Framing::Lines(100), 4) { Ok(p) => p, Err(e) => panic(e) }
+  let watching = toVec([events.ref(), inbox.ref()])
+  loop {
+    match select(watching, -1) {
+      Some(0) => match events.receive() {
+        SockEvent::Line(l) => { send(s.boss, "line:" + l) }
+        SockEvent::Eof => {
+          send(s.boss, "closed")
+          return ()
+        }
+        _ => return ()
+      },
+      _ => match inbox.receive() {
+        Mail::Msg(m) => { let _ = out.sendStr(m + "\n") }
+        _ => return ()
+      }
+    }
+  }
+}
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  client.setTimeout(5000)?
+  let conn = srv.accept()?
+  let pid = spawnActor(session, Start { ticket: conn.handOff()?, boss: boss.pid() })
+  client.sendStr("hello\n")?
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  send(pid, "pushed")
+  match client.recvLine()? { Some(l) => println("client got " + l), None => println("EOF") }
+  client.sendStr("bye\n")?
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  client.close()?
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  Ok(())
+}
+)SKN" + RUN_END), "line:hello\nclient got pushed\nline:bye\nclosed\n");
+    // Lines: "\n" and "\r\n" both end a line, a last line without one still arrives at the end of the
+    // stream, and Eof comes after it. Raw: the chunks, joined, are exactly what was sent.
+    check_str("active_lines_and_raw", cg_run_native(NET + R"SKN(
+fn show(e: SockEvent) -> String {
+  match e {
+    SockEvent::Line(l) => "Line(" + l + ")",
+    SockEvent::Chunk(b) => "Chunk(" + fromBytes(b) + ")",
+    SockEvent::Eof => "Eof",
+    SockEvent::Failed(w) => "Failed(" + w + ")",
+    SockEvent::Stopping => "Stopping"
+  }
+}
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let (_, ev) = conn.activate(Framing::Lines(100), 8)?
+  client.sendStr("a\r\nb\nc")?
+  client.close()?
+  let mut line = ""
+  loop {
+    let s = show(ev.receive())
+    line = line + s + " "
+    if s == "Eof" { break }
+  }
+  println(line)
+  let mut c2 = connect("127.0.0.1", srv.localPort()?)?
+  let conn2 = srv.accept()?
+  let (_, ev2) = conn2.activate(Framing::Raw, 8)?
+  c2.sendStr("raw ")?
+  c2.sendStr("bytes")?
+  c2.close()?
+  let mut got = ""
+  loop {
+    match ev2.receive() {
+      SockEvent::Chunk(b) => { got = got + fromBytes(b) }
+      other => {
+        println(got + " then " + show(other))
+        break
+      }
+    }
+  }
+  Ok(())
+}
+)SKN" + RUN_END), "Line(a) Line(b) Line(c) Eof \nraw bytes then Eof\n");
+    // Bytes recvLine had already read past a line come first, before anything read afterwards.
+    check_str("active_keeps_recvline_buffer", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  client.sendStr("one\ntwo\n")?
+  let mut conn = srv.accept()?
+  match conn.recvLine()? { Some(l) => println("read " + l), None => println("EOF") }
+  let (_, ev) = conn.activate(Framing::Lines(100), 4)?
+  client.sendStr("three\n")?
+  match ev.receive() { SockEvent::Line(l) => println("event " + l), _ => println("?") }
+  match ev.receive() { SockEvent::Line(l) => println("event " + l), _ => println("?") }
+  Ok(())
+}
+)SKN" + RUN_END), "read one\nevent two\nevent three\n");
+    // A line longer than the bound ends the stream with Failed -- the bound is what keeps a peer that
+    // never sends a newline from growing the buffer without end.
+    check_str("active_line_too_long", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let (_, ev) = conn.activate(Framing::Lines(4), 4)?
+  client.sendStr("ok\nabcdefgh\n")?
+  match ev.receive() { SockEvent::Line(l) => println(l), _ => println("?") }
+  match ev.receive() { SockEvent::Failed(w) => println(w), _ => println("?") }
+  Ok(())
+}
+)SKN" + RUN_END), "ok\nline too long (more than 4 bytes)\n");
+    // Back-pressure: an inbox of ONE event, and a thousand lines sent at once. The I/O thread must pause
+    // and be resumed by every receive -- a lost wake-up hangs here, a lost event breaks the order.
+    check_str("active_flow_control", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let (_, ev) = conn.activate(Framing::Lines(100), 1)?
+  let mut sb = stringBuilder()
+  for i in range(0, 1000) { sb = sb.append(toString(i)).append("\n") }
+  client.sendStr(sb.build())?
+  client.close()?
+  let mut next = 0
+  let mut bad = 0
+  loop {
+    match ev.receive() {
+      SockEvent::Line(l) => {
+        if l != toString(next) { bad = bad + 1 }
+        next = next + 1
+      }
+      other => {
+        println("${next} lines, ${bad} out of order, then " + (if other == SockEvent::Eof { "Eof" } else { "?" }))
+        break
+      }
+    }
+  }
+  Ok(())
+}
+)SKN" + RUN_END), "1000 lines, 0 out of order, then Eof\n");
+    // The owner's end closes the connection (Erlang: a socket belongs to its owning process): the actor
+    // activates, reports, and crashes; the client then sees EOF.
+    check_str("active_owner_end_closes", cg_run_native(NET + R"SKN(
+struct Start { ticket: SocketHandOff, boss: Pid[String] }
+fn doomed(inbox: Inbox[Int], s: Start) -> () {
+  let conn = match s.ticket.take() { Ok(c) => c, Err(e) => panic(e) }
+  let _ = match conn.activate(Framing::Lines(100), 4) { Ok(p) => p, Err(e) => panic(e) }
+  send(s.boss, "active")
+  panic("boom")
+}
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  client.setTimeout(5000)?
+  let conn = srv.accept()?
+  let _pid = spawnActor(doomed, Start { ticket: conn.handOff()?, boss: boss.pid() })
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  match boss.receive() {
+    Mail::Exited(_, why) => println(if indexOf(why, "boom") == 0 { "crashed: boom" } else { why }),
+    _ => println("?")
+  }
+  match client.recvLine()? { Some(l) => println("got " + l), None => println("EOF") }
+  Ok(())
+}
+)SKN" + RUN_END), "active\ncrashed: boom\nEOF\n");
+    // The actor's own Stop reaches the events inbox too, so a loop that only watches its socket still
+    // ends when the actor is told to.
+    check_str("active_stop_event", cg_run_native(NET + R"SKN(
+struct Start { ticket: SocketHandOff, boss: Pid[String] }
+fn listener(inbox: Inbox[Int], s: Start) -> () {
+  let conn = match s.ticket.take() { Ok(c) => c, Err(e) => panic(e) }
+  let (_, ev) = match conn.activate(Framing::Lines(100), 4) { Ok(p) => p, Err(e) => panic(e) }
+  send(s.boss, "active")
+  match ev.receive() { SockEvent::Stopping => send(s.boss, "stopped"), _ => send(s.boss, "?") }
+  ()
+}
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let srv = listen(0)?
+  let _client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let pid = spawnActor(listener, Start { ticket: conn.handOff()?, boss: boss.pid() })
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  stopActor(pid)
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  Ok(())
+}
+)SKN" + RUN_END), "active\nstopped\n");
+    // After activation the TcpConn is dead, and after close so is the ActiveConn.
+    check_str("active_old_conn_and_close_refused", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let (out, _) = conn.activate(Framing::Raw, 4)?
+  match conn.sendStr("x") { Ok(_) => println("old conn worked"), Err(e) => println(e) }
+  out.sendStr("hi\n")?
+  match client.recvLine()? { Some(l) => println("client got " + l), None => println("EOF") }
+  out.close()
+  out.close()
+  match out.sendStr("x") { Ok(_) => println("closed conn worked"), Err(e) => println(e) }
+  Ok(())
+}
+)SKN" + RUN_END),
+        "tcpSend: socket was activated\nclient got hi\nsend: the connection is closed\n");
+    // One I/O thread, a hundred connections, one select over all of them.
+    check_str("active_many_connections", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let port = srv.localPort()?
+  let mut evs: Vec[SockEvents] = vec()
+  let mut refs: Vec[InboxRef] = vec()
+  for k in range(1, 101) {
+    let c = connect("127.0.0.1", port)?
+    let conn = srv.accept()?
+    let (_, ev) = conn.activate(Framing::Lines(100), 2)?
+    push(evs, ev)
+    push(refs, ev.ref())
+    c.sendStr(toString(k) + "\n")?
+    c.close()?
+  }
+  let mut sum = 0
+  let mut closed = 0
+  while closed < 100 {
+    match select(refs, 5000) {
+      Some(i) => match evs[i].receive() {
+        SockEvent::Line(l) => { sum = sum + parseInt(l).unwrapOr(0) }
+        SockEvent::Eof => { closed = closed + 1 }
+        _ => { closed = 1000 }
+      },
+      None => {
+        println("timeout")
+        closed = 1000
+      }
+    }
+  }
+  println("sum ${sum}, closed ${closed}")
+  Ok(())
+}
+)SKN" + RUN_END), "sum 5050, closed 100\n");
+    // A task has no inbox, so it cannot activate a connection: the fault reaches its joiner as an Err.
+    check_str("active_in_task_faults", cg_run_native(NET + "use std::task::*\n" + R"SKN(
+fn tryIt(port: Int) -> String {
+  let c = match connect("127.0.0.1", port) { Ok(c) => c, Err(e) => panic(e) }
+  match c.activate(Framing::Raw, 4) { Ok(_) => "activated", Err(e) => e }
+}
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let t = spawn(tryIt, srv.localPort()?)
+  let _conn = srv.accept()?
+  match t.join() {
+    Ok(s) => println("ok: " + s),
+    Err(e) => println(if indexOf(e, "only an actor or the main program") >= 0 { "refused" } else { e })
+  }
+  Ok(())
+}
+)SKN" + RUN_END), "refused\n");
+    check_true("active_conn_not_sendable", check_has_p(NET +
+        "fn f(inbox: Inbox[ActiveConn], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0", "a socket handle"));
+    check_true("active_events_not_sendable", check_has_p(NET +
+        "fn f(inbox: Inbox[SockEvents], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0",
+        "an active connection's events"));
+    check_true("active_no_conn_literal", check_has_p(NET +
+        "let c = ActiveConn { id: 1 }\n0", "can only be created by `c.activate(...)`"));
+    check_true("active_no_events_literal", check_has_p(NET +
+        "let b: Inbox[Bytes] = newInbox()\nlet e = SockEvents { box: b }\n0",
+        "can only be created by `c.activate(...)`"));
+    check_true("active_natives_gated", check_has_p(U + "let r = rawActiveClose(1)\n0", "rawActiveClose"));
+    // SockEvent's variants are named apart from Mail's (Stop) and std::poll's (Data, Closed): with all
+    // three modules globbed, every variant may still be written bare. A shared name would resolve to
+    // one module silently, and a bare `Stop` in a Mail match would become a type error.
+    check_true("active_variants_bare_with_actor_and_poll", !p_fails(NET + "use std::poll::*\n" +
+        "fn m(x: Mail[Int]) -> Int { match x { Msg(n) => n, Exited(_, _) => 1, Stop => 2 } }\n"
+        "fn r(x: Received) -> Int { match x { Data(_) => 3, Received::WouldBlock => 4, Closed => 5 } }\n"
+        "fn s(x: SockEvent) -> Int { match x { Chunk(_) => 6, Line(_) => 7, Eof => 8, Failed(_) => 9, Stopping => 10 } }\n"
+        "fn i(x: Incoming) -> Int { match x { NewClient(_) => 11, AcceptFailed(_) => 12, ListenerStopping => 13 } }\n"
+        "m(Mail::Stop) + r(Received::Closed) + s(SockEvent::Eof) + i(Incoming::ListenerStopping)\n"));
+
+    // ---- active listeners (std::net: l.activate(capacity)) ----
+    // The runtime accepts, and each new connection arrives as a SocketHandOff ticket. The helper below is
+    // shared: a listener is closed by the I/O thread a moment after it is asked to, so "refused" is
+    // waited for (at most 100 tries), not assumed at once.
+    const std::string REFUSED_SOON = "use std::time::*\n" R"SKN(
+fn refusedSoon(port: Int) -> Bool {
+  let mut i = 0
+  while i < 100 {
+    match connect("127.0.0.1", port) {
+      Ok(c) => { let _ = c.close() }
+      Err(_) => return true
+    }
+    sleep(20)
+    i = i + 1
+  }
+  false
+}
+)SKN";
+    // The point: an acceptor waits on new clients AND its inbox with one select, so a message reaches it
+    // and a Stop ends it -- which a blocking accept() could not offer. The listener closes with it.
+    check_str("active_listener_select_and_stop", cg_run_native(NET + REFUSED_SOON + R"SKN(
+fn acceptor(inbox: Inbox[String], boss: Pid[String]) -> () {
+  let srv = match listen(0) { Ok(s) => s, Err(e) => panic(e) }
+  let port = match srv.localPort() { Ok(p) => p, Err(e) => panic(e) }
+  let (_, incoming) = match srv.activate(4) { Ok(p) => p, Err(e) => panic(e) }
+  send(boss, toString(port))
+  let watching = toVec([incoming.ref(), inbox.ref()])
+  loop {
+    match select(watching, -1) {
+      Some(0) => match incoming.receive() {
+        NewClient(t) => match t.take() {
+          Ok(c) => {
+            let _ = c.sendStr("welcome\n")
+            let _ = c.close()
+          }
+          Err(e) => { send(boss, e) }
+        },
+        _ => {
+          send(boss, "stopped")
+          return ()
+        }
+      },
+      _ => match inbox.receive() {
+        Mail::Msg(m) => { send(boss, "got " + m) }
+        _ => {
+          send(boss, "stopped")
+          return ()
+        }
+      }
+    }
+  }
+}
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let a = spawnActor(acceptor, boss.pid())
+  let port = match boss.receive() { Mail::Msg(m) => parseInt(m).unwrapOr(0), _ => 0 }
+  let mut c = connect("127.0.0.1", port)?
+  c.setTimeout(5000)?
+  match c.recvLine()? { Some(l) => println(l), None => println("EOF") }
+  send(a, "ping")
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  stopActor(a)
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  println(if refusedSoon(port) { "refused afterwards" } else { "still listening" })
+  Ok(())
+}
+)SKN" + RUN_END), "welcome\ngot ping\nstopped\nrefused afterwards\n");
+    // A ticket goes on to a worker unchanged, and the worker takes it -- the hand-off of §16, without
+    // accept() and handOff() in between.
+    check_str("active_listener_to_workers", cg_run_native(NET + R"SKN(
+fn worker(inbox: Inbox[SocketHandOff], n: Int) -> () {
+  for h in inbox.messages() {
+    match h.take() {
+      Ok(mut c) => {
+        match c.recvLine() { Ok(Some(l)) => { let _ = c.sendStr("worker ${n}: " + l + "\n") }, _ => {} }
+        let _ = c.close()
+      },
+      Err(e) => println(e)
+    }
+  }
+}
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let port = srv.localPort()?
+  let (_, incoming) = srv.activate(4)?
+  let mut workers: Vec[Pid[SocketHandOff]] = vec()
+  for n in range(1, 4) { push(workers, spawnActor(worker, n)) }
+  for n in range(1, 4) {
+    let mut c = connect("127.0.0.1", port)?
+    c.setTimeout(5000)?
+    c.sendStr("hello ${n}\n")?
+    match incoming.receive() {
+      NewClient(t) => { send(workers[n - 1], t) }
+      _ => println("?")
+    }
+    match c.recvLine()? { Some(l) => println(l), None => println("EOF") }
+  }
+  Ok(())
+}
+)SKN" + RUN_END), "worker 1: hello 1\nworker 2: hello 2\nworker 3: hello 3\n");
+    // Back-pressure on accepting: an inbox of ONE event, and fifty clients before the first receive. The
+    // rest wait in the operating system's queue and are accepted as room appears; none is lost.
+    check_str("active_listener_flow_control", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let port = srv.localPort()?
+  let (_, incoming) = srv.activate(1)?
+  let mut clients: Vec[TcpConn] = vec()
+  for n in range(1, 51) {
+    let c = connect("127.0.0.1", port)?
+    c.sendStr("${n}\n")?
+    push(clients, c)
+  }
+  let mut sum = 0
+  let mut got = 0
+  while got < 50 {
+    match incoming.receiveTimeout(5000) {
+      Some(NewClient(t)) => {
+        let mut c = t.take()?
+        match c.recvLine()? { Some(l) => { sum = sum + parseInt(l).unwrapOr(0) }, None => {} }
+        got = got + 1
+      }
+      _ => { got = 1000 }
+    }
+  }
+  println("${got} clients, sum ${sum}")
+  Ok(())
+}
+)SKN" + RUN_END), "50 clients, sum 1275\n");
+    // The owner's end closes the listener, and a connection accepted but NOT yet delivered (the inbox was
+    // full) is closed with it rather than left waiting. The first client's ticket WAS delivered and dies
+    // with the inbox; its socket, like any undelivered hand-off, is closed when the program ends -- so it is
+    // not read here. Client 2 was pending or still queued in the OS: either way it must see the end.
+    check_str("active_listener_owner_end_closes", cg_run_native(NET + REFUSED_SOON + R"SKN(
+fn doomed(inbox: Inbox[String], boss: Pid[String]) -> () {
+  let srv = match listen(0) { Ok(s) => s, Err(e) => panic(e) }
+  let port = match srv.localPort() { Ok(p) => p, Err(e) => panic(e) }
+  let _ = match srv.activate(1) { Ok(p) => p, Err(e) => panic(e) }
+  send(boss, toString(port))
+  match inbox.receive() { _ => panic("boom") }
+}
+fn ended(r: Result[Option[String], String]) -> String {
+  match r {
+    Ok(Some(l)) => "got " + l,
+    Ok(None) => "closed",
+    Err(e) => if indexOf(e, "timeout") >= 0 { "timeout" } else { "closed" }
+  }
+}
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let a = spawnActor(doomed, boss.pid())
+  let port = match boss.receive() { Mail::Msg(m) => parseInt(m).unwrapOr(0), _ => 0 }
+  let _c1 = connect("127.0.0.1", port)?
+  let mut c2 = connect("127.0.0.1", port)?
+  c2.setTimeout(5000)?
+  send(a, "crash now")
+  match boss.receive() { Mail::Exited(_, _) => println("crashed"), _ => println("?") }
+  println("client 2: " + ended(c2.recvLine()))
+  println(if refusedSoon(port) { "refused afterwards" } else { "still listening" })
+  Ok(())
+}
+)SKN" + RUN_END), "crashed\nclient 2: closed\nrefused afterwards\n");
+    check_str("active_listener_old_refused", cg_run_native(NET + R"SKN(
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let (lst, _) = srv.activate(1)?
+  match srv.accept() { Ok(_) => println("old listener worked"), Err(e) => println(e) }
+  lst.close()
+  lst.close()
+  Ok(())
+}
+)SKN" + RUN_END), "tcpAccept: socket was activated\n");
+    check_true("active_listener_not_sendable", check_has_p(NET +
+        "fn f(inbox: Inbox[ActiveListener], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0", "a socket handle"));
+    check_true("active_listener_clients_not_sendable", check_has_p(NET +
+        "fn f(inbox: Inbox[IncomingClients], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0",
+        "an active listener's new clients"));
+    check_true("active_listener_no_literal", check_has_p(NET +
+        "let l = ActiveListener { id: 1 }\n0", "can only be created by `l.activate(...)`"));
+    check_true("active_listener_no_clients_literal", check_has_p(NET +
+        "let b: Inbox[Bytes] = newInbox()\nlet i = IncomingClients { box: b }\n0",
+        "can only be created by `l.activate(...)`"));
+
     // ---- the checker, where a Pid[M] is made ----
     check_true("actor_rejects_lambda", check_has_p(U +
         "let p = spawnActor(fn(i: Inbox[Int], u: Int) -> () {}, 0)\n0", "not a lambda"));
@@ -9116,6 +9722,1059 @@ void test_std_actor() {
         "let p: Pid[String] = Pid { id: 0 }\n0", "a Pid can only be created by std::actor"));
     check_true("actor_no_inbox_literal", check_has_p(U +
         "let i: Inbox[Int] = Inbox { id: 0 }\n0", "an Inbox can only be created by std::actor"));
+
+    // ---- extra inboxes, ask, and bounded inboxes (back-pressure) ----
+    const std::string COUNTER =
+        "enum Query { Add(Int), Total(Pid[Int]) }\n"
+        "fn counter(inbox: Inbox[Query], start: Int) -> () {\n"
+        "  let mut total = start\n"
+        "  for q in inbox.messages() {\n"
+        "    match q { Query::Add(n) => { total += n }, Query::Total(p) => { send(p, total) } }\n"
+        "  }\n"
+        "}\n";
+    // The reply goes to an inbox of its own; the reply type (Int) comes from the request's Pid[Int].
+    check_str("actor_ask_round_trip", cg_run_native(U + COUNTER +
+        "let c = spawnActor(counter, 10)\n"
+        "send(c, Query::Add(5))\nsend(c, Query::Add(7))\n"
+        "match ask(c, fn(me) { Query::Total(me) }, 5000) { Ok(t) => println(t), Err(e) => println(e) }\n"),
+        "22\n");
+    // The main inbox's own mail neither answers an ask nor is lost by one: the actor first sends 99 to
+    // the main program, then replies to the ask.
+    check_str("actor_ask_beside_main_inbox", cg_run_native(U + GET +
+        "struct Req { boss: Pid[Int], replyTo: Pid[String] }\n"
+        "fn both(inbox: Inbox[Req], unused: Int) -> () {\n"
+        "  for r in inbox.messages() { send(r.boss, 99)\n send(r.replyTo, \"reply\") }\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let b = spawnActor(both, 0)\n"
+        "match ask(b, fn(rt) { Req { boss: me.pid(), replyTo: rt } }, 5000) {\n"
+        "  Ok(s) => println(s), Err(e) => println(e) }\n"
+        "println(got(me.receive()))\n"), "reply\n99\n");
+    check_str("actor_ask_timeout", cg_run_native(U +
+        "fn deaf(inbox: Inbox[Pid[Int]], unused: Int) -> () { for p in inbox.messages() {} }\n"
+        "let d = spawnActor(deaf, 0)\n"
+        "match ask(d, fn(me) { me }, 20) { Ok(t) => println(t), Err(e) => println(e) }\n"), "Timeout\n");
+    check_str("actor_ask_gone", cg_run_native(U +
+        "fn crasher(inbox: Inbox[Pid[Int]], unused: Int) -> () { panic(\"boom\") }\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let x = spawnActor(crasher, 0)\n"
+        "match me.receive() { Mail::Exited(_, _) => {}, _ => println(\"?\") }\n"
+        "match ask(x, fn(r) { r }, 1000) { Ok(t) => println(t), Err(e) => println(e) }\n"), "Gone\n");
+    // An extra inbox of the main program: bounded to one message, and closed.
+    check_str("actor_bounded_extra_inbox", cg_run_native(U +
+        "let rx: Inbox[Int] = newBoundedInbox(1)\n"
+        "println(\"${trySend(rx.pid(), 1)} ${trySend(rx.pid(), 2)}\")\n"
+        "match rx.receive() { Mail::Msg(v) => println(v), _ => println(\"?\") }\n"
+        "println(trySend(rx.pid(), 3))\n"
+        "rx.close()\n"
+        "println(\"${send(rx.pid(), 4)} ${trySend(rx.pid(), 5)}\")\n"), "Sent Full\n1\nSent\nfalse Gone\n");
+    // trySend is MUST-USE and send is not, deliberately: `Full` means nothing was queued, so dropping
+    // it loses a message while the caller believes it sent one, whereas `false` from `send` is the
+    // ordinary "the receiver has already ended" that Erlang-shaped code ignores on purpose.
+    check_true("try_send_discarded_warns", check_warn_has_p(U +
+        "let rx: Inbox[Int] = newBoundedInbox(1)\n"
+        "trySend(rx.pid(), 1)\n", "SendResult"));
+    check_true("try_send_used_is_quiet", check_warnc_p(U +
+        "let rx: Inbox[Int] = newBoundedInbox(1)\n"
+        "println(toString(trySend(rx.pid(), 1)))\n") == 0);
+    check_true("try_send_wildcard_is_quiet", check_warnc_p(U +
+        "let rx: Inbox[Int] = newBoundedInbox(1)\n"
+        "let _ = trySend(rx.pid(), 1)\n") == 0);
+    check_true("send_discarded_stays_quiet", check_warnc_p(U +
+        "let rx: Inbox[Int] = newInbox()\n"
+        "send(rx.pid(), 1)\n") == 0);
+    // Back-pressure: a bounded actor (capacity 2) that has not started reading is full after two
+    // messages. After "go" (through its own extra inbox) ten more blocking sends follow while it reads.
+    check_str("actor_bounded_back_pressure", cg_run_native(U +
+        "fn gated(inbox: Inbox[Int], boss: Pid[Pid[Int]]) -> () {\n"
+        "  let gate: Inbox[Int] = newInbox()\n"
+        "  send(boss, gate.pid())\n"
+        "  match gate.receive() { _ => {} }\n"
+        "  let mut sum = 0\n"
+        "  let mut n = 0\n"
+        "  for v in inbox.messages() { sum += v\n n += 1\n if n == 12 { println(\"sum ${sum}\") } }\n"
+        "}\n"
+        "let me: Inbox[Pid[Int]] = mainInbox()\n"
+        "let g = spawnActorBounded(gated, me.pid(), 2)\n"
+        "let gate = match me.receive() { Mail::Msg(p) => p, _ => panic(\"no gate\") }\n"
+        "println(\"${trySend(g, 1)} ${trySend(g, 2)} ${trySend(g, 3)}\")\n"
+        "send(gate, 0)\n"
+        "let mut i = 3\n"
+        "while i <= 12 { send(g, i)\n i += 1 }\n"), "Sent Sent Full\nsum 78\n");
+    auto faults_with = [&](const std::string& src, const char* needle) {
+        try { (void)cg_run_native(src); return false; }
+        catch (const std::exception& e) { return std::string(e.what()).find(needle) != std::string::npos; }
+    };
+    check_true("actor_main_inbox_cannot_close", faults_with(U +
+        "let me: Inbox[Int] = mainInbox()\nme.close()\n", "main inbox cannot be closed"));
+    check_true("actor_bounded_inbox_needs_room", faults_with(U +
+        "let rx: Inbox[Int] = newBoundedInbox(0)\n", "at least 1"));
+    check_true("actor_own_full_inbox_faults", faults_with(U +
+        "let rx: Inbox[Int] = newBoundedInbox(1)\nsend(rx.pid(), 1)\nsend(rx.pid(), 2)\n", "own inbox is full"));
+
+    check_true("actor_new_inbox_needs_type", check_has_p(U + "let rx = newInbox()\n0", "a new inbox needs its message type"));
+    check_true("actor_new_inbox_sendable", check_has_p(U +
+        "let rx: Inbox[fn(Int) -> Int] = newBoundedInbox(2)\n0", "a new inbox's messages"));
+    check_true("actor_new_inbox_not_a_value", check_has_p(U + "let f = newInbox\n0", "can only be called"));
+    check_true("actor_ask_not_a_value", check_has_p(U + "let f = ask\n0", "can only be called"));
+    check_true("actor_bounded_spawn_not_a_value", check_has_p(U + "let f = spawnActorBounded\n0", "can only be called"));
+    check_true("actor_bounded_spawn_rejects_lambda", check_has_p(U +
+        "let p = spawnActorBounded(fn(i: Inbox[Int], u: Int) -> () {}, 0, 2)\n0", "not a lambda"));
+    check_true("actor_bounded_spawn_sendable", check_has_p(U +
+        "fn f(inbox: Inbox[fn(Int) -> Int], unused: Int) -> () {}\nlet p = spawnActorBounded(f, 0, 2)\n0",
+        "messages of 'f'"));
+    check_true("actor_ask_needs_reply_type", check_has_p(U +
+        "fn a(i: Inbox[Int], x: Int) -> () {}\nlet p = spawnActor(a, 0)\nlet r = ask(p, fn(me) { 1 }, 10)\n0",
+        "ask needs the reply type"));
+    check_true("actor_ask_reply_sendable", check_has_p(U +
+        "fn a(i: Inbox[Int], x: Int) -> () {}\nlet p = spawnActor(a, 0)\n"
+        "let r: Result[fn(Int) -> Int, AskError] = ask(p, fn(me) { 1 }, 10)\n0", "the reply (fn(Int) -> Int) cannot be sent"));
+
+    // ---- generic helpers: a type parameter bounded `Sendable` at the checked sites ----
+    check_str("actor_generic_reply_inbox", cg_run_native(U + ECHO +
+        "fn replyInbox[R: Sendable]() -> Inbox[R] { newInbox() }\n"
+        "let rx: Inbox[Int] = replyInbox()\n"
+        "send(spawnActor(echo, 0), Ask { n: 4, replyTo: rx.pid() })\n"
+        "match rx.receive() { Mail::Msg(v) => println(v), _ => println(\"?\") }\n"), "8\n");
+    check_str("actor_generic_ask", cg_run_native(U + COUNTER +
+        "fn askOr[M, R: Sendable](p: Pid[M], make: fn(Pid[R]) -> M, dflt: R) -> R {\n"
+        "  match ask(p, make, 5000) { Ok(r) => r, Err(_) => dflt }\n"
+        "}\n"
+        "let c = spawnActor(counter, 3)\n"
+        "println(askOr(c, fn(me) { Query::Total(me) }, -1))\n"), "3\n");
+    check_true("actor_generic_inbox_needs_bound", check_has_p(U +
+        "fn replyInbox[R]() -> Inbox[R] { newInbox() }\n0", "a type parameter (R) without the bound 'Sendable'"));
+    check_true("actor_generic_ask_needs_bound", check_has_p(U +
+        "fn askIt[M, R](p: Pid[M], make: fn(Pid[R]) -> M) -> Int { match ask(p, make, 10) { Ok(_) => 1, Err(_) => 0 } }\n0",
+        "a type parameter (R) without the bound 'Sendable'"));
+
+    // ---- actorFn(f): a checked actor function as a value ----
+    const std::string ECHO_F =
+        "fn echoTimes(inbox: Inbox[Ask], factor: Int) -> () {\n"
+        "  for a in inbox.messages() { send(a.replyTo, a.n * factor) }\n"
+        "}\n";
+    const std::string ASK_S = "struct Ask { n: Int, replyTo: Pid[Int] }\n";
+    // A generic pool: the function arrives as a parameter, which spawnActor could not take.
+    check_str("actor_fn_generic_pool", cg_run_native(U + ASK_S + ECHO_F + GET +
+        "fn pool[M, I](a: ActorFn[M, I], init: I, n: Int) -> Vec[Pid[M]] {\n"
+        "  let mut ps: Vec[Pid[M]] = vec()\n"
+        "  let mut i = 0\n"
+        "  while i < n { push(ps, a.spawn(init))\n i += 1 }\n"
+        "  ps\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "for p in pool(actorFn(echoTimes), 3, 4) { send(p, Ask { n: 2, replyTo: me.pid() }) }\n"
+        "let mut sum = 0\nlet mut k = 0\n"
+        "while k < 4 { sum += got(me.receive())\n k += 1 }\n"
+        "println(sum)\n"), "24\n");
+    // A child spec (function + start value) is plain data: it travels to an actor, which starts it.
+    check_str("actor_fn_child_spec_travels", cg_run_native(U + ASK_S + ECHO_F +
+        "struct Child[M, I] { a: ActorFn[M, I], init: I }\n"
+        "fn starter(inbox: Inbox[Child[Ask, Int]], boss: Pid[Pid[Ask]]) -> () {\n"
+        "  for c in inbox.messages() { send(boss, c.a.spawnBounded(c.init, 4)) }\n"
+        "}\n"
+        "let me: Inbox[Pid[Ask]] = mainInbox()\n"
+        "send(spawnActor(starter, me.pid()), Child { a: actorFn(echoTimes), init: 10 })\n"
+        "let child = match me.receive() { Mail::Msg(p) => p, _ => panic(\"no child\") }\n"
+        "match ask(child, fn(r) { Ask { n: 5, replyTo: r } }, 5000) { Ok(v) => println(v), Err(e) => println(e) }\n"),
+        "50\n");
+    check_true("actor_fn_rejects_lambda", check_has_p(U +
+        "let a = actorFn(fn(i: Inbox[Int], u: Int) -> () {})\n0", "actorFn needs the name of a top-level function here, not a lambda"));
+    check_true("actor_fn_rejects_fn_param", check_has_p(U +
+        "fn wrap(g: fn(Inbox[Int], Int) -> ()) -> ActorFn[Int, Int] { actorFn(g) }\n0", "not a computed function value"));
+    // actorFn has ONE argument, so nothing at the call fixes T: refused, in T's own name.
+    check_true("actor_fn_rejects_undetermined_generic_fn", check_has_p(U +
+        "fn gen[T](i: Inbox[T], u: Int) -> () {}\nlet a = actorFn(gen)\n0",
+        "a type parameter (T) without the bound 'Sendable'"));
+    check_true("actor_fn_checks_messages", check_has_p(U +
+        "fn f(inbox: Inbox[fn(Int) -> Int], unused: Int) -> () {}\nlet a = actorFn(f)\n0", "messages of 'f'"));
+    check_true("actor_fn_checks_start_value", check_has_p(U +
+        "fn f(inbox: Inbox[Int], g: fn(Int) -> Int) -> () {}\nlet a = actorFn(f)\n0", "start value of 'f'"));
+    check_true("actor_fn_not_a_value", check_has_p(U + "let f = actorFn\n0", "can only be called"));
+    check_true("actor_fn_no_literal", check_has_p(U +
+        "fn f(inbox: Inbox[Int], unused: Int) -> () {}\nlet a = ActorFn { f: f }\n0",
+        "an ActorFn can only be created by `actorFn(f)`"));
+    check_true("actor_fn_no_record_update", check_has_p(U +
+        "fn f(inbox: Inbox[Int], unused: Int) -> () {}\nlet a = actorFn(f)\n"
+        "let b = ActorFn { f: fn(i: Inbox[Int], u: Int) -> () {}, ..a }\n0",
+        "an ActorFn can only be created by `actorFn(f)`"));
+
+    // ---- monitor(p, rx): being told that an actor has ended ----
+    const std::string SERVICE =
+        "struct Req { n: Int, replyTo: Pid[Int] }\n"
+        "fn service(inbox: Inbox[Req], unused: Int) -> () {\n"
+        "  for r in inbox.messages() {\n"
+        "    if r.n == 0 { panic(\"service died\") }\n"
+        "    send(r.replyTo, r.n)\n"
+        "  }\n"
+        "}\n"
+        "fn why(m: Mail[Int]) -> String {\n"
+        "  match m {\n"
+        "    Mail::Exited(_, reason) => { let k = indexOf(reason, \" at line \")\n"
+        "      if k < 0 { reason } else { slice(reason, 0, k) } },\n"
+        "    _ => \"?\"\n"
+        "  }\n"
+        "}\n";
+    // A crash ends an `ask` at once, with the reason -- where it used to sit out the whole timeout --
+    // and the monitor set by hand is told as well.
+    check_str("monitor_ask_reports_crash", cg_run_native(U + SERVICE +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let s = spawnActor(service, 0)\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "println(monitor(s, rx))\n"
+        "match ask(s, fn(r) { Req { n: 0, replyTo: r } }, 60000) {\n"
+        "  Ok(v) => println(v),\n"
+        "  Err(AskError::Crashed(reason)) => { let k = indexOf(reason, \" at line \")\n"
+        "    println(\"crashed: ${if k < 0 { reason } else { slice(reason, 0, k) }}\") },\n"
+        "  Err(e) => println(e),\n"
+        "}\n"
+        "println(why(rx.receive()))\n"), "true\ncrashed: service died\nservice died\n");
+    // A normal end is reported to the monitor -- and to nobody else.
+    check_str("monitor_reports_normal_end", cg_run_native(U + SERVICE +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let s = spawnActor(service, 0)\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "println(monitor(s, rx))\n"
+        "println(stopActor(s))\n"
+        "println(why(rx.receive()))\n"
+        "match me.receiveTimeout(50) { None => println(\"the starter hears nothing\"), _ => println(\"?\") }\n"),
+        "true\ntrue\nnormal\nthe starter hears nothing\n");
+    // An actor that has already ended: false, and the one report comes at once.
+    check_str("monitor_already_ended", cg_run_native(U + SERVICE +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let s = spawnActor(service, 0)\n"
+        "send(s, Req { n: 0, replyTo: me.pid() })\n"
+        "match me.receive() { Mail::Exited(_, _) => {}, _ => println(\"?\") }\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "println(monitor(s, rx))\n"
+        "println(why(rx.receive()))\n"), "false\ngone\n");
+    // A monitor reports once: the actor started into the same slot afterwards is not watched.
+    check_str("monitor_does_not_follow_a_slot", cg_run_native(U + SERVICE +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let at: Slot[Req] = newSlot()\n"
+        "let first = at.spawn(actorFn(service), 0)\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "println(monitor(at.pid(), rx))\n"
+        "send(at.pid(), Req { n: 0, replyTo: me.pid() })\n"
+        "println(why(rx.receive()))\n"
+        "match me.receive() { Mail::Exited(_, _) => {}, _ => println(\"?\") }\n"
+        "let second = at.spawn(actorFn(service), 0)\n"
+        "send(at.pid(), Req { n: 0, replyTo: me.pid() })\n"
+        "match me.receive() { Mail::Exited(_, _) => println(\"the starter hears the second one\"), _ => println(\"?\") }\n"
+        "match rx.receiveTimeout(50) { None => println(\"the monitor does not\"), _ => println(\"?\") }\n"),
+        "true\nservice died\nthe starter hears the second one\nthe monitor does not\n");
+
+    // ---- a GENERIC actor body, and a generic starter over it ----
+    // Types are erased, so one body serves every use and the id that travels is that body's. The body
+    // below is reachable ONLY through spawnActor -- never called directly -- so this also pins that the
+    // tree-shaker keeps a generic function reached as a value, and that it lowers.
+    const std::string GENERIC =
+        "fn relay[T: Sendable](inbox: Inbox[T], boss: Pid[T]) -> () {\n"
+        "  for m in inbox.messages() { send(boss, m) }\n"
+        "}\n"
+        "fn start[T: Sendable](boss: Pid[T]) -> Pid[T] { spawnActor(relay, boss) }\n";
+    // One erased body, two message types -- and the generic STARTER is what could not be written before.
+    check_str("actor_generic_body_and_starter", cg_run_native(U + GENERIC +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let sx: Inbox[String] = newInbox()\n"
+        "let ints = start(me.pid())\n"
+        "let strs = start(sx.pid())\n"
+        "send(ints, 21)\n"
+        "match me.receive() { Mail::Msg(n) => println(\"int: ${n}\"), _ => println(\"?\") }\n"
+        "send(strs, \"hi\")\n"
+        "match sx.receive() { Mail::Msg(s) => println(\"str: ${s}\"), _ => println(\"?\") }\n"),
+        "int: 21\nstr: hi\n");
+    // The start value is what fixes T at a direct spawn.
+    check_str("actor_generic_body_determined_by_init", cg_run_native(U +
+        "fn once[T: Sendable](inbox: Inbox[T], first: T) -> () { send(inbox.pid(), first) }\n"
+        "fn watcher(inbox: Inbox[Int], unused: Int) -> () {}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "let p = spawnActor(once, 7)\n"
+        "println(monitor(p, rx))\n"
+        "match rx.receive() { Mail::Exited(_, why) => println(why), _ => println(\"?\") }\n"),
+        "true\nnormal\n");
+    // An UNBOUNDED type parameter works too, where the call determines it: the sendability of the type
+    // it is solved to is what the rule needs, not a bound.
+    check_str("actor_generic_unbounded_determined_ok", cg_run_native(U +
+        "fn once[T](inbox: Inbox[T], first: T) -> () { send(inbox.pid(), first) }\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "let p = spawnActor(once, 7)\n"
+        "println(monitor(p, rx))\n"
+        "match rx.receive() { Mail::Exited(_, why) => println(why), _ => println(\"?\") }\n"),
+        "true\nnormal\n");
+    // actorFn takes one argument, so the EXPECTED type is the only thing that can fix T.
+    check_str("actor_fn_generic_with_annotation", cg_run_native(U +
+        "fn once[T: Sendable](inbox: Inbox[T], first: T) -> () { send(inbox.pid(), first) }\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let a: ActorFn[Int, Int] = actorFn(once)\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "let p = a.spawn(7)\n"
+        "println(monitor(p, rx))\n"
+        "match rx.receive() { Mail::Exited(_, why) => println(why), _ => println(\"?\") }\n"),
+        "true\nnormal\n");
+    // What a determined type parameter does NOT excuse: a message type that is not sendable.
+    check_true("actor_generic_still_checks_sendable", check_has_p(U +
+        "fn once[T](inbox: Inbox[T], first: T) -> () {}\n"
+        "fn mk() -> fn(Int) -> Int { fn(x: Int) -> Int { x } }\n"
+        "let p = spawnActor(once, mk())\n0",
+        "cannot be sent to an actor"));
+
+    // ---- stopRequested(): an actor whose loop is its own work ends itself ----
+    // It never receives, so stopActor's message would never be read -- it ASKS instead.
+    const std::string BUSY =
+        "fn busy(inbox: Inbox[Int], boss: Pid[Int]) -> () {\n"
+        "  send(boss, 1)\n"
+        "  let mut n = 0\n"
+        "  while !inbox.stopRequested() { n += 1 }\n"
+        "  send(boss, if n >= 0 { 2 } else { 3 })\n"
+        "}\n";
+    check_str("stop_requested_ends_a_busy_actor", cg_run_native(U + BUSY +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let p = spawnActor(busy, me.pid())\n"
+        "match me.receive() { Mail::Msg(_) => {}, _ => println(\"?\") }\n"
+        "println(stopActor(p))\n"
+        "match me.receive() { Mail::Msg(m) => println(\"ended: ${m}\"), _ => println(\"?\") }\n"),
+        "true\nended: 2\n");
+    // Nobody has asked, so it is false -- and asking consumes no mail.
+    check_str("stop_requested_false_until_asked", cg_run_native(U +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "println(me.stopRequested())\n"
+        "send(me.pid(), 7)\n"
+        "println(me.stopRequested())\n"
+        "match me.receive() { Mail::Msg(m) => println(m), _ => println(\"?\") }\n"),
+        "false\nfalse\n7\n");
+    // A released slot tells the actor running in it, exactly as stopActor does.
+    check_str("stop_requested_by_a_released_slot", cg_run_native(U + BUSY +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let at: Slot[Int] = newSlot()\n"
+        "let _id = at.spawn(actorFn(busy), me.pid())\n"
+        "match me.receive() { Mail::Msg(_) => {}, _ => println(\"?\") }\n"
+        "at.release()\n"
+        "match me.receive() { Mail::Msg(m) => println(\"ended: ${m}\"), _ => println(\"?\") }\n"),
+        "ended: 2\n");
+    // ActorId's stop/watch are stopActor/monitor for a child whose message type is erased.
+    check_str("actor_id_stop_and_watch", cg_run_native(U + BUSY +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let p = spawnActor(busy, me.pid())\n"
+        "match me.receive() { Mail::Msg(_) => {}, _ => println(\"?\") }\n"
+        "let a = p.actorId()\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "println(a.watch(rx))\n"
+        "println(a.stop())\n"
+        "match me.receive() { Mail::Msg(_) => {}, _ => println(\"?\") }\n"
+        "match rx.receive() { Mail::Exited(_, why) => println(why), _ => println(\"?\") }\n"),
+        "true\ntrue\nnormal\n");
+    // Only one's OWN inbox can be asked. The runtime refuses another actor's (actor_stop_requested in
+    // vm_tests); from Skarn it is not even reachable, because an Inbox is neither sendable nor buildable.
+    check_true("stop_requested_is_own_inbox_only", check_has_p(U +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let forged: Inbox[Int] = Inbox { id: 7 }\n"
+        "println(forged.stopRequested())\n", "can only be created by std::actor"));
+
+    // ---- select: waiting on several inboxes at once ----
+    // The case that was impossible before: one loop serving the actor's own mail AND a reply inbox
+    // fed by someone else. The reply arrives in the SECOND inbox and wakes the same select.
+    const std::string SELWORK =
+        "fn helper(inbox: Inbox[Pid[String]], unused: Int) -> () {\n"
+        "  for to in inbox.messages() { send(to, \"hello\") }\n"
+        "}\n"
+        "fn serve(inbox: Inbox[Int], boss: Pid[String]) -> () {\n"
+        "  let rx: Inbox[String] = newInbox()\n"
+        "  let h = spawnActor(helper, 0)\n"
+        "  let boxes = toVec([rx.ref(), inbox.ref()])\n"
+        "  let mut on = true\n"
+        "  while on {\n"
+        "    match select(boxes, 10000) {\n"
+        "      Some(0) => {\n"
+        "        match rx.receive() {\n"
+        "          Mail::Msg(s) => { send(boss, \"rx ${s}\") },\n"
+        "          _            => { on = false }\n"
+        "        }\n"
+        "      },\n"
+        "      Some(1) => {\n"
+        "        match inbox.receive() {\n"
+        "          Mail::Msg(n) => { if n == 0 { send(h, rx.pid()) } else { send(boss, \"job ${n}\") } },\n"
+        "          _            => { on = false }\n"
+        "        }\n"
+        "      },\n"
+        "      _ => { on = false }\n"
+        "    }\n"
+        "  }\n"
+        "  send(boss, \"done\")\n"
+        "}\n";
+    check_str("select_serves_two_inboxes", cg_run_native(U + SELWORK +
+        "let me: Inbox[String] = mainInbox()\n"
+        "let p = spawnActor(serve, me.pid())\n"
+        "send(p, 4)\n"
+        "match me.receive() { Mail::Msg(s) => println(s), _ => println(\"?\") }\n"
+        "send(p, 0)\n"
+        "match me.receive() { Mail::Msg(s) => println(s), _ => println(\"?\") }\n"
+        "stopActor(p)\n"
+        "match me.receive() { Mail::Msg(s) => println(s), _ => println(\"?\") }\n"),
+        "job 4\nrx hello\ndone\n");
+    // Nothing to read: the deadline answers None. Then both are ready and the LOWEST index wins, so
+    // the order of the list is a priority order.
+    check_str("select_timeout_and_tie_break", cg_run_native(U +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let rx: Inbox[String] = newInbox()\n"
+        "println(toString(select(toVec([me.ref(), rx.ref()]), 30)))\n"
+        "send(me.pid(), 1)\n"
+        "send(rx.pid(), \"x\")\n"
+        "println(toString(select(toVec([me.ref(), rx.ref()]), 0)))\n"
+        "println(toString(select(toVec([rx.ref(), me.ref()]), 0)))\n"),
+        "None\nSome(0)\nSome(0)\n");
+    // Watching nothing with no deadline could never end: a located fault, as rawPoll refuses the
+    // same shape rather than leaving a program hanging with no output.
+    check_true("select_empty_forever_faults", cg_faults_msg(U +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let none: Vec[InboxRef] = vec()\n"
+        "println(toString(select(none, -1)))\n", "would wait forever"));
+    // An InboxRef names the same mailbox an Inbox does: it cannot travel to another isolate ...
+    check_true("select_ref_is_not_sendable", check_has_p(U +
+        "struct Watch { r: InboxRef }\n"
+        "fn w(inbox: Inbox[Watch], unused: Int) -> () { let _m = inbox.receive() }\n"
+        "let _p = spawnActor(w, 0)\n", "a reference to an actor's inbox"));
+    // ... and it cannot be forged, for the reason an Inbox cannot.
+    check_true("select_ref_cannot_be_forged", check_has_p(U +
+        "let forged = InboxRef { id: 7 }\n"
+        "println(toString(select(toVec([forged]), 0)))\n",
+        "an InboxRef can only be created by `inbox.ref()`"));
+
+    // ---- deadlock detection: a cycle of blocked sends (and joins) ----
+    // Two actors, each filling the other's capacity-1 inbox and then waiting for room. EVERY
+    // participant must report it: the first to fault closes its inbox, which releases the other with
+    // "gone", so without the world's deadlock mark only ONE of them would ever say anything.
+    check_str("deadlock_two_actors_both_report", cg_run_native(U +
+        "enum Msg { Peer(Pid[Msg]), Work(Int) }\n"
+        "fn side(inbox: Inbox[Msg], boss: Pid[Int]) -> () {\n"
+        "  let peer = match inbox.receive() {\n"
+        "    Mail::Msg(Msg::Peer(p)) => p,\n"
+        "    _                       => panic(\"no peer\")\n"
+        "  }\n"
+        "  send(boss, 1)\n"
+        "  let mut i = 0\n"
+        "  while i < 100 { send(peer, Msg::Work(i))\n i += 1 }\n"
+        "}\n"
+        "fn said(me: Inbox[Int]) -> String {\n"
+        "  match me.receive() {\n"
+        "    Mail::Exited(_, why) => if indexOf(why, \"deadlock\") >= 0 { \"reported\" } else { why },\n"
+        "    _                    => \"?\",\n"
+        "  }\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let a = spawnActorBounded(side, me.pid(), 1)\n"
+        "let b = spawnActorBounded(side, me.pid(), 1)\n"
+        "send(a, Msg::Peer(b))\n"
+        "send(b, Msg::Peer(a))\n"
+        "match me.receive() { Mail::Msg(_) => {}, _ => println(\"?\") }\n"
+        "match me.receive() { Mail::Msg(_) => {}, _ => println(\"?\") }\n"
+        "println(\"${said(me)} ${said(me)}\")\n"),
+        "reported reported\n");
+    // The main program is an ordinary participant: it gets the located fault, which is the right end
+    // for a program that would otherwise have hung with no output at all.
+    check_true("deadlock_root_is_a_participant", faults_with(U +
+        "fn filler(inbox: Inbox[Int], back: Pid[Int]) -> () {\n"
+        "  let mut i = 0\n"
+        "  while i < 100 { send(back, i)\n i += 1 }\n"
+        "}\n"
+        "let _me: Inbox[Int] = mainInbox()\n"
+        "let rx: Inbox[Int] = newBoundedInbox(1)\n"
+        "let a = spawnActorBounded(filler, rx.pid(), 1)\n"
+        "let mut i = 0\n"
+        "while i < 100 { send(a, i)\n i += 1 }\n", "deadlock"));
+    // A JOIN names its target as exactly as a blocked send does, so a cycle through one is found.
+    // Before this, std::thread::join() had no deadline and such a cycle was invisible.
+    // A join cycle has TWO legitimate endings, and which one happens depends on who confirms first --
+    // so the test asserts the invariant (it is reported, and the program does not hang) rather than the
+    // mechanism. If the JOINER confirms first it faults, like any other participant. If the TASK
+    // confirms first it dies, its join returns, and the deadlock reaches the caller as the `Err` of a
+    // `Result`. That asymmetry is deliberate and needs no deadlock mark: unlike a dropped `send` Bool,
+    // a `Result` is must-use, so the checker will not let the caller drop it silently.
+    auto reports = [&](const std::string& src, const char* needle) {
+        try { return cg_run_native(src).find(needle) != std::string::npos; }
+        catch (const std::exception& e) { return std::string(e.what()).find(needle) != std::string::npos; }
+    };
+    check_true("deadlock_through_a_join", reports(
+        "use std::actor::*\nuse std::task::*\n"
+        "fn producer(back: Pid[Int]) -> Int {\n"
+        "  let mut i = 0\n"
+        "  while i < 50 { send(back, i)\n i += 1 }\n"
+        "  99\n"
+        "}\n"
+        "let _me: Inbox[Int] = mainInbox()\n"
+        "let rx: Inbox[Int] = newBoundedInbox(1)\n"
+        "let t = spawn(producer, rx.pid())\n"
+        "println(toString(t.join()))\n", "deadlock"));
+    // NEAR MISS, and the reason the walk stops at a receive: the addressee is not blocked SENDING,
+    // it is merely slow. It has no target, so no cycle exists and nothing may be reported -- the
+    // send simply goes through once the actor drains.
+    check_str("deadlock_a_slow_receiver_is_not_one", cg_run_native(
+        "use std::actor::*\nuse std::time::*\n"
+        "fn slow(inbox: Inbox[Int], back: Pid[Int]) -> () {\n"
+        "  sleep(800)\n"                            // well past the 250 ms first slice
+        "  let mut got = 0\n"
+        "  for _m in inbox.messages() {\n"
+        "    got += 1\n"
+        "    if got == 3 { send(back, got)\n break }\n"
+        "  }\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let a = spawnActorBounded(slow, me.pid(), 1)\n"
+        "let mut i = 0\n"
+        "while i < 3 { send(a, i)\n i += 1 }\n"
+        "match me.receive() { Mail::Msg(n) => println(\"delivered ${n}\"), _ => println(\"?\") }\n"),
+        "delivered 3\n");
+    // THE STALE-ENTRY FALSIFIER. A consumer that drains right around the grace boundary keeps the
+    // sender going in and out of the wait for seconds. A confirmation kept by the SENDER would see
+    // "still listed, generation unchanged" in that window and report a deadlock that never existed;
+    // the listing in the TARGET mailbox, removed before the message is queued, cannot.
+    check_str("deadlock_no_verdict_at_the_grace_boundary", cg_run_native(
+        "use std::actor::*\nuse std::time::*\n"
+        "fn dripping(inbox: Inbox[Int], back: Pid[Int]) -> () {\n"
+        "  let mut got = 0\n"
+        "  while got < 8 {\n"
+        "    sleep(300)\n"                          // just past the first slice, every time
+        "    match inbox.receive() { Mail::Msg(_) => { got += 1 }, _ => { got = 8 } }\n"
+        "  }\n"
+        "  send(back, got)\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let a = spawnActorBounded(dripping, me.pid(), 1)\n"
+        "let mut i = 0\n"
+        "while i < 8 { send(a, i)\n i += 1 }\n"
+        "match me.receive() { Mail::Msg(n) => println(\"drained ${n}\"), _ => println(\"?\") }\n"),
+        "drained 8\n");
+    // The END OF THE WORLD resolves a blocked send legitimately: every sender is released with
+    // false. That is not a deadlock and must never be reported as one.
+    check_str("deadlock_shutdown_releases_instead", cg_run_native(
+        "use std::actor::*\nuse std::time::*\n"
+        "fn filler(inbox: Inbox[Int], back: Pid[Int]) -> () {\n"
+        "  let mut sent = 0\n"
+        "  let mut i = 0\n"
+        "  while i < 50 { if send(back, i) { sent += 1 }\n i += 1 }\n"
+        "  println(\"the sender was released, ${sent} of 50 got through\")\n"
+        "}\n"
+        "let _rx: Inbox[Int] = newBoundedInbox(1)\n"
+        "let _a = spawnActorBounded(filler, _rx.pid(), 1)\n"
+        "sleep(700)\n"                              // let it block well past the first slice
+        "println(\"the program ends now\")\n"),
+        "the program ends now\nthe sender was released, 1 of 50 got through\n");
+
+    // ---- Slot[M]: an address that outlives its actor ----
+    const std::string WORKER =
+        "fn worker(inbox: Inbox[Ask], factor: Int) -> () {\n"
+        "  for a in inbox.messages() {\n"
+        "    if a.n == 13 { panic(\"unlucky\") }\n"
+        "    send(a.replyTo, a.n * factor)\n"
+        "  }\n"
+        "}\n";
+    // One address, three actors behind it: the first answers, crashes, and the message sent while the
+    // slot stands empty reaches the one started next.
+    check_str("slot_address_survives_restart", cg_run_native(U + ASK_S + WORKER + GET +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let s: Slot[Ask] = newSlot()\n"
+        "let id = s.spawn(actorFn(worker), 2)\n"
+        "let p = s.pid()\n"
+        "send(p, Ask { n: 5, replyTo: me.pid() })\n"
+        "println(got(me.receive()))\n"
+        "send(p, Ask { n: 13, replyTo: me.pid() })\n"
+        "match me.receive() { Mail::Exited(who, _) => println(who == id), _ => println(\"?\") }\n"
+        "send(p, Ask { n: 7, replyTo: me.pid() })\n"
+        "let again = s.spawn(actorFn(worker), 3)\n"
+        "println(got(me.receive()))\n"
+        "println(send(p, Ask { n: 1, replyTo: me.pid() }))\n"
+        "s.release()\n"
+        "println(send(p, Ask { n: 1, replyTo: me.pid() }))\n"), "10\ntrue\n21\ntrue\nfalse\n");
+    // A slot can be sent, so a supervisor actor can be handed the addresses it keeps alive.
+    check_str("slot_travels_to_a_supervisor", cg_run_native(U + ASK_S + WORKER + GET +
+        "fn keeper(inbox: Inbox[Slot[Ask]], unused: Int) -> () {\n"
+        "  for s in inbox.messages() { let id = s.spawn(actorFn(worker), 4) }\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let s: Slot[Ask] = newSlot()\n"
+        "send(spawnActor(keeper, 0), s)\n"
+        "send(s.pid(), Ask { n: 6, replyTo: me.pid() })\n"
+        "println(got(me.receive()))\n"), "24\n");
+    check_str("slot_stop_actor", cg_run_native(U + ASK_S + WORKER + GET +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let p = spawnActor(worker, 5)\n"
+        "send(p, Ask { n: 2, replyTo: me.pid() })\n"
+        "println(got(me.receive()))\n"
+        "println(stopActor(p))\n"), "10\ntrue\n");
+    check_true("slot_needs_message_type", check_has_p(U +
+        "let s = newSlot()\n0", "a new address needs its message type here"));
+    check_true("slot_message_must_be_sendable", check_has_p(U +
+        "let s: Slot[fn(Int) -> Int] = newSlot()\n0", "a new address's messages"));
+    check_true("slot_not_a_value", check_has_p(U + "let f = newSlot\n0", "can only be called"));
+    check_true("slot_no_literal", check_has_p(U +
+        "let s: Slot[Int] = Slot { id: 0 }\n0",
+        "a Slot can only be created by `newSlot()` / `newBoundedSlot(n)`"));
+    check_true("slot_bounded_needs_type", check_has_p(U +
+        "let s = newBoundedSlot(2)\n0", "a new address needs its message type here"));
+}
+
+// =============================================================================
+// std::supervisor -- the library supervisor over std::actor: restart a crashed child, give up past
+// the restart limit (the crash then reaches the supervisor's own starter), children of different
+// types, trees. Every case has exactly one possible output: a child counts its attempts at a
+// counter actor, so which attempt succeeds does not depend on timing.
+// =============================================================================
+void test_std_supervisor() {
+    std::cout << "[codegen: std::supervisor]\n";
+    const std::string U = "use std::actor::*\nuse std::supervisor::*\n";
+    // A counter that answers each request with the next number, and a child that fails until its
+    // attempt number reaches `okAt`, then announces "<tag> up <attempt>" to the boss.
+    const std::string COUNTER =
+        "enum Count { Next(Pid[Int]) }\n"
+        "fn counter(inbox: Inbox[Count], unused: Int) -> () {\n"
+        "  let mut n = 0\n"
+        "  for m in inbox.messages() { match m { Count::Next(r) => { n += 1\n send(r, n) } } }\n"
+        "}\n"
+        "struct Start { counter: Pid[Count], boss: Pid[String], okAt: Int, tag: String }\n"
+        "fn flaky(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let attempt = match ask(s.counter, fn(me) { Count::Next(me) }, 5000) { Ok(n) => n, Err(_) => 0 }\n"
+        "  if attempt < s.okAt { panic(\"attempt ${attempt} failed\") }\n"
+        "  send(s.boss, \"${s.tag} up ${attempt}\")\n"
+        "}\n";
+    const std::string MAIN =
+        "let me: Inbox[String] = mainInbox()\n"
+        "fn start(me: Inbox[String], okAt: Int) -> Start {\n"
+        "  Start { counter: spawnActor(counter, 0), boss: me.pid(), okAt: okAt, tag: \"a\" }\n"
+        "}\n"
+        // A fault's reason ends in its location (\" at line N (in f)\"); the cases compare the text before it.
+        "fn reason(why: String) -> String { let k = indexOf(why, \" at line \")\n if k < 0 { why } else { slice(why, 0, k) } }\n"
+        "fn report(m: Mail[String]) -> () {\n"
+        "  match m { Mail::Msg(t) => println(t), Mail::Exited(_, why) => println(\"died: ${reason(why)}\"), Mail::Stop => println(\"stop\") }\n"
+        "}\n";
+    const std::string ONE =
+        "fn sup(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(flaky), s))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 2, withinMs: 60000 })\n"
+        "}\n";
+
+    check_str("supervisor_restarts_crashed_child", cg_run_native(U + COUNTER + MAIN + ONE +
+        "let p = spawnActor(sup, start(me, 3))\n"
+        "report(me.receive())\n"), "a up 3\n");
+    check_str("supervisor_gives_up_past_limit", cg_run_native(U + COUNTER + MAIN + ONE +
+        "let p = spawnActor(sup, start(me, 4))\n"
+        "report(me.receive())\n"),
+        "died: supervisor: more than 2 restarts within 60000 ms; the last: attempt 3 failed\n");
+    check_str("supervisor_no_restarts_allowed", cg_run_native(U + COUNTER + MAIN +
+        "fn sup(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(flaky), s))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 0, withinMs: 60000 })\n"
+        "}\n"
+        "let p = spawnActor(sup, start(me, 2))\n"
+        "report(me.receive())\n"),
+        "died: supervisor: more than 0 restarts within 60000 ms; the last: attempt 1 failed\n");
+    // Children of two different message and start-value types in one list.
+    check_str("supervisor_heterogeneous_children", cg_run_native(U + COUNTER + MAIN +
+        "fn greeter(inbox: Inbox[String], boss: Pid[String]) -> () { send(boss, \"b up\") }\n"
+        "struct Both { s: Start, boss: Pid[String] }\n"
+        "fn sup(inbox: Inbox[Int], b: Both) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(flaky), b.s))\n"
+        "  push(kids, child(actorFn(greeter), b.boss))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 5, withinMs: 60000 })\n"
+        "}\n"
+        "let p = spawnActor(sup, Both { s: start(me, 2), boss: me.pid() })\n"
+        "let mut got: Vec[String] = vec()\n"
+        "while len(got) < 2 { match me.receive() { Mail::Msg(t) => push(got, t), _ => push(got, \"?\") } }\n"
+        "for t in sorted(got) { println(t) }\n"), "a up 2\nb up\n");
+    // A tree: the inner supervisor allows no restart and gives up at the child's first crash; the
+    // outer one starts the inner again, whose new child then succeeds.
+    check_str("supervisor_tree_restarts_inner", cg_run_native(U + COUNTER + MAIN +
+        "fn inner(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(flaky), s))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 0, withinMs: 60000 })\n"
+        "}\n"
+        "fn outer(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(inner), s))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 1, withinMs: 60000 })\n"
+        "}\n"
+        "let p = spawnActor(outer, start(me, 2))\n"
+        "report(me.receive())\n"), "a up 2\n");
+    // A crash of an actor that is not a child, and messages to the supervisor, change nothing: with
+    // a limit of exactly the two restarts the child needs, a counted stranger would make it give up.
+    check_str("supervisor_ignores_strangers", cg_run_native(U + COUNTER + MAIN +
+        "fn crasher(inbox: Inbox[Int], unused: Int) -> () { panic(\"stranger\") }\n"
+        "fn sup(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let c = spawnActor(crasher, 0)\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(flaky), s))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 2, withinMs: 60000 })\n"
+        "}\n"
+        "let p = spawnActor(sup, start(me, 3))\n"
+        "send(p, 1)\nsend(p, 2)\n"
+        "report(me.receive())\n"), "a up 3\n");
+    // supervise returns at Stop, when the program ends.
+    check_str("supervisor_returns_at_stop", cg_run_native(U + COUNTER + MAIN +
+        "fn sup(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(flaky), s))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 2, withinMs: 60000 })\n"
+        "  println(\"supervisor done\")\n"
+        "}\n"
+        "let p = spawnActor(sup, start(me, 1))\n"
+        "report(me.receive())\n"), "a up 1\nsupervisor done\n");
+    check_str("supervisor_checks_limit", cg_run_native(U + COUNTER + MAIN +
+        "fn sup(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: 2, withinMs: 0 })\n"
+        "}\n"
+        "let p = spawnActor(sup, start(me, 1))\n"
+        "report(me.receive())\n"), "died: supervise: withinMs must be at least 1\n");
+    // A child in a SLOT keeps one address across its restarts, and a send while it is being started
+    // again waits in the slot instead of being dropped.
+    // Each start announces itself with -1, so every step is ordered whatever the schedule: a message
+    // is only sent once its receiver is known to be up.
+    const std::string SLOTTED =
+        "struct Job { n: Int, replyTo: Pid[Int] }\n"
+        "fn flakyWorker(inbox: Inbox[Job], boss: Pid[Int]) -> () {\n"
+        "  send(boss, -1)\n"
+        "  for j in inbox.messages() {\n"
+        "    if j.n == 13 { panic(\"unlucky\") }\n"
+        "    send(j.replyTo, j.n * 2)\n"
+        "  }\n"
+        "}\n"
+        "struct Setup { at: Slot[Job], boss: Pid[Int], limit: Int }\n"
+        "fn keeper(inbox: Inbox[Int], s: Setup) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, childIn(s.at, actorFn(flakyWorker), s.boss))\n"
+        "  supervise(inbox, kids, RestartLimit { maxRestarts: s.limit, withinMs: 60000 })\n"
+        "}\n"
+        "fn got(m: Mail[Int]) -> Int { match m { Mail::Msg(v) => v, _ => -2 } }\n";
+    check_str("supervisor_slot_child_keeps_address", cg_run_native(U + SLOTTED +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let at: Slot[Job] = newSlot()\n"
+        "let k = spawnActor(keeper, Setup { at: at, boss: me.pid(), limit: 3 })\n"
+        "let p = at.pid()\n"
+        "println(got(me.receive()))\n"                     // the first child is up
+        "send(p, Job { n: 4, replyTo: me.pid() })\n"
+        "println(got(me.receive()))\n"
+        "send(p, Job { n: 13, replyTo: me.pid() })\n"      // it crashes on this one
+        "println(got(me.receive()))\n"                     // its successor, at the SAME address
+        "send(p, Job { n: 5, replyTo: me.pid() })\n"
+        "println(got(me.receive()))\n"), "-1\n8\n-1\n10\n");
+    // Past the limit the supervisor gives up AND gives up the address: a later send answers false.
+    check_str("supervisor_slot_released_when_giving_up", cg_run_native(U + SLOTTED +
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let at: Slot[Job] = newSlot()\n"
+        "let k = spawnActor(keeper, Setup { at: at, boss: me.pid(), limit: 0 })\n"
+        "let p = at.pid()\n"
+        "println(got(me.receive()))\n"
+        "send(p, Job { n: 13, replyTo: me.pid() })\n"
+        "match me.receive() { Mail::Exited(_, _) => println(\"gave up\"), _ => println(\"?\") }\n"
+        "println(send(p, Job { n: 1, replyTo: me.pid() }))\n"), "-1\ngave up\nfalse\n");
+    // ---- the strategies: what a crash costs the SIBLINGS ----
+    // Three children, each announcing its number at start. The one in the middle is made to crash, and
+    // the case counts who starts again. The announcements after a group restart come in whatever order
+    // the schedule picks, so they are SORTED -- never compared as a sequence.
+    const std::string GROUP =
+        "struct Note { i: Int, me: Pid[Int] }\n"
+        "struct Kid { i: Int, boss: Pid[Note] }\n"
+        "fn member(inbox: Inbox[Int], s: Kid) -> () {\n"
+        "  send(s.boss, Note { i: s.i, me: inbox.pid() })\n"
+        "  for m in inbox.messages() { if m == 0 { panic(\"boom\") } }\n"
+        "}\n"
+        "fn three(boss: Pid[Note]) -> Vec[dyn Supervised] {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(member), Kid { i: 0, boss: boss }))\n"
+        "  push(kids, child(actorFn(member), Kid { i: 1, boss: boss }))\n"
+        "  push(kids, child(actorFn(member), Kid { i: 2, boss: boss }))\n"
+        "  kids\n"
+        "}\n"
+        "fn spec(s: Strategy) -> SupervisorSpec {\n"
+        "  SupervisorSpec { strategy: s, limit: RestartLimit { maxRestarts: 3, withinMs: 60000 },\n"
+        "                   stopTimeoutMs: 0 }\n"
+        "}\n"
+        "fn allKeeper(inbox: Inbox[()], boss: Pid[Note]) -> () {\n"
+        "  superviseWith(inbox, three(boss), spec(Strategy::OneForAll))\n"
+        "}\n"
+        "fn restKeeper(inbox: Inbox[()], boss: Pid[Note]) -> () {\n"
+        "  superviseWith(inbox, three(boss), spec(Strategy::RestForOne))\n"
+        "}\n"
+        "fn oneKeeper(inbox: Inbox[()], boss: Pid[Note]) -> () {\n"
+        "  superviseWith(inbox, three(boss), spec(Strategy::OneForOne))\n"
+        "}\n"
+        // Start the group, crash the middle child, and report who announced itself afterwards.
+        "fn round(me: Inbox[Note], keeper: ActorFn[(), Pid[Note]], after: Int) -> String {\n"
+        "  let _k = keeper.spawn(me.pid())\n"
+        "  let mut victim: Option[Pid[Int]] = None\n"
+        "  let mut up = 0\n"
+        "  while up < 3 {\n"
+        "    match me.receive() {\n"
+        "      Mail::Msg(note) => { if note.i == 1 { victim = Some(note.me) }\n up += 1 },\n"
+        "      _ => { up = 3 },\n"
+        "    }\n"
+        "  }\n"
+        "  match victim { Some(p) => { send(p, 0) }, None => {} }\n"
+        "  let mut seen: Vec[Int] = vec()\n"
+        "  let mut n = 0\n"
+        "  while n < after {\n"
+        "    match me.receive() {\n"
+        "      Mail::Msg(note) => { push(seen, note.i)\n n += 1 },\n"
+        "      _ => { n = after },\n"
+        "    }\n"
+        "  }\n"
+        "  let mut out = \"\"\n"
+        "  for x in sorted(seen) { out = if out == \"\" { \"${x}\" } else { \"${out},${x}\" } }\n"
+        "  out\n"
+        "}\n"
+        "let me: Inbox[Note] = mainInbox()\n";
+    check_str("supervisor_one_for_all_restarts_siblings", cg_run_native(U + GROUP +
+        "println(round(me, actorFn(allKeeper), 3))\n"), "0,1,2\n");
+    check_str("supervisor_rest_for_one_spares_earlier", cg_run_native(U + GROUP +
+        "println(round(me, actorFn(restKeeper), 2))\n"), "1,2\n");
+    check_str("supervisor_one_for_one_touches_nobody", cg_run_native(U + GROUP +
+        "println(round(me, actorFn(oneKeeper), 1))\n"), "1\n");
+    // A group restart of children in SLOTS is what the wait for the end reports is for: a report
+    // arrives only once that actor's address is free, so the successor takes the same slot.
+    check_str("supervisor_group_restart_keeps_addresses", cg_run_native(U +
+        "struct Job { n: Int, replyTo: Pid[Int] }\n"
+        "struct Up { at: Pid[Job] }\n"
+        "fn twin(inbox: Inbox[Job], boss: Pid[Up]) -> () {\n"
+        "  send(boss, Up { at: inbox.pid() })\n"
+        "  for j in inbox.messages() {\n"
+        "    if j.n == 0 { panic(\"boom\") }\n"
+        "    send(j.replyTo, j.n * 2)\n"
+        "  }\n"
+        "}\n"
+        "fn keeper2(inbox: Inbox[()], boss: Pid[Up]) -> () {\n"
+        "  let a: Slot[Job] = newSlot()\n"
+        "  let b: Slot[Job] = newSlot()\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, childIn(a, actorFn(twin), boss))\n"
+        "  push(kids, childIn(b, actorFn(twin), boss))\n"
+        "  superviseWith(inbox, kids, SupervisorSpec { strategy: Strategy::OneForAll,\n"
+        "    limit: RestartLimit { maxRestarts: 3, withinMs: 60000 }, stopTimeoutMs: 0 })\n"
+        "}\n"
+        "fn waitFor(me: Inbox[Up], n: Int) -> Int {\n"
+        "  let mut seen = 0\n"
+        "  while seen < n { match me.receive() { Mail::Msg(_) => { seen += 1 }, _ => { seen = n } } }\n"
+        "  seen\n"
+        "}\n"
+        "let me: Inbox[Up] = mainInbox()\n"
+        "let rx: Inbox[Int] = newInbox()\n"
+        "let _k = spawnActor(keeper2, me.pid())\n"
+        "match me.receive() {\n"
+        "  Mail::Msg(first) => {\n"
+        "    println(waitFor(me, 1) == 1)\n"
+        "    send(first.at, Job { n: 0, replyTo: rx.pid() })\n"
+        "    println(waitFor(me, 2) == 2)\n"
+        "    match ask(first.at, fn(r) { Job { n: 21, replyTo: r } }, 60000) {\n"
+        "      Ok(v) => println(\"the same address answers: ${v}\"),\n"
+        "      Err(_) => println(\"the address is dead\"),\n"
+        "    }\n"
+        "  },\n"
+        "  _ => println(\"nothing started\"),\n"
+        "}\n"), "true\ntrue\nthe same address answers: 42\n");
+    // Stopping the supervisor stops its children, in REVERSE start order, each waited for before the
+    // next is told -- which is what a child that depends on an earlier one needs.
+    check_str("supervisor_shutdown_is_reverse_order", cg_run_native(U +
+        "struct Kid { i: Int, boss: Pid[Int] }\n"
+        "fn quiet(inbox: Inbox[Int], s: Kid) -> () {\n"
+        "  send(s.boss, s.i)\n"
+        "  for _m in inbox.messages() {}\n"
+        "  println(\"child ${s.i} ended\")\n"
+        "}\n"
+        "fn keeper3(inbox: Inbox[()], boss: Pid[Int]) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(quiet), Kid { i: 0, boss: boss }))\n"
+        "  push(kids, child(actorFn(quiet), Kid { i: 1, boss: boss }))\n"
+        "  push(kids, child(actorFn(quiet), Kid { i: 2, boss: boss }))\n"
+        "  superviseWith(inbox, kids, SupervisorSpec { strategy: Strategy::OneForOne,\n"
+        "    limit: RestartLimit { maxRestarts: 3, withinMs: 60000 }, stopTimeoutMs: 60000 })\n"
+        "}\n"
+        "let me: Inbox[Int] = mainInbox()\n"
+        "let k = spawnActor(keeper3, me.pid())\n"
+        "let mut up = 0\n"
+        "while up < 3 { match me.receive() { Mail::Msg(_) => { up += 1 }, _ => { up = 3 } } }\n"
+        "let watch: Inbox[Int] = newInbox()\n"
+        "let _w = monitor(k, watch)\n"
+        "let _s = stopActor(k)\n"
+        "match watch.receive() { Mail::Exited(_, why) => println(\"the supervisor ended: ${why}\"),\n"
+        "  _ => println(\"?\") }\n"),
+        "child 2 ended\nchild 1 ended\nchild 0 ended\nthe supervisor ended: normal\n");
+    // A child that does not end within the deadline: the supervisor escalates instead of restarting the
+    // group on a false assumption. `stubborn` ignores Stop, so only the main program can end it.
+    // Each announcement says WHICH child it is. Picking them apart by ARRIVAL ORDER would be a race:
+    // two children announce themselves from two threads, and the runtime promises nothing about who
+    // gets there first. Measured before this was fixed: the order was the expected one in 29 of 30
+    // runs, and in the thirtieth the poison went to `stubborn` -- which crashes nobody, so the
+    // supervisor never reports, and every party waited for ever.
+    check_str("supervisor_escalates_past_stop_deadline", cg_run_native(U +
+        "struct Up { at: Pid[Int], poison: Bool }\n"
+        "fn poisonable(inbox: Inbox[Int], boss: Pid[Up]) -> () {\n"
+        "  send(boss, Up { at: inbox.pid(), poison: true })\n"
+        "  for m in inbox.messages() { if m == 0 { panic(\"boom\") } }\n"
+        "}\n"
+        "fn stubborn(inbox: Inbox[Int], boss: Pid[Up]) -> () {\n"
+        "  send(boss, Up { at: inbox.pid(), poison: false })\n"
+        "  let mut go = true\n"
+        "  while go { match inbox.receive() { Mail::Msg(m) => { if m == 9 { go = false } }, _ => {} } }\n"
+        "}\n"
+        "fn keeper4(inbox: Inbox[()], boss: Pid[Up]) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  push(kids, child(actorFn(poisonable), boss))\n"
+        "  push(kids, child(actorFn(stubborn), boss))\n"
+        "  superviseWith(inbox, kids, SupervisorSpec { strategy: Strategy::OneForAll,\n"
+        "    limit: RestartLimit { maxRestarts: 3, withinMs: 60000 }, stopTimeoutMs: 100 })\n"
+        "}\n"
+        "fn reason(why: String) -> String { let k = indexOf(why, \" at line \")\n"
+        "  if k < 0 { why } else { slice(why, 0, k) } }\n"
+        "let me: Inbox[Up] = mainInbox()\n"
+        "let _k = spawnActor(keeper4, me.pid())\n"
+        "fn up(me: Inbox[Up]) -> Up {\n"
+        "  match me.receive() { Mail::Msg(u) => u, _ => panic(\"a child did not announce itself\") }\n"
+        "}\n"
+        "let a = up(me)\n"
+        "let b = up(me)\n"
+        "let poison  = if a.poison { a.at } else { b.at }\n"
+        "let patient = if a.poison { b.at } else { a.at }\n"
+        "send(poison, 0)\n"
+        "match me.receive() {\n"
+        "  Mail::Exited(_, why) => println(reason(why)),\n"
+        "  _ => println(\"no report\"),\n"
+        "}\n"
+        "send(patient, 9)\n"                      // let the stubborn one end, so the program can
+        ),
+        "supervisor: child 1 did not stop within 100 ms"
+        " (an actor that never receives must ask inbox.stopRequested())\n");
+    check_str("supervisor_checks_stop_timeout", cg_run_native(U + COUNTER + MAIN +
+        "fn sup(inbox: Inbox[Int], s: Start) -> () {\n"
+        "  let mut kids: Vec[dyn Supervised] = vec()\n"
+        "  superviseWith(inbox, kids, SupervisorSpec { strategy: Strategy::OneForOne,\n"
+        "    limit: RestartLimit { maxRestarts: 2, withinMs: 60000 }, stopTimeoutMs: -1 })\n"
+        "}\n"
+        "let p = spawnActor(sup, start(me, 1))\n"
+        "report(me.receive())\n"),
+        "died: supervise: stopTimeoutMs must not be negative (0 = wait as long as it takes)\n");
+
+    // The list of children is built where it is used: a trait object cannot be sent.
+    check_true("supervisor_children_not_sendable", check_has_p(U +
+        "fn f(inbox: Inbox[Vec[dyn Supervised]], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0",
+        "a trait object (dyn std::supervisor::Supervised)"));
+    check_true("supervisor_needs_use", check_has_p(
+        "use std::actor::*\nfn f(inbox: Inbox[Int], unused: Int) -> () {}\nlet c = child(actorFn(f), 0)\n0",
+        "child"));
+}
+
+// =============================================================================
+// std::log -- the opt-in logging module over std::io, std::time and std::actor. Two sinks (a file
+// appended directly, or a logger actor that owns the file) behind one `Log`, one level filter and
+// one line format. Every case reads the file back, so it checks what was WRITTEN, not what was
+// returned; the timestamp differs on every run, so only the rest of the line is compared.
+// =============================================================================
+void test_std_log() {
+    std::cout << "[codegen: std::log]\n";
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path base = fs::temp_directory_path() / "svc_log_test";
+    fs::remove_all(base, ec);
+    fs::create_directories(base, ec);
+    const std::string f = (base / "app.log").generic_string();
+
+    const std::string U = "use std::log::*\n";
+    // Print each line with its timestamp cut away: a line is "<iso> <LEVEL> <text>", and the ISO
+    // stamp holds no space, so everything from the first space on is the part under test.
+    const std::string SHOW =
+        "fn show(p: String) -> () {\n"
+        "  let text = match readTextFile(p) { Ok(s) => s, Err(e) => panic(e) }\n"
+        "  for ln in lines(text) {\n"
+        "    if len(ln) > 0 { let k = indexOf(ln, \" \")\n println(slice(ln, k + 1, len(ln))) }\n"
+        "  }\n"
+        "}\n";
+    const std::string FRESH = "let _d = deleteFile(\"" + f + "\")\n";
+
+    // The file sink: the four verbs, the fixed-width label, and `at` reached directly.
+    check_str("log_file_sink_writes_all_levels", cg_run_native(U + SHOW + FRESH +
+        "let log = Log::toFile(\"" + f + "\", Level::Debug)\n"
+        "log.debug(\"d\")\n log.info(\"i\")\n log.warn(\"w\")\n log.error(\"e\")\n"
+        "log.at(Level::Info, \"direct\")\n"
+        "show(\"" + f + "\")\n"),
+        "DEBUG d\nINFO  i\nWARN  w\nERROR e\nINFO  direct\n");
+    // The filter: nothing below `min` is written at all -- the file holds the two lines only.
+    check_str("log_filters_below_min", cg_run_native(U + SHOW + FRESH +
+        "let log = Log::toFile(\"" + f + "\", Level::Warn)\n"
+        "log.debug(\"no\")\n log.info(\"no\")\n log.warn(\"yes\")\n log.error(\"yes\")\n"
+        "show(\"" + f + "\")\n"),
+        "WARN  yes\nERROR yes\n");
+    // An inherent method answers to both spellings, so `Log::info(log, msg)` is the same call.
+    check_str("log_qualified_call_form", cg_run_native(U + SHOW + FRESH +
+        "let log = Log::toFile(\"" + f + "\", Level::Info)\n"
+        "Log::info(log, \"qualified\")\n"
+        "show(\"" + f + "\")\n"),
+        "INFO  qualified\n");
+    // The ordering the filter rests on, at every boundary. `>=` works on numbers, not on variants,
+    // which is why the rank exists at all.
+    check_int_p("log_level_rank_orders",
+        "use std::log::*\n"
+        "let ok = Level::Debug.rank() < Level::Info.rank()\n"
+        "  && Level::Info.rank() < Level::Warn.rank()\n"
+        "  && Level::Warn.rank() < Level::Error.rank()\n"
+        "  && Level::Warn.atLeast(Level::Warn) && !Level::Info.atLeast(Level::Warn)\n"
+        "if ok { 1 } else { 0 }\n", 1);
+    // The actor sink. The logger is stopped LAST and its end is waited for, so everything the
+    // worker sent has been written by the time the file is read -- Stop is queued at the END of a
+    // mailbox, so a logger told to stop still drains what is already in it.
+    check_str("log_actor_sink_drains_before_it_ends", cg_run_native(
+        U + "use std::actor::*\n" +
+        "fn worker(inbox: Inbox[Int], log: Log) -> () {\n"
+        "  for n in inbox.messages() { log.info(\"job ${n}\") }\n"
+        "}\n"
+        "fn endOf[M](p: Pid[M]) -> () {\n"
+        "  let done: Inbox[Int] = newInbox()\n"
+        "  let _m = monitor(p, done)\n"
+        "  let _s = stopActor(p)\n"
+        "  let _e = done.receiveTimeout(10000)\n"
+        "  done.close()\n"
+        "}\n" + FRESH +
+        // A capacity of 2 against 12 messages, so the sends really do wait for room.
+        "let sink = startLogger(\"" + f + "\", 2)\n"
+        "let w = spawnActor(worker, Log::toActor(sink, Level::Info))\n"
+        "let mut i = 0\n"
+        "while i < 12 { send(w, i)\n i += 1 }\n"
+        "endOf(w)\n"
+        "endOf(sink)\n"
+        "let text = match readTextFile(\"" + f + "\") { Ok(s) => s, Err(e) => panic(e) }\n"
+        "let mut n = 0\n"
+        "for ln in lines(text) { if len(ln) > 0 { n += 1 } }\n"
+        "println(\"${n}\")\n"),
+        "12\n");
+    // A `Log` is plain data, so it travels to an actor in its start value -- the case above rests
+    // on that, and this is what says so if it ever stops being true.
+    check_int_p("log_is_sendable",
+        "use std::log::*\nuse std::actor::*\n"
+        "fn body(inbox: Inbox[Int], log: Log) -> () {}\n"
+        "let p = spawnActor(body, Log::toFile(\"x\", Level::Info))\n"
+        "1\n", 1);
+    // A capacity below 1 would make a logger nobody can ever send to.
+    check_true("log_rejects_bad_capacity", cg_faults_msg(
+        "use std::log::*\nlet p = startLogger(\"x\", 0)\n0\n", "capacity"));
+    // `use` is not transitive: std::log reaches std::io, std::time and std::actor; an importer of
+    // std::log reaches none of them.
+    check_true("log_does_not_reexport_io", cg_check_fails_p(
+        "use std::log::*\nlet r = appendTextFile(\"x\", \"y\")\n0\n"));
+    check_true("log_does_not_reexport_actor", cg_check_fails_p(
+        "use std::log::*\nlet i = mainInbox()\n0\n"));
+    check_true("log_does_not_reexport_time", cg_check_fails_p(
+        "use std::log::*\nlet t = now()\n0\n"));
+    // The whole module is tree-shaken out of a program that does not use it.
+    check_true("shake_default_drops_log", [] {
+        const svc::Module m = svc::compile("42", svc::builtin_prelude());
+        for (const auto& s : m.struct_types)   if (s.name == "Log") return false;
+        for (const auto& s : m.function_names) if (s.find("startLogger") != std::string::npos) return false;
+        return true;
+    }());
+
+    fs::remove_all(base, ec);
 }
 
 // =============================================================================
@@ -9815,7 +11474,25 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // program. Their behaviour is pinned by the actor_* tests in vm_tests.
 // The hand-off two (ids 69-70: rawHandOff / rawTake) move a live socket between isolates -- side effects
 // on the OS, like every socket native -- and are pinned by actor_socket_hand_off in both suites.
-static_assert(NATIVE_COUNT == 71,
+// The inbox four (ids 71-74: rawNewInbox / rawCloseInbox / rawTrySend / rawSpawnActorBounded) are NOT
+// listed for the actor eight's reason: whether a bounded inbox is full, or a reply has arrived, depends
+// on how the actors interleave. Pinned by the actor_* tests in vm_tests.
+// The slot four (ids 75-78: rawNewSlot / rawSpawnInto / rawReleaseSlot / rawStopActor) are NOT listed
+// for the same reason: they are about an address a restarted actor keeps, so what they do depends on
+// when an actor crashed and what was on its way. Pinned by the actor_slot_* tests in vm_tests.
+// rawMonitor (id 79) is NOT listed either: it reports when another isolate ends, which no sequential
+// model has. Pinned by the actor_monitor_* tests in vm_tests.
+// rawStopRequested (id 80) is NOT listed either: it answers whether another isolate has asked this one
+// to stop, which no sequential model has. Pinned by actor_stop_requested in vm_tests.
+// rawSleep (id 81) is NOT listed either: its whole effect is the passing of time, which the oracle does
+// not model. Pinned by std_time_sleep_waits.
+// rawSelect (id 82) is NOT listed either: it answers which of several inboxes has mail, which depends on
+// how the isolates interleave. Pinned by the select_* tests here and by actor_select_* in vm_tests.
+// The active-socket four (ids 83-86: rawActivate / rawActiveSend / rawActiveClose / rawActivateListener)
+// are NOT listed:
+// they are socket natives (OS side effects) whose events a second thread delivers, so when an event
+// arrives depends on the network and the scheduler. Pinned by the active_* tests in both suites.
+static_assert(NATIVE_COUNT == 87,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 
@@ -11275,6 +12952,22 @@ void test_differential() {
         "let c = spawn(outer, 3)\n"
         "println(c.join())\nprintln(b.join())\nprintln(a.join())\nprintln(len(v))\n",
         /*with_prelude=*/true);
+    // The same through taskFn: a generic parallel map, and a TaskFn handed to a task that starts it.
+    check_same("diff_task_fn",
+        "use std::task::*\n"
+        "fn sq(n: Int) -> Int { println(\"sq \" + n)\n n * n }\n"
+        "fn parMap[A, R](t: TaskFn[A, R], xs: Vec[A]) -> Vec[Result[R, String]] {\n"
+        "  let mut ts: Vec[Task[R]] = vec()\n"
+        "  for x in xs { push(ts, t.spawn(x)) }\n"
+        "  let mut out: Vec[Result[R, String]] = vec()\n"
+        "  for t2 in ts { push(out, t2.join()) }\n"
+        "  out\n"
+        "}\n"
+        "fn run(t: TaskFn[Int, Int]) -> Int { match t.spawn(6).join() { Ok(v) => v, Err(_) => -1 } }\n"
+        "let mut xs: Vec[Int] = vec()\npush(xs, 3)\npush(xs, 1)\npush(xs, 2)\n"
+        "println(parMap(taskFn(sq), xs))\n"
+        "println(spawn(run, taskFn(sq)).join())\n",
+        /*with_prelude=*/true);
     check_same("diff_eq_cycles",
         "struct Node { v: Int, next: Option[Node] }\n"
         "struct W { x: Int, n: Node }\n"
@@ -11821,6 +13514,8 @@ int main(int argc, char** argv) {
     test_std_poll();
     test_std_task();
     test_std_actor();
+    test_std_supervisor();
+    test_std_log();
     test_interpolation();
     test_format();
     test_string_iter();

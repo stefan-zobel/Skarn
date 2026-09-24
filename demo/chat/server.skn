@@ -1,0 +1,55 @@
+// A chat server with topics, on actors and ACTIVE sockets: every client has a session actor that waits
+// on its connection and its inbox at once, so a line one client writes reaches the others right away.
+// The actors are in hub.skn; the protocol is at its top, and README.md shows a session.
+//
+// Run:   static_vmrun demo/chat/server.skn [--port=P] [--port-file=F]
+//        static_vmrun demo/chat/server.skn --selftest
+//   --port=P       port to listen on (default 7070; 0 lets the OS pick a free one)
+//   --port-file=F  write the port to file F once listening (for a harness; stdout may be buffered)
+//   --selftest     start the server on a free port, run a scripted conversation of several clients in
+//                  this process against it, print what each of them heard, and exit 0 if it all went
+//                  as expected (1 if not)
+//
+// Talk to it with chat_client.skn, one per terminal:
+//        static_vmrun demo/chat/chat_client.skn --port=7070
+//
+// The server runs until the process is ended (Ctrl+C).
+
+import hub
+import selftest
+use hub::*
+use std::actor::*
+use std::cli::*
+use std::env::*
+use std::io::*
+
+
+fn run() -> Result[(), String] {
+    let opts = CliArgs::parse(args())
+    if opts.hasFlag("selftest") {
+        return selftest::run()
+    }
+    let port = match parseInt(opts.getOptOr("port", "7070")) {
+        Ok(p) => p,
+        Err(_) => { return Err("--port needs a whole number") }
+    }
+    let inbox: Inbox[Int] = mainInbox()
+    let bound = startServer(port)?
+    match opts.getOpt("port-file") {
+        Some(f) => { writeFile(f, toBytes(toString(bound)))? },
+        None => {}
+    }
+    println("chat server listening on port ${bound}")
+    // The acceptor's crash would be reported here; nothing else ever arrives.
+    loop {
+        match inbox.receive() {
+            Mail::Exited(_, why) => { return Err("the acceptor crashed: ${why}") },
+            _ => {}
+        }
+    }
+}
+
+match run() {
+    Ok(_) => {},
+    Err(e) => panic("chat server: ${e}")
+}

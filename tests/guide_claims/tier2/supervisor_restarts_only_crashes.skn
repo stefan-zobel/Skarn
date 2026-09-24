@@ -1,0 +1,31 @@
+// CLAIM: a supervisor restarts a child that CRASHED, not one that finished its work -- a child that
+//        returns stays ended, so an actor with a natural end is not started again for ever.
+// GUIDE: SkarnActors.md (Supervisors: keeping them alive)
+// EXPECT: ok started 1 time(s), then quiet
+use std::actor::*
+use std::supervisor::*
+use std::time::*
+
+
+// Announces each start, then RETURNS. Nothing crashed, so nothing should be restarted.
+fn oneShot(inbox: Inbox[Int], boss: Pid[Int]) -> () {
+  send(boss, 1)
+}
+
+
+fn keeper(inbox: Inbox[Int], boss: Pid[Int]) -> () {
+  let mut kids: Vec[dyn Supervised] = vec()
+  push(kids, child(actorFn(oneShot), boss))
+  supervise(inbox, kids, RestartLimit { maxRestarts: 3, withinMs: 60000 })
+}
+
+
+let me: Inbox[Int] = mainInbox()
+let _k = spawnActor(keeper, me.pid())
+
+let mut starts = 0
+match me.receive() { Mail::Msg(_) => { starts += 1 }, _ => {} }
+sleep(300)                                  // long enough for a restart to have shown up
+
+let more = match me.receiveTimeout(50) { Some(_) => " and more", None => ", then quiet" }
+println("started ${starts} time(s)${more}")

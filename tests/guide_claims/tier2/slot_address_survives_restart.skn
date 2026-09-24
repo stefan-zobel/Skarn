@@ -1,0 +1,39 @@
+// CLAIM: an actor started into a `Slot` keeps that address across its restarts, so a client holding one
+//        `Pid` goes on being answered after the actor behind it has crashed and been started again.
+// GUIDE: SkarnActors.md (An address that survives a restart)
+// EXPECT: ok 8 then 10, one address
+use std::actor::*
+use std::supervisor::*
+
+struct Job { n: Int, replyTo: Pid[Int] }
+
+// Announces itself at every start, and cannot cope with 13.
+fn worker(inbox: Inbox[Job], boss: Pid[Int]) -> () {
+  send(boss, -1)
+  for j in inbox.messages() {
+    if j.n == 13 { panic("unlucky") }
+    send(j.replyTo, j.n * 2)
+  }
+}
+
+struct Setup { at: Slot[Job], boss: Pid[Int] }
+
+fn keeper(inbox: Inbox[Int], s: Setup) -> () {
+  let mut kids: Vec[dyn Supervised] = vec()
+  push(kids, childIn(s.at, actorFn(worker), s.boss))
+  supervise(inbox, kids, RestartLimit { maxRestarts: 3, withinMs: 10000 })
+}
+
+fn got(m: Mail[Int]) -> Int { match m { Mail::Msg(v) => v, _ => -2 } }
+
+let me: Inbox[Int] = mainInbox()
+let at: Slot[Job] = newSlot()
+spawnActor(keeper, Setup { at: at, boss: me.pid() })
+let p = at.pid()
+let _up = got(me.receive())                  // the first worker is up
+send(p, Job { n: 4, replyTo: me.pid() })
+let before = got(me.receive())
+send(p, Job { n: 13, replyTo: me.pid() })    // it crashes on this one
+let _up2 = got(me.receive())                 // its successor, at the SAME address
+send(p, Job { n: 5, replyTo: me.pid() })
+println("${before} then ${got(me.receive())}, one address")

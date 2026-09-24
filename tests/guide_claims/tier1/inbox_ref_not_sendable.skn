@@ -1,0 +1,12 @@
+// CLAIM: an InboxRef names the same mailbox an Inbox does, only without the message type -- so like an
+//        Inbox it cannot travel to another actor, and a message type containing one is rejected.
+// GUIDE: SkarnActors.md (Two queues in one loop)
+// EXPECT: fail cannot be sent to an actor
+use std::actor::*
+
+
+struct Watch { r: InboxRef }
+
+fn watcher(inbox: Inbox[Watch], unused: Int) -> () { let _m = inbox.receive() }
+
+let _p = spawnActor(watcher, 0)

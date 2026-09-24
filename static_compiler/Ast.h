@@ -508,6 +508,7 @@ inline std::string std_Iterable()     { return mangle_name(STD_ITER, "Iterable")
 inline std::string std_Eq()           { return mangle_name(STD_CORE, "Eq"); }        // the sealed structural-== marker
 inline std::string std_Hashable()     { return mangle_name(STD_CORE, "Hashable"); }  // the map-key marker
 inline std::string std_MustUse()      { return mangle_name(STD_CORE, "MustUse"); }   // the open must-use marker
+inline std::string std_Sendable()     { return mangle_name(STD_CORE, "Sendable"); }  // the sealed can-be-sent marker
 inline std::string std_ProcessOutput(){ return mangle_name(STD_PROCESS, "ProcessOutput"); }
 inline std::string std_Char()          { return mangle_name(STD_STRING, "Char"); }
 inline std::string std_codePointToStr(){ return mangle_name(STD_STRING, "codePointToStr"); }
@@ -515,8 +516,23 @@ inline std::string std_Task()         { return mangle_name(STD_TASK, "Task"); } 
 inline std::string std_spawn()        { return mangle_name(STD_TASK, "spawn"); }      // its one constructor
 inline std::string std_spawnActor()   { return mangle_name(STD_ACTOR, "spawnActor"); }
 inline std::string std_mainInbox()    { return mangle_name(STD_ACTOR, "mainInbox"); }
+inline std::string std_spawnActorBounded() { return mangle_name(STD_ACTOR, "spawnActorBounded"); }
+inline std::string std_newInbox()     { return mangle_name(STD_ACTOR, "newInbox"); }
+inline std::string std_newBoundedInbox() { return mangle_name(STD_ACTOR, "newBoundedInbox"); }
+inline std::string std_ask()          { return mangle_name(STD_ACTOR, "ask"); }
 inline std::string std_Pid()          { return mangle_name(STD_ACTOR, "Pid"); }
 inline std::string std_Inbox()        { return mangle_name(STD_ACTOR, "Inbox"); }
+// An inbox in a `select` list: names a mailbox, carries no message type. Made only by inbox.ref().
+inline std::string std_InboxRef()     { return mangle_name(STD_ACTOR, "InboxRef"); }
+// An address that outlives its actor: `newSlot` fixes its message type, as the inbox makers do.
+inline std::string std_Slot()         { return mangle_name(STD_ACTOR, "Slot"); }
+inline std::string std_newSlot()      { return mangle_name(STD_ACTOR, "newSlot"); }
+inline std::string std_newBoundedSlot() { return mangle_name(STD_ACTOR, "newBoundedSlot"); }
+// The checked function values: made only by `actorFn(f)` / `taskFn(f)` with a named function.
+inline std::string std_ActorFn()      { return mangle_name(STD_ACTOR, "ActorFn"); }
+inline std::string std_actorFn()      { return mangle_name(STD_ACTOR, "actorFn"); }
+inline std::string std_TaskFn()       { return mangle_name(STD_TASK, "TaskFn"); }
+inline std::string std_taskFn()       { return mangle_name(STD_TASK, "taskFn"); }
 
 // ----- debug rendering ------------------------------------------------------
 

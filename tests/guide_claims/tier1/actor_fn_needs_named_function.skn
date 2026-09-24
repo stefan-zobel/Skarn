@@ -1,0 +1,9 @@
+// CLAIM: `actorFn` checks its function like `spawnActor` does: it must be named -- a function that arrived as
+//        a parameter might be a closure, which cannot travel to another heap.
+// GUIDE: SkarnActors.md (Generic actor code)
+// EXPECT: fail actorFn needs the name of a top-level function here
+use std::actor::*
+
+fn wrap(g: fn(Inbox[Int], Int) -> ()) -> ActorFn[Int, Int] { actorFn(g) }
+
+println("unreachable")

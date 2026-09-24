@@ -1,6 +1,6 @@
-# run_guide_examples.ps1 -- every ```rust block of the two guides, extracted and run.
+# run_guide_examples.ps1 -- every ```rust block of the guides, extracted and run.
 #
-# The guides are the single source of truth: this runner reads SkarnGuide.md and SkarnIn30Minutes.md at
+# The guides are the single source of truth: this runner reads SkarnGuide.md, SkarnIn30Minutes.md and SkarnActors.md at
 # run time, turns every ```rust fence into a program, runs it with static_vmrun, and checks it against the
 # annotations the reader sees. Nothing is copied into the repository, so an example cannot drift from its
 # test. (The hand-written claim fixtures next to this script are run by run_guide_claims.ps1.)
@@ -57,7 +57,9 @@ if (-not (Test-Path $Exe)) {
     exit 1
 }
 if ($Guide.Count -eq 0) {
-    $Guide = @((Join-Path $repoRoot 'SkarnGuide.md'), (Join-Path $repoRoot 'SkarnIn30Minutes.md'))
+    $Guide = @((Join-Path $repoRoot 'SkarnGuide.md'),
+               (Join-Path $repoRoot 'SkarnIn30Minutes.md'),
+               (Join-Path $repoRoot 'SkarnActors.md'))
 }
 
 $utf8 = New-Object System.Text.UTF8Encoding($false)

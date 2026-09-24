@@ -2828,6 +2828,40 @@ inline void test_value_codec_refusals() {
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 
+// The live bytes of a KIND_BYTES value, or a marker when it is not one.
+inline std::string bytes_of(Value v) {
+    if (!v.isPtr()) return "<not bytes>";
+    const GcObject* hdr = GcObject::from_slots(v.asPtr());
+    if (hdr->kind != GcObject::KIND_BYTES) return "<not bytes>";
+    const GcObject* backing = GcObject::from_slots(hdr->slots()[BYTES_SLOT_BACKING].asPtr());
+    return std::string(backing->bytes(), static_cast<size_t>(hdr->slots()[BYTES_SLOT_COUNT].asSigned48()));
+}
+
+// encode_bytes builds, without a heap, the buffer the active-socket I/O thread posts. It must be
+// EXACTLY what encode() makes for that value -- so decode() needs no second path -- which the round
+// trip checks byte for byte.
+inline void test_value_codec_encode_bytes() {
+    std::cout << "=== value_codec_encode_bytes ===\n";
+    try {
+        auto round = [](uint8_t tag, const std::string& data, bool* same) {
+            const auto      buf = vcodec::encode_bytes(tag, data.data(), data.size());
+            Heap            dst(16 * 1024);
+            RootedValuePool pool;
+            const Value     v = vcodec::decode(buf.data(), buf.size(), dst, nullptr, pool, nullptr, 0);
+            *same = vcodec::encode(v) == buf;
+            return bytes_of(v);
+        };
+        bool same1 = false, same2 = false;
+        const bool content1 = round(1, "a line", &same1) == std::string("\x01" "a line");
+        const bool content2 = round(2, "", &same2) == std::string("\x02");
+        std::cout << std::format("  decodes to tag + data:            {} {}\n",
+                                 content1 ? "PASS" : "FAIL", content2 ? "PASS" : "FAIL");
+        std::cout << std::format("  identical to encode()'s buffer:   {} {}\n",
+                                 same1 ? "PASS" : "FAIL", same2 ? "PASS" : "FAIL");
+        check(content1 && content2 && same1 && same2);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
 // =============================================================================
 // test_value_codec_malformed -- decode() refuses every object the VM could not have built.
 //
@@ -3306,6 +3340,114 @@ inline void task_fns(Assembler& as) {
     as.R6(OpCode::PANIC, 0, 1, 0);
     as.J(OpCode::RET);
 
+    // acrashon(_): waits for one message, then faults -- a crash the test can time.
+    as.label("acrashon");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_str(6, "boom on demand");
+    as.R6(OpCode::PANIC, 0, 6, 0);
+    as.J(OpCode::RET);
+
+    // awatch(pid): monitors the actor its ARGUMENT addresses -- an actor it did not start -- and sends
+    // the address from the report to the main program, so the test can check who it was told about.
+    as.label("awatch");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.R6(OpCode::MOV, 2, 0, 0);
+    as.R6(OpCode::MOV, 3, 1, 0);
+    as.call_native_id(4, 5, 2, 2, NATIVE_MONITOR);
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(6, 5, 2, 2, NATIVE_RECEIVE);
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.call_native_id(6, 5, 2, 1, NATIVE_MAIL_FROM);
+    as.load_const(2, 0);
+    as.R6(OpCode::MOV, 3, 6, 0);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
+    // abusy(inbox_id): an actor that NEVER receives -- its loop is its own work. It cannot be stopped by
+    // mail, so it asks rawStopRequested instead, and ends itself. Then it reports 77 to the main program.
+    // The argument is the inbox to ask about: 0 means "my own", anything else the slot it was started
+    // into (whose id is not the actor's own).
+    as.label("abusy");
+    as.R6(OpCode::MOV, 1, 0, 0);
+    as.load_const(7, 0);
+    as.B (OpCode::BNE_INT, 1, 7, "abusy_loop");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.label("abusy_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.call_native_id(4, 5, 2, 1, NATIVE_STOP_REQUESTED);
+    as.B1(OpCode::BF, 4, "abusy_loop");
+    as.load_const(2, 0);
+    as.load_const(3, 77);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
+    // afill(target_id): sends to the inbox its ARGUMENT names, for ever, and never receives. Two of
+    // these pointed at each other -- or one pointed at the main program, which points back -- is a
+    // cycle of blocked sends, which ends in a located fault rather than in a wait nobody can break.
+    as.label("afill");
+    as.R6(OpCode::MOV, 1, 0, 0);            // r1 = the target inbox id (the start value)
+    as.load_const(6, 1);
+    as.label("afill_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.R6(OpCode::MOV, 3, 6, 0);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.J(OpCode::J, "afill_loop");
+
+    // aselect(_): parks in a SELECT over its own inbox and a second one, with no deadline. Whatever
+    // wakes it, it receives that inbox and sends the mail KIND to the main program -- so a test can
+    // see that Stop reaches an actor sleeping in a select, not only one sleeping in a receive.
+    as.label("aselect");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.load_const(2, 0);
+    as.call_native_id(6, 5, 2, 1, NATIVE_NEW_INBOX);     // r6 = a second inbox
+    as.VEC_NEW(7);
+    as.VEC_PUSH(7, 1);
+    as.VEC_PUSH(7, 6);
+    as.R6(OpCode::MOV, 2, 7, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_SELECT);        // r4 = the index that woke us
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(7, 0);
+    as.B (OpCode::BEQ_INT, 4, 7, "aselect_read");
+    as.R6(OpCode::MOV, 2, 6, 0);
+    as.label("aselect_read");
+    as.load_const(3, 0);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);       // cannot wait: select said it is ready
+    as.load_const(2, 0);
+    as.R6(OpCode::MOV, 3, 4, 0);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
+    // aslot(inbox_id): like aecho, but it receives on the inbox its ARGUMENT names -- the slot it was
+    // started into, whose id is not its own (rawSpawnInto). Doubles each message to the main program.
+    as.label("aslot");
+    as.R6(OpCode::MOV, 1, 0, 0);
+    as.label("aslot_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BEQ_INT, 4, 7, "aslot_done");
+    as.load_const(7, 1);
+    as.B (OpCode::BNE_INT, 4, 7, "aslot_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.call_native_id(6, 5, 2, 1, NATIVE_MAIL_MSG);
+    as.R6(OpCode::ADD_INT, 6, 6, 6);
+    as.load_const(2, 0);
+    as.R6(OpCode::MOV, 3, 6, 0);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.J(OpCode::J, "aslot_loop");
+    as.label("aslot_done");
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
     // aconn(_): receives a hand-off ticket, takes the connection, writes "hi", closes it, tells the
     // main program it is done (sends 1 to address 0), then waits for Stop.
     as.label("aconn");
@@ -3347,6 +3489,126 @@ inline void task_fns(Assembler& as) {
     as.R6(OpCode::PRINTLN, 7, 6, 0);
     as.load_const(0, 0);
     as.J(OpCode::RET);
+
+    // Extra and bounded inboxes (same frame layout as above, plus r8 = gate inbox, r9 = the next
+    // expected message, r10 = sum):
+    //   areply(_)  -> every message is an inbox address; answers 7 there. Ends at Stop.
+    //   agate(n)   -> makes an extra inbox (the GATE), sends its id to the main program, and waits on
+    //                 it. Then:
+    //                 * n > 0 (after "go"): consumes messages 1..n from its main inbox, checking their
+    //                   order, sends the sum to the main program (-1 if out of order), waits for Stop;
+    //                 * n = 0 (the gate got Stop): drains its main inbox until Stop, printing "A stopped"
+    //                   -- or "A no stop" if two seconds pass without it.
+    //   aflood(p)  -> sends 1 to the main program, then 5 to p (blocking if p's inbox is full), prints
+    //                 "B done" once the send returns (whatever it answered), waits for Stop.
+    as.label("areply");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.label("areply_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BEQ_INT, 4, 7, "areply_done");
+    as.load_const(7, 1);
+    as.B (OpCode::BNE_INT, 4, 7, "areply_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.call_native_id(6, 5, 2, 1, NATIVE_MAIL_MSG);
+    as.R6(OpCode::MOV, 2, 6, 0);
+    as.load_const(3, 7);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.J(OpCode::J, "areply_loop");
+    as.label("areply_done");
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
+    as.label("agate");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.load_const(2, 0);
+    as.call_native_id(8, 5, 2, 1, NATIVE_NEW_INBOX);           // r8 = the gate
+    as.load_const(2, 0);
+    as.R6(OpCode::MOV, 3, 8, 0);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);                // tell the main program
+    as.R6(OpCode::MOV, 2, 8, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);             // "go", or Stop
+    as.load_const(7, 0);
+    as.B (OpCode::BEQ_INT, 0, 7, "agate_drain");
+    as.load_const(9, 1);
+    as.load_const(10, 0);
+    as.label("agate_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BEQ_INT, 4, 7, "agate_bad");
+    as.load_const(7, 1);
+    as.B (OpCode::BNE_INT, 4, 7, "agate_loop");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.call_native_id(6, 5, 2, 1, NATIVE_MAIL_MSG);
+    as.B (OpCode::BNE_INT, 6, 9, "agate_bad");
+    as.R6(OpCode::ADD_INT, 10, 10, 6);
+    as.load_const(7, 1);
+    as.R6(OpCode::ADD_INT, 9, 9, 7);
+    as.B (OpCode::BNE_INT, 6, 0, "agate_loop");
+    as.label("agate_report");
+    as.load_const(2, 0);
+    as.R6(OpCode::MOV, 3, 10, 0);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);
+    as.label("agate_wait");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BNE_INT, 4, 7, "agate_wait");
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+    as.label("agate_bad");
+    as.load_const(10, -1);
+    as.J(OpCode::J, "agate_report");
+    as.label("agate_drain");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, 2000);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BEQ_INT, 4, 7, "agate_stopped");
+    as.load_const(7, 0);
+    as.B (OpCode::BEQ_INT, 4, 7, "agate_nostop");
+    as.J(OpCode::J, "agate_drain");
+    as.label("agate_stopped");
+    as.load_str(6, "A stopped");
+    as.R6(OpCode::PRINTLN, 7, 6, 0);
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+    as.label("agate_nostop");
+    as.load_str(6, "A no stop");
+    as.R6(OpCode::PRINTLN, 7, 6, 0);
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
+    as.label("aflood");
+    as.call_native_id(1, 5, 0, 0, NATIVE_SELF_ID);
+    as.load_const(2, 0);
+    as.load_const(3, 1);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);                // hello
+    as.R6(OpCode::MOV, 2, 0, 0);
+    as.load_const(3, 5);
+    as.call_native_id(7, 5, 2, 2, NATIVE_SEND);                // may block
+    as.load_str(6, "B done");                                  // past the send, whatever it answered
+    as.R6(OpCode::PRINTLN, 7, 6, 0);
+    as.label("aflood_wait");
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, -1);
+    as.call_native_id(4, 5, 2, 2, NATIVE_RECEIVE);
+    as.load_const(7, 3);
+    as.B (OpCode::BNE_INT, 4, 7, "aflood_wait");
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
+    // tinbox(_): a TASK asking for an inbox (refused: tasks have no mail).
+    as.label("tinbox");
+    as.load_const(1, 0);
+    as.call_native_id(2, 3, 1, 1, NATIVE_NEW_INBOX);
+    as.J(OpCode::RET);
 }
 
 inline void declare_task_fns(Assembler& as) {
@@ -3359,8 +3621,25 @@ inline void declare_task_fns(Assembler& as) {
     as.declare_fn("tdeep",  3, 1);
     as.declare_fn("aecho",  8, 1);
     as.declare_fn("acrash", 2, 1);
+    as.declare_fn("aslot",  8, 1);
+    as.declare_fn("acrashon", 8, 1);
+    as.declare_fn("awatch", 8, 1);
+    as.declare_fn("abusy",  8, 1);
+    as.declare_fn("aselect", 8, 1);
+    as.declare_fn("afill",  8, 1);
     as.declare_fn("astop",  8, 1);
     as.declare_fn("aconn",  8, 1);
+    as.declare_fn("areply", 8, 1);
+    as.declare_fn("agate",  12, 1);
+    as.declare_fn("aflood", 8, 1);
+    as.declare_fn("tinbox", 4, 1);
+}
+
+// id -> r[rd]: spawnActorBounded fn(arg, capacity), where arg is already in r44.
+inline void spawn_actor_bounded(Assembler& as, uint8_t rd, const char* fn, int64_t capacity) {
+    as.LOAD_FN(43, as.func_id(fn));
+    as.load_const(45, capacity);
+    as.call_native_id(rd, 42, 43, 3, NATIVE_ACTOR_SPAWN_BOUNDED);
 }
 
 // r[rd] = native(r[ra]) / native(r[ra], r[rb]), through the argument scratch r40 / r41.
@@ -3374,6 +3653,19 @@ inline void call2(Assembler& as, uint8_t rd, uint16_t native, uint8_t ra, uint8_
     as.call_native_id(rd, 42, 40, 2, native);
 }
 
+// id -> r[rd]: rawNewSlot(capacity) -- an address with no actor yet.
+inline void new_slot(Assembler& as, uint8_t rd, int64_t capacity) {
+    as.load_const(43, capacity);
+    as.call_native_id(rd, 42, 43, 1, NATIVE_NEW_SLOT);
+}
+// id -> r[rd]: rawSpawnInto(slot, fn, arg), with the slot's id in r[rslot] and as the start value
+// (which is what an actor in a slot needs: the inbox it receives on is the slot, not itself).
+inline void spawn_into(Assembler& as, uint8_t rd, uint8_t rslot, const char* fn) {
+    as.R6(OpCode::MOV, 43, rslot, 0);
+    as.LOAD_FN(44, as.func_id(fn));
+    as.R6(OpCode::MOV, 45, rslot, 0);
+    as.call_native_id(rd, 42, 43, 3, NATIVE_SPAWN_INTO);
+}
 // id -> r[rd]: spawnActor fn(arg), where arg is already in r41.
 inline void spawn_actor(Assembler& as, uint8_t rd, const char* fn) {
     as.LOAD_FN(40, as.func_id(fn));
@@ -3784,6 +4076,147 @@ inline void test_actor_socket_hand_off() {
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 
+// Active sockets: the world's I/O thread reads an activated connection and delivers LINES into an
+// inbox of capacity 2 -- three are ready at once, so the thread must pause and be resumed by the
+// receives. Bytes recvLine had buffered come first; a line split across two sends is joined; "\r\n"
+// ends a line too; the end of the stream arrives as its own event. Writing goes through the id; after
+// close it is refused, and so is the old descriptor. A second connection is still active when the
+// program ends: the world has to stop the I/O thread (the test would hang otherwise).
+inline void test_active_socket() {
+    using namespace forkjoin;
+    std::cout << "=== active_socket ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        as.load_const(20, 0);          call1(as, 21, NATIVE_TCP_LISTEN, 20);        // listener
+        call1(as, 22, NATIVE_TCP_LOCAL_PORT, 21);
+        as.load_str(23, "127.0.0.1");  call2(as, 24, NATIVE_TCP_CONNECT, 23, 22);   // client
+        call1(as, 25, NATIVE_TCP_ACCEPT, 21);                                       // server side
+        as.load_const(20, 2);          call1(as, 26, NATIVE_NEW_INBOX, 20);         // capacity 2
+        as.load_str(27, "ab\r\ncd\nef"); as.BYTES_FROM_STR(28, 27);
+        call2(as, 29, NATIVE_TCP_SEND, 24, 28);
+        as.load_str(30, "pre\n");      as.BYTES_FROM_STR(31, 30);                   // "already buffered"
+        auto activate = [&](uint8_t rd, uint8_t rsock, int64_t mode, uint8_t rpending) {
+            as.R6(OpCode::MOV, 43, rsock, 0);
+            as.R6(OpCode::MOV, 44, 26, 0);
+            as.load_const(45, mode);
+            as.load_const(46, 100);
+            as.R6(OpCode::MOV, 47, rpending, 0);
+            as.call_native_id(rd, 42, 43, 5, NATIVE_ACTIVATE);
+        };
+        activate(32, 25, 1, 31);
+        auto next = [&](uint8_t rd) {                   // at most 5 s: a lost event fails, never hangs
+            as.load_const(20, 5000);
+            call2(as, 19, NATIVE_RECEIVE, 26, 20);
+            call1(as, rd, NATIVE_MAIL_MSG, 26);
+        };
+        next(1); next(2); next(3);
+        as.load_str(27, "hi");         as.BYTES_FROM_STR(28, 27);
+        call2(as, 33, NATIVE_ACTIVE_SEND, 32, 28);                                  // server -> client
+        as.load_const(20, 16);         call2(as, 34, NATIVE_TCP_RECV, 24, 20);
+        as.load_str(27, "gh\n");       as.BYTES_FROM_STR(28, 27);
+        call2(as, 29, NATIVE_TCP_SEND, 24, 28);
+        call1(as, 29, NATIVE_TCP_CLOSE, 24);
+        next(4); next(5);
+        call1(as, 35, NATIVE_ACTIVE_CLOSE, 32);
+        call2(as, 36, NATIVE_ACTIVE_SEND, 32, 28);                                  // after close
+        call2(as, 37, NATIVE_TCP_SEND, 25, 28);                                     // the old descriptor
+        call2(as, 38, NATIVE_TCP_CONNECT, 23, 22);
+        call1(as, 39, NATIVE_TCP_ACCEPT, 21);
+        activate(18, 39, 0, 28);                                                    // left active
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool lines_ok  = r.fault.empty() && bytes_of(r.regs[1]) == "\x01pre" &&
+                               bytes_of(r.regs[2]) == "\x01" "ab" && bytes_of(r.regs[3]) == "\x01" "cd" &&
+                               bytes_of(r.regs[4]) == "\x01" "efgh";
+        const bool closed_ok = r.fault.empty() && bytes_of(r.regs[5]) == "\x02";
+        const bool send_ok   = r.fault.empty() && r.regs[33].isNil() && bytes_of(r.regs[34]) == "hi";
+        const bool after_ok  = r.fault.empty() && r.regs[35].isNil() &&
+                               str_of(r.regs[36]).find("closed") != std::string::npos;
+        const bool stale_ok  = r.fault.empty() && str_of(r.regs[37]).find("activated") != std::string::npos;
+        const bool second_ok = r.fault.empty() && r.regs[18].isInt();
+        std::cout << std::format("  lines in order, paused and resumed:    {}{}\n", lines_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  end of stream is an event:             {}\n", closed_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  writing through the id:                {}\n", send_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  refused after close:                   {}  (\"{}\")\n", after_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[36]));
+        std::cout << std::format("  the old descriptor refused:            {}  (\"{}\")\n", stale_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[37]));
+        std::cout << std::format("  the world ends with one still active:  {}\n", second_ok ? "PASS" : "FAIL");
+        check(lines_ok && closed_ok && send_ok && after_ok && stale_ok && second_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// An activated LISTENER: the I/O thread accepts, parks each connection in the world's hand-off table and
+// delivers its ticket. Three clients connect while the inbox holds ONE event, so the thread must pause
+// and be resumed; nothing else in this program makes tickets, so they are 1, 2, 3 in order. A taken
+// connection must be BLOCKING (the listener was switched to non-blocking, and Windows and BSD pass that
+// on): a 200 ms receive with nothing sent must time out, not fail at once. The old descriptor and a send
+// to the listener's id are refused; after close a new client is refused; a second active listener is
+// still open when the program ends.
+inline void test_active_listener() {
+    using namespace forkjoin;
+    std::cout << "=== active_listener ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        as.load_const(20, 0);          call1(as, 21, NATIVE_TCP_LISTEN, 20);
+        call1(as, 22, NATIVE_TCP_LOCAL_PORT, 21);
+        as.load_str(23, "127.0.0.1");
+        as.load_const(20, 1);          call1(as, 26, NATIVE_NEW_INBOX, 20);         // capacity 1
+        call2(as, 30, NATIVE_ACTIVATE_LISTENER, 21, 26);
+        call2(as, 24, NATIVE_TCP_CONNECT, 23, 22);
+        call2(as, 25, NATIVE_TCP_CONNECT, 23, 22);
+        call2(as, 27, NATIVE_TCP_CONNECT, 23, 22);
+        auto next = [&](uint8_t rd) {                   // at most 5 s: a lost event fails, never hangs
+            as.load_const(20, 5000);
+            call2(as, 19, NATIVE_RECEIVE, 26, 20);
+            call1(as, rd, NATIVE_MAIL_MSG, 26);
+        };
+        next(1); next(2); next(3);
+        as.load_const(20, 1);          call1(as, 31, NATIVE_TAKE, 20);              // the first client
+        as.load_const(20, 200);        call2(as, 32, NATIVE_TCP_SET_TIMEOUT, 31, 20);
+        as.load_const(20, 16);         call2(as, 33, NATIVE_TCP_RECV, 31, 20);      // blocking: a timeout
+        as.load_str(34, "hi");         as.BYTES_FROM_STR(35, 34);
+        call2(as, 36, NATIVE_TCP_SEND, 24, 35);
+        as.load_const(20, 16);         call2(as, 37, NATIVE_TCP_RECV, 31, 20);      // "hi"
+        call1(as, 38, NATIVE_TCP_ACCEPT, 21);                                       // the old descriptor
+        call2(as, 39, NATIVE_ACTIVE_SEND, 30, 35);                                  // not a connection
+        call1(as, 4, NATIVE_ACTIVE_CLOSE, 30);
+        as.load_const(20, 300);        call1(as, 5, NATIVE_SLEEP, 20);              // the thread closes it
+        call2(as, 6, NATIVE_TCP_CONNECT, 23, 22);                                   // refused now
+        as.load_const(20, 0);          call1(as, 7, NATIVE_TCP_LISTEN, 20);
+        call2(as, 8, NATIVE_ACTIVATE_LISTENER, 7, 26);                              // left active
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool tickets_ok = r.fault.empty() && bytes_of(r.regs[1]) == "\x04" "1" &&
+                                bytes_of(r.regs[2]) == "\x04" "2" && bytes_of(r.regs[3]) == "\x04" "3";
+        const bool block_ok   = r.fault.empty() && r.regs[32].isNil() &&
+                                str_of(r.regs[33]).find("timeout") != std::string::npos &&
+                                bytes_of(r.regs[37]) == "hi";
+        const bool stale_ok   = r.fault.empty() && str_of(r.regs[38]).find("activated") != std::string::npos;
+        const bool nosend_ok  = r.fault.empty() && str_of(r.regs[39]).find("not a connection") != std::string::npos;
+        const bool closed_ok  = r.fault.empty() && r.regs[4].isNil() &&
+                                str_of(r.regs[6]).find("could not connect") != std::string::npos;
+        const bool second_ok  = r.fault.empty() && r.regs[8].isInt();
+        std::cout << std::format("  tickets 1, 2, 3 through an inbox of 1:  {}{}\n", tickets_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  the taken connection blocks:           {}  (\"{}\")\n", block_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[33]));
+        std::cout << std::format("  the old descriptor refused:            {}  (\"{}\")\n", stale_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[38]));
+        std::cout << std::format("  a send to the listener refused:        {}  (\"{}\")\n", nosend_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[39]));
+        std::cout << std::format("  closed: a new client is refused:       {}  (\"{}\")\n", closed_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[6]));
+        std::cout << std::format("  the world ends with one still active:  {}\n", second_ok ? "PASS" : "FAIL");
+        check(tickets_ok && block_ok && stale_ok && nosend_ok && closed_ok && second_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
 // Misuse faults with a located message.
 inline void test_actor_misuse() {
     using namespace forkjoin;
@@ -3823,7 +4256,583 @@ inline void test_actor_misuse() {
             Heap heap;
             ok &= expect("receiving on another actor's inbox", run(as, heap), "belongs to another actor");
         }
+        {   // a negative capacity
+            Assembler as; declare_task_fns(as); as.label("main");
+            as.load_const(20, -1); call1(as, 21, NATIVE_NEW_INBOX, 20);
+            Heap heap;
+            ok &= expect("an inbox of capacity -1", run(as, heap), "capacity must be 0");
+        }
+        {   // receiving on an inbox after closing it
+            Assembler as; declare_task_fns(as); as.label("main");
+            as.load_const(20, 0); call1(as, 21, NATIVE_NEW_INBOX, 20);
+            call1(as, 22, NATIVE_CLOSE_INBOX, 21);
+            as.load_const(20, 0); call2(as, 23, NATIVE_RECEIVE, 21, 20);
+            Heap heap;
+            ok &= expect("receiving on a closed inbox", run(as, heap), "inbox is closed");
+        }
+        {   // the main inbox ends with its owner
+            Assembler as; declare_task_fns(as); as.label("main");
+            main_inbox(as, 10); as.load_const(20, 0); call1(as, 21, NATIVE_CLOSE_INBOX, 20);
+            Heap heap;
+            ok &= expect("closing the main inbox", run(as, heap), "main inbox cannot be closed");
+        }
+        {   // a send to one's own full inbox would wait forever
+            Assembler as; declare_task_fns(as); as.label("main");
+            as.load_const(20, 1); call1(as, 21, NATIVE_NEW_INBOX, 20);
+            call2(as, 22, NATIVE_SEND, 21, 20);
+            call2(as, 23, NATIVE_SEND, 21, 20);
+            Heap heap;
+            ok &= expect("a send to one's own full inbox", run(as, heap), "own inbox is full");
+        }
+        {   // a bounded actor needs room for at least one message
+            Assembler as; declare_task_fns(as); as.label("main");
+            as.load_const(44, 0); spawn_actor_bounded(as, 11, "astop", 0);
+            Heap heap;
+            ok &= expect("a bounded actor of capacity 0", run(as, heap), "at least 1");
+        }
+        {   // a task has no mail, so it cannot make an inbox: its join reports the fault
+            Assembler as; declare_task_fns(as); as.label("main");
+            as.load_const(41, 0); spawn(as, 10, "tinbox"); join(as, 10, 20, 30);
+            Heap heap;
+            const Run r = run(as, heap);
+            const bool t_ok = r.fault.empty() && r.regs[20].isBool() && !r.regs[20].asBool() &&
+                              str_of(r.regs[30]).find("only an actor or the main program") != std::string::npos;
+            std::cout << std::format("  {:<36} {}{}\n", "an inbox made in a task", t_ok ? "PASS" : "FAIL",
+                                     t_ok ? "" : "  (got: \"" + (r.fault.empty() ? str_of(r.regs[30]) : r.fault) + "\")");
+            ok &= t_ok;
+        }
         check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A second inbox: a request carries its address, and the reply arrives there -- not in the main inbox.
+// After closing it, a send answers false and trySend "gone".
+inline void test_actor_extra_inbox_reply() {
+    using namespace forkjoin;
+    std::cout << "=== actor_extra_inbox_reply ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(20, 0);  call1(as, 21, NATIVE_NEW_INBOX, 20);            // r21 = the reply inbox
+        as.load_const(41, 0);  spawn_actor(as, 11, "areply");
+        call2(as, 12, NATIVE_SEND, 11, 21);                                     // "answer at r21"
+        as.load_const(22, -1); call2(as, 13, NATIVE_RECEIVE, 21, 22);
+        call1(as, 14, NATIVE_MAIL_MSG, 21);
+        receive_main(as, 15, 0);                                                // the main inbox: empty
+        call1(as, 16, NATIVE_CLOSE_INBOX, 21);
+        call2(as, 17, NATIVE_SEND, 21, 20);
+        call2(as, 18, NATIVE_TRY_SEND, 21, 20);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool id_ok    = r.fault.empty() && r.regs[21].isInt() && r.regs[11].isInt() &&
+                              r.regs[21].asSigned48() > 0 && r.regs[21].asSigned48() != r.regs[11].asSigned48();
+        const bool reply_ok = r.fault.empty() && is_int(13, 1) && is_int(14, 7) && is_int(15, 0);
+        const bool close_ok = r.fault.empty() && r.regs[17].isBool() && !r.regs[17].asBool() && is_int(18, 2);
+        std::cout << std::format("  a new inbox has its own id:          {}{}\n", id_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  the reply arrives there, not in main: {}\n", reply_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  closed: send false, trySend gone:    {}\n", close_ok ? "PASS" : "FAIL");
+        check(id_ok && reply_ok && close_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// Back-pressure. A bounded actor (capacity 3) that is not yet reading: trySend fills it and then
+// answers "full". After "go" (through the actor's own extra inbox), 36 more blocking sends follow
+// while it reads; it checks that all 40 arrive in order. Then a bounded actor that has crashed
+// answers trySend with "gone".
+inline void test_actor_bounded_backpressure() {
+    using namespace forkjoin;
+    constexpr int N = 40;
+    std::cout << "=== actor_bounded_backpressure ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(44, N);  spawn_actor_bounded(as, 11, "agate", 3);
+        receive_main(as, 13, 10000);  mail_read(as, 14, NATIVE_MAIL_MSG);      // r14 = its gate
+        for (int i = 1; i <= 4; ++i) {                                          // r21..r24
+            as.load_const(20, i);
+            call2(as, static_cast<uint8_t>(20 + i), NATIVE_TRY_SEND, 11, 20);
+        }
+        as.load_const(20, 0);  call2(as, 25, NATIVE_SEND, 14, 20);              // go
+        as.R6(OpCode::MOV, 26, 25, 0);                                          // the go send: true
+        for (int i = 4; i <= N; ++i) {                                          // r26 = AND of the sends
+            as.load_const(20, i);
+            call2(as, 27, NATIVE_SEND, 11, 20);
+            as.R6(OpCode::AND_BOOL, 26, 26, 27);
+        }
+        receive_main(as, 28, 10000);  mail_read(as, 29, NATIVE_MAIL_MSG);      // the sum
+        as.load_const(44, 0);  spawn_actor_bounded(as, 30, "acrash", 1);
+        receive_main(as, 31, 10000);                                            // its exit report
+        as.load_const(20, 1);  call2(as, 32, NATIVE_TRY_SEND, 30, 20);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool full_ok = r.fault.empty() && is_int(21, 0) && is_int(22, 0) && is_int(23, 0) && is_int(24, 1);
+        const bool flow_ok = r.fault.empty() && r.regs[26].isBool() && r.regs[26].asBool() &&
+                             is_int(28, 1) && is_int(29, int64_t{N} * (N + 1) / 2);
+        const bool gone_ok = r.fault.empty() && is_int(31, 2) && is_int(32, 2);
+        std::cout << std::format("  capacity 3: three sent, the fourth full: {}{}\n", full_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  {} messages through, in order (sum {}): {}\n", N, int64_t{N} * (N + 1) / 2,
+                                 flow_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  trySend to a crashed actor -> gone:     {}\n", gone_ok ? "PASS" : "FAIL");
+        check(full_ok && flow_ok && gone_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// The end of the program with back-pressure in flight. Actor A (capacity 1) is full and waits on its
+// extra GATE inbox; actor B is blocked sending to A. The world's end must (1) wake A on the gate,
+// (2) get Stop into A's FULL main inbox (A drains it and prints "A stopped"; without Stop it would
+// print "A no stop" after two seconds), and (3) let B's send go -- false, or true if A's drain made
+// room first; either way B prints "B done" and the program ends.
+inline void test_actor_bounded_shutdown() {
+    using namespace forkjoin;
+    std::cout << "=== actor_bounded_shutdown ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(44, 0);  spawn_actor_bounded(as, 11, "agate", 1);
+        receive_main(as, 13, 10000);                                            // A is at its gate
+        as.load_const(20, 1);  call2(as, 21, NATIVE_TRY_SEND, 11, 20);          // sent
+        call2(as, 22, NATIVE_TRY_SEND, 11, 20);                                 // full
+        as.R6(OpCode::MOV, 41, 11, 0);  spawn_actor(as, 12, "aflood");
+        receive_main(as, 23, 10000);                                            // B's hello
+        receive_main(as, 24, 100);                                              // give B time to block
+        Heap heap;
+        const auto t0 = std::chrono::steady_clock::now();
+        const Run r = run(as, heap);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool setup_ok = r.fault.empty() && is_int(21, 0) && is_int(22, 1) && is_int(23, 1);
+        const bool a_ok     = r.printed.find("A stopped") != std::string::npos;
+        const bool b_ok     = r.printed.find("B done") != std::string::npos;
+        std::cout << std::format("  A full, B blocked on it:            {}{}\n", setup_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  Stop reached A through a full inbox: {}\n", a_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  B's send was let go, the end came:   {}  ({:.0f} ms, \"{}\")\n", b_ok ? "PASS" : "FAIL",
+                                 ms, r.printed);
+        check(setup_ok && a_ok && b_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A SLOT is an address that outlives its actor. The crashed actor's report names the SLOT (so a
+// supervisor's comparison survives a restart), a send while the slot is empty waits in it, and the
+// actor started into it next reads that mail and answers at the same address. Releasing the slot
+// ends the address.
+inline void test_actor_slot_restart() {
+    using namespace forkjoin;
+    std::cout << "=== actor_slot_restart ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        new_slot(as, 11, 0);
+        as.load_const(41, 0);  spawn_into(as, 12, 11, "acrash");
+        receive_main(as, 13, -1);                       // the crash report ...
+        mail_read(as, 14, NATIVE_MAIL_FROM);            // ... names the SLOT, not the isolate
+        send_int(as, 15, 11, 21);                       // nobody is in the slot: this waits in it
+        spawn_into(as, 16, 11, "aslot");
+        receive_main(as, 17, -1);  mail_read(as, 18, NATIVE_MAIL_MSG);
+        send_int(as, 19, 11, 50);                       // the SAME address, a new actor
+        receive_main(as, 20, -1);  mail_read(as, 21, NATIVE_MAIL_MSG);
+        call1(as, 22, NATIVE_RELEASE_SLOT, 11);
+        send_int(as, 23, 11, 1);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool report_ok = r.fault.empty() && is_int(13, 2) && r.regs[14].isInt() && r.regs[11].isInt() &&
+                               r.regs[14].asSigned48() == r.regs[11].asSigned48();
+        const bool queued_ok = r.fault.empty() && r.regs[15].isBool() && r.regs[15].asBool() &&
+                               is_int(17, 1) && is_int(18, 42);
+        const bool same_ok   = r.fault.empty() && is_int(20, 1) && is_int(21, 100);
+        const bool gone_ok   = r.fault.empty() && r.regs[23].isBool() && !r.regs[23].asBool();
+        std::cout << std::format("  the exit report names the slot:   {}{}\n", report_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  a send while empty waits in it:   {}\n", queued_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  the address survives the restart: {}\n", same_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  released: a later send is false:  {}\n", gone_ok ? "PASS" : "FAIL");
+        check(report_ok && queued_ok && same_ok && gone_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// What an actor did not read before it crashed is DROPPED: delivering the message that crashed it to
+// its successor would crash that one too. Only what arrives afterwards waits for the new actor.
+inline void test_actor_slot_drops_pending() {
+    using namespace forkjoin;
+    std::cout << "=== actor_slot_drops_pending ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        new_slot(as, 11, 0);
+        send_int(as, 12, 11, 7);                        // waits in the slot ...
+        as.load_const(41, 0);  spawn_into(as, 13, 11, "acrash");   // ... and this one never reads it
+        receive_main(as, 14, -1);                       // the crash report
+        send_int(as, 15, 11, 9);
+        spawn_into(as, 16, 11, "aslot");
+        receive_main(as, 17, -1);  mail_read(as, 18, NATIVE_MAIL_MSG);
+        receive_main(as, 19, 50);                       // nothing else is coming
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool ok = r.fault.empty() && is_int(14, 2) && is_int(17, 1) && is_int(18, 18) && is_int(19, 0);
+        std::cout << std::format("  the unread message is dropped:  {}{}\n", ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// rawStopActor tells an actor to end, wherever it waits. An address nobody answers at is false.
+inline void test_actor_stop_actor() {
+    using namespace forkjoin;
+    std::cout << "=== actor_stop_actor ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(41, 0);  spawn_actor(as, 11, "aecho");
+        send_int(as, 12, 11, 21);
+        receive_main(as, 13, -1);  mail_read(as, 14, NATIVE_MAIL_MSG);
+        call1(as, 15, NATIVE_STOP_ACTOR, 11);
+        as.load_const(20, 987654);  call1(as, 16, NATIVE_STOP_ACTOR, 20);
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool alive_ok = r.fault.empty() && r.regs[14].isInt() && r.regs[14].asSigned48() == 42;
+        const bool stop_ok  = r.fault.empty() && r.regs[15].isBool() && r.regs[15].asBool() &&
+                              r.regs[16].isBool() && !r.regs[16].asBool();
+        std::cout << std::format("  21 -> 42, then stopped:      {}{}\n", alive_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  a stranger's address: false: {}\n", stop_ok ? "PASS" : "FAIL");
+        check(alive_ok && stop_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A MONITOR is told when an actor ends, in an inbox of the watcher's own: a crash with its message, and
+// a normal end with "normal" -- which the starter's own report does not cover. It does not replace that
+// report; both arrive.
+inline void test_actor_monitor() {
+    using namespace forkjoin;
+    std::cout << "=== actor_monitor ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(43, 0);  as.call_native_id(11, 42, 43, 1, NATIVE_NEW_INBOX);   // r11 = the watch inbox
+        as.load_const(41, 0);  spawn_actor(as, 12, "acrashon");
+        call2(as, 13, NATIVE_MONITOR, 12, 11);                                        // still running: true
+        send_int(as, 14, 12, 1);                                                      // now it faults
+        as.load_const(43, -1); call2(as, 15, NATIVE_RECEIVE, 11, 43);                 // the monitor's report
+        call1(as, 16, NATIVE_MAIL_FROM, 11);
+        call1(as, 17, NATIVE_MAIL_REASON, 11);
+        receive_main(as, 18, 10000);                                                  // the starter's own
+        mail_read(as, 19, NATIVE_MAIL_FROM);
+        // A normal end: stopActor on a monitored actor reports "normal" -- and only to the monitor.
+        as.load_const(41, 0);  spawn_actor(as, 20, "aecho");
+        call2(as, 21, NATIVE_MONITOR, 20, 11);
+        call1(as, 22, NATIVE_STOP_ACTOR, 20);
+        as.load_const(43, -1); call2(as, 23, NATIVE_RECEIVE, 11, 43);
+        call1(as, 24, NATIVE_MAIL_FROM, 11);
+        call1(as, 25, NATIVE_MAIL_REASON, 11);
+        receive_main(as, 26, 50);                                                     // nothing for the starter
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        auto same   = [&](int a, int b) { return r.regs[a].isInt() && r.regs[b].isInt() &&
+                                                 r.regs[a].asSigned48() == r.regs[b].asSigned48(); };
+        const bool crash_ok  = r.fault.empty() && r.regs[13].isBool() && r.regs[13].asBool() &&
+                               is_int(15, 2) && same(16, 12) &&
+                               str_of(r.regs[17]).find("boom on demand") != std::string::npos;
+        const bool both_ok   = r.fault.empty() && is_int(18, 2) && same(19, 12);
+        const bool normal_ok = r.fault.empty() && r.regs[21].isBool() && r.regs[21].asBool() &&
+                               is_int(23, 2) && same(24, 20) && str_of(r.regs[25]) == "normal";
+        const bool quiet_ok  = r.fault.empty() && is_int(26, 0);
+        std::cout << std::format("  a crash reaches the monitor:      {}{}\n", crash_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  ... and the starter as well:      {}\n", both_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  a normal end reports \"normal\":    {}  (\"{}\")\n", normal_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[25]));
+        std::cout << std::format("  ... and is NOT sent to the starter: {}\n", quiet_ok ? "PASS" : "FAIL");
+        check(crash_ok && both_ok && normal_ok && quiet_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// An actor that did NOT start another one can watch it -- which the starter's report cannot do -- and a
+// monitor on an actor that has already ended reports at once, so a monitor always ends in one report.
+inline void test_actor_monitor_others() {
+    using namespace forkjoin;
+    std::cout << "=== actor_monitor_others ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(41, 0);  spawn_actor(as, 11, "aecho");        // the actor being watched
+        as.R6(OpCode::MOV, 41, 11, 0);  spawn_actor(as, 12, "awatch");
+        call1(as, 13, NATIVE_STOP_ACTOR, 11);
+        receive_main(as, 14, 10000);  mail_read(as, 15, NATIVE_MAIL_MSG);   // the watcher's word
+        // An actor that has already ended: false, and the report comes at once.
+        as.load_const(43, 0);  as.call_native_id(16, 42, 43, 1, NATIVE_NEW_INBOX);
+        as.load_const(41, 0);  spawn_actor(as, 17, "acrash");
+        receive_main(as, 18, 10000);                                        // its crash, so it is over
+        call2(as, 19, NATIVE_MONITOR, 17, 16);
+        as.load_const(43, 0); call2(as, 20, NATIVE_RECEIVE, 16, 43);
+        call1(as, 21, NATIVE_MAIL_REASON, 16);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool watcher_ok = r.fault.empty() && is_int(14, 1) && r.regs[15].isInt() && r.regs[11].isInt() &&
+                                r.regs[15].asSigned48() == r.regs[11].asSigned48();
+        const bool gone_ok    = r.fault.empty() && r.regs[19].isBool() && !r.regs[19].asBool() &&
+                                is_int(20, 2) && str_of(r.regs[21]) == "gone";
+        std::cout << std::format("  a non-starter is told of the end: {}{}\n", watcher_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  already ended: false, report now: {}  (\"{}\")\n", gone_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[21]));
+        check(watcher_ok && gone_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// An actor whose loop is its OWN work never reaches a receive, so mail cannot end it. rawStopRequested
+// reads the flag every ending path sets, so such an actor can end itself -- and it consumes no mail.
+inline void test_actor_stop_requested() {
+    using namespace forkjoin;
+    std::cout << "=== actor_stop_requested ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        call1(as, 11, NATIVE_STOP_REQUESTED, 10);       // the root's own inbox: nobody has asked
+        as.load_const(41, 0);  spawn_actor(as, 12, "abusy");
+        call1(as, 13, NATIVE_STOP_ACTOR, 12);
+        receive_main(as, 14, -1);  mail_read(as, 15, NATIVE_MAIL_MSG);
+        new_slot(as, 16, 0);                            // releasing a slot tells the actor in it too
+        spawn_into(as, 17, 16, "abusy");
+        call1(as, 18, NATIVE_RELEASE_SLOT, 16);
+        receive_main(as, 19, -1);  mail_read(as, 20, NATIVE_MAIL_MSG);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool quiet_ok = r.fault.empty() && r.regs[11].isBool() && !r.regs[11].asBool();
+        const bool stop_ok  = r.fault.empty() && r.regs[13].isBool() && r.regs[13].asBool() &&
+                              is_int(14, 1) && is_int(15, 77);
+        const bool slot_ok  = r.fault.empty() && is_int(19, 1) && is_int(20, 77);
+        std::cout << std::format("  nothing asked: false:            {}{}\n", quiet_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  a busy actor ends on the flag:   {}\n", stop_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  a released slot sets it as well: {}\n", slot_ok ? "PASS" : "FAIL");
+        {   // ... and it may only be asked about one's OWN inbox
+            Assembler bad;
+            declare_task_fns(bad);
+            bad.label("main");
+            main_inbox(bad, 10);
+            bad.load_const(41, 0);  spawn_actor(bad, 11, "aecho");
+            call1(bad, 12, NATIVE_STOP_REQUESTED, 11);
+            Heap bad_heap;
+            const Run br = run(bad, bad_heap);
+            const bool foreign_ok = br.fault.find("belongs to another actor") != std::string::npos;
+            std::cout << std::format("  someone else's inbox: a fault:   {}  (\"{}\")\n",
+                                     foreign_ok ? "PASS" : "FAIL", br.fault);
+            check(quiet_ok && stop_ok && slot_ok && foreign_ok);
+        }
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A receive waits on ONE inbox. rawSelect waits on SEVERAL and answers which of them has something,
+// so an actor can serve its own mail and a reply inbox from one loop. It takes nothing out: the
+// receive that follows reads the inbox the index names, and cannot wait.
+inline void test_actor_select() {
+    using namespace forkjoin;
+    std::cout << "=== actor_select ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);                                    // the root's own inbox: address 0
+        as.load_const(43, 0);  as.call_native_id(11, 42, 43, 1, NATIVE_NEW_INBOX);
+        as.VEC_NEW(12);                                        // [ main, extra ] -- main wins a tie
+        as.load_const(13, 0);
+        as.VEC_PUSH(12, 13);
+        as.VEC_PUSH(12, 11);
+        auto select = [&](uint8_t rd, uint8_t rlist, int64_t ms) {
+            as.R6(OpCode::MOV, 40, rlist, 0);
+            as.load_const(41, ms);
+            as.call_native_id(rd, 42, 40, 2, NATIVE_SELECT);
+        };
+        select(14, 12, 50);                                    // nothing yet: the deadline, so -1
+        as.load_const(41, 0);  spawn_actor(as, 15, "aecho");
+        send_int(as, 16, 15, 21);                              // it answers 42 to address 0
+        select(17, 12, 10000);                                 // the MAIN inbox: index 0
+        receive_main(as, 18, 0);                               // ... and this cannot wait
+        mail_read(as, 19, NATIVE_MAIL_MSG);
+        send_int(as, 20, 11, 7);                               // into our SECOND inbox
+        select(21, 12, 10000);                                 // index 1
+        as.R6(OpCode::MOV, 40, 11, 0);                         // and reading it is an ordinary receive
+        as.load_const(41, 0);
+        as.call_native_id(22, 42, 40, 2, NATIVE_RECEIVE);
+        as.R6(OpCode::MOV, 40, 11, 0);
+        as.call_native_id(23, 42, 40, 1, NATIVE_MAIL_MSG);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool timeout_ok = r.fault.empty() && is_int(14, -1);
+        const bool first_ok   = r.fault.empty() && is_int(17, 0) && is_int(18, 1) && is_int(19, 42);
+        const bool second_ok  = r.fault.empty() && is_int(21, 1) && is_int(22, 1) && is_int(23, 7);
+        std::cout << std::format("  nothing to read: the deadline:  {}{}\n", timeout_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  mail in the first inbox:        {}\n", first_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  mail in the second inbox:       {}\n", second_ok ? "PASS" : "FAIL");
+        bool rules_ok = true;
+        {   // someone else's inbox in the list: refused exactly as a receive on it would be
+            Assembler bad;
+            declare_task_fns(bad);
+            bad.label("main");
+            main_inbox(bad, 10);
+            bad.load_const(41, 0);  spawn_actor(bad, 11, "aecho");
+            bad.VEC_NEW(12);
+            bad.VEC_PUSH(12, 11);
+            bad.R6(OpCode::MOV, 40, 12, 0);
+            bad.load_const(41, 0);
+            bad.call_native_id(13, 42, 40, 2, NATIVE_SELECT);
+            Heap bad_heap;
+            const Run br = run(bad, bad_heap);
+            const bool foreign_ok = br.fault.find("belongs to another actor") != std::string::npos;
+            std::cout << std::format("  someone else's inbox: a fault:  {}  (\"{}\")\n",
+                                     foreign_ok ? "PASS" : "FAIL", br.fault);
+            rules_ok = rules_ok && foreign_ok;
+        }
+        {   // watching nothing with no deadline: no event could ever end it, so it is a fault
+            Assembler bad;
+            declare_task_fns(bad);
+            bad.label("main");
+            main_inbox(bad, 10);
+            bad.VEC_NEW(11);
+            bad.R6(OpCode::MOV, 40, 11, 0);
+            bad.load_const(41, -1);
+            bad.call_native_id(12, 42, 40, 2, NATIVE_SELECT);
+            Heap bad_heap;
+            const Run br = run(bad, bad_heap);
+            const bool empty_ok = br.fault.find("would wait forever") != std::string::npos;
+            std::cout << std::format("  no inbox, no deadline: a fault: {}  (\"{}\")\n",
+                                     empty_ok ? "PASS" : "FAIL", br.fault);
+            rules_ok = rules_ok && empty_ok;
+        }
+        check(timeout_ok && first_ok && second_ok && rules_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A select is not a receive, so the ways an actor is ENDED must reach it too: Stop goes into every
+// inbox an actor owns, and each of them wakes the pad the select sleeps on.
+inline void test_actor_select_stop() {
+    using namespace forkjoin;
+    std::cout << "=== actor_select_stop ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(41, 0);  spawn_actor(as, 11, "aselect");   // parks in a select, forever
+        call1(as, 12, NATIVE_STOP_ACTOR, 11);
+        receive_main(as, 13, 10000);                              // it reports what woke it
+        mail_read(as, 14, NATIVE_MAIL_MSG);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool ok = r.fault.empty() && r.regs[12].isBool() && r.regs[12].asBool() &&
+                        is_int(13, 1) && is_int(14, 3);          // MAIL_STOP, seen through the select
+        std::cout << std::format("  Stop wakes a parked select:     {}{}\n", ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A send to one's OWN full inbox is already a located fault: only the waiting isolate could empty
+// it. A CYCLE of such waits over several isolates is the same fact, and gets the same answer -- no
+// in-band message can break it, since Stop and exit reports ignore the capacity and never touch the
+// `space` condition variable. Here the main program and one actor each fill the other's inbox.
+inline void test_actor_send_cycle() {
+    using namespace forkjoin;
+    std::cout << "=== actor_send_cycle ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(43, 1);  as.call_native_id(11, 42, 43, 1, NATIVE_NEW_INBOX);  // bounded to one
+        as.R6(OpCode::MOV, 44, 11, 0);                        // the actor sends back to it ...
+        spawn_actor_bounded(as, 12, "afill", 1);              // ... and its own inbox holds one
+        as.load_const(20, 7);
+        as.label("cycle_loop");                               // ... while we fill the actor's
+        as.R6(OpCode::MOV, 40, 12, 0);
+        as.R6(OpCode::MOV, 41, 20, 0);
+        as.call_native_id(21, 42, 40, 2, NATIVE_SEND);
+        as.J(OpCode::J, "cycle_loop");
+        Heap heap;
+        const Run r = run(as, heap);
+        const bool named  = r.fault.find("deadlock") != std::string::npos;
+        const bool why    = r.fault.find("waiting for room in inbox") != std::string::npos;
+        std::cout << std::format("  a send cycle is a fault:    {}  (\"{}\")\n",
+                                 named ? "PASS" : "FAIL", r.fault);
+        std::cout << std::format("  and it names the cycle:     {}\n", why ? "PASS" : "FAIL");
+        check(named && why);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// Misusing a slot is a located fault in the caller, never a silently shared address.
+inline void test_actor_slot_misuse() {
+    using namespace forkjoin;
+    std::cout << "=== actor_slot_misuse ===\n";
+    try {
+        auto expect = [](const char* label, const Run& r, const char* want) {
+            const bool ok = r.fault.find(want) != std::string::npos;
+            std::cout << std::format("  {:<28} {}  (\"{}\")\n", label, ok ? "PASS" : "FAIL", r.fault);
+            return ok;
+        };
+        bool all = true;
+        {   // two actors in one slot
+            Assembler as;
+            declare_task_fns(as);
+            as.label("main");
+            main_inbox(as, 10);
+            new_slot(as, 11, 0);
+            spawn_into(as, 12, 11, "aslot");
+            spawn_into(as, 13, 11, "aslot");
+            Heap heap;
+            all &= expect("occupied slot:", run(as, heap), "already has an actor");
+        }
+        {   // a released slot is gone
+            Assembler as;
+            declare_task_fns(as);
+            as.label("main");
+            main_inbox(as, 10);
+            new_slot(as, 11, 0);
+            call1(as, 12, NATIVE_RELEASE_SLOT, 11);
+            spawn_into(as, 13, 11, "aslot");
+            Heap heap;
+            all &= expect("released slot:", run(as, heap), "not a slot");
+        }
+        {   // an ordinary actor's address is not a slot
+            Assembler as;
+            declare_task_fns(as);
+            as.label("main");
+            main_inbox(as, 10);
+            as.load_const(41, 0);  spawn_actor(as, 11, "aecho");
+            spawn_into(as, 12, 11, "aslot");
+            Heap heap;
+            all &= expect("an actor's own address:", run(as, heap), "not a slot");
+        }
+        check(all);
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 

@@ -1,6 +1,6 @@
 // CLAIM: an actor's `for m in inbox.messages()` loop ends when the program ends (Stop), so the code after
 //        it runs -- and an actor keeps its state between messages.
-// GUIDE: 20 (Actors: long-lived, talking by messages)
+// GUIDE: SkarnActors.md (Your first actor)
 // EXPECT: ok total 12 counter stopped
 use std::actor::*
 

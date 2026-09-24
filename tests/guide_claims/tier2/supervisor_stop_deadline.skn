@@ -1,0 +1,58 @@
+// CLAIM: `stopTimeoutMs` is what a supervisor does about a child that never receives. With a deadline, a
+//        RESTART gives up and crashes, naming the child, instead of waiting for an end that never comes.
+// GUIDE: SkarnActors.md (Stopping)
+// EXPECT: ok gave up: did not stop within 50 ms
+use std::actor::*
+use std::supervisor::*
+
+
+struct Up { at: Pid[Int], poison: Bool }
+
+
+// Crashes on 0. Its sibling below ignores Stop, so stopping the group must time out.
+fn poisonable(inbox: Inbox[Int], boss: Pid[Up]) -> () {
+  send(boss, Up { at: inbox.pid(), poison: true })
+  for m in inbox.messages() { if m == 0 { panic("boom") } }
+}
+
+
+// Ignores Stop on purpose: only a 9 ends it, so only the main program can.
+fn stubborn(inbox: Inbox[Int], boss: Pid[Up]) -> () {
+  send(boss, Up { at: inbox.pid(), poison: false })
+  let mut go = true
+  while go { match inbox.receive() { Mail::Msg(m) => { if m == 9 { go = false } }, _ => {} } }
+}
+
+
+fn keeper(inbox: Inbox[()], boss: Pid[Up]) -> () {
+  let mut kids: Vec[dyn Supervised] = vec()
+  push(kids, child(actorFn(poisonable), boss))
+  push(kids, child(actorFn(stubborn), boss))
+  superviseWith(inbox, kids, SupervisorSpec { strategy: Strategy::OneForAll,
+    limit: RestartLimit { maxRestarts: 3, withinMs: 60000 }, stopTimeoutMs: 50 })
+}
+
+
+// Each child says WHICH it is, so nothing depends on which announcement arrives first.
+fn up(me: Inbox[Up]) -> Up {
+  match me.receive() { Mail::Msg(u) => u, _ => panic("a child did not announce itself") }
+}
+
+
+let me: Inbox[Up] = mainInbox()
+let _k = spawnActor(keeper, me.pid())
+let a = up(me)
+let b = up(me)
+let poison  = if a.poison { a.at } else { b.at }
+let patient = if a.poison { b.at } else { a.at }
+
+send(poison, 0)                                  // the crash starts the group restart
+
+let why = match me.receive() {
+  Mail::Exited(_, r) => if indexOf(r, "did not stop within 50 ms") >= 0 {
+    "did not stop within 50 ms"
+  } else { r },
+  _ => "?",
+}
+println("gave up: ${why}")
+send(patient, 9)                                 // let the stubborn one end

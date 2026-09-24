@@ -4,7 +4,7 @@ Skarn is a sound, statically typed language in the ML/Rust tradition — checked
 compile time (generics compile to one shared body, not a copy per type) — that happens to target a compact
 bytecode VM (the vMachine interpreter). Its type system borrows from the functional world, but its **core is
 imperative**: statements, mutable bindings, loops, and in-place updates are ordinary Skarn, not an escape
-hatch ([§22](#22-programming-styles-imperative-functional-streaming) writes the same program three ways).
+hatch ([§23](#23-programming-styles-imperative-functional-streaming) writes the same program three ways).
 This guide is a complete, example-driven tour of the language for working programmers. It assumes you are
 comfortable with a mainstream statically typed language and have seen a few functional-programming ideas
 (closures, pattern matching, immutable-by-default values), but it does **not** assume you know any particular
@@ -44,15 +44,18 @@ Concretely:
   no vtables. Trait dispatch instead reads the coarse type tag every value already carries (the one the GC and
   the value representation need anyway), so it too costs nothing extra. See [§16](#16-traits)
   for how "erased" and "dispatch on the runtime type" fit together without contradiction.
+- **No shared memory between threads.** Multi-core work is fork-join tasks and share-nothing **actors**
+  with typed mailboxes, supervisors and back-pressure ([Actors in Skarn](SkarnActors.md));
+  each runs on its own heap and messages are copied, so there are no data races and no locks.
 
 ### Compared to the languages it borrows from
 
 | | Shares with Skarn | What Skarn does differently |
 |---|---|---|
 | **Rust** | enums + `match`, `Option`/`Result` + `?`, traits + bounds, immutability, no null | **GC instead of a borrow checker** — no lifetimes/ownership/`&mut`; generics are *erased* (one body), not monomorphized |
-| **Gleam / OCaml / Elm (the ML family)** | sound static typing, sum types + exhaustive `match`, *erased* generics (one body), immutability by default | Rust-style traits + bounds + `dyn`; a C-family curly-brace surface with method syntax; inference for locals only (signatures are annotated); targets a compact bytecode VM |
+| **Gleam / OCaml / Elm (the ML family)** | sound static typing, sum types + exhaustive `match`, *erased* generics (one body), immutability by default; Gleam's share-nothing actors with typed mailboxes | Rust-style traits + bounds + `dyn`; a C-family curly-brace surface with method syntax; inference for locals only (signatures are annotated); targets a compact bytecode VM; an actor is an **OS thread** (BEAM's are lightweight and preemptively scheduled), and supervision is a library rather than OTP |
 | **Kotlin** | GC on a bytecode VM, *erased* generics, sealed types + exhaustive `when`, expression-oriented (`if`/`when`) | `Option` instead of nullable types (`T?`); `Result` + `?` instead of exceptions; no classes or subclassing (structs + traits only) |
-| **Swift** | enums with associated values + exhaustive `switch`, `Optional` as a real sum type (≈ `Option`), protocols + constraints (≈ traits + bounds), value-type structs | runs on a GC bytecode VM (Swift is native + ARC); errors as `Result`/`?` values rather than `throws`; no classes or subclassing |
+| **Swift** | enums with associated values + exhaustive `switch`, `Optional` as a real sum type (≈ `Option`), protocols + constraints (≈ traits + bounds), value-type structs, `actor`s with isolated state behind a `Sendable` bound | runs on a GC bytecode VM (Swift is native + ARC); errors as `Result`/`?` values rather than `throws`; no classes or subclassing; actors are isolated by having **separate heaps** and copied messages, not by compiler-checked isolation over one shared heap — and there is no `async`/`await` |
 | **Go** | GC, an application / CLI focus, errors as values (not exceptions) | real sum types + generics-with-traits + exhaustive `match` + `?` — deliberately *not* Go's minimal surface / `if err != nil` |
 
 ### Deliberate scope (what Skarn is *not*)
@@ -125,12 +128,13 @@ static_vmrun.exe myprogram.skn
 18. [Option, Result, and the `?` operator](#18-option-result-and-the--operator)
 19. [Iterators](#19-iterators)
 20. [Modules](#20-modules)
-21. [Input, output, and the standard natives](#21-input-output-and-the-standard-natives)
-22. [Programming styles: imperative, functional, streaming](#22-programming-styles-imperative-functional-streaming)
-23. [The type system in one page](#23-the-type-system-in-one-page)
-24. [A complete little program](#24-a-complete-little-program)
-25. [The memory & cost model](#25-the-memory--cost-model)
-26. [Quick reference: the standard library](#26-quick-reference-the-standard-library)
+21. [Concurrency](#21-concurrency)
+22. [Input, output, and the standard natives](#22-input-output-and-the-standard-natives)
+23. [Programming styles: imperative, functional, streaming](#23-programming-styles-imperative-functional-streaming)
+24. [The type system in one page](#24-the-type-system-in-one-page)
+25. [A complete little program](#25-a-complete-little-program)
+26. [The memory & cost model](#26-the-memory--cost-model)
+27. [Quick reference: the standard library](#27-quick-reference-the-standard-library)
 
 ---
 
@@ -1295,7 +1299,7 @@ not the struct itself, so assigning it to another name or passing it to a functi
 copying it. What "immutable by default" gives you is that a plain binding cannot be mutated — there is no
 "mutate a field" statement unless the binding is `mut`. So structs *feel* value-like as long as you don't
 mutate, but that is a property of the default, not of copying: two `mut` names for the same struct see each
-other's changes. This matters enough that [§25](#25-the-memory--cost-model) treats it in full. The idiomatic
+other's changes. This matters enough that [§26](#26-the-memory--cost-model) treats it in full. The idiomatic
 "change" is therefore not to mutate in place but to build a new struct:
 
 ```rust group=point
@@ -2102,7 +2106,7 @@ match get(arr, 9) {
 `vec()` creates an empty, growable vector. `push(v, x)` appends and `pop(v)` removes the last element
 (returning an `Option`, since the vector might be empty). A vector is a reference value, so `push`/`pop` mutate
 the *shared* object in place — every name bound to it, and every function it was passed to, sees the change
-(see [§25](#25-the-memory--cost-model)). Because they mutate, the binding you push/pop through must be `mut`
+(see [§26](#26-the-memory--cost-model)). Because they mutate, the binding you push/pop through must be `mut`
 (Skarn's one mutation rule — see below).
 
 ```rust
@@ -2611,7 +2615,7 @@ You can also **implement the built-in traits for your own types**, not just your
 one you will reach for most often, because it unlocks `sorted` / `sort` / `min` / `max` on a type of your own.
 Just write `impl Ord for YourType { fn lessThan(self, other: YourType) -> Bool { … } }`; there is a worked
 example under [§19 sorting](#19-iterators). (`Clone` is the other user-implementable built-in; `Eq` and
-`Hashable` are sealed markers you never implement — see [§23](#built-in-traits-at-a-glance).)
+`Hashable` are sealed markers you never implement — see [§24](#built-in-traits-at-a-glance).)
 
 ### Mutating the receiver: `mut self`
 
@@ -3088,7 +3092,7 @@ println("sum=" + sum)   // => sum=10
 
 Stages take an iterator and return a new iterator, so you compose them. The element-wise stages are lazy and
 build no intermediate vectors — the two exceptions are `chunks` and `windows`, which necessarily materialize a
-`Vec` per pull (see their cost note in [§25](#25-the-memory--cost-model)).
+`Vec` per pull (see their cost note in [§26](#26-the-memory--cost-model)).
 
 - `map(it, f)` — apply `f` to each element
 - `filter(it, p)` — keep elements where `p` is true
@@ -3216,7 +3220,7 @@ This reads beautifully but is not free: each step allocates the tuple(s) *and* t
 tuple-yielding combinator is the most allocation-heavy *element-wise* loop shape (only `chunks`/`windows`, which
 build a whole `Vec` per pull, are heavier still). In a hot loop prefer a plain index, or the zero-allocation
 `for (k, v) in m` (over a map) and direct `for x in xs` (over a container), which bypass both. See
-[§25](#25-the-memory--cost-model) for the full cost model.
+[§26](#26-the-memory--cost-model) for the full cost model.
 
 ### Writing your own iterator
 
@@ -3485,11 +3489,13 @@ the filesystem, and one without `use std::process` cannot start a program.
 | `std::net` | blocking TCP (IPv4 + IPv6) and a minimal HTTP/1.0 `httpGet` — one connection at a time per thread, and a connection can be handed to an actor; **plaintext only** (no TLS, so `http://` not `https://`) |
 | `std::poll` | non-blocking sockets and readiness polling — many connections from one thread, with the loop written by the program; builds on `std::net` |
 | `std::task` | fork-join parallelism — `spawn` runs a function on its own thread and heap, `join` waits for its result; the argument and result are **copied**, nothing else is shared |
-| `std::actor` | actors — long-lived functions on their own threads with a mailbox; `spawnActor`, `send`, `inbox.messages()`; every message is **copied**, a crash is reported to the actor's starter |
+| `std::actor` | actors — long-lived functions on their own threads with a mailbox; `spawnActor`, `send`, `inbox.messages()`, `ask`, bounded mailboxes; every message is **copied**, a crash is reported to the actor's starter |
+| `std::supervisor` | keeping actors running — `supervise` starts a group of child actors and starts again each one that crashes, up to a restart limit; supervisors nest into trees |
 | `std::regex` | linear-time byte-level regular expressions (Thompson NFA / Pike VM) — no catastrophic backtracking, and therefore **no** backreferences or lookaround |
+| `std::log` | timestamped log lines at four levels, filtered by a minimum, written to a file directly or through a logger actor that owns the file; no rotation and no configuration file |
 
 This table says only what each module is *for*. **Every function of every module, with its signature, is listed
-in [§26](#26-quick-reference-the-standard-library).**
+in [§27](#27-quick-reference-the-standard-library).**
 
 You may define a function of your own named like a built-in, a native, or a trait method — `toInt`, `sqrt`,
 `next`. It wins wherever it is **visible**, which means your own module, and it does not reach any further: the
@@ -3678,6 +3684,42 @@ match httpGet("example.com", 80, "/") {
 }
 ```
 
+And `std::regex` matches, captures, and rewrites text with a linear-time engine (compile once, reuse):
+
+```rust
+use std::regex::*
+let re = match Regex::compile("(?<key>[a-z]+)=([0-9]+)") { Ok(r) => r, Err(e) => panic(e.message) }
+
+match re.captures("  port=8080;") {           // capture groups (0 = whole match)
+  Some(c) => {
+    match c.groupNamed("key") { Some(m) => println(m.text), None => () }   // => port
+    match c.group(2)          { Some(m) => println(m.text), None => () }   // => 8080
+  },
+  None => println("no match"),
+}
+
+println(toString(count(re.searchAll("a=1 b=22 c=333"))))   // => 3         (lazy)
+println(re.replaceAllRe("a=1 b=22", "$1:$2"))              // => a:1 b:22  (templates)
+```
+
+Any prelude name can also be reached explicitly as `std::name` (useful when a local definition shadows it).
+
+## 21. Concurrency
+
+Three steps, each solving a different problem, and they compose:
+
+| | what it buys | what it costs |
+|---|---|---|
+| `std::poll` | one thread serving **many connections** — waiting on several sockets at once | one core; a slow handler stalls every connection |
+| `std::task` | **several cores** for one computation — fork, compute, join | a task runs once and returns one value |
+| `std::actor` | **long-lived** workers that keep state and talk by messages ([its own guide](SkarnActors.md)) | an actor is an OS thread, so hundreds are fine and millions are not |
+
+The rule underneath all three: **nothing is shared.** Every task and every actor has its own heap, and a
+value that crosses between them is copied, not referenced. That is what removes data races by
+construction rather than by discipline — there is no lock in this chapter, and no `async`/`await` either.
+The checker decides what may cross (the `Sendable` bound), so a program that would have shared something
+does not compile.
+
 ### Serving more than one connection
 
 Everything above blocks: `accept` waits for a client, `recv` waits for bytes, and while it waits the
@@ -3779,7 +3821,8 @@ what it takes:
 
 - **`f` must be a named top-level function** with one parameter (pass a struct or a tuple for more). A
   lambda cannot travel to another heap, and neither can a function-typed variable, because it might hold
-  one.
+  one. A **generic** function is fine wherever the call fixes its type parameters — one compiled body
+  serves every use, so there is nothing else to travel.
 - **The argument and the result must be plain data**: numbers, strings, bytes, and collections, tuples,
   structs and enums made of those. A function value, a `dyn` trait object, a socket or another `Task`
   inside them is a compile error.
@@ -3789,147 +3832,52 @@ use std::task::*
 println(spawn(fn(x: Int) -> Int { x * 2 }, 21).join())   // error: spawn needs the name of a top-level function
 ```
 
+**Passing a task function around.** Because `spawn` needs the *name*, a helper cannot call it on a function
+it received as a parameter. `taskFn(f)` is the way out: it checks the named function once, like `spawn`
+would, and returns a `TaskFn[A, R]` that can be passed around; `t.spawn(x)` starts a task from it. A generic
+parallel map:
+
+```rust
+use std::task::*
+
+fn square(n: Int) -> Int { n * n }
+
+fn parMap[A, R](t: TaskFn[A, R], xs: Vec[A]) -> Vec[Result[R, String]] {
+  let mut tasks: Vec[Task[R]] = vec()
+  for x in xs { push(tasks, t.spawn(x)) }      // all start at once
+  let mut out: Vec[Result[R, String]] = vec()
+  for task in tasks { push(out, task.join()) }
+  out
+}
+
+let mut xs: Vec[Int] = vec()
+push(xs, 3)
+push(xs, 4)
+println(parMap(taskFn(square), xs))           // => [Ok(9), Ok(16)]
+```
+
+A helper that works on values of a type parameter and hands them to another heap needs to know that they
+are plain data. The bound **`T: Sendable`** says so. `Sendable` is a built-in marker like `Eq`: the compiler
+decides it from a type's parts, and you never implement it. A function passed to `taskFn` is still checked
+with its concrete types, so `parMap` above needs no bound.
+
 What a task prints appears when it is **joined**, in join order, so the output does not depend on which
 task happened to run first. A task nobody joins is still waited for when the program ends; what it
 printed is dropped.
 
-### Actors: long-lived, talking by messages
+### Actors: long-lived workers that talk by messages
 
-A task computes one result. An **actor** (`std::actor`) keeps running: it waits for messages, answers
-them, and keeps its own state between them.
+An actor is a function on a thread of its own, with a mailbox and state nobody else can reach. It is how
+Skarn keeps long-lived work on several cores: a pool of workers, a service that survives its own crashes,
+a server that hands each connection to whoever is free. Supervision, back-pressure and the rest of the
+model have a guide of their own:
 
-The model comes from **Erlang**: processes that share nothing, messages that are copied into a mailbox, and a
-crash that stays with the actor that crashed and is reported instead of spreading. Three things differ:
-- **Mailboxes are typed.** A `Pid[M]` says which messages its actor understands, closer to Gleam's typed
-  subjects than to Erlang's untyped ones.
-- **Every actor is an operating-system thread.** Erlang's lightweight processes run on a scheduler of their
-  own. Thousands of actors are fine; millions are not.
-- **There is no selective receive, and no links or supervisors.** A crash is reported to the actor that
-  started the crashed one, and nothing is restarted.
-
-`spawnActor(f, init)` starts `f(inbox, init)` on a thread of its own and returns the actor's **address**, a
-`Pid[M]`. `send(pid, m)` puts a copy of `m` into its mailbox. The actor reads its mail with
-`inbox.messages()`, a lazy iterator that ends when the program ends, so an actor's whole life is a `for`
-loop:
-
-```rust
-use std::actor::*
-
-// Ask the counter for its total: the message carries the address to answer to.
-enum Cmd { Add(Int), Total(Pid[Int]) }
-
-fn counter(inbox: Inbox[Cmd], start: Int) -> () {
-  let mut total = start
-  for cmd in inbox.messages() {
-    match cmd {
-      Cmd::Add(n)     => { total = total + n },
-      Cmd::Total(ask) => { send(ask, total) },
-    }
-  }
-}
-
-let me: Inbox[Int] = mainInbox()          // the main program's own mailbox
-let c = spawnActor(counter, 100)
-send(c, Cmd::Add(5))
-send(c, Cmd::Add(7))
-send(c, Cmd::Total(me.pid()))
-match me.receive() {
-  Mail::Msg(t) => println(t),             // => 112
-  _ => println("no answer"),
-}
-```
-
-`inbox.receive()` is the full form. It returns a `Mail`:
-- `Msg(m)`, a message;
-- `Exited(id, reason)`, when an actor this one started has **crashed**. The crash does not spread; its
-  starter is told, and a `send` to the crashed actor returns `false` from then on;
-- `Stop`, when the program is ending. `messages()` stops there by itself.
-
-`inbox.receiveTimeout(ms)` gives up with `None` after `ms` milliseconds. The main program gets its one
-mailbox with `mainInbox()`, annotated with its message type.
-
-The rules are the ones from tasks, applied to what gets copied: the actor function is a **named top-level
-function**, and the message type and the start value must be **plain data**. An address (`Pid`) is plain data,
-so messages can carry the address to reply to; an `Inbox` is not — only its actor may read it:
-
-```rust fail
-use std::actor::*
-fn keeper(inbox: Inbox[Inbox[Int]], unused: Int) -> () {}
-let k = spawnActor(keeper, 0)   // error: cannot be sent to an actor
-```
-
-Actors print a line at a time into the program's output, so lines from different actors never mix, but
-their order depends on scheduling. When the program ends, every actor gets `Stop` and the program waits for
-them to finish. `demo/actors/wordcount.skn` counts words with a reader, N counter actors and a collector.
-
-A connection is not plain data — its socket belongs to the actor that opened it — so it cannot be a message.
-To give one to another actor, **hand it off**: `c.handOff()` detaches the connection and returns a
-`SocketHandOff`, a ticket that *can* be sent, and the receiving actor turns it back into a `TcpConn` with
-`h.take()`, once. Bytes that `recvLine` had already read ahead travel with it. The sender's `TcpConn` is dead
-from then on: every operation on it returns an `Err`.
-
-```rust
-use std::net::*
-use std::actor::*
-
-// A worker answers on every connection it is handed.
-fn worker(inbox: Inbox[SocketHandOff], unused: Int) -> () {
-  for h in inbox.messages() {
-    match h.take() {
-      Ok(mut c) => {
-        match c.recvLine() {
-          Ok(Some(line)) => { let _ = c.sendStr("echo " + line + "\n") },
-          _ => {},
-        }
-        let _ = c.close()
-      },
-      Err(e) => println(e),
-    }
-  }
-}
-
-fn demo() -> Result[(), String] {
-  let lst = listen(0)?                                  // the system picks a free port
-  let mut client = connect("127.0.0.1", lst.localPort()?)?
-  let conn = lst.accept()?
-  let w = spawnActor(worker, 0)
-  send(w, conn.handOff()?)                              // the ticket travels; the socket follows
-  client.sendStr("hi\n")?
-  println(match client.recvLine()? { Some(s) => s, None => "<eof>" })   // => echo hi
-  match conn.sendStr("late") { Ok(_) => println("sent"), Err(e) => println(e) }   // => tcpSend: socket was handed to another actor
-  client.close()?
-  lst.close()?
-  Ok(())
-}
-match demo() { Ok(_) => {}, Err(e) => println(e) }
-```
-
-That is how a server spreads over several cores: one actor accepts and hands each connection to a worker.
-`demo/actor_server/` is one, with a load generator built on tasks.
-
-And `std::regex` matches, captures, and rewrites text with a linear-time engine (compile once, reuse):
-
-```rust
-use std::regex::*
-let re = match Regex::compile("(?<key>[a-z]+)=([0-9]+)") { Ok(r) => r, Err(e) => panic(e.message) }
-
-match re.captures("  port=8080;") {           // capture groups (0 = whole match)
-  Some(c) => {
-    match c.groupNamed("key") { Some(m) => println(m.text), None => () }   // => port
-    match c.group(2)          { Some(m) => println(m.text), None => () }   // => 8080
-  },
-  None => println("no match"),
-}
-
-println(toString(count(re.searchAll("a=1 b=22 c=333"))))   // => 3         (lazy)
-println(re.replaceAllRe("a=1 b=22", "$1:$2"))              // => a:1 b:22  (templates)
-```
-
-Any prelude name can also be reached explicitly as `std::name` (useful when a local definition shadows it).
+**[Actors in Skarn](SkarnActors.md)** — from the first `spawnActor` to supervisor trees, in 18 short
+sections. Start there if you have never used an actor system; it assumes nothing.
 
 ---
 
-## 21. Input, output, and the standard natives
+## 22. Input, output, and the standard natives
 
 Beyond the language itself, a set of built-in functions ("natives") give you access to the outside world. They
 are ordinary functions; the fallible ones return `Result` or `Option`.
@@ -4061,7 +4009,7 @@ Silicon, and rather than guess at a third platform's name it puts them all in on
 
 ---
 
-## 22. Programming styles: imperative, functional, streaming
+## 23. Programming styles: imperative, functional, streaming
 
 Skarn is **multi-paradigm** and does not push you toward one way of writing code. You can write in a plain
 imperative style, in a functional style, or freely mix the two — the type system is happy with all of it, and
@@ -4141,7 +4089,7 @@ imperative loop for one hot inner routine; a streaming pipeline can end in a `fo
 
 ---
 
-## 23. The type system in one page
+## 24. The type system in one page
 
 A few properties that hold everywhere, gathered in one place:
 
@@ -4182,12 +4130,14 @@ fine — each element is converted at the point you add it.)
 
 ### Built-in traits at a glance
 
-Five traits are built into the standard library. Four split **2 + 2** — two are sealed, two are ordinary, and
-the split is *reasoned*, not arbitrary; the fifth, **`MustUse`**, is an open marker for a warning (see
-[Advisory warnings](#advisory-warnings)). **Two are sealed compile-time markers** you never implement (the
+Six traits are built into the standard library. Five split **3 + 2** — three are sealed, two are ordinary, and
+the split is *reasoned*, not arbitrary; the sixth, **`MustUse`**, is an open marker for a warning (see
+[Advisory warnings](#advisory-warnings)). **Three are sealed compile-time markers** you never implement (the
 checker decides membership and discharges the bound statically, no dispatch): **`Eq`** — sealed because equality
-is **structural by construction**, so there is nothing to implement — and **`Hashable`** — sealed because a heap
-object's **pointer bits are not stable under the moving GC**, so only the primitive-backed types can be keys.
+is **structural by construction**, so there is nothing to implement — **`Hashable`** — sealed because a heap
+object's **pointer bits are not stable under the moving GC**, so only the primitive-backed types can be keys —
+and **`Sendable`** — sealed because whether a value can be copied into another task's or actor's heap follows
+from its parts, and a wrong claim would fail on the copy.
 **The other two are ordinary dispatched traits you *can* implement** for your own types: **`Ord`** (built-in
 impls for `Int`/`Double`/`String`; add your own with `impl Ord` — the one exception is the erasure types) and
 **`Clone`**.
@@ -4196,12 +4146,13 @@ impls for `Int`/`Double`/`String`; add your own with `impl Ord` — the one exce
 |-------|---------------|---------|----------------|----------|
 | `Eq` | `==` / `!=` (see [§5](#5-operators)) | derived structurally: any type whose components are all `Eq` (immediates + `String` + erasure types are the leaves; a function-carrying type is **not** `Eq`) | no (auto-derived) | no |
 | `Hashable` | map keys / set elements (see [§14](#14-collections)) | `Int`, `Double`, `Bool`, `String`, and erasure types that wrap one of those (`Char`, integer-backed `enum`s, `transparent` newtypes over these) | no (fixed marker) | no |
+| `Sendable` | what may be copied to another task or actor, in generic code (see [§21](#21-concurrency) and [Actors in Skarn](SkarnActors.md)) | derived structurally: plain data — scalars, `String`, `Bytes`, and collections, tuples, structs and enums of those; **not** a function value, a `dyn` value, a socket, a `Task` or an `Inbox` | no (auto-derived) | no |
 | `Ord` | `sort` / `sorted` / `min` / `max` (ring, `std::iter`) and `minOf` / `maxOf` / `clamp` (opt-in `std::math` — needs `use std::math`); see [§19](#19-iterators) | `Int` / `Double` / `String` built in; **user types may `impl Ord`** (write `fn lessThan`). The one exception is **erasure types** (`Char` / `transparent` newtypes / integer-backed `enum`s) — a method trait can't dispatch on them; a `Char` compares with `<` but is not `Ord` | **yes** (like `Clone`; erasure types excepted) | no |
 | `Clone` | `clone(x)` (see [§14](#14-collections)) | built-in for the containers; **user-extensible** — write `impl Clone for MyType` | **yes** | no (returns `Self`) |
 | `MustUse` | the unused-value warning (see [Advisory warnings](#advisory-warnings)) | none built in; **any type the program owns**, erasure types included — write `impl MustUse for MyType {}` | **yes** (empty impl) | no |
 
-The three markers (`Eq`, `Hashable`, `MustUse`) cost nothing at run time; `==` on a leaf is a single instruction
-and on a composite a structural walk. None of the five is usable as `dyn T`, but for two different reasons: the
+The four markers (`Eq`, `Hashable`, `Sendable`, `MustUse`) cost nothing at run time; `==` on a leaf is a single
+instruction and on a composite a structural walk. None of the six is usable as `dyn T`, but for two different reasons: the
 markers are **compile-time only** — there is nothing to dispatch, so a `dyn` of them is meaningless and
 rejected; `Ord` and `Clone` fail **object safety** (`Ord` takes `Self` as a second parameter, `Clone` returns
 `Self` — see [§17](#17-trait-objects-dyn-trait)).
@@ -4286,7 +4237,7 @@ The runner can be asked to treat these warnings as hard errors, which is useful 
 
 ---
 
-## 24. A complete little program
+## 25. A complete little program
 
 To close, here is a small program that ties many features together: an evaluator for arithmetic expressions
 with named variables. It uses an `enum` to model the expression tree, `match` with recursion to walk it, a
@@ -4348,7 +4299,7 @@ match eval(broken, env) {
 
 ---
 
-## 25. The memory & cost model
+## 26. The memory & cost model
 
 Skarn has no manual memory management — no `free`, no reference counting, no borrow checker. A **garbage
 collector** reclaims values once they are unreachable. To write efficient code (and to understand what `clone`
@@ -4470,7 +4421,7 @@ automatically when the heap needs room.
 
 ---
 
-## 26. Quick reference: the standard library
+## 27. Quick reference: the standard library
 
 The functions below are always in scope (no import needed). They are ordinary functions — remember that a
 trait method or a library function is called as `f(x)`, and `x |> f` is the same thing written left to right.
@@ -4602,6 +4553,7 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `a.add(b)` / `a.sub(b)` / `d.scale(k)` / `d.negate()` | `Duration` algebra |
 | `a.isBefore(b)` / `a.isAfter(b)` | order two `Instant`s → `Bool` |
 | `startStopwatch()` / `sw.elapsedNanos()` / `sw.elapsedMillis()` | a monotonic stopwatch (`startStopwatch` free) |
+| `sleep(ms)` | wait `ms` milliseconds. Only this actor or task waits — each has a thread of its own |
 
 **TCP networking** *(all `std::net` — `use std::net::*`; blocking, plaintext only; close sockets explicitly)*
 
@@ -4636,6 +4588,8 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 |----------|---------|
 | `spawn(f, x)` | start `f(x)` on its own thread → `Task[R]` (free). `f` must be a named, non-generic top-level function with one parameter; its parameter and result types must be plain data — no function values, `dyn` values, sockets or tasks |
 | `t.join()` | wait for the task → `Result[R, String]`: `Ok(result)`, or `Err(message)` if it faulted. Once per task; what the task printed appears here |
+| `taskFn(f)` / `tf.spawn(x)` | `f` as a value that generic code can take and start tasks from → `TaskFn[A, R]`, checked as `spawn` would check `f` / start `f(x)` → `Task[R]` (free). A `TaskFn` can itself be sent |
+| `T: Sendable` | the bound that lets generic code copy values of `T` to another task or actor (a built-in marker, in `std::core`; never implemented by hand) |
 
 **Actors** *(all `std::actor` — `use std::actor::*`; one thread and one heap per actor, every message copied)*
 
@@ -4648,6 +4602,47 @@ trait method or a library function is called as `f(x)`, and `x |> f` is the same
 | `inbox.receive()` | wait for the next mail → `Mail[M]`: `Mail::Msg(m)`, `Mail::Exited(id, reason)` (an actor this one started has crashed), or `Mail::Stop` (the program is ending) |
 | `inbox.receiveTimeout(ms)` | as `receive`, but `None` after `ms` milliseconds → `Option[Mail[M]]` |
 | `inbox.pid()` / `p.actorId()` | this actor's address, to hand out → `Pid[M]` / an actor's id, to compare with the one in `Exited` → `ActorId` |
+| `ask(p, make, ms)` | request and reply: sends `make(replyAddress)` to `p`, waits at most `ms` milliseconds for the answer on an inbox of its own → `Result[R, AskError]` (`Gone`, `Timeout`, `Stopped`, `Crashed(reason)`) (free). It monitors the receiver, so a crash ends the wait at once instead of after `ms`. The reply type `R` comes from the `Pid[R]` in the request, and must be plain data |
+| `newInbox()` / `newBoundedInbox(n)` | a further inbox of this actor (or of the main program), with its own address → `Inbox[M]` (free; annotate it: `let rx: Inbox[T] = newInbox()`; the bounded one holds at most `n` messages) |
+| `inbox.close()` | close an inbox made with `newInbox`: later sends answer `false`, what it holds is dropped. A main inbox cannot be closed |
+| `spawnActorBounded(f, init, n)` | as `spawnActor`, but its mailbox holds at most `n` messages; a `send` to it waits while it is full (free). A RING of such waits — including one through a `join` — is detected: every actor in it crashes with a fault naming the ring, because no message could have broken it |
+| `trySend(p, m)` | send without ever waiting → `SendResult`: `Sent`, `Full` (nothing was queued) or `Gone` (free). MUST-USE: `Full` means nothing was queued |
+| `inbox.ref()` | this inbox as an entry for a `select` list → `InboxRef`. It carries no message type, which is what lets inboxes of different types be waited on together. Like an `Inbox`, it cannot be sent |
+| `select(boxes, ms)` | wait until one of several inboxes has something → `Option[Int]`, the INDEX into `boxes` (`None` = the timeout passed; a negative `ms` waits indefinitely) (free). Ties go to the LOWEST index, so the order is a priority order. It takes nothing out: the `receive()` that follows cannot wait. An empty list with a negative `ms` is a fault |
+| `actorFn(f)` / `a.spawn(init)` / `a.spawnBounded(init, n)` | `f` as a value that generic code can take and start actors from → `ActorFn[M, I]`, checked as `spawnActor` would check `f` / start an actor → `Pid[M]` (free). An `ActorFn` can itself be sent |
+| a GENERIC `f` | allowed wherever the call fixes its type parameters (one erased body serves every use). `spawnActor(relay, boss)` learns them from `boss`; `actorFn(relay)` alone needs an annotation |
+| `newSlot()` / `newBoundedSlot(n)` | an address that outlives the actors started into it → `Slot[M]` (free; annotate it: `let s: Slot[T] = newSlot()`; the bounded one holds at most `n` messages) |
+| `s.pid()` / `s.spawn(a, init)` / `s.release()` | the address to hand out → `Pid[M]` / start an actor at it → `ActorId` (an error if one is running there) / end the address: later sends answer `false`, an actor still there is told to stop |
+| `stopActor(p)` | tell the actor at `p` to end → `Bool`: `false` if it no longer runs. It stops when it next receives; an actor that never receives cannot be stopped |
+| `monitor(p, rx)` | be told when the actor at `p` ends → `Bool`: `false` if it had already ended. Exactly ONE `Mail::Exited(id, reason)` follows, in your own inbox `rx`; the reason is `"normal"`, `"gone"`, or the fault message. It watches that actor, not the address |
+| `inbox.stopRequested()` | has anyone told this actor to end? → `Bool`. Takes no mail out of the inbox. How an actor whose loop is its own work ends itself, since a stop is a message it would never read |
+| `a.stop()` / `a.watch(rx)` | `stopActor` / `monitor` by `ActorId`, for code holding actors whose message type is erased — a supervisor over `Vec[dyn Supervised]` |
+
+**Supervision** *(all `std::supervisor` — `use std::supervisor::*`; builds on `std::actor`)*
+
+| Function | Purpose |
+|----------|---------|
+| `child(a, init)` | a child a supervisor can start again: the `ActorFn` `a` and its start value → `Child[M, I]`, which is `Supervised` (free) |
+| `childIn(slot, a, init)` | the same, but always started at the address `slot` (`std::actor`'s `newSlot`), so the child keeps one address across its restarts → `SlotChild[M, I]` (free) |
+| `supervise(inbox, children, limit)` | run in an actor with its own inbox: start every `children: Vec[dyn Supervised]`, start again each one that crashes, return at `Stop`. More than `limit.maxRestarts` restarts within `limit.withinMs` milliseconds (`RestartLimit { maxRestarts, withinMs }`), and it panics, so its own starter is told. Messages to it are dropped |
+| `superviseWith(inbox, children, spec)` | the same loop with both choices spelled out: `SupervisorSpec { strategy, limit, stopTimeoutMs }`. `supervise` is this with `OneForOne` and no deadline |
+| `Strategy::OneForOne` / `OneForAll` / `RestForOne` | what a crash costs the siblings: nothing / stop them all, wait, start them all / the same for those started after the crashed one. A group restart counts as ONE restart |
+| `stopTimeoutMs` | how long a child may take to stop. `0` waits (the group stands still, the supervisor keeps receiving); more makes a RESTART give up and crash, naming the child, and a SHUTDOWN abandon it. A child that neither receives nor asks `stopRequested()` cannot be ended at all |
+
+**Logging** *(all `std::log` — `use std::log::*`; builds on `std::io`, `std::time` and `std::actor`. A line is `<iso timestamp> <LEVEL> <text>`; the verbs are methods, so `use std::log::*` claims none of the names `info`, `warn`, `error` or `debug`)*
+
+| Function | Purpose |
+|----------|---------|
+| `Log::toFile(path, min)` | a logger appending straight to `path`; nothing below `min` is written. One append per line, and that call is atomic, so several actors may share the file |
+| `Log::toActor(to, min)` | a logger sending its lines to `to: Pid[String]` instead. Costs a message, and buys one order for the whole program and, with a bounded inbox, back-pressure |
+| `log.debug(msg)` / `log.info(msg)` / `log.warn(msg)` / `log.error(msg)` | write one line at that level (also `Log::info(log, msg)`, as for any method) |
+| `log.at(level, msg)` | the same with the level as a value — the one place that filters, formats and writes |
+| `Level::Debug` / `Info` / `Warn` / `Error` | the four levels; `l.rank()` orders them, `l.atLeast(min)` is the filter, `l.label()` is the fixed-width text in the line |
+| `startLogger(path, capacity)` | start a logger actor owning `path` → `Pid[String]`. Its inbox holds at most `capacity` lines, so a program logging faster than the disk writes is slowed rather than grown |
+
+A `Log` is plain data, so it is sendable: an actor is handed its logger in its start value. Stop a logger
+actor **last** — `Stop` is queued at the end of a mailbox, so everything already sent is written, but a line
+sent after it has ended is dropped.
 
 **Regex** *(all `std::regex` — `use std::regex::*`; byte-level, linear-time Pike VM; no backrefs/lookaround. Note the names: matching anywhere is `search`, not `find`, and rewriting is `replaceRe`, not `replace` — those two belong to `std::iter` / `std::string`)*
 
@@ -4800,6 +4795,9 @@ case), `m` (multiline), `s` (dotall) — as `Regex::compileWith(pattern, "ims")`
 
 ### Where to go next
 
+- [Actors in Skarn](SkarnActors.md) — long-lived workers that share nothing and talk by messages:
+  mailboxes, supervisors and back-pressure, in 19 short sections. It is the guide of its own that §21
+  points at.
 - The grammar in `docs/skarn_grammar.ebnf` is the precise reference for the syntax.
 - [docs/Compiler.md](docs/Compiler.md) and [docs/VirtualMachine.md](docs/VirtualMachine.md) describe how the
   compiler and the virtual machine work inside.

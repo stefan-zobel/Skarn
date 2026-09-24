@@ -1,0 +1,124 @@
+// A worker that serves TWO queues from one loop (std::actor's `select`).
+//
+//   main --jobs----> [ jobs inbox ] --\
+//                                      >-- one worker, one loop
+//   main --control-> [ ctl inbox  ] --/
+//
+// A `receive` waits on ONE inbox, so before `select` a worker could only block on one of its queues
+// at a time. Here it waits on both: `select` answers WHICH one has something, and the receive that
+// follows is an ordinary typed one on the inbox that index names.
+//
+// The two queues carry DIFFERENT types -- a job is an Int, a control message is a `Ctl` -- which is
+// the point: neither has to be squeezed into a case of the other. The list is built from
+// `inbox.ref()`, because inboxes of different message types cannot share a Vec.
+//
+// PRIORITY. Ties go to the lowest index, so the order of the list is a priority order. The worker
+// puts control FIRST, so a pause takes effect even while jobs are already waiting -- and while it is
+// paused it watches the control queue ALONE, so the jobs wait in their own inbox until it resumes.
+//
+// The worker announces its control address before anything else, so the main program never sends to
+// an address it has not been told about -- which is what makes the output the same under every
+// schedule.
+//
+//     static_vmrun demo/actors/select.skn
+//     static_vmrun demo/actors/select.skn --jobs=8
+use std::actor::*
+use std::cli::*
+use std::env::*
+
+
+// What the control queue carries. Nothing about it matches the job type, and it does not have to.
+enum Ctl { Pause, Resume, Report }
+
+
+// What the main program hears. The first message is the address of a queue the worker owns: an
+// Inbox cannot be sent, but a Pid is plain data.
+enum Note { Control(Pid[Ctl]), Say(String) }
+
+
+fn worker(inbox: Inbox[Int], boss: Pid[Note]) -> () {
+  let ctl: Inbox[Ctl] = newInbox()
+  send(boss, Note::Control(ctl.pid()))
+  let both = toVec([ctl.ref(), inbox.ref()])   // control first: it wins a tie
+  let onlyCtl = toVec([ctl.ref()])
+  let mut paused = false
+  let mut done   = 0
+  let mut sum    = 0
+  let mut going  = true
+  while going {
+    let watching = if paused { onlyCtl } else { both }
+    match select(watching, 5000) {
+      Some(0) => {
+        match ctl.receive() {
+          Mail::Msg(Ctl::Pause)  => { paused = true   send(boss, Note::Say("paused")) },
+          Mail::Msg(Ctl::Resume) => { paused = false  send(boss, Note::Say("resumed")) },
+          Mail::Msg(Ctl::Report) => { send(boss, Note::Say("done ${done}, sum ${sum}")) },
+          _                      => { going = false }
+        }
+      },
+      Some(1) => {
+        match inbox.receive() {
+          // 0 is a MARKER, not a job: it says "you have taken everything sent before me", which is
+          // what lets the main program ask for a report at a point it knows the answer to.
+          Mail::Msg(n) => {
+            if n == 0 { send(boss, Note::Say("the job queue is drained")) }
+            else      { done += 1  sum += n * n }
+          },
+          _ => { going = false }
+        }
+      },
+      _ => { send(boss, Note::Say("idle for 5 s"))  going = false }
+    }
+  }
+  ctl.close()
+  send(boss, Note::Say("ended after ${done} job(s)"))
+}
+
+
+fn say(me: Inbox[Note]) -> String {
+  match me.receive() {
+    Mail::Msg(Note::Say(s))   => s,
+    Mail::Msg(Note::Control(_)) => "(a second control address)",
+    _                         => "(the worker ended)",
+  }
+}
+
+
+let opts = CliArgs::parse(toVec(args()))
+let jobs = match parseInt(opts.getOptOr("jobs", "4")) {
+  Ok(n)  => if n > 0 { n } else { 4 },
+  Err(_) => panic("--jobs needs a whole number"),
+}
+
+let me: Inbox[Note] = mainInbox()
+let w = spawnActor(worker, me.pid())
+
+// The worker's control address, which only the worker could hand out.
+let ctl = match me.receive() {
+  Mail::Msg(Note::Control(p)) => p,
+  _                           => panic("the worker did not announce its control queue"),
+}
+println("the worker is up, and its control queue has its own address")
+
+// Pause FIRST, then queue the jobs: they pile up in the job inbox untouched, because a paused
+// worker is not watching it at all.
+send(ctl, Ctl::Pause)
+println(say(me))
+
+let mut i = 1
+while i <= jobs {
+  send(w, i)
+  i += 1
+}
+send(w, 0)                                  // the marker, at the end of the job queue
+send(ctl, Ctl::Report)
+println("${say(me)}  <- still nothing done: ${jobs} job(s) are waiting in the other queue")
+
+send(ctl, Ctl::Resume)
+println(say(me))                            // "resumed": the control queue is served first
+println(say(me))                            // the marker has been reached, so every job is in
+send(ctl, Ctl::Report)
+println(say(me))
+
+let _stopped = stopActor(w)
+println(say(me))

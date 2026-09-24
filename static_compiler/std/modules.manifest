@@ -29,4 +29,6 @@ std::net      net.skn
 std::poll     poll.skn
 std::task     task.skn
 std::actor    actor.skn
+std::supervisor supervisor.skn
 std::regex    regex.skn
+std::log      log.skn

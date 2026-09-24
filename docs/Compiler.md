@@ -196,8 +196,9 @@ branch types (in `if`, `match`, or the `break` values of a `loop`) is exact.
   - Built-in functions and natives can only be called, never used as values.
 - **`dyn Trait`** values are the plain values themselves: no box, no vtable. A method may appear in a `dyn`
   type only if it takes `self` and does not mention `Self` in another parameter.
-- **Sealed marker traits.** `Eq` and `Hashable` are derived by the compiler and cannot be implemented by
-  users; see "Language semantics" below. The third marker, `MustUse`, is open; see "Warnings and diagnostics".
+- **Sealed marker traits.** `Eq`, `Hashable` and `Sendable` are derived by the compiler and cannot be
+  implemented by users; see "Language semantics" below and, for `Sendable`, "Fork-join tasks". The fourth
+  marker, `MustUse`, is open; see "Warnings and diagnostics".
 
 Higher-kinded types, higher-rank polymorphism and `where` clauses beyond a parameter's own bounds are not
 part of the language.
@@ -299,20 +300,35 @@ ordinary generic function in `std/task.skn`; the VM side is described under "Tas
 [VirtualMachine.md](VirtualMachine.md). Because a task works on its own heap, its argument and result are
 copied. The checker therefore adds these rules at every call of `spawn`:
 
-- **`f` must name a top-level function** that is not generic and takes one parameter. A lambda, a closure
-  or a function-typed variable is rejected: a closure is a heap object that cannot be copied, and a
-  `fn(A) -> R` type does not say whether a value is one. A generic function is rejected because the types
-  checked here must be the ones the task actually runs with.
+- **`f` must name a top-level function** taking one parameter. A lambda, a closure or a function-typed
+  variable is rejected: a closure is a heap object that cannot be copied, and a `fn(A) -> R` type does not
+  say whether a value is one. A **generic** function is accepted where the call determines its type
+  parameters — types are erased, so one compiled body serves every use and the id that travels is that
+  body's, and the rules below are then checked against the types it really runs at. What nothing at the
+  call determines stays rejected: an undetermined type cannot be proven sendable.
 - **The parameter type and the result type must be sendable.** Sendable means plain data: numbers, `Bool`,
   `String`, `Bytes`, and tuples, collections, structs and enums built only from sendable parts. It excludes
-  function values, trait objects, type parameters, and handles — a socket (`TcpConn`, `TcpListener`,
-  `NbConn`, `NbListener`) or a `Task`. A handle is a struct over an integer that is meaningful only in the
-  heap that created it. The check walks recursive types, treating a type met again as sendable so far, and
-  caches nothing. A disallowed component behind a mutual recursion is therefore still found.
+  function values, trait objects, type parameters without the bound `Sendable`, and handles — a socket
+  (`TcpConn`, `TcpListener`, `NbConn`, `NbListener`), a `Task` or an actor's `Inbox`. A handle is a struct
+  over an integer that is meaningful only in the heap that created it. The check walks recursive types,
+  treating a type met again as sendable so far, and caches nothing. A disallowed component behind a mutual
+  recursion is therefore still found.
 - **`spawn` can only be called**, never used as a value, since a value would be called where none of this is
   checked.
 - **A `Task` is built only by `spawn`.** A struct literal or record update of `Task` outside `std::task` is
   an error. Otherwise a `Task[String]` could be made from the id of a task that returns an `Int`.
+
+Two additions let generic code work with tasks and actors:
+- **`Sendable` is a sealed marker trait** in `std::core` that names exactly the sendable types. Like `Eq`, it
+  has no impls: the compiler decides it from a type's parts, and a written `impl Sendable` is an error. A
+  type parameter is sendable when it carries the bound, so `fn replyInbox[R: Sendable]() -> Inbox[R]`
+  compiles and the checks happen where the helper is called, with the concrete type. A failed bound names the
+  part that is not sendable. `dyn Sendable` does not exist, and `Sendable` cannot select a blanket impl,
+  since erased newtypes are sendable and would dispatch as their underlying primitive.
+- **`taskFn(f)` makes a checked function value**, a `TaskFn[A, R]`, under the rules of `spawn`; `t.spawn(x)`
+  then starts a task. A generic helper cannot call `spawn` on a function it received as a parameter, since
+  the parameter might hold a closure. It can take a `TaskFn` instead. A `TaskFn` literal outside `std::task`
+  is an error, so its function is always a named one, and a `TaskFn` is itself sendable.
 
 The four natives underneath are generic, and they take the `Task` itself, so a task's result type comes from
 its handle. `rawTaskTake` and `rawTaskError` are one native under two types, and `rawJoin`'s `Bool` says which
@@ -337,14 +353,63 @@ start value.
 
 A `Pid[M]` promises that the actor it names receives `M`. The checker keeps that promise where a `Pid` is
 **made**, so `send` needs no check of its own:
-- **`spawnActor(f, init)`:** `f` must name a non-generic top-level function
-  `fn(Inbox[M], I) -> ()`, for the same reasons as a task's function. The message type `M` and the start
-  value `I` must be sendable. Every message is copied, so a message may carry a `Pid` (it is plain data)
-  but not an `Inbox`, the receiving end of one actor's mailbox.
+- **`spawnActor(f, init)`:** `f` must name a top-level function `fn(Inbox[M], I) -> ()`, for the same
+  reasons as a task's function, and a generic one is accepted on the same terms — the start value is
+  usually what fixes its type parameter. The message type `M` and the start value `I` must be sendable.
+  Every message is copied, so a message may carry a `Pid` (it is plain data) but not an `Inbox`, the
+  receiving end of one actor's mailbox.
+- **A generic actor body, and a generic starter over it.** Because one erased body serves every use,
+  `fn relay[T: Sendable](inbox: Inbox[T], boss: Pid[T])` can be started at several message types, and
+  `fn start[T: Sendable](boss: Pid[T]) -> Pid[T] { spawnActor(relay, boss) }` can be written: inside it
+  `T` is abstract and sendable through its bound alone, the same rule a new inbox already follows. What
+  stays fixed is the address: one `Pid` still carries one message type.
 - **`mainInbox()`** gives the main program an inbox. Its message type comes only from an annotation
   (`let inbox: Inbox[T] = mainInbox()`); it must be known at the call and sendable.
-- **`spawnActor` and `mainInbox` can only be called**, never used as values.
-- **`Pid` and `Inbox` literals are an error outside `std::actor`.**
+- **`newInbox()` / `newBoundedInbox(n)`** give an actor or the main program a further inbox, with the same
+  rule as `mainInbox`: an annotated, sendable message type.
+- **`spawnActorBounded(f, init, n)`** starts an actor whose inbox holds at most `n` messages, with the rules
+  of `spawnActor`.
+- **`ask(pid, make, timeoutMs) -> Result[R, AskError]`** makes a reply inbox, sends `make(replyAddress)`,
+  waits for the reply and closes the inbox. Its reply type `R` is fixed by the `Pid[R]` the request carries
+  (or by an annotation) and must be known at the call and sendable, because `R` is the message type of the
+  inbox it makes. It also monitors the receiver, so `AskError` has a `Crashed(reason)` beside `Gone`,
+  `Timeout` and `Stopped`: a crash ends the wait at once instead of after the timeout.
+- **`monitor(p, rx) -> Bool`** asks to be told when the actor at `p` ends: exactly one
+  `Mail::Exited(id, reason)` arrives in the caller's own inbox `rx`, for a crash, for a normal end
+  (`"normal"`), or at once if it had already ended (`"gone"`, and the call answers `false`). It watches
+  that actor, not the address. It needs no rule of its own — it creates neither an isolate nor an address.
+- **`inbox.stopRequested() -> Bool`** answers whether anyone has told this actor to end. `stopActor(p)` is
+  a message, so an actor whose loop is its own work never reads it; asking is how such an actor ends
+  itself (`while i < n && !inbox.stopRequested() { … }`). It consumes no mail.
+- **`a.stop()` and `a.watch(rx)` on an `ActorId`** are `stopActor` and `monitor` by id, for code holding
+  children whose message type is erased — what a supervisor over `Vec[dyn Supervised]` has.
+- **`actorFn(f)`** makes an `ActorFn[M, I]` under the rules of `spawnActor`. `a.spawn(init)` and
+  `a.spawnBounded(init, n)` then start actors from code that received the function as a value — a worker
+  pool, or a supervisor that is sent a child's function and start value and starts it. An `ActorFn` is
+  sendable, because only `actorFn` makes one.
+- **Inside a generic function**, the message type of a new inbox and the reply type of `ask` may be a type
+  parameter bounded `Sendable`.
+- **`newSlot()` / `newBoundedSlot(n)`** get the same rule as the inbox makers: a `Slot[M]` is an address
+  that outlives the actors started into it (`s.spawn(actorFn(f), init)`), so `M` must be known at the call
+  and sendable. A `Slot` is plain data, so it can be sent to the supervisor that keeps the address alive.
+- **These functions can only be called**, never used as values, so no call escapes the rules above.
+- **`Pid`, `Inbox`, `Slot`, `InboxRef` and `ActorFn` literals are an error outside `std::actor`.**
+
+A request that wants an answer does not need a selective receive: the answer goes to an inbox of its own,
+with its own type. A bounded inbox provides back-pressure — `send` waits while it is full, `trySend` reports
+`Full` instead — and exit reports and `Stop` always get through. `trySend`'s result is **must-use**, because
+`Full` means nothing was queued; `send`'s `Bool` is not, because `false` says only that the receiver has
+already ended. A RING of such waits, including one that
+runs through a `join`, is detected by the runtime and reported to every actor in it as an ordinary crash.
+None of this needs a checker rule beyond the ones above; the waiting is the runtime's.
+
+To serve several of those inboxes from one loop, `select(boxes, timeoutMs)` waits until any of them has
+something and answers WHICH — the index into the list, or `None` when the timeout passed. The list holds
+`InboxRef`s, made by `inbox.ref()`, because inboxes of different message types are different types and
+cannot share a `Vec`; the receive that follows is an ordinary typed one on the inbox that index names, and
+cannot wait, because only the owner takes mail out of an inbox. Ties go to the lowest index, so the order
+of the list is a priority order. An `InboxRef` names the same mailbox an `Inbox` does, so like an `Inbox`
+it cannot be sent to another actor.
 
 A connection cannot be a message: `TcpConn` stays unsendable, since its descriptor means something only in
 the actor that opened it. `std::net` moves it in two steps instead. `c.handOff()` detaches the connection
@@ -354,6 +419,79 @@ back. A `SocketHandOff` literal or record update outside `std::net` is an error,
 ticket for someone else's connection. After the hand-off the sender's `TcpConn` still type-checks; it is a
 rule of the runtime, not of the type system, that every operation on it now returns an `Err` saying the
 socket was handed to another actor.
+
+An actor that owns a connection and must also react to its inbox cannot block in `recvLine`.
+`c.activate(framing, capacity)` hands the reading of the connection to the runtime and returns two halves:
+an `ActiveConn` to write with (`send`, `sendStr`, `close`) and the `SockEvents` to read from, an inbox of
+the actor into which the runtime delivers what arrives. `select` then waits on it and the actor's own
+inbox together.
+- **Events:** `Framing::Lines(max)` delivers `Line(text)` per line and `Framing::Raw` delivers `Chunk(bytes)`
+  as read; `Eof` ends the stream, `Failed(why)` reports an error or a line longer than `max`, and
+  `Stopping` is the actor's own stop. The names differ from `Mail`'s and `std::poll`'s on purpose, so a
+  program using all three may write each one bare.
+- **Back-pressure:** at most `capacity` events wait; while the inbox is full the runtime stops reading.
+- **Rules:** neither `ActiveConn` nor `SockEvents` can be sent to another actor, and a literal of either
+  outside `std::net` is an error. As with a hand-off, the activated `TcpConn` still type-checks but every
+  operation on it returns an `Err`; the connection is closed when its actor ends.
+
+A listener can be activated the same way. `l.activate(capacity)` returns an `ActiveListener` (`close`)
+and `IncomingClients` (`ref`, `receive`, `receiveTimeout`), and every new connection arrives as
+`Incoming::NewClient(ticket)` — a `SocketHandOff`, ready to be sent on to a worker. `AcceptFailed(why)`
+ends the listener and `ListenerStopping` is the actor's own stop, so an acceptor waiting with `select`
+can be messaged and stopped. Neither half can be sent, a literal of either outside `std::net` is an
+error, and the listener is closed when its actor ends.
+
+`std::supervisor` keeps actors running, written in Skarn over `std::actor`, with no rule and no native of
+its own.
+- **What it does:** `supervise(inbox, children, limit)` starts every child and starts again each one that
+  crashes (`one_for_one`), and it returns at `Stop`. More than `maxRestarts` restarts within `withinMs`
+  milliseconds, and it panics; its own starter is then told, so supervisors nest into trees.
+- **The full form:** `superviseWith(inbox, children, SupervisorSpec { strategy, limit, stopTimeoutMs })`
+  is the same loop with both choices spelled out. `Strategy::OneForAll` stops every other child when one
+  crashes, waits until they have all ended, and starts them all again; `Strategy::RestForOne` does that
+  for the children started AFTER the crashed one, which is what children that depend on the ones before
+  them need. A group restart counts as one restart. The wait is for an end REPORT, which arrives only
+  once that actor's address is free, so a child in a slot is started again exactly where it was.
+- **Shutdown:** at `Stop` the children are stopped in reverse start order and every address is released.
+  With a `stopTimeoutMs` the supervisor waits for each child before telling the next.
+- **Why a function, not an actor:** a crash is reported to the actor that started the child. The loop
+  therefore runs inside the supervising actor, which builds its children there, as `child(actorFn(f),
+  init)` values in a `Vec[dyn Supervised]`. The children may have different message types; a trait object
+  cannot be sent, and the list never is.
+- **A child at a fixed address:** `childIn(slot, actorFn(f), init)` puts the child in a `Slot`, so its
+  address survives every restart and a message sent while it is being started again waits in the slot
+  instead of being dropped. Past the limit the supervisor releases its children's addresses before it
+  gives up, so none is left to swallow mail nobody will read.
+- **A child that never receives cannot be stopped**, because a stop is a message. Such a child must ask
+  `inbox.stopRequested()` in its own loop, and then it ends like any other. For the one that does not,
+  `stopTimeoutMs` decides: 0, the default, waits — the group stands still, but the supervisor stays
+  receive-ready, so the program still ends. A deadline makes a restart panic, naming the child, so the
+  supervisor's own starter learns of it rather than the group being restarted on a false assumption;
+  during a shutdown the child is abandoned instead and the supervisor returns normally.
+- **Limits:**
+  - Only a crash restarts a child. A child that returns of its own accord stays ended.
+  - A child made with `child` has a new address after a restart; one made with `childIn` keeps the slot's.
+  - A supervisor that gives up tells its children to stop and releases their addresses, but it cannot end
+    one that never receives.
+
+`std::log` is logging, also plain Skarn and also over `std::actor`, with no rule and no native of its own.
+A `Log` holds a sink and a minimum level; a line is a timestamp, a level and the text.
+- **Two sinks.** `Log::toFile(path, min)` appends straight to the file, one append per line, and that call
+  is atomic, so several actors may share one file. `Log::toActor(to, min)` sends the line to an actor that
+  owns the file instead: it costs a message and buys one order for the whole program and, with the bounded
+  inbox `startLogger` gives its actor, back-pressure.
+- **The verbs are methods, not free functions.** `info`, `warn`, `error` and `debug` are four of the names
+  a program is most likely to want for itself, and an inherent method belongs to its type, so
+  `use std::log::*` brings in the type `Log` and does not claim any of them. One declaration answers to
+  both `log.info(msg)` and `Log::info(log, msg)`. `startLogger` is the module's one free name.
+- **`Level` is a plain enum**, not an integer-backed one: an erased enum can carry no methods, and the
+  comparison operators accept only numbers, strings and characters, so the ordering the filter needs is a
+  `rank()` written out once.
+- **A `Log` is plain data and therefore sendable**, so an actor is handed its logger in its start value.
+- **Stop a logger actor last.** A stop is queued at the end of a mailbox, so everything already sent is
+  written; a line sent after it has ended is dropped, and `send` reports that.
+- Deliberately absent: rotation, truncation, structured fields, a configuration file, and any output to
+  standard error.
 
 The reference interpreter used for differential testing does not model actors. A receive depends on which
 actor ran first, and a sequential model would present one schedule as the answer. Actor programs are

@@ -189,6 +189,37 @@ inline constexpr const char* EOD_MSG = "value codec: buffer ended mid-value";
 }
 
 // =============================================================================
+// encode_bytes -- the buffer encode() would produce for a Bytes value holding `tag`
+// followed by data[0, n), built WITHOUT a heap.
+//
+// Its caller is the active-socket I/O thread (vmcore.cpp), which delivers what it reads
+// into a mailbox but owns no heap to build a value in. A Bytes value is the one shape it
+// needs, and that shape carries no struct type id, so the buffer means the same in every
+// image. It is exactly encode()'s output for such a value -- a KIND_BYTES header (node 0,
+// slots {backing, count}) and its KIND_STRING backing (node 1) of exactly `count` bytes --
+// which the vm_tests round trip checks byte for byte, so decode() needs no second path.
+// =============================================================================
+[[nodiscard]] inline std::vector<uint8_t> encode_bytes(uint8_t tag, const char* data, size_t n) {
+    const uint32_t count = static_cast<uint32_t>(n + 1);
+    std::vector<uint8_t> out;
+    out.reserve(n + 40);
+    byteio::put_u32(out, 2);                                            // node_count
+    byteio::put_u8 (out, GcObject::KIND_BYTES);                         // node 0: the header
+    byteio::put_u32(out, BYTES_HDR_SLOTS);
+    byteio::put_u8 (out, GcObject::KIND_STRING);                        // node 1: the backing
+    byteio::put_u32(out, count);
+    byteio::put_u8 (out, tag);
+    out.insert(out.end(), data, data + n);
+    byteio::put_u8 (out, static_cast<uint8_t>(Value::Type::Pointer));   // header.backing -> node 1
+    byteio::put_u32(out, 1);
+    byteio::put_u8 (out, static_cast<uint8_t>(Value::Type::Integer));   // header.count
+    byteio::put_u64(out, count);
+    byteio::put_u8 (out, static_cast<uint8_t>(Value::Type::Pointer));   // root -> node 0
+    byteio::put_u32(out, 0);
+    return out;
+}
+
+// =============================================================================
 // decode -- bytes -> a value graph in `dst`.
 //
 // The caller supplies a FRESH RootedValuePool and must keep it alive for as long as the

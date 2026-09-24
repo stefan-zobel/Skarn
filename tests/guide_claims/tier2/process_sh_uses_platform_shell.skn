@@ -1,6 +1,6 @@
 // CLAIM: sh(cmdline) runs the command line through the PLATFORM's shell -- cmd /c on Windows,
 //        /bin/sh -c elsewhere -- so one source works on both. Only a failure to START is an Err.
-// GUIDE: 21 (Running processes)
+// GUIDE: 22 (Running processes)
 // EXPECT: ok child said: from-child
 use std::process::*
 

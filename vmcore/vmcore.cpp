@@ -33,6 +33,8 @@
 #include <unordered_map>        // the world registry: isolate id -> record
 #include <atomic>     // World::actors_started, read by the root's output buffer
 #include <optional>   // the world a root execute() owns
+#include <algorithm>  // std::find -- a mailbox's list of senders waiting for room
+#include <utility>    // std::exchange -- a receive takes the I/O thread's pause mark
 #ifdef _WIN32
 // Winsock MUST precede <windows.h> to avoid winsock.h/winsock2.h redefinition errors.
 #  include <winsock2.h>
@@ -133,15 +135,18 @@ static constexpr int SOCK_SEND_FLAGS = 0;             // Windows: no signal; mac
 // descriptor -- a TcpConn kept after close(), or after handOff() -- no longer matches and is refused,
 // instead of silently reaching whatever connection took the slot next. (Before generations, the
 // next accept() reused the slot at once, which made "a socket used after it was handed off" an
-// alias of a stranger's connection rather than an error.) The slot keeps one bit about how its
-// previous generation ended, for the message.
+// alias of a stranger's connection rather than an error.) The slot keeps how its previous
+// generation ended, for the message.
 struct NetRegistry {
     static constexpr int     SLOT_BITS = 24;
     static constexpr int64_t SLOT_MASK = (int64_t{1} << SLOT_BITS) - 1;
+    // How a slot's previous generation ended: closed, handed to another isolate, or activated (its
+    // reading moved to the world's I/O thread -- see IoHub).
+    enum class Ended : uint8_t { closed, handed, activated };
     struct Slot {
-        socket_t s           = INVALID_SOCK;
-        int64_t  gen         = 0;
-        bool     prev_handed = false;   // the previous generation ended by a hand-off
+        socket_t s        = INVALID_SOCK;
+        int64_t  gen      = 0;
+        Ended    prev_end = Ended::closed;
     };
     std::vector<Slot> slots;
     ~NetRegistry() {
@@ -164,19 +169,20 @@ struct NetRegistry {
         return &slots[i];
     }
     socket_t get(int64_t fd) { Slot* sl = live(fd); return sl ? sl->s : INVALID_SOCK; }
-    void release(Slot& sl, bool handed) {
+    void release(Slot& sl, Ended how) {
         sl.s = INVALID_SOCK;
-        sl.prev_handed = handed;
+        sl.prev_end = how;
         sl.gen = (sl.gen + 1) & ((int64_t{1} << 23) - 1);   // stays within a positive 48-bit Int
     }
-    void drop(int64_t fd) { if (Slot* sl = live(fd)) release(*sl, false); }
-    // Detach a socket for a hand-off to another isolate: the socket leaves this registry (it is not
-    // closed), and the descriptor goes stale. INVALID_SOCK if `fd` is not a live descriptor.
-    socket_t hand_off(int64_t fd) {
+    void drop(int64_t fd) { if (Slot* sl = live(fd)) release(*sl, Ended::closed); }
+    // Detach a socket, for a hand-off to another isolate or for activation: the socket leaves this
+    // registry (it is not closed), and the descriptor goes stale. INVALID_SOCK if `fd` is not a live
+    // descriptor.
+    socket_t detach(int64_t fd, Ended how) {
         Slot* sl = live(fd);
         if (!sl) return INVALID_SOCK;
         const socket_t s = sl->s;
-        release(*sl, true);
+        release(*sl, how);
         return s;
     }
     // Why a descriptor is refused -- the text after "tcpX: ".
@@ -184,9 +190,10 @@ struct NetRegistry {
         if (fd >= 0) {
             const auto i = static_cast<size_t>(fd & SLOT_MASK);
             const int64_t gen = fd >> SLOT_BITS;
-            if (i < slots.size() && slots[i].prev_handed &&
-                ((gen + 1) & ((int64_t{1} << 23) - 1)) == slots[i].gen)
-                return "socket was handed to another actor";
+            if (i < slots.size() && ((gen + 1) & ((int64_t{1} << 23) - 1)) == slots[i].gen) {
+                if (slots[i].prev_end == Ended::handed)    return "socket was handed to another actor";
+                if (slots[i].prev_end == Ended::activated) return "socket was activated";
+            }
         }
         return "invalid socket";
     }
@@ -210,6 +217,11 @@ struct NetRegistry {
 //
 // Nothing is shared between two heaps: every value crosses as a value-codec buffer, encoded in
 // the sender's heap and decoded in the receiver's.
+//
+// An actor may own more than one INBOX: its main one, whose id is the actor's, and extra ones it
+// makes (rawNewInbox), each with its own world-wide id -- typically one per request whose reply it
+// waits for. Only the owner receives from an inbox; the end of the owner closes them all. Any inbox
+// may be BOUNDED: then a send to it waits while it is full (back-pressure).
 // =============================================================================
 
 // One message in a mailbox. MAIL_EXITED reports that an actor this isolate started has FAULTED
@@ -223,25 +235,213 @@ struct Mail {
     std::string          reason;       // MAIL_EXITED: its fault message
 };
 
-// An actor's (or the root's) queue. Unbounded in v1. `dead` is set when its owner has ended, and
-// from then on a send is refused (the sender learns it from rawSend's Bool). `stop_seen`: after an
-// actor has received Stop once, every further receive answers Stop again, so any loop ends.
-struct Mailbox {
+// Several inboxes, one sleeper. A receive waits on ONE mailbox's `cv`; rawSelect waits here instead,
+// and every mailbox wakes its owner's pad in addition to its own `cv`. The pad belongs to the
+// ISOLATE, not to a mailbox, which is what lets one wait cover all of them.
+//   * `waiters` is why an ordinary send does not pay for a feature it does not use: with nobody
+//     parked, waking is one relaxed load and no mutex.
+//   * `gen` closes the race between the scan and the wait. rawSelect looks at the mailboxes while
+//     holding NO pad lock, so mail can arrive in between; it then parks only if `gen` is unchanged.
+//   * A notifier takes the mailbox mutex and this one in SEQUENCE, never nested (put/offer release
+//     the box before waking) -- so no lock order between the two exists to get wrong.
+struct WaitPad {
     std::mutex              m;
     std::condition_variable cv;
+    uint64_t                gen = 0;        // guarded by m; bumped on every wake
+    std::atomic<int>        waiters{ 0 };
+    void wake() {
+        if (waiters.load(std::memory_order_relaxed) == 0) return;
+        { std::lock_guard<std::mutex> lk(m); ++gen; }
+        cv.notify_all();
+    }
+};
+
+// One inbox's queue: an actor's main inbox (its id is the actor's), the root's (id 0), or an extra
+// inbox an actor or the root made with rawNewInbox. Only its OWNER receives from it.
+//   * `dead` is set when the inbox is closed -- by rawCloseInbox or because its owner ended -- and
+//     from then on a send is refused (the sender learns it from rawSend's Bool).
+//   * `capacity` bounds the MESSAGES in the queue (0 = unbounded). Exit reports and Stop are
+//     system mail and always enter, so a full inbox can still be stopped and told of a crash. A send
+//     to a full inbox waits on `space` until a receive makes room, the inbox dies, or the world ends
+//     (`released`) -- the last so that no sender blocked here can hold up the world's final join.
+//   * `stop_seen`: once Stop has been received, every further receive answers Stop again, so any
+//     loop ends.
+//   * A SLOT (rawNewSlot) is a mailbox made BEFORE its actor and outliving it: an address that
+//     survives a restart. When its actor ends it is VACATED instead of closed -- it keeps its id and
+//     stays in the registry, so a send during the gap waits in it for the next actor. Only
+//     rawReleaseSlot ends it.
+// One send that is waiting for room, and the EVIDENCE a wait-for edge rests on. It is listed in the
+// TARGET mailbox from just before the wait until room (or death) is seen -- both transitions under
+// that mailbox's `m`, and the removal happens BEFORE the message is queued. So "this ticket is
+// listed", read under that mutex, means exactly: this send has NOT been accepted and cannot become
+// accepted without the list changing. The sender's own bookkeeping could not carry that weight: a
+// sender may be preempted between "room appeared" and "entry removed" for an unbounded time.
+struct SendWait {
+    int64_t  sender = 0;
+    uint64_t ticket = 0;      // world-wide unique, never reused; one per rawSend call
+    int64_t  target = -1;     // the box's owner, REFRESHED under the box's m on every pass
+    bool     listed = false;  // guarded by the target mailbox's m
+};
+
+struct Mailbox {
+    // WAITING: the slice passed with no room. The Mail is untouched and the sender stays listed, so
+    // the caller can walk the wait-for graph and come back to the same wait.
+    enum Offer { SENT, FULL, GONE, WAITING };
+    static constexpr int64_t NO_OWNER = -1;      // a slot between two actors
+    std::mutex              m;
+    std::condition_variable cv;                  // a receiver waits for mail
+    std::condition_variable space;               // a sender waits for room (bounded inboxes only)
     std::deque<Mail>        q;
+    int64_t                 owner     = 0;       // the isolate that receives from it
+    size_t                  capacity  = 0;       // messages; 0 = unbounded
+    size_t                  messages  = 0;       // MAIL_MSG entries in q
     bool                    dead      = false;
+    bool                    slot      = false;   // an address that outlives its actor (rawNewSlot)
+    bool                    released  = false;   // the world is ending: a full inbox refuses
     bool                    stopped   = false;   // Stop has been queued
     bool                    stop_seen = false;   // ... and received
+    // The world's I/O thread found this inbox full and stopped reading its socket (IoHub). The receive
+    // that makes room clears it and wakes that thread. Set and cleared under `m`, so a receive between
+    // "full" and "paused" cannot be missed.
+    bool                    io_paused = false;
+    // The OWNER's wake pad, for rawSelect: copied out under `m` and woken after it is released, so
+    // the two mutexes are only ever held in sequence. Null while a slot has no actor.
+    std::shared_ptr<WaitPad> pad;
+    // The sends waiting for room here, for deadlock detection. Guarded by `m`, and never touched at
+    // all unless a send actually blocks -- an inbox with room costs nothing for it.
+    std::vector<SendWait*>  blocked;
+    // `owner`, read safely. Every other reader takes `m`; rawSend's self-send guard used to read it
+    // bare, which was a race.
+    bool owner_is(int64_t who) { std::lock_guard<std::mutex> lk(m); return owner == who; }
+    void unlist(SendWait* w) {                       // caller holds m; idempotent
+        if (!w->listed) return;
+        blocked.erase(std::find(blocked.begin(), blocked.end(), w));
+        w->listed = false;
+    }
+    bool lists(uint64_t ticket) {                    // caller holds m
+        for (const SendWait* w : blocked) if (w->ticket == ticket) return true;
+        return false;
+    }
+    // System mail (MAIL_EXITED, MAIL_STOP): never waits, ignores the capacity.
     bool put(Mail&& mail) {
+        std::shared_ptr<WaitPad> p;
         {
             std::lock_guard<std::mutex> lk(m);
             if (dead) return false;
             if (mail.kind == MAIL_STOP) { if (stopped) return true; stopped = true; }
             q.push_back(std::move(mail));
+            p = pad;
         }
         cv.notify_one();
+        if (p) p->wake();
         return true;
+    }
+    // A message. `wait`: block while the inbox is full (rawSend); otherwise answer FULL (rawTrySend).
+    // `mail` is consumed IFF the answer is SENT -- FULL, GONE and WAITING leave it for another try.
+    // `w` (rawSend on a bounded inbox): the sender's wait record. It makes the wait SLICED -- after
+    // `slice` with no room the answer is WAITING and the sender stays listed -- and keeps `target` in
+    // step with `owner`, so a slot that changes actor under a waiting sender is SEEN rather than
+    // remembered wrong. Without `w` the wait is the unbounded one it always was.
+    Offer offer(Mail& mail, bool wait, SendWait* w = nullptr,
+                std::chrono::milliseconds slice = std::chrono::milliseconds::zero()) {
+        std::shared_ptr<WaitPad> p;
+        {
+            std::unique_lock<std::mutex> lk(m);
+            auto room = [&] { return dead || released || messages < capacity; };
+            if (capacity != 0 && wait) {
+                if (w) {
+                    while (!room()) {
+                        // Listed only once there is established to be no room: a send that never
+                        // waits never touches the list.
+                        if (!w->listed) { blocked.push_back(w); w->listed = true; }
+                        w->target = owner;
+                        if (space.wait_for(lk, slice) == std::cv_status::timeout && !room())
+                            return WAITING;
+                    }
+                    unlist(w);          // on EVERY exit, and BEFORE the queue is touched
+                } else {
+                    space.wait(lk, room);
+                }
+            }
+            if (dead) return GONE;
+            if (capacity != 0 && messages >= capacity) return wait ? GONE : FULL;
+            q.push_back(std::move(mail));
+            ++messages;
+            p = pad;
+        }
+        cv.notify_one();
+        if (p) p->wake();
+        return SENT;
+    }
+    // The I/O thread's send (IoHub): never waits. On FULL it marks the inbox paused in the same
+    // critical section in which it found it full, so the receive that makes room is certain to see
+    // the mark and wake the thread -- there is no window between the two.
+    Offer offer_or_pause(Mail& mail) {
+        std::shared_ptr<WaitPad> p;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            if (dead) return GONE;
+            if (capacity != 0 && messages >= capacity) { io_paused = true; return FULL; }
+            q.push_back(std::move(mail));
+            ++messages;
+            p = pad;
+        }
+        cv.notify_one();
+        if (p) p->wake();
+        return SENT;
+    }
+    // Closing: refuse every later send, drop what is queued, and wake anyone waiting on either side.
+    void close() {
+        std::shared_ptr<WaitPad> p;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            dead = true;
+            q.clear();
+            messages = 0;
+            p = pad;
+        }
+        cv.notify_all();
+        space.notify_all();
+        if (p) p->wake();
+    }
+    // No pad wake here: `released` says nothing about what a select waits for (queued mail or Stop),
+    // and the end of the world puts Stop into every actor's inboxes -- which does wake it -- before
+    // releasing them.
+    void release() {
+        { std::lock_guard<std::mutex> lk(m); released = true; }
+        space.notify_all();
+    }
+    // A slot whose actor ended: it keeps its id and stays reachable, but what the actor did not read
+    // is dropped -- re-delivering the message that crashed it would crash its successor too. A sender
+    // waiting for room goes on, into the queue the next actor will read.
+    void vacate() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            owner    = NO_OWNER;
+            q.clear();
+            messages = 0;
+            pad.reset();       // with the owner: the next rawSpawnInto brings its own
+        }
+        space.notify_all();
+    }
+    // Ending a slot for good: no later send gets in, and an actor still running in it is told to
+    // stop. NOT close(), which clears the queue and would drop that very Stop. The Stop goes in
+    // whether or not one was queued before, BECAUSE the clear above has just dropped it: an actor
+    // told to stop and then released -- what an orderly shutdown does -- would otherwise wait on a
+    // mailbox that is empty, dead and out of the registry, which nothing can reach again.
+    void retire() {
+        std::shared_ptr<WaitPad> p;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            dead     = true;
+            q.clear();
+            messages = 0;
+            if (owner != NO_OWNER) { stopped = true; q.push_back(Mail{ MAIL_STOP, {}, 0, {} }); }
+            p = pad;
+        }
+        cv.notify_all();
+        space.notify_all();
+        if (p) p->wake();   // the actor in the slot may be in a select, not in a receive
     }
 };
 
@@ -251,7 +451,15 @@ struct Isolate {
     int64_t                  id      = 0;
     int64_t                  starter = 0;       // the isolate that started it (0 = the root)
     bool                     actor   = false;
-    std::shared_ptr<Mailbox> mailbox;           // actors only
+    std::shared_ptr<Mailbox> mailbox;           // actors only: the main inbox
+    int64_t                  mailbox_id = 0;    // its id: the actor's own, or a slot's (rawSpawnInto)
+    // Where this isolate sleeps when it waits on SEVERAL inboxes (rawSelect). Every mailbox it owns
+    // holds a copy, and wakes it. Made at birth, so an inbox can be attached before the thread runs.
+    std::shared_ptr<WaitPad> pad = std::make_shared<WaitPad>();
+    // Who asked to be told when this actor ends (rawMonitor): the inboxes the reports go into, and
+    // whether the end has already happened. Both are guarded by World::m, like the registries.
+    std::vector<int64_t>     watchers;
+    bool                     ended = false;
     std::thread              thread;
     std::mutex               join_m;            // one joiner at a time: the starter, or the world
     bool                     thread_joined = false;
@@ -267,9 +475,123 @@ struct Isolate {
         if (!thread_joined && thread.joinable()) thread.join();
         thread_joined = true;
     }
+    // A join that can wait WITH A DEADLINE. std::thread::join() has none, so a joiner could not wake
+    // to look for a deadlock -- and "actor A joins task T while T blocks sending into A's full
+    // inbox" is the same family of bug as a send cycle. The thread is still joined afterwards; this
+    // only GATES that join, so no lifetime semantics change and ~World's join loop is untouched.
+    std::mutex               fin_m;
+    std::condition_variable  fin_cv;
+    bool                     finished = false;    // run_isolate has returned
+    std::vector<SendWait*>   join_blocked;        // joiners waiting here; guarded by fin_m
+    void finish() {
+        { std::lock_guard<std::mutex> lk(fin_m); finished = true; }
+        fin_cv.notify_all();
+    }
+    void unlist_join(SendWait* w) {               // caller holds fin_m; idempotent
+        if (!w->listed) return;
+        join_blocked.erase(std::find(join_blocked.begin(), join_blocked.end(), w));
+        w->listed = false;
+    }
+    bool lists_join(uint64_t ticket) {            // caller holds fin_m
+        for (const SendWait* w : join_blocked) if (w->ticket == ticket) return true;
+        return false;
+    }
 };
 
+// One entry of the wait-for index. Two kinds, both naming their target EXACTLY -- which is what a
+// receive and a select cannot do, and why only these two make edges:
+//   * a blocked SEND: waiting for room in `box` (address `box_id`), whose owner is `target`;
+//   * a blocked JOIN: waiting for isolate `iso` (= `target`) to finish.
+// The shared_ptr keeps its object alive for a walker that holds no world lock, which is what lets
+// the index be read without World::m.
+struct WaitEdge {
+    std::shared_ptr<Mailbox> box;          // exactly one of box / iso is set
+    std::shared_ptr<Isolate> iso;
+    int64_t                  box_id = 0;   // the ADDRESS, for the report
+    uint64_t                 ticket = 0;
+    int64_t                  target = Mailbox::NO_OWNER;
+};
+
+// =============================================================================
+// Active sockets -- Erlang's active mode (rawActivate / rawActiveSend / rawActiveClose).
+//
+// An actor that owns a connection often has to react to two sources at once: input on the socket,
+// and messages in its inbox. Each has a wait of its own, and none covers both. Activating a
+// connection hands its READING to the world's one I/O thread, which delivers what arrives as
+// messages into an inbox of the owner; the owner then waits on that inbox and its own with the
+// ordinary select. Writing stays with the owner.
+//   * ONE thread per world, running WSAPoll / poll over every active socket, started by the first
+//     activation. It copies bytes and posts mail; it runs no Skarn code and touches no heap -- an
+//     event is a value-codec buffer of a Bytes value (vcodec::encode_bytes), decoded in the
+//     owner's heap by the ordinary rawMailMsg. The first byte says what it is (ACTIVE_*).
+//   * It NEVER waits on an inbox: a full one is marked paused (Mailbox::offer_or_pause) and its
+//     socket is not polled until the receive that makes room wakes the thread. With a bounded inbox
+//     that is Erlang's {active, once}: TCP throttles the peer while the owner is behind.
+//   * ONLY this thread closes an active socket, and never while it is inside poll. The owner asks
+//     (rawActiveClose, or its end), and it sends only from its own thread; an ActiveConn cannot be
+//     sent, so a send and a close are never in flight together. Closing from another thread would
+//     let the OS hand the number to a new socket while poll still watches it.
+//   * It is woken through a connected pair of loopback TCP sockets -- WSAPoll waits on sockets
+//     only, and one code path on every platform lets the Windows run check the POSIX one.
+//   * A LISTENER can be activated too (rawActivateListener). The thread then accepts, parks each new
+//     connection in the world's hand-off table like rawHandOff does, and delivers its TICKET -- which
+//     is sendable, so the owner can pass it on to a worker unchanged.
+// =============================================================================
+enum : uint8_t { ACTIVE_DATA = 0, ACTIVE_LINE = 1, ACTIVE_CLOSED = 2, ACTIVE_FAILED = 3, ACTIVE_TICKET = 4 };
+
 struct World;
+
+struct ActiveSock {
+    int64_t                  id        = 0;
+    socket_t                 s         = INVALID_SOCK;
+    int64_t                  owner     = 0;       // the isolate that activated it: it alone sends and closes
+    std::shared_ptr<Mailbox> box;                 // where its events go
+    bool                     listener  = false;   // accept connections (else read the stream)
+    bool                     lines     = false;   // frame into lines (else deliver the chunks as read)
+    size_t                   max_line  = 0;
+    bool                     close_req = false;   // guarded by IoHub::m: the owner asked to close, or ended
+    // The fields below belong to the I/O thread alone -- and, before the entry is published, to the
+    // activating thread; IoHub::m orders the two.
+    std::string              partial;             // an unfinished line
+    std::deque<Mail>         pending;             // events read but not delivered yet (the inbox was full)
+    // A listener only, index-parallel to `pending`: the hand-off ticket each event carries, -1 for none.
+    // An event dropped undelivered takes its connection out of the hand-off table and closes it, so no
+    // client waits on a connection nobody will ever get.
+    std::deque<int64_t>      pending_tickets;
+    bool                     paused    = false;   // the inbox was full: not polled until a receive makes room
+    bool                     done      = false;   // end of stream, an error, an overlong line, or a closed inbox
+};
+
+class IoHub {
+public:
+    explicit IoHub(World* w) : world(w) {}
+    ~IoHub() { stop(); }
+    bool     start(std::string* err);                        // the wake line and the thread
+    int64_t  add(std::shared_ptr<ActiveSock> e);             // publish an activated socket; its id
+    // The socket rawActiveSend may write to, or INVALID_SOCK and why not.
+    socket_t sending_socket(int64_t id, int64_t caller, std::string* why);
+    // Ask for a close. False (with `why`) only for a connection of another isolate; closing twice is fine.
+    bool     request_close(int64_t id, int64_t caller, std::string* why);
+    void     close_owned_by(int64_t owner);                  // the owner has ended
+    void     wake();
+    void     stop();                                         // the world ends: join, close everything
+private:
+    void loop();
+    void read_once(ActiveSock& e);
+    void accept_some(ActiveSock& e);
+    void flush(ActiveSock& e);
+    void drop_tickets(ActiveSock& e);
+    void drain_wake();
+    World*                                                    world;      // the hand-off table, for listeners
+    std::mutex                                                m;          // guards socks, next_id, stopping
+    std::unordered_map<int64_t, std::shared_ptr<ActiveSock>> socks;
+    int64_t                                                   next_id  = 1;
+    bool                                                      stopping = false;
+    socket_t                                                  wake_rd  = INVALID_SOCK;
+    socket_t                                                  wake_wr  = INVALID_SOCK;
+    std::thread                                               thread;
+    std::vector<char>                                         buf;        // the I/O thread's read buffer
+};
 
 // The output of the root and of every actor goes to the ROOT's stream, a LINE at a time: PRINTLN
 // is two stream calls (text, newline), so unsynchronized writers would split each other's lines.
@@ -302,26 +624,109 @@ struct World {
     std::mutex                m;                  // guards everything below
     std::unordered_map<int64_t, std::shared_ptr<Isolate>> isolates;
     int64_t                   next_id  = 1;       // 0 is the root
+    // The ROOT has no Isolate record, so its wake pad lives here; main_mailbox is given a copy in
+    // execute(), where the root builds its world.
+    std::shared_ptr<WaitPad>  root_pad = std::make_shared<WaitPad>();
     std::shared_ptr<Mailbox>  main_mailbox = std::make_shared<Mailbox>();
+    // Every open inbox by id: the root's (0), each actor's main inbox (under the actor's id) and the
+    // extra ones (ids from the same counter as the isolates, so one id names one thing). A closed
+    // inbox leaves this map, so a send to it finds nothing.
+    std::unordered_map<int64_t, std::shared_ptr<Mailbox>> mailboxes{ { 0, main_mailbox } };
     bool                      main_inbox_taken = false;
     bool                      stopping = false;
     // Sockets in transit between isolates (rawHandOff -> rawTake): ticket -> OS socket. A socket here
     // belongs to no isolate's NetRegistry; whatever is never taken is closed when the world ends.
     std::unordered_map<int64_t, socket_t> handoffs;
     int64_t                   next_ticket = 1;
+    // The I/O thread of the active sockets, made by the first rawActivate (so a program that never
+    // activates one runs exactly as before). Stopped by ~World after every isolate has been joined.
+    std::shared_ptr<IoHub>    io;
+    // Deadlock detection. `wait_m` is a LEAF: nothing is acquired while it is held, and it is never
+    // held together with Mailbox::m or World::m. That is what recording the target ISOLATE (rather
+    // than a mailbox id, which would need a registry lookup) buys -- and it is load-bearing, because
+    // World::m -> Mailbox::m nesting already exists in three places, so taking wait_m under World::m
+    // would close a three-lock cycle.
+    //   * `send_waits` is a reverse INDEX, a place to look. The evidence is the target mailbox's
+    //     `blocked` list; a hop is only ever trusted after re-reading that.
+    //   * `deadlocked` holds the isolates of a confirmed cycle. Without it only ONE participant would
+    //     ever fault: the first to end closes its mailboxes, which releases everyone waiting on it
+    //     with GONE, i.e. a `send` answering false -- silently, since send is not must-use. A send
+    //     that comes back GONE therefore asks whether it is marked. Isolate ids are never reused, so
+    //     a mark cannot reach a restarted actor.
+    std::mutex                              wait_m;
+    std::unordered_map<int64_t, WaitEdge>   send_waits;
+    std::unordered_map<int64_t, std::string> deadlocked;
+    std::atomic<uint64_t>                   next_wait_ticket{ 1 };
 
     std::shared_ptr<Isolate> find(int64_t id) {
         std::lock_guard<std::mutex> lk(m);
         auto it = isolates.find(id);
         return it == isolates.end() ? nullptr : it->second;
     }
-    // The mailbox an id addresses: the root's (id 0) or an actor's; null for anything else.
+    // The open inbox an id addresses; null for anything else (a task, a closed inbox, a stranger).
     std::shared_ptr<Mailbox> mailbox_of(int64_t id) {
-        if (id == 0) return main_mailbox;
-        auto iso = find(id);
-        return iso && iso->actor ? iso->mailbox : nullptr;
+        std::lock_guard<std::mutex> lk(m);
+        auto it = mailboxes.find(id);
+        return it == mailboxes.end() ? nullptr : it->second;
     }
-    // The end of the world: Stop to every actor, then join every thread -- repeatedly, because an
+    // Registers a new inbox for `owner` under `id`. Caller holds `m`. An actor's inbox made while
+    // the world ends gets Stop at once, like an actor born then.
+    void add_mailbox_locked(int64_t id, const std::shared_ptr<Mailbox>& box) {
+        mailboxes.emplace(id, box);
+        if (stopping && box->owner != 0) { box->put(Mail{ MAIL_STOP, {}, 0, {} }); box->release(); }
+    }
+    // Closes one inbox, or every inbox an isolate owns (its end).
+    void close_mailbox(int64_t id) {
+        std::shared_ptr<Mailbox> box;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            auto it = mailboxes.find(id);
+            if (it == mailboxes.end()) return;
+            box = it->second;
+            mailboxes.erase(it);
+        }
+        box->close();
+    }
+    // The active-socket hub, if one was ever started.
+    std::shared_ptr<IoHub> hub() {
+        std::lock_guard<std::mutex> lk(m);
+        return io;
+    }
+    // ... or started now. Null (with `err`) if its thread or wake line could not be made.
+    std::shared_ptr<IoHub> hub_or_start(std::string* err) {
+        std::lock_guard<std::mutex> lk(m);
+        if (!io) {
+            auto h = std::make_shared<IoHub>(this);
+            if (!h->start(err)) return nullptr;
+            io = std::move(h);
+        }
+        return io;
+    }
+    // Every inbox an isolate owns, right now (rawStopActor: an actor may be waiting on any of them).
+    std::vector<std::shared_ptr<Mailbox>> mailboxes_of(int64_t owner) {
+        std::vector<std::shared_ptr<Mailbox>> boxes;
+        std::lock_guard<std::mutex> lk(m);
+        for (auto& [id, box] : mailboxes) if (box->owner == owner) boxes.push_back(box);
+        return boxes;
+    }
+    // Every inbox an isolate owns, at its end: closed -- except a SLOT, which is vacated and stays
+    // in the registry, so its address survives until the next actor is started into it.
+    void close_mailboxes_of(int64_t owner) {
+        std::vector<std::shared_ptr<Mailbox>> boxes;
+        std::vector<std::shared_ptr<Mailbox>> slots;
+        {
+            std::lock_guard<std::mutex> lk(m);
+            for (auto it = mailboxes.begin(); it != mailboxes.end();) {
+                if (it->second->owner != owner) { ++it; continue; }
+                if (it->second->slot) { slots.push_back(it->second); ++it; }
+                else { boxes.push_back(it->second); it = mailboxes.erase(it); }
+            }
+        }
+        for (auto& b : boxes) b->close();
+        for (auto& s : slots) s->vacate();
+    }
+    // The end of the world: Stop into every actor's inboxes (an actor may be waiting on any of them),
+    // release every sender blocked on a full inbox, then join every thread -- repeatedly, because an
     // actor may still start others while it winds down (those get Stop at birth, see spawn).
     ~World() {
         // The root's own partial line was written BEFORE anything the actors print while they stop;
@@ -330,8 +735,10 @@ struct World {
         {
             std::lock_guard<std::mutex> lk(m);
             stopping = true;
-            for (auto& [id, iso] : isolates)
-                if (iso->actor) iso->mailbox->put(Mail{ MAIL_STOP, {}, 0, {} });
+            for (auto& [id, box] : mailboxes) {
+                if (box->owner != 0) box->put(Mail{ MAIL_STOP, {}, 0, {} });
+                box->release();
+            }
         }
         for (;;) {
             std::shared_ptr<Isolate> next;
@@ -343,10 +750,11 @@ struct World {
             if (!next) break;
             next->join_thread();
         }
-        {
-            std::lock_guard<std::mutex> lk(main_mailbox->m);
-            main_mailbox->dead = true;
-        }
+        // Every actor has ended, so no active socket is being written to any more, and the I/O thread
+        // -- which never waits -- can be stopped. BEFORE the root's inboxes close, so it never posts
+        // into a mailbox that is being torn down (it would only get GONE, but there is nothing to gain).
+        if (io) io->stop();
+        close_mailboxes_of(0);   // the root's own inboxes: every actor has ended, nobody sends
         // Every isolate has ended, so nobody can take these any more.
         for (auto& [ticket, s] : handoffs) sock_close(s);
     }
@@ -388,14 +796,25 @@ int LineForwardBuf::sync() {
     return 0;
 }
 
-// This execution's place in its world (VM::isolate). The root has id 0 and gets a mailbox only
-// through rawMainInbox; an actor has its own; a task has none. `current` is the mail rawReceive
-// took last, which rawMailMsg / rawMailFrom / rawMailReason then read.
+// This execution's place in its world (VM::isolate). The root has id 0 and gets its main inbox only
+// through rawMainInbox; an actor has its own from the start; a task has none and may make none.
+// `inboxes` are the open inboxes this isolate owns, by id -- a copy of its entries in the world's
+// map, so a receive finds its queue without taking the world's lock (usually one or two entries).
+// `current` is the mail rawReceive took last, which rawMailMsg / rawMailFrom / rawMailReason read.
 struct IsolateLocal {
     World*                   world = nullptr;
     int64_t                  id    = 0;
-    std::shared_ptr<Mailbox> mailbox;
+    int64_t                  main_box = 0;   // the id of its main inbox: its own, or the slot it runs in
+    bool                     actor = false;
+    std::vector<std::pair<int64_t, std::shared_ptr<Mailbox>>> inboxes;
+    // This isolate's wake pad: where rawSelect sleeps, and what every inbox above wakes. The same
+    // object the World reaches through Isolate::pad -- the two ends a wait-for graph would need.
+    std::shared_ptr<WaitPad> pad;
     Mail                     current;
+    Mailbox* inbox(int64_t box_id) const {
+        for (const auto& [i, b] : inboxes) if (i == box_id) return b.get();
+        return nullptr;
+    }
 };
 
 // =============================================================================
@@ -473,7 +892,11 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
     if (task) {
         local.world        = task->world;
         local.id           = task->isolate->id;
-        local.mailbox      = task->isolate->mailbox;
+        local.actor        = task->isolate->actor;
+        local.main_box     = task->isolate->mailbox_id;
+        local.pad          = task->isolate->pad;
+        if (task->isolate->mailbox)
+            local.inboxes.emplace_back(task->isolate->mailbox_id, task->isolate->mailbox);
         vm.task_input      = task->input;
         vm.task_input_size = task->input_size;
         vm.task_entry_pc   = task->entry_pc;
@@ -481,7 +904,9 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
         own_world.emplace();
         own_world->image  = &image;
         own_world->target = out ? out : &std::cout;
+        own_world->main_mailbox->pad = own_world->root_pad;   // the root's inbox wakes the root
         local.world       = &*own_world;
+        local.pad         = own_world->root_pad;
     }
     vm.image   = &image;
     vm.isolate = &local;
@@ -958,11 +1383,21 @@ static Value native_make_dir(Value* args, uint8_t nargs, Context* ctx) {
 }
 
 // appendFile(path, buffer) -> nil (success) | String (error message). The compiler wraps
-// this Ok/Err (NativeReturn::Result). Like writeFile but opens the file in APPEND mode
-// (std::ios::app), creating it if absent -- so repeated calls accumulate. `buffer` must be
-// a KIND_BYTES (a String source is served by the pure-prelude appendTextFile wrapper). The
-// buffer's live bytes are materialized host-side BEFORE the file op (a later error alloc
-// could otherwise relocate the backing).
+// this Ok/Err (NativeReturn::Result). Like writeFile but APPENDS, creating the file if
+// absent -- so repeated calls accumulate. `buffer` must be a KIND_BYTES (a String source is
+// served by the pure-prelude appendTextFile wrapper). The buffer's live bytes are
+// materialized host-side BEFORE the file op (a later error alloc could otherwise relocate
+// the backing).
+//
+// IT APPENDS AT THE OS LEVEL, not through a stream, and that is the whole point. It used to
+// be `std::ofstream(path, std::ios::app)`, which finds the end when it OPENS and then writes
+// at that remembered offset -- so two isolates appending at the same moment remember the same
+// offset and overwrite each other. That lost whole lines, silently and with no error anywhere:
+// four actors kept 496 of 800, one kept 800 of 800. FILE_APPEND_DATA (granted WITHOUT
+// FILE_WRITE_DATA, which is what arms it) and O_APPEND both position at the true end AS PART
+// OF the write, so a single write cannot be overtaken. One write per call keeps that
+// guarantee; a caller that wants a line to arrive whole must pass it in one call, which
+// appendTextFile does. Guarded by native_append_is_atomic in static_compiler_tests.
 static Value native_append_file(Value* args, uint8_t nargs, Context* ctx) {
     if (nargs < 2 || !is_string(args[0]))
         return native_make_error(ctx, "appendFile: path must be a string");
@@ -981,12 +1416,30 @@ static Value native_append_file(Value* args, uint8_t nargs, Context* ctx) {
         const uint32_t count   = static_cast<uint32_t>(hdr->slots()[BYTES_SLOT_COUNT].asSigned48());
         data.assign(backing->bytes(), count);
     }
-    std::ofstream f(path, std::ios::binary | std::ios::app);
-    if (!f)
+#ifdef _WIN32
+    const HANDLE h = CreateFileA(path.c_str(), FILE_APPEND_DATA,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
         return native_make_error(ctx, "could not open file: " + path);
-    f.write(data.data(), static_cast<std::streamsize>(data.size()));
-    if (!f)
+    DWORD wrote = 0;
+    const BOOL ok = data.empty()
+                  ? TRUE                              // an empty append still creates the file
+                  : WriteFile(h, data.data(), static_cast<DWORD>(data.size()), &wrote, nullptr);
+    CloseHandle(h);
+    if (!ok || (!data.empty() && wrote != data.size()))
         return native_make_error(ctx, "could not write file: " + path);
+#else
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0)
+        return native_make_error(ctx, "could not open file: " + path);
+    const ssize_t wrote = data.empty()
+                        ? 0
+                        : ::write(fd, data.data(), data.size());
+    ::close(fd);
+    if (wrote < 0 || static_cast<size_t>(wrote) != data.size())
+        return native_make_error(ctx, "could not write file: " + path);
+#endif
     return Value::fromNil();
 }
 
@@ -2068,8 +2521,10 @@ static Value native_sha256(Value* args, uint8_t nargs, Context* ctx) {
 
 // =============================================================================
 // Isolate natives -- tasks (rawSpawn / rawJoin / rawTaskTake), actors (rawSpawnActor / rawSend /
-// rawReceive / rawMailMsg / rawMailFrom / rawMailReason / rawMainInbox), and for both rawTaskInput
-// and rawSelfId. The runtime they share (World, Isolate, Mailbox) is described above execute().
+// rawReceive / rawMailMsg / rawMailFrom / rawMailReason / rawMainInbox), their extra and bounded
+// inboxes (rawNewInbox / rawCloseInbox / rawTrySend / rawSpawnActorBounded), and for both
+// rawTaskInput and rawSelfId. The runtime they share (World, Isolate, Mailbox) is described above
+// execute().
 //
 // HOW AN ISOLATE STARTS AT A FUNCTION. execute() normally begins at instruction 0, the top-level
 // code. An isolate instead gets the world's code with a short ENTRY STUB appended -- appending
@@ -2108,10 +2563,18 @@ static std::vector<uint32_t> task_code(const std::vector<uint32_t>& program, uin
 //   * A TASK buffers its output and hands it over at join; on success its result is encoded
 //     straight after execute() returns (encode() allocates nothing, so the heap cannot collect
 //     between HALT and the copy).
-//   * An ACTOR writes its output a line at a time to the root's stream. When it ends its mailbox is
-//     marked dead FIRST, so a sender told about the crash can no longer reach it; then, if it
-//     FAULTED, its starter gets MAIL_EXITED (v1 reports crashes only).
+//   * An ACTOR writes its output a line at a time to the root's stream. When it ends all its inboxes
+//     are closed FIRST, so a sender told about the crash can no longer reach it (and a sender blocked
+//     on a full inbox of it is let go); then, if it FAULTED, its starter gets MAIL_EXITED (v1 reports
+//     crashes only).
 static void run_isolate(World* world, std::shared_ptr<Isolate> iso, uint16_t fn_id) {
+    // Tell any joiner that this isolate is done, on EVERY exit of this function -- a task returns
+    // early, an actor falls through the reports. The thread is still joined afterwards; this only
+    // lets a joiner wait with a deadline instead of parking in std::thread::join() for ever.
+    struct FinishOnExit {
+        Isolate* i;
+        ~FinishOnExit() { i->finish(); }
+    } finish_on_exit{ iso.get() };
     std::ostringstream task_out;
     LineForwardBuf     actor_buf(world, /*always_lines=*/true);
     std::ostream       actor_out(&actor_buf);
@@ -2150,14 +2613,34 @@ static void run_isolate(World* world, std::shared_ptr<Isolate> iso, uint16_t fn_
         return;
     }
     actor_buf.flush_partial();
-    {
-        std::lock_guard<std::mutex> lk(iso->mailbox->m);
-        iso->mailbox->dead = true;
-        iso->mailbox->q.clear();
+    // Its active sockets are closed with it, as in Erlang, where a socket belongs to its owning
+    // process. Only a request: the I/O thread does the closing (see IoHub).
+    if (auto h = world->hub()) h->close_owned_by(iso->id);
+    world->close_mailboxes_of(iso->id);   // the main inbox and every extra one (a slot is vacated)
+    // Every report names the ADDRESS, which for an actor in a slot outlives it -- so a supervisor's
+    // comparison survives a restart.
+    const std::string reason = faulted ? std::move(fault) : std::string("normal");
+    // The STARTER is told of a crash only, and unconditionally: that is the v1 contract every existing
+    // program is written against. Its main inbox is found through its record, since its id is not its
+    // inbox's when the starter itself lives in a slot.
+    if (faulted) {
+        std::shared_ptr<Mailbox> box;
+        if (iso->starter == 0) box = world->mailbox_of(0);
+        else if (auto st = world->find(iso->starter)) box = st->mailbox;
+        if (box) box->put(Mail{ MAIL_EXITED, {}, iso->mailbox_id, reason });
     }
-    if (faulted)
-        if (auto box = world->mailbox_of(iso->starter))
-            box->put(Mail{ MAIL_EXITED, {}, iso->id, std::move(fault) });
+    // MONITORS are told of every end, a normal one included ("normal"). Taking the list and marking the
+    // end under one lock is what makes "exactly one report per monitor" hold: a monitor set from here on
+    // finds `ended` and reports at once instead of waiting for an end that has already happened.
+    std::vector<int64_t> watchers;
+    {
+        std::lock_guard<std::mutex> lk(world->m);
+        iso->ended = true;
+        watchers.swap(iso->watchers);
+    }
+    for (const int64_t box_id : watchers)
+        if (auto box = world->mailbox_of(box_id))
+            box->put(Mail{ MAIL_EXITED, {}, iso->mailbox_id, reason });
 }
 
 // The id inside a handle: a bare Int, or Skarn's one-field `Task[R]` / `Pid[M]` / `Inbox[M]`
@@ -2178,7 +2661,12 @@ static Value handle_id(Value v) {
 // therefore registers the new record before the world can be done with it; the next pass of the
 // world's join loop finds it. Registering first would let that loop see a record whose `thread` is
 // still being assigned. Nothing else needs the record before spawn returns its id.
-static int64_t start_isolate(Value* args, uint8_t nargs, Context* ctx, bool actor, const char* who) {
+//
+// `into` is a SLOT the actor takes over instead of getting a mailbox of its own (rawSpawnInto): the
+// slot keeps its id, so the new actor answers at the address its predecessor had.
+static int64_t start_isolate(Value* args, uint8_t nargs, Context* ctx, bool actor, const char* who,
+                             size_t capacity = 0, std::shared_ptr<Mailbox> into = nullptr,
+                             int64_t into_id = 0) {
     VM* vm = ctx->vm;
     IsolateLocal* local = vm->isolate;
     if (!local || !local->world)
@@ -2198,25 +2686,181 @@ static int64_t start_isolate(Value* args, uint8_t nargs, Context* ctx, bool acto
         raise_located(ctx, (std::string(who) + ": the argument cannot be sent: " + e.what()).c_str());
     }
     if (actor) {
-        iso->mailbox = std::make_shared<Mailbox>();
+        iso->mailbox = into ? into : std::make_shared<Mailbox>();
+        if (!into) iso->mailbox->capacity = capacity;
         world->actors_started.store(true, std::memory_order_release);
     }
     {
+        // The main inbox is registered together with the id, before the thread exists: the actor may
+        // receive at once, and a world ending from now on finds it (born while the world ends: Stop
+        // at once, in add_mailbox_locked). A slot is registered already and keeps its id.
         std::lock_guard<std::mutex> lk(world->m);
         iso->id = world->next_id++;
+        if (actor && into) {
+            iso->mailbox_id = into_id;
+            std::lock_guard<std::mutex> box_lk(into->m);
+            into->owner = iso->id;
+            into->pad   = iso->pad;          // vacate() cleared the previous actor's
+        } else if (actor) {
+            iso->mailbox_id       = iso->id;
+            iso->mailbox->owner   = iso->id;
+            iso->mailbox->pad     = iso->pad;
+            world->add_mailbox_locked(iso->id, iso->mailbox);
+        }
     }
     try {
         iso->thread = std::thread(run_isolate, world, iso, static_cast<uint16_t>(fn_id));
     } catch (const std::system_error& e) {
+        if (actor && into) into->vacate();
+        else if (actor) world->close_mailbox(iso->id);
         raise_located(ctx, (std::string(who) + ": could not start a thread: " + e.what()).c_str());
     }
     {
         std::lock_guard<std::mutex> lk(world->m);
         world->isolates.emplace(iso->id, iso);
-        if (actor && world->stopping)          // born while the world ends: stop at once
-            iso->mailbox->put(Mail{ MAIL_STOP, {}, 0, {} });
     }
     return iso->id;
+}
+
+// How long a blocked send waits before it looks for a cycle, and the cap it doubles up to. Only a
+// send that ACTUALLY blocks pays this: back-pressure is a designed feature, and a sender woken by a
+// receive within the first slice never registers anything. A permanently stuck one wakes about once
+// a second. 50 ms was considered and rejected -- it would wake a healthy blocked sender twenty times
+// a second, and it would lose the race against a supervisor resolving the cycle with releaseSlot.
+static constexpr auto SEND_GRACE     = std::chrono::milliseconds(250);
+static constexpr auto SEND_MAX_SLICE = std::chrono::milliseconds(2000);
+static constexpr size_t CYCLE_MAX    = 4096;   // the walk's length cap; a cycle is far shorter
+
+// One rawSend's wait. Owns BOTH halves of the bookkeeping -- the listing in the target mailbox and
+// the world's index -- so neither can outlive the send when the deadlock fault (a throw, out of a
+// [[noreturn]] helper) unwinds this native. A leaked entry would be a permanent false-positive
+// generator: a node whose edge can never change again. The two locks are taken in SEQUENCE, never
+// nested.
+struct SendWaitGuard {
+    World*                   world;
+    std::shared_ptr<Mailbox> box;          // a send wait ...
+    std::shared_ptr<Isolate> iso;          // ... or a join wait
+    int64_t                  box_id;
+    SendWait                 w;
+    bool                     published = false;
+    SendWaitGuard(World* wd, std::shared_ptr<Mailbox> b, std::shared_ptr<Isolate> i,
+                  int64_t bid, int64_t self)
+        : world(wd), box(std::move(b)), iso(std::move(i)), box_id(bid) {
+        w.sender = self;
+        w.ticket = world->next_wait_ticket.fetch_add(1, std::memory_order_relaxed);
+    }
+    // The first slice has passed: make the edge visible to other walkers. Not done before that, so a
+    // wait that ends quickly never touches the index at all.
+    void publish() {
+        if (published) return;
+        int64_t target;
+        if (box) { std::lock_guard<std::mutex> lk(box->m); target = box->owner; }
+        else     { target = iso->id; }
+        { std::lock_guard<std::mutex> lk(world->wait_m);
+          world->send_waits[w.sender] = WaitEdge{ box, iso, box_id, w.ticket, target }; }
+        published = true;
+    }
+    ~SendWaitGuard() {
+        if (box) { std::lock_guard<std::mutex> lk(box->m);  box->unlist(&w); }
+        else     { std::lock_guard<std::mutex> lk(iso->fin_m); iso->unlist_join(&w); }
+        if (!published) return;
+        std::lock_guard<std::mutex> lk(world->wait_m);
+        const auto it = world->send_waits.find(w.sender);
+        if (it != world->send_waits.end() && it->second.ticket == w.ticket)
+            world->send_waits.erase(it);          // never erase a NEWER attempt of the same isolate
+    }
+};
+
+// One hop of a walk: "isolate `sender` is waiting to send into this edge's mailbox".
+struct Hop { int64_t sender; WaitEdge e; };
+
+// A hop is trusted only when the TARGET MAILBOX still lists the sender's ticket. The world's index
+// says where to look; it is never the evidence. Also refuses a box that is dying or a world that is
+// ending -- both resolve the wait legitimately -- and a slot whose owner changed under the sender.
+// Takes one Mailbox::m, nothing else.
+static bool still_waiting(const Hop& h) {
+    if (h.e.box) {
+        std::lock_guard<std::mutex> lk(h.e.box->m);
+        if (h.e.box->dead || h.e.box->released) return false;
+        if (h.e.box->owner != h.e.target)        return false;
+        return h.e.box->lists(h.e.ticket);
+    }
+    std::lock_guard<std::mutex> lk(h.e.iso->fin_m);      // a join wait: satisfied by `finished`
+    if (h.e.iso->finished) return false;
+    return h.e.iso->lists_join(h.e.ticket);
+}
+
+// The text of a confirmed cycle, as a chain the reader can follow. Each step names what it waits
+// FOR by ADDRESS -- an inbox, or a task -- as every other report names the address, so that it
+// survives a slot restart; and each step after the first says whose wait it is by naming the thing
+// the previous step was waiting for. No isolate ids appear, because a program never sees one.
+static std::string cycle_text(const std::vector<Hop>& cyc, bool contains_self) {
+    auto waits_for = [](const Hop& h) {
+        return h.e.box ? "waiting for room in inbox " + std::to_string(h.e.box_id)
+                       : "waiting for task " + std::to_string(h.e.box_id);
+    };
+    auto whose = [](const Hop& prev) {
+        return prev.e.box ? "inbox " + std::to_string(prev.e.box_id) + "'s owner"
+                          : "task " + std::to_string(prev.e.box_id);
+    };
+    std::string s = contains_self ? "deadlock -- " : "waiting on a deadlocked cycle -- ";
+    for (size_t i = 0; i < cyc.size(); ++i)
+        s += (i ? "; " + whose(cyc[i - 1]) + " is " : "") + waits_for(cyc[i]);
+    return s + "; and " + whose(cyc.back()) + " is the one this chain started at -- the ring is "
+               "closed, so no one in it can ever take the step the next one waits for";
+}
+
+// Walk the wait-for graph from `self` and CONFIRM what it finds; "" means no verdict.
+//
+// Two passes, and no sleep between them. Pass 1 collects the hops, each confirmed against its target
+// mailbox; pass 2 re-confirms the same hops after pass 1 has finished. A participant's "listed"
+// interval is contiguous, so both of its confirmations fall inside it -- and therefore the instant
+// pass 1 ended falls inside EVERY participant's interval. That is one real instant at which all of
+// them were unsatisfied claimants at once, which is what makes the verdict a proof rather than a
+// snapshot stitched together from different moments.
+//
+// Every participant is MARKED before the text is returned, so the ones that are released with GONE
+// when the first of them ends still report the deadlock instead of answering false.
+static std::string confirm_send_cycle(World* w, int64_t self) {
+    std::vector<Hop> path;
+    std::unordered_map<int64_t, size_t> seen;
+    for (int64_t id = self; path.size() < CYCLE_MAX; ) {
+        if (const auto at = seen.find(id); at != seen.end()) {
+            const std::vector<Hop> cyc(path.begin() + static_cast<ptrdiff_t>(at->second), path.end());
+            for (const Hop& h : cyc) if (!still_waiting(h)) return "";        // pass 2
+            const std::string text = cycle_text(cyc, at->second == 0);
+            {   // mark every participant, so that ALL of them report it
+                std::lock_guard<std::mutex> lk(w->wait_m);
+                for (const Hop& h : cyc) w->deadlocked.emplace(h.sender, text);
+            }
+            return text;
+        }
+        WaitEdge e;
+        {
+            std::lock_guard<std::mutex> lk(w->wait_m);
+            const auto it = w->send_waits.find(id);
+            if (it == w->send_waits.end()) return "";   // receiving, selecting, or running: no verdict
+            e = it->second;
+        }
+        // A vacated slot has no owner: whoever waits there waits for a SPAWN, an outside event like
+        // a receive, so the chain ends without a verdict.
+        if (e.target == Mailbox::NO_OWNER) return "";
+        const Hop h{ id, e };
+        if (!still_waiting(h)) return "";
+        seen.emplace(id, path.size());
+        path.push_back(h);
+        id = e.target;
+    }
+    return "";
+}
+
+// Has a cycle containing `self` already been confirmed (by self or by another participant)? Read
+// when a wait ends in GONE, because the first participant to fault closes its mailboxes and that is
+// what releases the others.
+static std::string taken_deadlock(World* w, int64_t self) {
+    std::lock_guard<std::mutex> lk(w->wait_m);
+    const auto it = w->deadlocked.find(self);
+    return it == w->deadlocked.end() ? std::string() : it->second;
 }
 
 // rawSpawn(fn, arg) -> Int, the task id.
@@ -2244,7 +2888,33 @@ static Value native_task_join(Value* args, uint8_t nargs, Context* ctx) {
     if (iso->claimed)
         raise_located(ctx, "join: this task was already joined");
     iso->claimed = true;
-    iso->join_thread();
+    // Wait for the task in slices, so a cycle running THROUGH this join is found -- "an actor joins
+    // a task that is blocked sending into that actor's full inbox" is the same bug as a send cycle,
+    // and std::thread::join() alone could never notice it. The listing lives in the target isolate
+    // under its own mutex, with "satisfied" being `finished`, exactly as a send's listing lives in
+    // the target mailbox with "satisfied" being "queued".
+    {
+        IsolateLocal* local = ctx->vm->isolate;
+        SendWaitGuard g(local->world, nullptr, iso, iso->id, local->id);
+        auto slice = SEND_GRACE;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(iso->fin_m);
+                if (iso->finished) { iso->unlist_join(&g.w); break; }
+                if (!g.w.listed) { iso->join_blocked.push_back(&g.w); g.w.listed = true; }
+                g.w.target = iso->id;
+                if (iso->fin_cv.wait_for(lk, slice) != std::cv_status::timeout || iso->finished) {
+                    if (iso->finished) { iso->unlist_join(&g.w); break; }
+                    continue;
+                }
+            }
+            g.publish();
+            if (const std::string why = confirm_send_cycle(local->world, local->id); !why.empty())
+                raise_located(ctx, ("join: " + why).c_str());
+            if (slice < SEND_MAX_SLICE) slice *= 2;
+        }
+    }
+    iso->join_thread();   // it has finished, so this returns at once
     if (!iso->printed.empty()) {
         *ctx->vm->out << iso->printed;
         iso->printed.clear();
@@ -2302,6 +2972,90 @@ static Value native_actor_spawn(Value* args, uint8_t nargs, Context* ctx) {
     return Value::fromSigned48(start_isolate(args, nargs, ctx, /*actor=*/true, "spawnActor"));
 }
 
+// rawSpawnActorBounded(fn, arg, capacity) -> Int: an actor whose main inbox holds at most
+// `capacity` messages; a send to it waits while it is full (back-pressure).
+static Value native_actor_spawn_bounded(Value* args, uint8_t nargs, Context* ctx) {
+    const Value cap = nargs >= 3 ? args[2] : Value::fromNil();
+    if (!cap.isInt() || cap.asSigned48() < 1)
+        raise_located(ctx, "spawnActorBounded: the capacity must be at least 1");
+    return Value::fromSigned48(start_isolate(args, 2, ctx, /*actor=*/true, "spawnActorBounded",
+                                             static_cast<size_t>(cap.asSigned48())));
+}
+
+// rawNewSlot(capacity) -> Int: an ADDRESS with no actor yet. Messages sent to it wait until an actor
+// is started into it (rawSpawnInto), and it survives that actor -- which is how a restarted actor
+// keeps the address its predecessor had. Anyone may make one; only holding its id means anything.
+static Value native_new_slot(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world)
+        raise_located(ctx, "newSlot: this execution has no world");
+    const Value cap = nargs >= 1 ? args[0] : Value::fromNil();
+    if (!cap.isInt() || cap.asSigned48() < 0)
+        raise_located(ctx, "newSlot: the capacity must be 0 (unbounded) or more");
+    auto box = std::make_shared<Mailbox>();
+    box->slot     = true;
+    box->owner    = Mailbox::NO_OWNER;
+    box->capacity = static_cast<size_t>(cap.asSigned48());
+    int64_t id;
+    {
+        std::lock_guard<std::mutex> lk(local->world->m);
+        id = local->world->next_id++;
+        local->world->add_mailbox_locked(id, box);
+    }
+    return Value::fromSigned48(id);
+}
+
+// rawSpawnInto(slot, fn, arg) -> Int, the actor id. The actor receives on the slot instead of on a
+// mailbox of its own, so it answers at the slot's address. One actor at a time.
+static Value native_spawn_into(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world)
+        raise_located(ctx, "spawnInto: this execution cannot start isolates");
+    if (nargs < 3)
+        raise_located(ctx, "spawnInto: needs a slot, a function and a start value");
+    const Value id = handle_id(args[0]);
+    if (!id.isInt()) raise_located(ctx, "spawnInto: not an address");
+    auto box = local->world->mailbox_of(id.asSigned48());
+    if (!box || !box->slot) raise_located(ctx, "spawnInto: this address is not a slot, or it was released");
+    {
+        std::lock_guard<std::mutex> lk(box->m);
+        if (box->owner != Mailbox::NO_OWNER)
+            raise_located(ctx, "spawnInto: this address already has an actor");
+    }
+    return Value::fromSigned48(start_isolate(args + 1, static_cast<uint8_t>(nargs - 1), ctx,
+                                             /*actor=*/true, "spawnInto", 0, box, id.asSigned48()));
+}
+
+// rawReleaseSlot(slot) -> (). Ends an address: later sends answer false, and an actor still running
+// in it is told to stop (it ends when it reads its mail, as at the end of the program).
+static Value native_release_slot(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world) raise_located(ctx, "release: this execution has no world");
+    const Value id = handle_id(nargs >= 1 ? args[0] : Value::fromNil());
+    if (!id.isInt()) raise_located(ctx, "release: not an address");
+    if (auto box = local->world->mailbox_of(id.asSigned48()); box && box->slot) {
+        local->world->close_mailbox(id.asSigned48());   // out of the registry first: no later send gets in
+        box->retire();
+    }
+    return Value::fromNil();
+}
+
+// rawStopActor(pid) -> Bool. Tells an actor to end: Stop into EVERY inbox it owns, because it may be
+// waiting on any of them. False if it no longer runs. Its own return is what actually ends it -- an
+// actor that never receives cannot be stopped from outside.
+static Value native_stop_actor(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world) raise_located(ctx, "stopActor: this execution has no world");
+    const Value id = handle_id(nargs >= 1 ? args[0] : Value::fromNil());
+    if (!id.isInt()) raise_located(ctx, "stopActor: not an actor address");
+    auto box = local->world->mailbox_of(id.asSigned48());
+    if (!box) return Value::fromBool(false);
+    int64_t owner;
+    { std::lock_guard<std::mutex> lk(box->m); owner = box->owner; }
+    if (owner == Mailbox::NO_OWNER || owner == 0) return Value::fromBool(false);
+    for (auto& b : local->world->mailboxes_of(owner)) b->put(Mail{ MAIL_STOP, {}, 0, {} });
+    return Value::fromBool(true);
+}
 // rawMainInbox() -> Int. Gives the ROOT a mailbox, so it can receive replies and crash reports.
 // ONCE: the Inbox it becomes fixes the message type, and a second one of another type could read
 // the same queue as something else.
@@ -2315,38 +3069,209 @@ static Value native_main_inbox(Value*, uint8_t, Context* ctx) {
             raise_located(ctx, "mainInbox: the main inbox was already taken");
         local->world->main_inbox_taken = true;
     }
-    local->mailbox = local->world->main_mailbox;
+    local->inboxes.emplace_back(0, local->world->main_mailbox);
     return Value::fromSigned48(0);
 }
 
-// rawSend(pid, msg) -> Bool. The message is encoded HERE, in the sender's heap. False when the
-// addressee no longer runs (or never was an actor); the message is then dropped, as in Erlang.
-static Value native_send(Value* args, uint8_t nargs, Context* ctx) {
+// rawNewInbox(capacity) -> Int, the id of a new inbox THIS isolate owns: a second address, typically
+// for replies, so that they neither mix with nor wait behind the main inbox's mail. Capacity 0 =
+// unbounded. For actors and the root; a task has no mail at all. The inbox lives until rawCloseInbox
+// or the end of its owner.
+static Value native_new_inbox(Value* args, uint8_t nargs, Context* ctx) {
     IsolateLocal* local = ctx->vm->isolate;
-    const Value   id    = handle_id(nargs >= 1 ? args[0] : Value::fromNil());
-    if (!local || !local->world || !id.isInt() || nargs < 2)
-        raise_located(ctx, "send: not an actor address");
-    Mail mail;
-    mail.kind = MAIL_MSG;
-    try {
-        mail.buf = vcodec::encode(args[1]);
-    } catch (const vcodec::ValueCodecError& e) {
-        raise_located(ctx, (std::string("send: the message cannot be sent: ") + e.what()).c_str());
+    if (!local || !local->world || (local->id != 0 && !local->actor))
+        raise_located(ctx, "newInbox: only an actor or the main program can have an inbox");
+    const Value cap = nargs >= 1 ? args[0] : Value::fromNil();
+    if (!cap.isInt() || cap.asSigned48() < 0)
+        raise_located(ctx, "newInbox: the capacity must be 0 (unbounded) or more");
+    auto box = std::make_shared<Mailbox>();
+    box->owner    = local->id;
+    box->capacity = static_cast<size_t>(cap.asSigned48());
+    box->pad      = local->pad;      // so a select over it is woken
+    int64_t id;
+    {
+        std::lock_guard<std::mutex> lk(local->world->m);
+        id = local->world->next_id++;
+        local->world->add_mailbox_locked(id, box);
     }
-    auto box = local->world->mailbox_of(id.asSigned48());
-    return Value::fromBool(box && box->put(std::move(mail)));
+    local->inboxes.emplace_back(id, std::move(box));
+    return Value::fromSigned48(id);
 }
 
-// This isolate's mailbox, checked against the inbox the program names. An Inbox cannot be sent,
-// so a mismatch means a forged one.
+// This isolate's inbox that `inbox` names. An Inbox cannot be sent, so an inbox of another isolate
+// means a forged one; one that is not open any more was closed.
 static Mailbox& own_mailbox(Value inbox, Context* ctx, const char* who) {
     IsolateLocal* local = ctx->vm->isolate;
     const Value   id    = handle_id(inbox);
-    if (!local || !local->mailbox)
-        raise_located(ctx, (std::string(who) + ": this execution has no inbox (mainInbox first?)").c_str());
-    if (!id.isInt() || id.asSigned48() != local->id)
-        raise_located(ctx, (std::string(who) + ": this inbox belongs to another actor").c_str());
-    return *local->mailbox;
+    // Not an open inbox of ours. A task has none at all, and the root none at 0 before mainInbox;
+    // an open one of someone else is a forged Inbox; anything else was closed (the closing isolate
+    // keeps no record of it -- an actor making an inbox per request would grow it without end).
+    const bool has_mail = local && local->world && (local->actor || local->id == 0);
+    if (has_mail && id.isInt()) {
+        const int64_t i = id.asSigned48();
+        if (Mailbox* box = local->inbox(i)) return *box;
+        if (auto box = local->world->mailbox_of(i); box && box->owner != local->id)
+            raise_located(ctx, (std::string(who) + ": this inbox belongs to another actor").c_str());
+        if (!(i == 0 && local->id == 0))
+            raise_located(ctx, (std::string(who) + ": this inbox is closed").c_str());
+    }
+    raise_located(ctx, (std::string(who) + ": this execution has no inbox (mainInbox first?)").c_str());
+}
+
+// rawCloseInbox(inbox) -> (). Closes an extra inbox of this isolate: later sends to it answer false
+// and whatever is queued is dropped -- a late reply nobody waits for any more cannot pile up. The
+// MAIN inbox cannot be closed: exit reports and Stop arrive there, and it ends with its owner.
+static Value native_close_inbox(Value* args, uint8_t nargs, Context* ctx) {
+    (void)own_mailbox(nargs >= 1 ? args[0] : Value::fromNil(), ctx, "close");
+    IsolateLocal* local = ctx->vm->isolate;
+    const int64_t id    = handle_id(args[0]).asSigned48();
+    if (id == local->main_box)
+        raise_located(ctx, "close: the main inbox cannot be closed (it ends with its owner)");
+    local->world->close_mailbox(id);
+    std::erase_if(local->inboxes, [id](const auto& e) { return e.first == id; });
+    return Value::fromNil();
+}
+
+// rawMonitor(pid, inbox) -> Bool. Be told when the actor at `pid` ends: MAIL_EXITED with its ADDRESS and
+// the reason ("normal", or the fault message) goes into `inbox`, which must be one of the caller's own.
+// It watches THAT actor, not the address, and reports EXACTLY ONCE -- an actor started into the same slot
+// afterwards is not watched. The Bool says whether it was still running; if it had already ended, the
+// report is delivered at once with the reason "gone", so the caller's receive loop is the same either way.
+static Value native_monitor(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world) raise_located(ctx, "monitor: this execution has no world");
+    if (nargs < 2) raise_located(ctx, "monitor: needs an address and an inbox to report into");
+    Mailbox&      into     = own_mailbox(args[1], ctx, "monitor");
+    const int64_t inbox_id = handle_id(args[1]).asSigned48();
+    const Value   id       = handle_id(args[0]);
+    if (!id.isInt()) raise_located(ctx, "monitor: not an actor address");
+    const int64_t target   = id.asSigned48();
+    World*        world    = local->world;
+    bool          watching = false;
+    {
+        // Under the world's lock, so an actor that ends in between is not missed: run_isolate marks
+        // `ended` and takes the list under the same lock.
+        std::lock_guard<std::mutex> lk(world->m);
+        const auto box = world->mailboxes.find(target);
+        if (box != world->mailboxes.end()) {
+            int64_t owner;
+            { std::lock_guard<std::mutex> box_lk(box->second->m); owner = box->second->owner; }
+            const auto iso = owner > 0 ? world->isolates.find(owner) : world->isolates.end();
+            if (iso != world->isolates.end() && !iso->second->ended) {
+                iso->second->watchers.push_back(inbox_id);
+                watching = true;
+            }
+        }
+    }
+    if (!watching) into.put(Mail{ MAIL_EXITED, {}, target, "gone" });
+    return Value::fromBool(watching);
+}
+
+// rawStopRequested(inbox) -> Bool. Has this actor been told to end? It reads the flag that every ending
+// path sets when it queues Stop -- rawStopActor, a released slot, and the end of the world -- and
+// consumes no mail, so the loop that asks may go on receiving as usual afterwards. It is for an actor
+// whose loop is its OWN work and which therefore never reaches a receive: such an actor cannot be ended
+// from outside, and this is how it ends itself. Checking any ONE of its inboxes is enough, because every
+// ending path puts Stop into ALL of them.
+static Value native_stop_requested(Value* args, uint8_t nargs, Context* ctx) {
+    Mailbox& box = own_mailbox(nargs >= 1 ? args[0] : Value::fromNil(), ctx, "stopRequested");
+    std::lock_guard<std::mutex> lk(box.m);
+    return Value::fromBool(box.stopped);
+}
+
+// rawSleep(ms) -> (). This isolate waits, and nothing else does: every isolate has its own thread, so a
+// sleeping actor holds up no other. It is what `std::time`'s sleep calls, and what a loop that must poll
+// -- a supervisor waiting for its children to end after it has been told to stop, when every receive
+// answers Stop at once -- uses to poll without burning a core.
+static Value native_sleep(Value* args, uint8_t nargs, Context* ctx) {
+    const Value ms = nargs >= 1 ? args[0] : Value::fromNil();
+    if (!ms.isInt() || ms.asSigned48() < 0) raise_located(ctx, "sleep: the time must be 0 milliseconds or more");
+    if (ms.asSigned48() > 0) std::this_thread::sleep_for(std::chrono::milliseconds(ms.asSigned48()));
+    return Value::fromNil();
+}
+
+// The message of a send, encoded HERE, in the sender's heap -- before any waiting, so a sender
+// blocked on a full inbox holds no heap object.
+static Mail encode_message(Value* args, uint8_t nargs, Context* ctx, const char* who) {
+    Mail mail;
+    mail.kind = MAIL_MSG;
+    try {
+        mail.buf = vcodec::encode(nargs >= 2 ? args[1] : Value::fromNil());
+    } catch (const vcodec::ValueCodecError& e) {
+        raise_located(ctx, (std::string(who) + ": the message cannot be sent: " + e.what()).c_str());
+    }
+    return mail;
+}
+static std::shared_ptr<Mailbox> addressee(Value* args, uint8_t nargs, Context* ctx, const char* who) {
+    IsolateLocal* local = ctx->vm->isolate;
+    const Value   id    = handle_id(nargs >= 1 ? args[0] : Value::fromNil());
+    if (!local || !local->world || !id.isInt() || nargs < 2)
+        raise_located(ctx, (std::string(who) + ": not an actor address").c_str());
+    return local->world->mailbox_of(id.asSigned48());
+}
+
+
+// rawSend(pid, msg) -> Bool. False when the addressee no longer runs, its inbox was closed, or the
+// program is ending while the inbox is full; the message is then dropped, as in Erlang. To a FULL
+// bounded inbox it waits until there is room (back-pressure). Waiting on one's own full inbox could
+// never end -- only this isolate empties it -- so that is a located fault instead; a CYCLE of such
+// waits over several isolates is the same fact and gets the same answer (confirm_send_cycle), which
+// is why the old note that "a cycle of two actors is not detected" is gone from the documentation.
+static Value native_send(Value* args, uint8_t nargs, Context* ctx) {
+    auto box  = addressee(args, nargs, ctx, "send");
+    Mail mail = encode_message(args, nargs, ctx, "send");
+    if (!box) return Value::fromBool(false);
+    IsolateLocal* local = ctx->vm->isolate;
+    if (box->capacity != 0 && box->owner_is(local->id)) {
+        if (box->offer(mail, /*wait=*/false) == Mailbox::FULL)
+            raise_located(ctx, "send: this actor's own inbox is full, and waiting for room would never end");
+        return Value::fromBool(true);   // SENT (GONE is impossible: the owner is running)
+    }
+    // An unbounded inbox never blocks, so it keeps exactly the path it always had: the detection
+    // machinery below is not reached, not allocated and not locked.
+    if (box->capacity == 0)
+        return Value::fromBool(box->offer(mail, /*wait=*/true) == Mailbox::SENT);
+    // Bounded: try once without waiting. Only a send that really has to wait pays for any of the
+    // bookkeeping -- listing a sender that is about to be admitted anyway would put a push_back and
+    // an erase on every bounded send.
+    switch (box->offer(mail, /*wait=*/false)) {
+        case Mailbox::SENT: return Value::fromBool(true);
+        case Mailbox::GONE: return Value::fromBool(false);
+        default: break;                 // FULL: fall through to the waiting loop
+    }
+    const int64_t addr = handle_id(nargs >= 1 ? args[0] : Value::fromNil()).asSigned48();
+    SendWaitGuard g(local->world, box, nullptr, addr, local->id);
+    auto slice = SEND_GRACE;
+    for (;;) {
+        const Mailbox::Offer r = box->offer(mail, /*wait=*/true, &g.w, slice);
+        if (r == Mailbox::SENT) return Value::fromBool(true);
+        if (r != Mailbox::WAITING) {
+            // GONE: the inbox closed, or the world is ending. If a cycle WE are part of was
+            // confirmed, the closing is a consequence of it -- report it rather than answer false.
+            if (const std::string why = taken_deadlock(local->world, local->id); !why.empty())
+                raise_located(ctx, ("send: " + why).c_str());
+            return Value::fromBool(false);
+        }
+        g.publish();
+        if (const std::string why = confirm_send_cycle(local->world, local->id); !why.empty())
+            raise_located(ctx, ("send: " + why).c_str());
+        if (slice < SEND_MAX_SLICE) slice *= 2;
+    }
+}
+
+// rawTrySend(pid, msg) -> Int: 0 sent, 1 the inbox is full (nothing was queued), 2 the addressee is
+// gone. Never waits.
+static Value native_try_send(Value* args, uint8_t nargs, Context* ctx) {
+    auto box  = addressee(args, nargs, ctx, "trySend");
+    Mail mail = encode_message(args, nargs, ctx, "trySend");
+    if (!box) return Value::fromSigned48(2);
+    switch (box->offer(mail, /*wait=*/false)) {
+        case Mailbox::SENT:    return Value::fromSigned48(0);
+        case Mailbox::FULL:    return Value::fromSigned48(1);
+        case Mailbox::GONE:    return Value::fromSigned48(2);
+        case Mailbox::WAITING: break;   // unreachable without a SendWait; listed so the switch is total
+    }
+    return Value::fromSigned48(2);
 }
 
 // rawReceive(inbox, timeoutMs) -> Int: MAIL_NONE (the timeout passed), MAIL_MSG, MAIL_EXITED or
@@ -2368,7 +3293,99 @@ static Value native_receive(Value* args, uint8_t nargs, Context* ctx) {
     local->current = std::move(box.q.front());
     box.q.pop_front();
     if (local->current.kind == MAIL_STOP) box.stop_seen = true;
+    if (local->current.kind == MAIL_MSG) {
+        --box.messages;
+        // The I/O thread stopped reading into this inbox when it was full; this receive made room.
+        const bool resume = std::exchange(box.io_paused, false);
+        if (box.capacity != 0) { lk.unlock(); box.space.notify_one(); }   // room for one sender
+        if (resume) {
+            if (lk.owns_lock()) lk.unlock();     // never hold a mailbox while taking World::m
+            if (auto h = local->world->hub()) h->wake();
+        }
+    }
     return Value::fromSigned48(local->current.kind);
+}
+
+// Read a Vec or Array of inbox handles into host memory. Like read_int_seq, but each element goes
+// through handle_id, so a bare Int and Skarn's one-field `InboxRef` both work. The whole read
+// happens BEFORE anything else, so nothing here can be moved out from under us by a collection.
+static bool read_handle_seq(Value v, std::vector<int64_t>* out) {
+    if (!v.isPtr()) return false;
+    GcObject* hdr   = GcObject::from_slots(v.asPtr());
+    Value*    elems = nullptr;
+    uint32_t  n     = 0;
+    if (hdr->kind == GcObject::KIND_ARRAY) {
+        elems = hdr->slots();
+        n     = static_cast<uint32_t>(hdr->slot_count());
+    } else if (hdr->kind == GcObject::KIND_VEC) {
+        GcObject* backing = GcObject::from_slots(hdr->slots()[VEC_SLOT_BACKING].asPtr());
+        n     = static_cast<uint32_t>(hdr->slots()[VEC_SLOT_COUNT].asSigned48());
+        elems = backing->slots();
+    } else {
+        return false;
+    }
+    out->reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        const Value id = handle_id(elems[i]);
+        if (!id.isInt()) return false;
+        out->push_back(id.asSigned48());
+    }
+    return true;
+}
+
+// rawSelect(boxes, timeoutMs) -> Int: the INDEX of the first inbox with something to read, or -1
+// when the timeout passed. A negative timeout waits indefinitely. Ties go to the lowest index, so a
+// caller expresses a priority by the order of the list.
+//
+// It reports readiness and takes nothing out: the caller then calls rawReceive on the inbox it
+// names, which cannot block, because only the owner dequeues and the owner is the caller. The
+// readiness test is rawReceive's own predicate, which is what makes that exact.
+//
+// Unlike rawReceive it cannot wait on any one mailbox's `cv` -- it waits on the ISOLATE's WaitPad,
+// which every one of its mailboxes wakes. The scan below holds no pad lock while it takes a
+// mailbox's, and the generation counter catches mail that arrived during the scan; see WaitPad.
+static Value native_select(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    std::vector<int64_t> ids;
+    if (nargs < 1 || !read_handle_seq(args[0], &ids))
+        raise_located(ctx, "select: expected (boxes: Vec[InboxRef], timeoutMs: Int)");
+    const int64_t ms = (nargs >= 2 && args[1].isInt()) ? args[1].asSigned48() : -1;
+    // Every inbox must be one of ours, checked before anything waits -- own_mailbox words the two
+    // refusals (someone else's, or closed) exactly as receive does.
+    std::vector<Mailbox*> boxes;
+    boxes.reserve(ids.size());
+    for (const int64_t id : ids)
+        boxes.push_back(&own_mailbox(Value::fromSigned48(id), ctx, "select"));
+    // Nothing to watch and no deadline: no event could ever end this wait. rawPoll refuses the same
+    // shape rather than leaving a program hanging with no output.
+    if (boxes.empty() && ms < 0)
+        raise_located(ctx, "select: a negative timeout with no inbox would wait forever");
+    if (!local || !local->pad)
+        raise_located(ctx, "select: this execution has no inbox (mainInbox first?)");
+    WaitPad& pad = *local->pad;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms < 0 ? 0 : ms);
+    pad.waiters.fetch_add(1, std::memory_order_relaxed);
+    int64_t found = -1;
+    for (;;) {
+        uint64_t gen;
+        { std::lock_guard<std::mutex> lk(pad.m); gen = pad.gen; }
+        for (size_t i = 0; i < boxes.size() && found < 0; ++i) {
+            std::lock_guard<std::mutex> lk(boxes[i]->m);
+            if (!boxes[i]->q.empty() || boxes[i]->stop_seen) found = static_cast<int64_t>(i);
+        }
+        if (found >= 0) break;
+        std::unique_lock<std::mutex> lk(pad.m);
+        if (pad.gen != gen) continue;             // something arrived while we were scanning
+        if (ms < 0) {
+            pad.cv.wait(lk, [&] { return pad.gen != gen; });
+        } else if (pad.cv.wait_until(lk, deadline, [&] { return pad.gen != gen; })) {
+            continue;
+        } else {
+            break;                                 // the deadline passed with nothing to read
+        }
+    }
+    pad.waiters.fetch_sub(1, std::memory_order_relaxed);
+    return Value::fromSigned48(found);
 }
 
 // rawMailMsg(inbox) -> the message rawReceive took, decoded into THIS heap. Once per message.
@@ -2417,7 +3434,7 @@ static Value native_hand_off(Value* args, uint8_t nargs, Context* ctx) {
     IsolateLocal* local = vm->isolate;
     if (!local || !local->world) return native_make_error(ctx, "handOff: this execution has no world");
     const int64_t fd = args[0].asSigned48();
-    const socket_t s = vm->net->hand_off(fd);
+    const socket_t s = vm->net->detach(fd, NetRegistry::Ended::handed);
     if (s == INVALID_SOCK)
         return native_make_error(ctx, std::string("handOff: ") + vm->net->invalid_reason(fd));
     std::lock_guard<std::mutex> lk(local->world->m);
@@ -2445,6 +3462,454 @@ static Value native_take(Value* args, uint8_t nargs, Context* ctx) {
     }
     if (s == INVALID_SOCK) return native_make_error(ctx, "take: this connection was already taken");
     return Value::fromSigned48(vm->net->add(s));
+}
+
+// ---- Active sockets: the I/O thread (see IoHub, next to World) ------------------------------------
+
+// One event onto `e.pending`: the tag byte, then the payload.
+static void active_event(ActiveSock& e, uint8_t tag, const char* p, size_t n) {
+    e.pending.push_back(Mail{ MAIL_MSG, vcodec::encode_bytes(tag, p, n), 0, {} });
+}
+static void active_fail(ActiveSock& e, const std::string& why) {
+    active_event(e, ACTIVE_FAILED, why.data(), why.size());
+    e.partial.clear();
+    e.done = true;
+}
+
+// What was read, as events: the chunk itself, or every complete line in it ("\n" or "\r\n" ends
+// one, and is not part of it). A line longer than max_line ends the stream with a failure: without
+// the bound, a peer that never sends a newline would grow the buffer without end. Also called by
+// rawActivate, before the entry is published, for the bytes recvLine had already buffered.
+static void active_frame(ActiveSock& e, const char* p, size_t n) {
+    if (e.done || n == 0) return;
+    if (!e.lines) { active_event(e, ACTIVE_DATA, p, n); return; }
+    size_t start = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (p[i] != '\n') continue;
+        e.partial.append(p + start, i - start);
+        start = i + 1;
+        if (!e.partial.empty() && e.partial.back() == '\r') e.partial.pop_back();
+        if (e.partial.size() > e.max_line) {
+            active_fail(e, "line too long (more than " + std::to_string(e.max_line) + " bytes)");
+            return;
+        }
+        active_event(e, ACTIVE_LINE, e.partial.data(), e.partial.size());
+        e.partial.clear();
+    }
+    e.partial.append(p + start, n - start);
+    if (e.partial.size() > e.max_line + 1)          // + 1: room for the '\r' of a "\r\n" still to come
+        active_fail(e, "line too long (more than " + std::to_string(e.max_line) + " bytes)");
+}
+
+// Deliver what is pending, in order, until the inbox is full (paused) or closed (done). A listener's
+// undelivered tickets go with a closed inbox: their connections are dropped, not left waiting.
+void IoHub::flush(ActiveSock& e) {
+    while (!e.pending.empty()) {
+        switch (e.box->offer_or_pause(e.pending.front())) {
+            case Mailbox::SENT:
+                e.pending.pop_front();
+                if (e.listener) e.pending_tickets.pop_front();
+                break;
+            case Mailbox::FULL:
+                e.paused = true;
+                return;
+            default:                                             // GONE: the inbox was closed
+                drop_tickets(e);
+                e.pending.clear();
+                e.paused = false;
+                e.done   = true;
+                return;
+        }
+    }
+    e.paused = false;
+}
+
+// Take the connections of a listener's undelivered events out of the hand-off table and close them.
+void IoHub::drop_tickets(ActiveSock& e) {
+    for (const int64_t t : e.pending_tickets) {
+        if (t < 0) continue;
+        socket_t s = INVALID_SOCK;
+        {
+            std::lock_guard<std::mutex> lk(world->m);
+            auto it = world->handoffs.find(t);
+            if (it != world->handoffs.end()) { s = it->second; world->handoffs.erase(it); }
+        }
+        if (s != INVALID_SOCK) sock_close(s);
+    }
+    e.pending_tickets.clear();
+}
+
+// A connection the client gave up on before it was accepted: skip it, the listener is fine.
+static bool accept_aborted() {
+#ifdef _WIN32
+    const int e = WSAGetLastError();
+    return e == WSAECONNRESET || e == WSAEINTR;
+#else
+    return errno == ECONNABORTED || errno == EINTR || errno == EPROTO;
+#endif
+}
+
+// Accept what is waiting on a ready listener. Each connection is made blocking -- Windows and BSD pass
+// the listener's non-blocking mode on, and every descriptor Skarn gets from std::net blocks -- parked in
+// the world's hand-off table like a rawHandOff, and its ticket delivered. At most a batch per readiness,
+// so a busy listener cannot starve the other sockets; the next poll comes back for the rest. Any error but
+// "nothing waiting" or "the client already left" ends the listener with a failure: repeating `accept`
+// on, say, a full descriptor table would only spin.
+void IoHub::accept_some(ActiveSock& e) {
+    for (int k = 0; k < 64 && !e.paused && !e.done; ++k) {
+        const socket_t c = accept(e.s, nullptr, nullptr);
+        if (c == INVALID_SOCK) {
+            if (sock_would_block()) return;
+            if (accept_aborted()) continue;
+            active_fail(e, net_error_msg("accept"));
+            e.pending_tickets.push_back(-1);
+            flush(e);
+            return;
+        }
+        sock_suppress_sigpipe(c);
+        set_nonblocking(c, false);
+        int64_t ticket;
+        {
+            std::lock_guard<std::mutex> lk(world->m);
+            ticket = world->next_ticket++;
+            world->handoffs.emplace(ticket, c);
+        }
+        const std::string text = std::to_string(ticket);
+        active_event(e, ACTIVE_TICKET, text.data(), text.size());
+        e.pending_tickets.push_back(ticket);
+        flush(e);
+    }
+}
+
+// A connected pair of loopback sockets: `wr` writes a byte, `rd` becomes readable. The accepted peer
+// is checked to be `wr` itself, since another local process could connect to the listener first.
+static bool make_wake_pair(socket_t* rd, socket_t* wr, std::string* err) {
+    if (!ensure_wsa()) { *err = "WSAStartup failed"; return false; }
+    socket_t l = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (l == INVALID_SOCK) { *err = net_error_msg("socket"); return false; }
+    sockaddr_in a{};
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port        = 0;
+    socklen_t alen    = sizeof(a);
+    if (bind(l, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || listen(l, 4) != 0 ||
+        getsockname(l, reinterpret_cast<sockaddr*>(&a), &alen) != 0) {
+        *err = net_error_msg("bind");
+        sock_close(l);
+        return false;
+    }
+    socket_t w = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (w == INVALID_SOCK || connect(w, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+        *err = net_error_msg("connect");
+        if (w != INVALID_SOCK) sock_close(w);
+        sock_close(l);
+        return false;
+    }
+    sockaddr_in mine{};
+    socklen_t   mlen = sizeof(mine);
+    getsockname(w, reinterpret_cast<sockaddr*>(&mine), &mlen);
+    socket_t r = INVALID_SOCK;
+    for (int tries = 0; tries < 8 && r == INVALID_SOCK; ++tries) {
+        sockaddr_in peer{};
+        socklen_t   plen = sizeof(peer);
+        socket_t    c    = accept(l, reinterpret_cast<sockaddr*>(&peer), &plen);
+        if (c == INVALID_SOCK) break;
+        if (peer.sin_port == mine.sin_port && peer.sin_addr.s_addr == mine.sin_addr.s_addr) r = c;
+        else sock_close(c);                      // not ours
+    }
+    sock_close(l);
+    if (r == INVALID_SOCK) {
+        *err = "could not connect the wake line";
+        sock_close(w);
+        return false;
+    }
+    set_nonblocking(r, true);
+    set_nonblocking(w, true);
+    sock_suppress_sigpipe(w);
+    int one = 1;
+    setsockopt(w, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
+    *rd = r;
+    *wr = w;
+    return true;
+}
+
+bool IoHub::start(std::string* err) {
+    if (!make_wake_pair(&wake_rd, &wake_wr, err)) return false;
+    buf.resize(64 * 1024);
+    try {
+        thread = std::thread([this] { loop(); });
+    } catch (const std::system_error& e) {
+        *err = std::string("could not start the I/O thread: ") + e.what();
+        sock_close(wake_rd); sock_close(wake_wr);
+        wake_rd = wake_wr = INVALID_SOCK;
+        return false;
+    }
+    return true;
+}
+
+int64_t IoHub::add(std::shared_ptr<ActiveSock> e) {
+    int64_t id;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        id    = next_id++;
+        e->id = id;
+        socks.emplace(id, std::move(e));
+    }
+    wake();
+    return id;
+}
+
+socket_t IoHub::sending_socket(int64_t id, int64_t caller, std::string* why) {
+    std::lock_guard<std::mutex> lk(m);
+    auto it = socks.find(id);
+    if (it == socks.end() || it->second->close_req) { *why = "the connection is closed"; return INVALID_SOCK; }
+    if (it->second->owner != caller) { *why = "this connection belongs to another actor"; return INVALID_SOCK; }
+    if (it->second->listener) { *why = "not a connection (an active listener)"; return INVALID_SOCK; }
+    return it->second->s;
+}
+
+bool IoHub::request_close(int64_t id, int64_t caller, std::string* why) {
+    {
+        std::lock_guard<std::mutex> lk(m);
+        auto it = socks.find(id);
+        if (it == socks.end() || it->second->close_req) return true;   // closed already
+        if (it->second->owner != caller) { *why = "this connection belongs to another actor"; return false; }
+        it->second->close_req = true;
+    }
+    wake();
+    return true;
+}
+
+void IoHub::close_owned_by(int64_t owner) {
+    bool any = false;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        for (auto& [id, e] : socks)
+            if (e->owner == owner && !e->close_req) { e->close_req = true; any = true; }
+    }
+    if (any) wake();
+}
+
+// One byte down the wake line. Non-blocking: if the line is full, a byte is already waiting, which
+// is all a wake needs.
+void IoHub::wake() {
+    if (wake_wr == INVALID_SOCK) return;
+    const char b = 1;
+    (void)::send(wake_wr, &b, 1, SOCK_SEND_FLAGS);
+}
+
+void IoHub::drain_wake() {
+    char tmp[256];
+    while (::recv(wake_rd, tmp, sizeof(tmp), 0) > 0) {}
+}
+
+// One read of a socket poll called ready. Non-blocking where the platform allows it per call, so a
+// spurious readiness cannot stall every other connection.
+void IoHub::read_once(ActiveSock& e) {
+#ifdef MSG_DONTWAIT
+    constexpr int flags = MSG_DONTWAIT;
+#else
+    constexpr int flags = 0;
+#endif
+    const int n = ::recv(e.s, buf.data(), static_cast<int>(buf.size()), flags);
+    if (n > 0) { active_frame(e, buf.data(), static_cast<size_t>(n)); return; }
+    if (n < 0 && sock_would_block()) return;
+    if (n == 0) {
+        if (e.lines && !e.partial.empty()) {            // a last line without a newline, as recvLine
+            if (e.partial.back() == '\r') e.partial.pop_back();
+            active_event(e, ACTIVE_LINE, e.partial.data(), e.partial.size());
+            e.partial.clear();
+        }
+        active_event(e, ACTIVE_CLOSED, nullptr, 0);
+        e.done = true;
+        return;
+    }
+    active_fail(e, net_error_msg("recv"));
+}
+
+void IoHub::loop() {
+    std::vector<std::shared_ptr<ActiveSock>> live, polled, closing;
+    std::vector<pollfd_t>                    pfds;
+    for (;;) {
+        live.clear();
+        closing.clear();
+        {
+            std::lock_guard<std::mutex> lk(m);
+            if (stopping) return;
+            for (auto it = socks.begin(); it != socks.end();) {
+                if (it->second->close_req) { closing.push_back(it->second); it = socks.erase(it); }
+                else { live.push_back(it->second); ++it; }
+            }
+        }
+        for (auto& e : closing) {                           // here only: never while inside poll
+            drop_tickets(*e);                               // a listener's accepted-but-undelivered ones
+            sock_close(e->s);
+        }
+        for (auto& e : live)
+            if (e->paused || !e->pending.empty()) flush(*e);
+        pfds.clear();
+        polled.clear();
+        pollfd_t w{};
+        w.fd     = wake_rd;
+        w.events = POLL_READ;
+        pfds.push_back(w);
+        for (auto& e : live) {
+            if (e->paused || e->done) continue;
+            pollfd_t p{};
+            p.fd     = e->s;
+            p.events = POLL_READ;
+            pfds.push_back(p);
+            polled.push_back(e);
+        }
+        if (sock_poll(pfds.data(), static_cast<unsigned>(pfds.size()), -1) < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));   // EINTR and friends: look again
+            continue;
+        }
+        if (pfds[0].revents != 0) drain_wake();
+        for (size_t i = 0; i < polled.size(); ++i) {
+            if (pfds[i + 1].revents == 0) continue;
+            if (polled[i]->listener) {
+                accept_some(*polled[i]);                    // delivers as it goes
+            } else {
+                read_once(*polled[i]);
+                flush(*polled[i]);
+            }
+        }
+    }
+}
+
+// A listener's undelivered tickets need no dropping here: they are in the world's hand-off table, which
+// ~World closes right after this.
+void IoHub::stop() {
+    {
+        std::lock_guard<std::mutex> lk(m);
+        stopping = true;
+    }
+    wake();
+    if (thread.joinable()) thread.join();
+    for (auto& [id, e] : socks) sock_close(e->s);
+    socks.clear();
+    if (wake_rd != INVALID_SOCK) sock_close(wake_rd);
+    if (wake_wr != INVALID_SOCK) sock_close(wake_wr);
+    wake_rd = wake_wr = INVALID_SOCK;
+}
+
+// rawActivate(fd, inbox, mode, maxLen, pending) -> Int id | String. Hands the READING of a connection
+// to the world's I/O thread, which delivers into `inbox` (one of the caller's own): mode 0 the chunks
+// as read, mode 1 lines of at most maxLen bytes. `pending` are bytes recvLine had already read past a
+// line; they come first. The descriptor goes stale ("socket was activated"); rawActiveSend and
+// rawActiveClose take the returned id. Only an actor or the main program can: a task has no inbox.
+static Value native_activate(Value* args, uint8_t nargs, Context* ctx) {
+    VM* vm = ctx->vm;
+    if (!vm->net) return native_make_error(ctx, "activate: networking unavailable");
+    if (nargs < 5 || !args[0].isInt() || !args[2].isInt() || !args[3].isInt())
+        return native_make_error(ctx, "activate: expected (sock, inbox, mode, maxLen, pending)");
+    Mailbox&      box   = own_mailbox(args[1], ctx, "activate");
+    IsolateLocal* local = vm->isolate;
+    std::shared_ptr<Mailbox> into;
+    for (const auto& [id, b] : local->inboxes) if (b.get() == &box) into = b;
+    if (!into) raise_located(ctx, "activate: this execution has no inbox (mainInbox first?)");
+    const int64_t mode    = args[2].asSigned48();
+    const int64_t max_len = args[3].asSigned48();
+    if (mode != 0 && mode != 1) return native_make_error(ctx, "activate: unknown framing");
+    if (mode == 1 && max_len < 1) return native_make_error(ctx, "activate: the longest line must be 1 byte or more");
+    std::string pending;
+    if (args[4].isPtr() && GcObject::from_slots(args[4].asPtr())->kind == GcObject::KIND_BYTES) {
+        GcObject* hdr     = GcObject::from_slots(args[4].asPtr());
+        GcObject* backing = GcObject::from_slots(hdr->slots()[BYTES_SLOT_BACKING].asPtr());
+        pending.assign(backing->bytes(), static_cast<size_t>(hdr->slots()[BYTES_SLOT_COUNT].asSigned48()));
+    }
+    // The hub first: if it cannot start, the connection stays as it was.
+    std::string herr;
+    auto hub = local->world->hub_or_start(&herr);
+    if (!hub) return native_make_error(ctx, "activate: " + herr);
+    const int64_t  fd = args[0].asSigned48();
+    const socket_t s  = vm->net->detach(fd, NetRegistry::Ended::activated);
+    if (s == INVALID_SOCK)
+        return native_make_error(ctx, std::string("activate: ") + vm->net->invalid_reason(fd));
+    auto e = std::make_shared<ActiveSock>();
+    e->s        = s;
+    e->owner    = local->id;
+    e->box      = std::move(into);
+    e->lines    = (mode == 1);
+    e->max_line = static_cast<size_t>(max_len);
+    active_frame(*e, pending.data(), pending.size());   // not published yet: still this thread's
+    return Value::fromSigned48(hub->add(std::move(e)));
+}
+
+// rawActivateListener(fd, inbox) -> Int id | String. Hands a LISTENER to the world's I/O thread, which
+// accepts and delivers each new connection into `inbox` (one of the caller's own) as a hand-off ticket
+// -- the one rawTake redeems, so the owner may pass it on to a worker unchanged. The descriptor goes
+// stale ("socket was activated"); rawActiveClose takes the returned id and closes the listener.
+static Value native_activate_listener(Value* args, uint8_t nargs, Context* ctx) {
+    VM* vm = ctx->vm;
+    if (!vm->net) return native_make_error(ctx, "activate: networking unavailable");
+    if (nargs < 2 || !args[0].isInt())
+        return native_make_error(ctx, "activate: expected (listener, inbox)");
+    Mailbox&      box   = own_mailbox(args[1], ctx, "activate");
+    IsolateLocal* local = vm->isolate;
+    std::shared_ptr<Mailbox> into;
+    for (const auto& [id, b] : local->inboxes) if (b.get() == &box) into = b;
+    if (!into) raise_located(ctx, "activate: this execution has no inbox (mainInbox first?)");
+    const int64_t fd = args[0].asSigned48();
+    const socket_t live = vm->net->get(fd);
+    if (live == INVALID_SOCK)
+        return native_make_error(ctx, std::string("activate: ") + vm->net->invalid_reason(fd));
+    std::string herr;
+    auto hub = local->world->hub_or_start(&herr);
+    if (!hub) return native_make_error(ctx, "activate: " + herr);
+    // Non-blocking BEFORE it is detached, so a failure leaves the listener as it was. The I/O thread
+    // accepts only on readiness, and a client that left in between must not make it wait.
+    if (set_nonblocking(live, true) != 0) return native_make_error(ctx, "activate: " + net_error_msg("ioctl"));
+    const socket_t s = vm->net->detach(fd, NetRegistry::Ended::activated);
+    auto e = std::make_shared<ActiveSock>();
+    e->s        = s;
+    e->owner    = local->id;
+    e->box      = std::move(into);
+    e->listener = true;
+    return Value::fromSigned48(hub->add(std::move(e)));
+}
+
+// rawActiveSend(id, data) -> () | String. Sends the whole buffer on an active connection of the caller.
+static Value native_active_send(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world) return native_make_error(ctx, "send: this execution has no world");
+    if (nargs < 2 || !args[0].isInt())
+        return native_make_error(ctx, "send: expected (conn: Int, data: Bytes)");
+    if (!args[1].isPtr() || GcObject::from_slots(args[1].asPtr())->kind != GcObject::KIND_BYTES)
+        return native_make_error(ctx, "send: data must be a byte buffer");
+    auto hub = local->world->hub();
+    std::string why = "the connection is closed";
+    const socket_t s = hub ? hub->sending_socket(args[0].asSigned48(), local->id, &why) : INVALID_SOCK;
+    if (s == INVALID_SOCK) return native_make_error(ctx, "send: " + why);
+    std::string data;
+    {
+        GcObject*      hdr     = GcObject::from_slots(args[1].asPtr());
+        GcObject*      backing = GcObject::from_slots(hdr->slots()[BYTES_SLOT_BACKING].asPtr());
+        const uint32_t count   = static_cast<uint32_t>(hdr->slots()[BYTES_SLOT_COUNT].asSigned48());
+        data.assign(backing->bytes(), count);
+    }
+    size_t sent = 0;
+    while (sent < data.size()) {
+        const int n = ::send(s, data.data() + sent, static_cast<int>(data.size() - sent), SOCK_SEND_FLAGS);
+        if (n < 0) return native_make_error(ctx, "send: " + net_error_msg("send"));
+        sent += static_cast<size_t>(n);
+    }
+    return Value::fromNil();
+}
+
+// rawActiveClose(id) -> (). Asks the I/O thread to close the connection; later sends are refused and
+// events not received yet are dropped. Closing twice is fine; another isolate's connection is a fault.
+static Value native_active_close(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world || nargs < 1 || !args[0].isInt())
+        raise_located(ctx, "close: not an active connection");
+    if (auto hub = local->world->hub()) {
+        std::string why;
+        if (!hub->request_close(args[0].asSigned48(), local->id, &why))
+            raise_located(ctx, ("close: " + why).c_str());
+    }
+    return Value::fromNil();
 }
 
 std::vector<NativeFunc> build_native_table() {
@@ -2508,5 +3973,21 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_SELF_ID]      = native_self_id;
     t[NATIVE_HAND_OFF]     = native_hand_off;
     t[NATIVE_TAKE]         = native_take;
+    t[NATIVE_NEW_INBOX]    = native_new_inbox;
+    t[NATIVE_CLOSE_INBOX]  = native_close_inbox;
+    t[NATIVE_TRY_SEND]     = native_try_send;
+    t[NATIVE_ACTOR_SPAWN_BOUNDED] = native_actor_spawn_bounded;
+    t[NATIVE_NEW_SLOT]     = native_new_slot;
+    t[NATIVE_SPAWN_INTO]   = native_spawn_into;
+    t[NATIVE_RELEASE_SLOT] = native_release_slot;
+    t[NATIVE_STOP_ACTOR]   = native_stop_actor;
+    t[NATIVE_MONITOR]      = native_monitor;
+    t[NATIVE_STOP_REQUESTED] = native_stop_requested;
+    t[NATIVE_SLEEP]        = native_sleep;
+    t[NATIVE_SELECT]       = native_select;
+    t[NATIVE_ACTIVATE]     = native_activate;
+    t[NATIVE_ACTIVE_SEND]  = native_active_send;
+    t[NATIVE_ACTIVE_CLOSE] = native_active_close;
+    t[NATIVE_ACTIVATE_LISTENER] = native_activate_listener;
     return t;
 }
