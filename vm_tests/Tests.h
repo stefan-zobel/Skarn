@@ -4217,6 +4217,99 @@ inline void test_active_listener() {
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 
+// A send deadline on an active connection whose peer never reads. The root sends 8 KB at a time until a
+// send fails: once the socket buffers are full a send waits, and after 200 ms without progress it gives
+// up and closes the connection. So the run takes at least 200 ms (and far less than the 5 s a lost
+// deadline would need to reach the loop's cap), the next send finds the connection closed, and the peer,
+// reading what did get through, reaches the end of the stream. Negative times and a listener's id are
+// located faults.
+inline void test_active_send_deadline() {
+    using namespace forkjoin;
+    std::cout << "=== active_send_deadline ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        as.load_const(20, 0);          call1(as, 21, NATIVE_TCP_LISTEN, 20);
+        call1(as, 22, NATIVE_TCP_LOCAL_PORT, 21);
+        as.load_str(23, "127.0.0.1");  call2(as, 24, NATIVE_TCP_CONNECT, 23, 22);   // the peer: never reads
+        call1(as, 25, NATIVE_TCP_ACCEPT, 21);
+        as.load_const(20, 4);          call1(as, 26, NATIVE_NEW_INBOX, 20);
+        as.load_str(27, "");           as.BYTES_FROM_STR(31, 27);
+        as.R6(OpCode::MOV, 43, 25, 0);
+        as.R6(OpCode::MOV, 44, 26, 0);
+        as.load_const(45, 0);
+        as.load_const(46, 0);
+        as.R6(OpCode::MOV, 47, 31, 0);
+        as.call_native_id(32, 42, 43, 5, NATIVE_ACTIVATE);                          // raw chunks
+        as.load_const(20, 200);        call2(as, 33, NATIVE_ACTIVE_SET_SEND_TIMEOUT, 32, 20);
+        as.load_str(27, std::string(8192, 'x'));  as.BYTES_FROM_STR(28, 27);
+        as.load_const(29, 0);          as.load_const(30, 5000);                     // at most 40 MB
+        as.label("asd_send");
+        call2(as, 34, NATIVE_ACTIVE_SEND, 32, 28);
+        as.R6(OpCode::IS_NIL, 35, 34, 0);
+        as.C2(OpCode::INCR, 29);
+        as.B1(OpCode::BF, 35, "asd_failed");
+        as.B(OpCode::BLT_INT, 29, 30, "asd_send");
+        as.label("asd_failed");
+        call2(as, 36, NATIVE_ACTIVE_SEND, 32, 28);                                  // closed now
+        as.load_const(20, 2000);       call2(as, 19, NATIVE_TCP_SET_TIMEOUT, 24, 20);
+        as.load_const(18, 0);          as.load_const(17, 100000);
+        as.label("asd_drain");                                                      // the peer reads it all
+        as.load_const(20, 65536);      call2(as, 37, NATIVE_TCP_RECV, 24, 20);
+        as.R6(OpCode::LEN, 38, 37, 0);
+        as.C2(OpCode::INCR, 18);
+        as.load_const(16, 0);
+        as.B(OpCode::BEQ_INT, 38, 16, "asd_drained");
+        as.B(OpCode::BLT_INT, 18, 17, "asd_drain");
+        as.label("asd_drained");
+        Heap heap;
+        const auto t0 = std::chrono::steady_clock::now();
+        const Run r = run(as, heap);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const bool set_ok    = r.fault.empty() && r.regs[33].isNil();
+        const bool gave_up   = r.fault.empty() && str_of(r.regs[34]).find("has not read for 200 ms") != std::string::npos &&
+                               r.regs[29].isInt() && r.regs[29].asSigned48() < 5000 && ms >= 190.0 && ms < 5000.0;
+        const bool closed_ok = r.fault.empty() && str_of(r.regs[36]).find("closed") != std::string::npos;
+        const bool eof_ok    = r.fault.empty() && r.regs[37].isPtr() &&
+                               GcObject::from_slots(r.regs[37].asPtr())->kind == GcObject::KIND_BYTES &&
+                               bytes_of(r.regs[37]).empty();
+        std::cout << std::format("  the deadline is set:                    {}{}\n", set_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  a send gives up after 200 ms ({:.0f} ms): {}  (\"{}\")\n", ms, gave_up ? "PASS" : "FAIL",
+                                 str_of(r.regs[34]));
+        std::cout << std::format("  the next send finds it closed:          {}  (\"{}\")\n", closed_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[36]));
+        std::cout << std::format("  the peer reaches the end of the stream: {}\n", eof_ok ? "PASS" : "FAIL");
+
+        auto expect = [](const char* label, const Run& fr, const char* want) {
+            const bool ok = fr.fault.find(want) != std::string::npos;
+            std::cout << std::format("  {:<39} {}{}\n", label, ok ? "PASS" : "FAIL",
+                                     ok ? "" : "  (got: \"" + fr.fault + "\")");
+            return ok;
+        };
+        bool misuse_ok = true;
+        {   // a negative time
+            Assembler fa; declare_task_fns(fa); fa.label("main");
+            fa.load_const(20, 1);  fa.load_const(21, -1);
+            call2(fa, 22, NATIVE_ACTIVE_SET_SEND_TIMEOUT, 20, 21);
+            Heap h;
+            misuse_ok &= expect("a negative time", run(fa, h), "0 milliseconds or more");
+        }
+        {   // a listener's id
+            Assembler fa; declare_task_fns(fa); fa.label("main");
+            fa.load_const(20, 0);  call1(fa, 21, NATIVE_TCP_LISTEN, 20);
+            fa.load_const(20, 1);  call1(fa, 26, NATIVE_NEW_INBOX, 20);
+            call2(fa, 30, NATIVE_ACTIVATE_LISTENER, 21, 26);
+            fa.load_const(20, 100);
+            call2(fa, 22, NATIVE_ACTIVE_SET_SEND_TIMEOUT, 30, 20);
+            Heap h;
+            misuse_ok &= expect("a listener's id", run(fa, h), "not a connection");
+        }
+        check(set_ok && gave_up && closed_ok && eof_ok && misuse_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
 // Misuse faults with a located message.
 inline void test_actor_misuse() {
     using namespace forkjoin;

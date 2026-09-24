@@ -240,6 +240,13 @@ impl ActiveConn {
   // Close the connection. Later sends return an Err, and events not received yet are dropped.
   // Closing twice is fine.
   fn close(self) -> () { rawActiveClose(self.id) }
+
+  // How long a send may wait for a peer that does not read, counted from the last byte that went out.
+  // When it runs out the send returns Err("... has not read for <ms> ms ...") and the connection is
+  // CLOSED: a message half written would leave the peer mid-message. 0, the default, waits without
+  // limit. Either way a waiting send ends with an Err as soon as this actor is told to stop, so a peer
+  // that stops reading can never keep its actor -- or the program -- from ending.
+  fn setSendTimeout(self, ms: Int) -> () { rawActiveSetSendTimeout(self.id, ms) }
 }
 
 // The reading half: an inbox the runtime delivers into. Only `c.activate(...)` makes one.

@@ -1,0 +1,29 @@
+// CLAIM: with `out.setSendTimeout(ms)`, a send to a peer that has stopped reading gives up once nothing has gone out for that long -- it returns an Err and CLOSES the connection, so the next send finds it closed.
+// GUIDE: SkarnActors.md (A connection that also listens to its inbox)
+// EXPECT: ok send: the peer has not read for 200 ms; the connection is closed | send: the connection is closed
+use std::net::*
+
+fn run() -> Result[(), String] {
+  let lst = listen(0)?
+  let _peer = connect("127.0.0.1", lst.localPort()?)?    // connected, but never reads
+  let conn = lst.accept()?
+  let (out, _) = conn.activate(Framing::Raw, 4)?
+  out.setSendTimeout(200)
+  let mut sb = stringBuilder()
+  for _ in range(0, 1024) { sb = sb.append("xxxxxxxx") }
+  let block = toBytes(sb.build())
+  let mut why = ""
+  let mut sent = 0
+  while len(why) == 0 && sent < 5000 {
+    match out.send(block) {
+      Ok(_) => { sent = sent + 1 }
+      Err(e) => { why = e }
+    }
+  }
+  match out.sendStr("more") {
+    Ok(_) => print("${why} | sent again")
+    Err(e) => print("${why} | ${e}")
+  }
+  Ok(())
+}
+match run() { Ok(_) => {}, Err(e) => print("error: ${e}") }

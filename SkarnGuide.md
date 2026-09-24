@@ -3423,6 +3423,34 @@ The forms you will use:
 - `use a::b::*` — bring in everything (a "glob"; a local definition or explicit `use` silently wins over it).
 - `mod::name` — reach a name with a qualifier without a `use`.
 
+**Two globs may bring in the same name.** That is fine until you use the name bare: Skarn cannot know
+which one you mean, so it reports an error there and names both modules. It never picks one silently.
+
+```rust group=glob file=shapes.skn
+// shapes.skn
+pub fn area() -> Int { 1 }
+```
+
+```rust group=glob file=rooms.skn
+// rooms.skn
+pub fn area() -> Int { 20 }
+```
+
+```rust group=glob
+// main.skn
+import shapes
+import rooms
+use shapes::*
+use rooms::*
+println(shapes::area() + rooms::area())   // => 21
+// println(area())   // error: 'area' is ambiguous: it is provided by both `use rooms::*` and `use shapes::*`
+```
+
+Write `shapes::area()`, or choose one with `use shapes::area`. Names that only one of the globs provides are
+not affected. A glob also beats the names the standard library makes available everywhere (`trim`, `map`, …).
+If a module you glob exports its own `trim`, that is the `trim` you get. The standard one stays reachable as
+`std::trim`, and so does every such name, whatever your own code calls `trim`.
+
 Same-named types or functions in different modules coexist without conflict. The trait coherence rule from
 [§16](#16-traits) applies across modules: an `impl Trait for Type` must live in the module that defines the
 trait or the module that defines the type.

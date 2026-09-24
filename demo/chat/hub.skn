@@ -266,6 +266,10 @@ fn session(inbox: Inbox[String], start: SessionStart) -> () {
             return ()
         }
     }
+    // A client that stops reading but keeps its connection open would otherwise hold this session in
+    // a send for as long as it likes. After 5 s without progress the send fails and the connection is
+    // closed. (A topic that drops this session tells it to stop, which ends such a wait at once.)
+    out.setSendTimeout(5000)
     let mut s = Session {
         me: inbox.pid(), out: out, registry: start.registry,
         name: "guest${inbox.pid().id}", current: "", joined: #{}

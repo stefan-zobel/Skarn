@@ -1,0 +1,6 @@
+// CLAIM: a glob beats the always-imported standard names: a module's own `trim` wins where it is glob-imported, the standard one stays reachable as `std::trim`, and a name the module does not provide still comes from the standard library.
+// GUIDE: §Modules (binding precedence)
+// EXPECT: ok mine|x|ab
+import tools
+use tools::*
+println(trim("  x  "), "|", std::trim("  x  "), "|", toUpper("ab") |> toLower)

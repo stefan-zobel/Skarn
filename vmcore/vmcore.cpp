@@ -533,6 +533,9 @@ struct WaitEdge {
 //     let the OS hand the number to a new socket while poll still watches it.
 //   * It is woken through a connected pair of loopback TCP sockets -- WSAPoll waits on sockets
 //     only, and one code path on every platform lets the Windows run check the POSIX one.
+//   * An active connection is NON-BLOCKING, so a send whose peer does not read waits in poll, where it
+//     notices its actor's Stop and the connection's deadline (rawActiveSetSendTimeout). A peer that
+//     stops reading therefore can neither pin its actor for ever nor keep the world from ending.
 //   * A LISTENER can be activated too (rawActivateListener). The thread then accepts, parks each new
 //     connection in the world's hand-off table like rawHandOff does, and delivers its TICKET -- which
 //     is sendable, so the owner can pass it on to a worker unchanged.
@@ -550,6 +553,7 @@ struct ActiveSock {
     bool                     lines     = false;   // frame into lines (else deliver the chunks as read)
     size_t                   max_line  = 0;
     bool                     close_req = false;   // guarded by IoHub::m: the owner asked to close, or ended
+    int64_t                  send_timeout_ms = 0; // guarded by IoHub::m: how long a send may wait for the peer (0: no limit)
     // The fields below belong to the I/O thread alone -- and, before the entry is published, to the
     // activating thread; IoHub::m orders the two.
     std::string              partial;             // an unfinished line
@@ -568,8 +572,10 @@ public:
     ~IoHub() { stop(); }
     bool     start(std::string* err);                        // the wake line and the thread
     int64_t  add(std::shared_ptr<ActiveSock> e);             // publish an activated socket; its id
-    // The socket rawActiveSend may write to, or INVALID_SOCK and why not.
-    socket_t sending_socket(int64_t id, int64_t caller, std::string* why);
+    // The socket rawActiveSend may write to, or INVALID_SOCK and why not; and its send deadline.
+    socket_t sending_socket(int64_t id, int64_t caller, std::string* why, int64_t* timeout_ms);
+    // Set the send deadline. False (with `why`) for another isolate's connection or a listener.
+    bool     set_send_timeout(int64_t id, int64_t caller, int64_t ms, std::string* why);
     // Ask for a close. False (with `why`) only for a connection of another isolate; closing twice is fine.
     bool     request_close(int64_t id, int64_t caller, std::string* why);
     void     close_owned_by(int64_t owner);                  // the owner has ended
@@ -3659,13 +3665,24 @@ int64_t IoHub::add(std::shared_ptr<ActiveSock> e) {
     return id;
 }
 
-socket_t IoHub::sending_socket(int64_t id, int64_t caller, std::string* why) {
+socket_t IoHub::sending_socket(int64_t id, int64_t caller, std::string* why, int64_t* timeout_ms) {
     std::lock_guard<std::mutex> lk(m);
     auto it = socks.find(id);
     if (it == socks.end() || it->second->close_req) { *why = "the connection is closed"; return INVALID_SOCK; }
     if (it->second->owner != caller) { *why = "this connection belongs to another actor"; return INVALID_SOCK; }
     if (it->second->listener) { *why = "not a connection (an active listener)"; return INVALID_SOCK; }
+    *timeout_ms = it->second->send_timeout_ms;
     return it->second->s;
+}
+
+bool IoHub::set_send_timeout(int64_t id, int64_t caller, int64_t ms, std::string* why) {
+    std::lock_guard<std::mutex> lk(m);
+    auto it = socks.find(id);
+    if (it == socks.end() || it->second->close_req) return true;         // closed: nothing left to send
+    if (it->second->owner != caller) { *why = "this connection belongs to another actor"; return false; }
+    if (it->second->listener) { *why = "not a connection (an active listener)"; return false; }
+    it->second->send_timeout_ms = ms;
+    return true;
 }
 
 bool IoHub::request_close(int64_t id, int64_t caller, std::string* why) {
@@ -3823,10 +3840,15 @@ static Value native_activate(Value* args, uint8_t nargs, Context* ctx) {
     std::string herr;
     auto hub = local->world->hub_or_start(&herr);
     if (!hub) return native_make_error(ctx, "activate: " + herr);
-    const int64_t  fd = args[0].asSigned48();
-    const socket_t s  = vm->net->detach(fd, NetRegistry::Ended::activated);
-    if (s == INVALID_SOCK)
+    const int64_t  fd   = args[0].asSigned48();
+    const socket_t live = vm->net->get(fd);
+    if (live == INVALID_SOCK)
         return native_make_error(ctx, std::string("activate: ") + vm->net->invalid_reason(fd));
+    // Non-blocking BEFORE it is detached, so a failure leaves the connection as it was. A send then
+    // waits in poll, where it can watch its deadline and its actor's Stop (native_active_send), and a
+    // spurious readiness cannot stall the I/O thread's recv on a platform without MSG_DONTWAIT.
+    if (set_nonblocking(live, true) != 0) return native_make_error(ctx, "activate: " + net_error_msg("ioctl"));
+    const socket_t s = vm->net->detach(fd, NetRegistry::Ended::activated);
     auto e = std::make_shared<ActiveSock>();
     e->s        = s;
     e->owner    = local->id;
@@ -3871,6 +3893,8 @@ static Value native_activate_listener(Value* args, uint8_t nargs, Context* ctx) 
 }
 
 // rawActiveSend(id, data) -> () | String. Sends the whole buffer on an active connection of the caller.
+// Fails when the connection's deadline passes without progress (and then closes it), or when the
+// caller is told to stop while it waits.
 static Value native_active_send(Value* args, uint8_t nargs, Context* ctx) {
     IsolateLocal* local = ctx->vm->isolate;
     if (!local || !local->world) return native_make_error(ctx, "send: this execution has no world");
@@ -3879,8 +3903,10 @@ static Value native_active_send(Value* args, uint8_t nargs, Context* ctx) {
     if (!args[1].isPtr() || GcObject::from_slots(args[1].asPtr())->kind != GcObject::KIND_BYTES)
         return native_make_error(ctx, "send: data must be a byte buffer");
     auto hub = local->world->hub();
+    const int64_t id = args[0].asSigned48();
     std::string why = "the connection is closed";
-    const socket_t s = hub ? hub->sending_socket(args[0].asSigned48(), local->id, &why) : INVALID_SOCK;
+    int64_t timeout_ms = 0;
+    const socket_t s = hub ? hub->sending_socket(id, local->id, &why, &timeout_ms) : INVALID_SOCK;
     if (s == INVALID_SOCK) return native_make_error(ctx, "send: " + why);
     std::string data;
     {
@@ -3889,11 +3915,64 @@ static Value native_active_send(Value* args, uint8_t nargs, Context* ctx) {
         const uint32_t count   = static_cast<uint32_t>(hdr->slots()[BYTES_SLOT_COUNT].asSigned48());
         data.assign(backing->bytes(), count);
     }
+    // The socket is non-blocking (native_activate). A send that goes through at once costs one ::send,
+    // as before; only when the peer's window is full does this wait -- in poll, in slices, so that it
+    // notices both its actor's Stop (a stopActor, a supervisor, the end of the world: without this an
+    // actor whose peer stopped reading could never end, and the world's final join would hang) and the
+    // connection's deadline, which counts from the last byte that went out.
+    using clock = std::chrono::steady_clock;
+    constexpr int64_t SLICE_MS = 50;
+    Mailbox* own = local->actor ? local->inbox(local->main_box) : nullptr;   // the root is never stopped
     size_t sent = 0;
+    clock::time_point deadline{};
+    bool waiting = false;
     while (sent < data.size()) {
         const int n = ::send(s, data.data() + sent, static_cast<int>(data.size() - sent), SOCK_SEND_FLAGS);
-        if (n < 0) return native_make_error(ctx, "send: " + net_error_msg("send"));
-        sent += static_cast<size_t>(n);
+        if (n >= 0) { sent += static_cast<size_t>(n); waiting = false; continue; }
+        if (!sock_would_block()) return native_make_error(ctx, "send: " + net_error_msg("send"));
+        if (!waiting) {
+            waiting  = true;
+            deadline = clock::now() + std::chrono::milliseconds(timeout_ms);
+        }
+        for (;;) {
+            if (own) {
+                std::lock_guard<std::mutex> lk(own->m);
+                if (own->stopped) return native_make_error(ctx, "send: the actor was told to stop");
+            }
+            int64_t slice = SLICE_MS;
+            if (timeout_ms > 0) {
+                const auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - clock::now()).count();
+                if (left <= 0) {
+                    std::string ignored;
+                    hub->request_close(id, local->id, &ignored);
+                    return native_make_error(ctx, "send: the peer has not read for " + std::to_string(timeout_ms) +
+                                                  " ms; the connection is closed");
+                }
+                slice = std::min<int64_t>(slice, left);
+            }
+            pollfd_t p{};
+            p.fd     = s;
+            p.events = POLL_WRITE;
+            if (sock_poll(&p, 1, static_cast<int>(slice)) > 0) break;   // room, or an error the send reports
+        }
+    }
+    return Value::fromNil();
+}
+
+// rawActiveSetSendTimeout(id, ms) -> (). How long a send on this active connection may wait for the peer
+// to make room, counted from the last byte that went out; when it runs out, the send fails and the
+// connection is closed. 0 (the default) waits without limit. A closed connection ignores it; a negative
+// time, a listener and another isolate's connection are faults.
+static Value native_active_set_send_timeout(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!local || !local->world || nargs < 2 || !args[0].isInt() || !args[1].isInt())
+        raise_located(ctx, "setSendTimeout: not an active connection");
+    const int64_t ms = args[1].asSigned48();
+    if (ms < 0) raise_located(ctx, "setSendTimeout: the time must be 0 milliseconds or more");
+    if (auto hub = local->world->hub()) {
+        std::string why;
+        if (!hub->set_send_timeout(args[0].asSigned48(), local->id, ms, &why))
+            raise_located(ctx, ("setSendTimeout: " + why).c_str());
     }
     return Value::fromNil();
 }
@@ -3989,5 +4068,6 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_ACTIVE_SEND]  = native_active_send;
     t[NATIVE_ACTIVE_CLOSE] = native_active_close;
     t[NATIVE_ACTIVATE_LISTENER] = native_activate_listener;
+    t[NATIVE_ACTIVE_SET_SEND_TIMEOUT] = native_active_set_send_timeout;
     return t;
 }
