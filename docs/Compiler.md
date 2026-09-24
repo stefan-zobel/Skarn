@@ -604,14 +604,15 @@ x64\Release\static_compiler_tests.exe --gen 1234
 - `--repro <seed>` reruns one generated program; `--gen <seed>` prints it without running it.
 - Use Release builds for sweeps.
 
-**The documentation is tested as well.** `tests/guide_claims/run_guide_claims.ps1` runs:
+**The documentation is tested as well.** `tests/guide_claims/run_guide_claims.py` runs:
 
 - about two hundred claim programs, each pinning one statement of the guides, including the diagnostics
   for common mistakes;
 - every code block of both guides, checked against the output annotated in the text;
-- every program under `examples/`, compared with its expected output.
+- every program under `examples/`, compared with its expected output;
+- a check that every internal link of the guides resolves.
 
-`tests/check_doc_anchors.ps1` checks that section names cited from source comments still exist in this
+`tests/check_doc_anchors.py` checks that section names cited from source comments still exist in this
 document and [VirtualMachine.md](VirtualMachine.md).
 
 ## Adding a language feature

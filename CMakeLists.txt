@@ -101,6 +101,33 @@ target_include_directories(skarn_lsp PRIVATE skarn_lsp)
 target_link_libraries(skarn_lsp PRIVATE skarnclib vmcore)
 add_test(NAME skarn_lsp_selftest COMMAND skarn_lsp --selftest)
 
+# ---- the documentation and demo gates ----------------------------------------
+# Python runners over the built driver: the guide claims, every code block of the guides,
+# the programs under examples/ (exact output), the guides' internal links, the section
+# names cited from source, and the demos (type-check + self-tests). Each exits non-zero on
+# any failure. They need only the Python 3 found above for the prelude embed.
+if(TARGET skarnvm)
+    set(SKARN_DRIVER --exe $<TARGET_FILE:skarnvm>)
+    add_test(NAME doc_claims
+             COMMAND "${Python3_EXECUTABLE}" tests/guide_claims/run_guide_claims.py ${SKARN_DRIVER} --no-examples
+             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME doc_examples
+             COMMAND "${Python3_EXECUTABLE}" tests/guide_claims/run_guide_examples.py ${SKARN_DRIVER}
+             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME examples
+             COMMAND "${Python3_EXECUTABLE}" tests/run_examples.py ${SKARN_DRIVER}
+             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME doc_links
+             COMMAND "${Python3_EXECUTABLE}" tests/guide_claims/check_anchors.py
+             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME doc_anchors
+             COMMAND "${Python3_EXECUTABLE}" tests/check_doc_anchors.py
+             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME demos
+             COMMAND "${Python3_EXECUTABLE}" tests/run_demos.py ${SKARN_DRIVER}
+             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+endif()
+
 # ---- stack reserve for the front-end executables ----------------------------
 # Parsing and checking are recursive descent: one level of expression nesting costs up to
 # ~21 KB of stack in a debug build, and MSVC reserves only 1 MB by default -- a long pipe

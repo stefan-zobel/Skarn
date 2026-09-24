@@ -20,10 +20,11 @@ the tagged release.
 git fetch --tags
 git worktree add /tmp/skarn-release <tag>      # e.g. 0.2.0
 cmake -B /tmp/skarn-release/build -S /tmp/skarn-release -DCMAKE_BUILD_TYPE=Release
-cmake --build /tmp/skarn-release/build --target skarnvm skarn_lsp -- -j$(sysctl -n hw.logicalcpu)
+cmake --build /tmp/skarn-release/build -- -j$(sysctl -n hw.logicalcpu)
 ```
 
-Confirm that both binaries exist and are executable before continuing.
+This builds every target, the test suites included, which step 2 runs. Confirm that `skarnvm` and
+`skarn_lsp` exist and are executable before continuing.
 
 ---
 
@@ -33,14 +34,22 @@ Confirm that both binaries exist and are executable before continuing.
 ctest --test-dir /tmp/skarn-release/build --output-on-failure
 ```
 
-Expected totals (Release, arm64) — these must match the Windows numbers in the
-release notes:
+All ten entries must pass: the four suites (`vm_tests`, `vm_fault_probe`, `static_compiler_tests`,
+`skarn_lsp_selftest`) and the six Python gates (`doc_claims`, `doc_examples`, `examples`, `doc_links`,
+`doc_anchors`, `demos`, which need Python 3.9 or newer). Expected totals (Release, arm64) — these must
+match the Windows numbers in the release notes:
 
 ```
 vm_tests               98 passed, 0 failed  (checks: 134 passed, 0 failed)
 vm_fault_probe          1 passed, 0 failed
 static_compiler_tests  <N> passed, 0 failed
+guide claims           <N> passed, 0 failed
+guide examples         <N> passed, <M> check-only, 0 ignored, 0 failed
+examples               <N> passed, 0 failed
+demos                  <N> passed, 0 failed
 ```
+
+`--output-on-failure` prints these lines only for a failing entry; `ctest -V` prints them all.
 
 Do not publish if anything is red.
 
@@ -130,7 +139,7 @@ git worktree remove /tmp/skarn-release
 ### Checklist
 
 - [ ] Built from the exact release tag, not a branch tip
-- [ ] All three ctest entries green, totals match Windows
+- [ ] All ten ctest entries green, totals match Windows
 - [ ] Archive unpacks to a single `Skarn-<version>-macos-arm64/` folder
 - [ ] Executable bit set on `skarnvm` and `skarn_lsp` (`.tar.gz` preserves it; `.zip` does not)
 - [ ] `README.txt` inside the archive is the macOS-specific one (Gatekeeper note, `./skarnvm` not `static_vmrun.exe`)

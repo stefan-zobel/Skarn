@@ -136,10 +136,12 @@ Run the driver without arguments for the full list. A multi-file program is a di
 
 ## Tests
 
-**macOS:** `ctest --test-dir build` runs the VM suite, the hardware-fault probe, the compiler suite and the
-language-server self-test. The individual binaries are `build/vm_tests`, `build/static_compiler_tests` and
-`build/skarn_lsp --selftest`. The documentation harnesses in the table below are PowerShell scripts and have
-only been run on Windows, so the macOS gate is the smaller one.
+**macOS:** `ctest --test-dir build` runs all ten entries: the VM suite, the hardware-fault probe, the
+compiler suite, the language-server self-test, and the six documentation and demo gates of the table below
+(`doc_claims`, `doc_examples`, `examples`, `doc_links`, `doc_anchors`, `demos`). The individual binaries are
+`build/vm_tests`, `build/static_compiler_tests` and `build/skarn_lsp --selftest`. The Python scripts of the
+table (Python 3.9 or newer, no packages) also run by hand, as `python3 tests/...`; they find `build/skarnvm` on
+their own, and `--exe` names another driver.
 
 **Windows:**
 
@@ -147,7 +149,9 @@ only been run on Windows, so the macOS gate is the smaller one.
 |---|---|
 | `x64\Release\vm_tests.exe` | the VM: opcodes, the heap and the collector, natives, the bytecode format |
 | `x64\Release\static_compiler_tests.exe` | the compiler: checker, codegen, and differential runs against a reference interpreter over generated programs |
-| `powershell -File tests\guide_claims\run_guide_claims.ps1` | the documentation: guide claims, every guide example, and every program under `examples/` |
+| `python tests\guide_claims\run_guide_claims.py` | the documentation: guide claims, every guide example, every program under `examples/`, and the guides' internal links |
+| `python tests\check_doc_anchors.py` | that every section name cited from source still exists in the `docs/` documents |
+| `python tests\run_demos.py` | the demos: every program under `demo/` type-checks, and the chat server's self-test passes |
 | `x64\Release\skarn_lsp.exe --selftest` | the language server: JSON, message framing, diagnostics, error recovery, outline, hover, go to definition, references, rename, completion, signature help, formatting, a scripted session |
 
 ## Editor support

@@ -24,22 +24,24 @@ is read by the runner (first match wins).
 
 ## Running
 
-From a developer shell (any cwd), after building the solution (x64 Release by default):
+With Python 3.9 or newer (standard library only), from any cwd, after building the project:
 
 ```
-powershell -File tests/guide_claims/run_guide_claims.ps1
+python tests/guide_claims/run_guide_claims.py
 ```
 
-Options: `-Config Debug` (use the Debug `static_vmrun.exe`), `-Exe <path>` (an explicit driver),
-`-Dir <path>` (a subset). Exit code is `0` iff every claim held; a drifted claim prints
-`FAIL … <why>` and the script exits `1`, so this is CI-gateable.
+The driver is found on its own: `x64/Release/static_vmrun.exe` from the Visual Studio solution, or
+`build/skarnvm` from the CMake build. Options: `--config Debug` (the Debug build), `--exe <path>` (an explicit
+driver), `--dir <path>` (a subset), `--timeout <s>` (per program, default 60). Exit code is `0` iff every
+claim held; a drifted claim prints `FAIL … <why>` and the script exits `1`, so this is CI-gateable. The CMake
+build registers each runner as a `ctest` entry.
 
-## Every guide example — `run_guide_examples.ps1`
+## Every guide example — `run_guide_examples.py`
 
 The claims above are written by hand, so a guide example nobody wrote a fixture for is unguarded. So a
 second runner checks **every** ```` ```rust ```` block of all three guides. It extracts them **at run time** — the
 guides are the single source of truth, and there are no copies in the repository that could drift from them.
-`run_guide_claims.ps1` calls it at the end (skip with `-NoExamples`), so the one command above runs both.
+`run_guide_claims.py` calls it at the end (skip with `--no-examples`), so the one command above runs both.
 
 For each block it asserts:
 
@@ -69,21 +71,21 @@ An unknown marker, a group with only `file=` blocks, `fail` inside a group, `// 
 the file examples write nothing into the repository.
 
 ```
-powershell -File tests/guide_claims/run_guide_examples.ps1
-powershell -File tests/guide_claims/run_guide_examples.ps1 -Only 2356          # the block (or group) at that line
-powershell -File tests/guide_claims/run_guide_examples.ps1 -Emit C:\tmp\ex     # also dump the programs
+python tests/guide_claims/run_guide_examples.py
+python tests/guide_claims/run_guide_examples.py --only 2356        # the block (or group) at that line
+python tests/guide_claims/run_guide_examples.py --emit /tmp/ex     # also dump the programs
 ```
 
-`-Guide <file.md>` runs another markdown file; `-Config` / `-Exe` as above. Exit `0` iff every block held.
+`--guide <file.md>` runs another markdown file; `--config` / `--exe` as above. Exit `0` iff every block held.
 
 **Writing a guide example:** annotate what the program *prints*, never a value — `let q = 7 / 2  // => 3` fails,
 because nothing is printed; write `println(7 / 2)  // => 3`. Do not leave a binding unused (the unused-variable
 warning fails the block). A block with no `// =>` at all is only required to run cleanly, which is the right
 choice for output that differs between runs (a random roll, the environment).
 
-## Example programs — `tests/run_examples.ps1`
+## Example programs — `tests/run_examples.py`
 
-The third runner, also called at the end of `run_guide_claims.ps1` (and skipped by the same `-NoExamples`),
+The third runner, also called at the end of `run_guide_claims.py` (and skipped by the same `--no-examples`),
 checks the realistic programs under `examples/` — each a small real task written from the guides alone
 (see `examples/README.md`). Every example runs with `--strict` in a temporary copy of its directory and must
 exit `0`, print nothing to stderr, and print **exactly** its `expected.out`; an optional `args.txt` holds the
@@ -91,25 +93,26 @@ command-line arguments. Where a guide block checks one feature in isolation, the
 when features meet in a whole program.
 
 ```
-powershell -File tests/run_examples.ps1
-powershell -File tests/run_examples.ps1 -Only word_freq
-powershell -File tests/run_examples.ps1 -Update      # rewrite expected.out; review the diff before keeping it
+python tests/run_examples.py
+python tests/run_examples.py --only word_freq
+python tests/run_examples.py --update      # rewrite expected.out; review the diff before keeping it
 ```
 
-## Link integrity — `check_anchors.ps1`
+## Link integrity — `check_anchors.py`
 
 A sibling gate for a guide's *internal* cross-references. `SkarnGuide.md` links to its own
 sections with `[text](#slug)`; when a heading is renamed but a link is not, the link silently 404s a reader —
 a blind spot the claim fixtures cannot cover (a link to `#14-maps` after the heading became `## 14. Collections`,
-which slugs to `#14-collections`). `check_anchors.ps1` mechanically validates every internal anchor against the GitHub slug
+which slugs to `#14-collections`). `check_anchors.py` mechanically validates every internal anchor against the GitHub slug
 of every heading (fence-aware, so code-block `#` lines and example `](#…)` are ignored):
 
 ```
-powershell -File tests/guide_claims/check_anchors.ps1
+python tests/guide_claims/check_anchors.py
 ```
 
-`-File <path>` checks a different markdown file. Exit `0` iff every anchor resolves; a broken anchor prints
-`#slug (first at line N)` and the script exits `1`. Run it in the same doc gate as the claim harness.
+Without arguments it checks all three guides; paths as arguments check other markdown files. Exit `0` iff
+every anchor resolves; a broken anchor prints `#slug (first at line N)` and the script exits `1`.
+`run_guide_claims.py` runs it at the end, with the other two runners.
 
 ## Tiers
 

@@ -29,9 +29,9 @@ cd examples/word_freq
 
 ## How they are checked
 
-`tests/run_examples.ps1` runs every example with `--strict` in a temporary copy of its directory and
+`tests/run_examples.py` runs every example with `--strict` in a temporary copy of its directory and
 compares the output with `expected.out` byte for byte; `args.txt` holds the command-line arguments where a
-program takes any. It is part of the documentation gate, `tests/guide_claims/run_guide_claims.ps1`.
+program takes any. It is part of the documentation gate, `tests/guide_claims/run_guide_claims.py`.
 
-After an intended change in output, regenerate with `powershell -File tests/run_examples.ps1 -Update` and
+After an intended change in output, regenerate with `python tests/run_examples.py --update` and
 review the diff of the `expected.out` files before keeping it.
