@@ -283,6 +283,7 @@ public:
           catch (const ContinueSignal&)  { res.faulted = true; res.fault_msg = "continue at top level"; }
           catch (const std::exception& e){ res.faulted = true; res.fault_msg = e.what(); }
         res.output = std::move(out_);
+        res.err_output = std::move(err_);
         res.coverage = cov_;   // what this run evaluated; the caller merges it only if the run AGREED
         return res;
     }
@@ -320,6 +321,7 @@ private:
     std::unordered_map<std::string, const Method*> defaults_;        // trait\x1fmethod -> default Method*
     std::vector<const Stmt*> top_stmts_;
     std::string out_;
+    std::string err_;               // eprint / eprintln (a task's text lands when it runs, i.e. at its join)
     NativeEnv    nenv_;             // fixed fixtures for the differentiable natives
     std::size_t  stdin_pos_ = 0;    // shared cursor into nenv_.stdin_text (readLine / readAllStdin)
 
@@ -1546,6 +1548,11 @@ private:
         if (name == "print" || name == "println") {       // variadic, NO separator; println adds one newline
             for (size_t i = 0; i < argx.size(); ++i) out_ += stringify_arg(argx[i], ev(i));
             if (name == "println") out_ += "\n";
+            out = RtValue{}; return true;
+        }
+        if (name == "eprint" || name == "eprintln") {     // the same, into the error stream
+            for (size_t i = 0; i < argx.size(); ++i) err_ += stringify_arg(argx[i], ev(i));
+            if (name == "eprintln") err_ += "\n";
             out = RtValue{}; return true;
         }
         // `panic` DIVERGES, so it is the one builtin that never reaches the handled `return true` the

@@ -268,7 +268,10 @@ reaching whichever socket reuses the slot. The file-handle natives behind `std::
 write, sync, close) use a second table of the same shape. A file opened for appending positions every write
 at the end as part of the write, as `appendFile` does, and `sync` is `FlushFileBuffers` on Windows and
 `fsync` on POSIX. Neither kind of descriptor means anything in another isolate, so the checker keeps both
-out of messages. `tcpConnect` gives up after 10 seconds: on POSIX
+out of messages. Two natives serve the program's own streams: `flushOutput` flushes its output stream,
+and `rawWriteErr` writes one string to its error stream — the compiler joins the arguments of `eprint` /
+`eprintln` into that one string, so a call arrives in one piece, and the native flushes the output stream
+first, so the two streams appear in the order they were written. `tcpConnect` gives up after 10 seconds: on POSIX
 through a non-blocking connect and `select()`, on Windows through a blocking connect bounded by `TCP_MAXRT`,
 because there the `select()` wait can add one timer tick (about 15 ms) even on loopback.
 
@@ -535,7 +538,11 @@ calling convention, and halts. Appending the stub leaves every function's addres
   through its mailbox.
 - **Output.** A task's output is collected and written out when the task is joined, in join order, so it
   does not depend on scheduling. An actor writes to the main program's output stream a line at a time, so
-  lines from different actors never mix. Isolates read an empty standard input.
+  lines from different actors never mix. A flush — `std::io`'s `flushOutput()`, or a read from standard
+  input — also writes out the line the isolate has started, and flushes the stream; in a task it changes
+  nothing until the join. Standard error is different: every isolate writes to the main program's error
+  stream at once, a whole call under one lock — a task too, since a diagnostic must arrive even from a
+  task that never ends. Isolates read an empty standard input.
 - **Memory.** An isolate starts small — 64 KiB of register stack and 1024 return frames, and an actor's heap
   at 64 KiB — and grows like any other execution. Hundreds of actors are therefore affordable.
 
@@ -596,15 +603,23 @@ has a default, so small hand-built programs pass only what they use:
 - the constant pool, constant arrays, struct types, string literals and function table;
 - the trait-dispatch table and its dimensions;
 - line, column, function-name and module tables for fault reports;
-- the native table, the program arguments, and the output and input streams.
+- the native table, the program arguments, and the output, input and error streams.
 
 The caller owns the heap, the globals and the interner and passes them in. There is no global or
 thread-local interpreter state, so executions are independent — including at the same time on different
-threads. Each concurrent execution needs its own heap, globals, interner, program arguments and output and
-input streams; the constant pool, struct types, function table, trait table and native table are read-only
-and may be shared. The two stream parameters default to the process-wide standard output and input, which
-two concurrent executions must not both take, or they will interleave their output and compete for the
-same input.
+threads. Each concurrent execution needs its own heap, globals, interner, program arguments and output,
+input and error streams; the constant pool, struct types, function table, trait table and native table are read-only
+and may be shared. The stream parameters default to the process-wide standard output, input and error,
+which two concurrent executions must not both take, or they will interleave their output and compete for
+the same input.
+
+The VM does not decide when output reaches the operating system; the stream it is given does. It flushes
+that stream only when asked to (`flushOutput`, a read from standard input) and when the execution ends.
+The driver `skarnvm` hands it a stream that pushes completed lines on at once when output is sparse, and
+gathers a burst of lines for at most 10 ms before a background thread pushes them — the C runtime alone
+would hold output to a pipe or a file in 4 KiB blocks, which a killed server never writes. A flush per
+line would cost a program printing a million lines four to eleven times its run time; this costs it
+10 to 17 %.
 
 ## Dispatch
 

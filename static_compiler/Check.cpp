@@ -258,6 +258,8 @@ public:
         { "len",             "fn len(String | List[T] | Array[T] | Vec[T] | Bytes | Map[K, V]) -> Int" },
         { "print",           "fn print(T, ...)" },
         { "println",         "fn println(T, ...)" },
+        { "eprint",          "fn eprint(T, ...)" },
+        { "eprintln",        "fn eprintln(T, ...)" },
         { "panic",           "fn panic(String) -> Never" },
         { "has",             "fn has(Map[K, V], K) -> Bool" },
         { "delete",          "fn delete(Map[K, V], K) -> Bool" },
@@ -1295,6 +1297,7 @@ private:
         add_native("rename",       { S, S }, make_named(std_Result(), { ty_unit(), S }),       STD_IO);
         add_native("copyFile",     { S, S }, make_named(std_Result(), { ty_unit(), S }),       STD_IO);
         add_native("readAllStdin", {},       S,                                                STD_IO);
+        add_native("flushOutput",  {},       ty_unit(),                                        STD_IO);
         // File handles -- std::io's File wraps the descriptor; the raw natives stay internal.
         add_native("rawFileOpen",  { S, ty_int() },        make_named(std_Result(), { ty_int(), S }),    STD_IO);
         add_native("rawFileRead",  { ty_int(), ty_int() }, make_named(std_Result(), { B, S }),           STD_IO);
@@ -1566,10 +1569,10 @@ private:
 
     // print(a, ...) -- variadic; each argument is rendered and written back-to-back with NO separator
     // (sugar for sequential single-arg prints). Requires at least one argument. Special-cased (not a
-    // fixed FnSig) because of the variadic arity.
-    TyPtr check_print(const std::vector<Expr*>& args, Expr& node) {
+    // fixed FnSig) because of the variadic arity. eprint (standard error) has the same rules.
+    TyPtr check_print(const std::vector<Expr*>& args, Expr& node, const char* who) {
         if (args.empty())
-            error(node.line, node.col, "print expects at least one argument");
+            error(node.line, node.col, std::string(who) + " expects at least one argument");
         for (Expr* a : args) infer(*a);   // any type is printable
         return ty_unit();
     }
@@ -4124,8 +4127,10 @@ private:
                     return call_direct_fn(bit->second, id.name, args, node, expected);
                 }
                 if (id.name == "len") { callee.ty = ty_error(); return check_len(args, node); }
-                if (id.name == "print")   { callee.ty = ty_error(); return check_print(args, node); }
+                if (id.name == "print")   { callee.ty = ty_error(); return check_print(args, node, "print"); }
                 if (id.name == "println") { callee.ty = ty_error(); return check_println(args); }
+                if (id.name == "eprint")  { callee.ty = ty_error(); return check_print(args, node, "eprint"); }
+                if (id.name == "eprintln") { callee.ty = ty_error(); return check_println(args); }
                 if (id.name == "panic")   { callee.ty = ty_error(); return check_panic(args, node); }
                 if (id.name == "has")     { callee.ty = ty_error(); return check_map_kv_bool(args, node, "has"); }
                 if (id.name == "delete")  { callee.ty = ty_error(); return check_map_kv_bool(args, node, "delete"); }

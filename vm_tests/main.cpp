@@ -84,6 +84,7 @@ int main(int argc, char** argv) {
     run("native_procctx",           test_native_procctx);
     run("native_dirops",            test_native_dirops);
     run("native_stdin",             test_native_stdin);
+    run("native_write_err",         test_native_write_err);
     run("native_process",           test_native_process);
     run("gc",                       test_gc);
     run("globals",                  test_globals);

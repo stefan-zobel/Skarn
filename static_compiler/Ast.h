@@ -452,6 +452,8 @@ inline constexpr std::string_view BUILTIN_FN_NAMES[] = {
     "array", "emptyArray", "vec", "push", "len",
     // Universal / opcode-backed builtins: stringify, output, abort
     "toString", "print", "println", "panic",
+    // Standard error: stringify like print, then ONE call of the rawWriteErr native (no opcode)
+    "eprint", "eprintln",
     // Map builtins: read / membership / removal / snapshot
     "has", "delete", "get", "keys", "values",
     // Internal live-map cursor primitives (behind the prelude MapCursor)

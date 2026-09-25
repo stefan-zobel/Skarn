@@ -691,6 +691,8 @@ struct World {
     const ProgramImage*       image  = nullptr;   // the ROOT's image: what every isolate runs
     std::ostream*             target = nullptr;   // the root's real output stream
     std::mutex                out_m;              // one line at a time into `target`
+    std::ostream*             err_target = nullptr;   // the root's error stream (eprint / eprintln)
+    std::mutex                err_m;              // one call at a time into `err_target`
     std::atomic<bool>         actors_started{ false };
     LineForwardBuf            root_buf{ this, false };
     std::ostream              root_out{ &root_buf };
@@ -922,7 +924,8 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
                      std::istream* in,
                      const std::vector<std::string>* function_modules,
                      const std::vector<std::vector<Value>>* const_arrays,
-                     const TaskEntry* task) {
+                     const TaskEntry* task,
+                     std::ostream* err) {
     std::vector<uint32_t> padded = bytecode;
     padded.resize(bytecode.size() + 3,
         Instruction::J(static_cast<uint8_t>(OpCode::HALT)).raw);
@@ -980,6 +983,7 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
         own_world.emplace();
         own_world->image  = &image;
         own_world->target = out ? out : &std::cout;
+        own_world->err_target = err ? err : &std::cerr;
         own_world->main_mailbox->pad = own_world->root_pad;   // the root's inbox wakes the root
         local.world       = &*own_world;
         local.pad         = own_world->root_pad;
@@ -995,6 +999,10 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
     // stdin sink for readLine / readAllStdin: caller-supplied stream, or std::cin by
     // default. A caller (tests, a REPL) can feed input by passing its own std::istream.
     vm.in                = in ? in : &std::cin;
+    // eprint / eprintln sink: the world's error stream, shared by every isolate of the world (a task
+    // or an actor writes there at once, not at its join -- a diagnostic must arrive even from one
+    // that hangs).
+    vm.err               = local.world->err_target;
     // Serious-fault diagnostics (Phase 1): the code origin (instruction 0) so a fault
     // ip maps to an instruction index, plus the per-instruction line table and the
     // per-fn-id name table. Cold-path only (raise_located); not GC roots.
@@ -1814,6 +1822,42 @@ static Value native_read_all_stdin(Value*, uint8_t, Context* ctx) {
                     std::istreambuf_iterator<char>());
     GcObject* s = ctx->vm->heap->alloc_string_gc(all, ctx);
     return Value::fromPtr(s->payload());
+}
+
+// flushOutput() -> (). Pushes what this isolate has printed on to the program's stream now, a
+// partial line included: the root's and an actor's `out` is a LineForwardBuf, whose sync writes the
+// partial line and flushes the world's target under its lock. A task's `out` is its private buffer,
+// handed over at join, so there it changes nothing -- which is the task's ordering promise, not a gap.
+// Zero-arg (dummy window base); allocates nothing.
+static Value native_flush_output(Value*, uint8_t, Context* ctx) {
+    if (ctx->vm->out) ctx->vm->out->flush();
+    return Value::fromNil();
+}
+
+// rawWriteErr(s) -> (). What eprint / eprintln lower to: the compiler joins all arguments (and
+// eprintln's newline) into ONE string first, so one call is one piece of text. It is written and
+// flushed under the world's err_m, so lines of different actors and tasks never mix, and it goes
+// out at once -- also from a task, whose ordinary output waits for its join. No world (a hand-built
+// test context): straight to vm->err, else std::cerr. What this isolate printed before is flushed
+// first, so a terminal shows a diagnostic after the output that preceded it (a task's output is its
+// private buffer, so there this changes nothing). Allocates nothing.
+static Value native_write_err(Value* args, uint8_t nargs, Context* ctx) {
+    if (nargs < 1 || !is_string(args[0])) return Value::fromNil();
+    if (ctx->vm->out) ctx->vm->out->flush();
+    const GcObject* o = GcObject::from_slots(args[0].asPtr());
+    const char* bytes = o->bytes();
+    const auto  n     = static_cast<std::streamsize>(o->string_length());
+    World* w = ctx->vm->isolate ? ctx->vm->isolate->world : nullptr;
+    if (w && w->err_target) {
+        std::lock_guard<std::mutex> lk(w->err_m);
+        w->err_target->write(bytes, n);
+        w->err_target->flush();
+    } else {
+        std::ostream& e = ctx->vm->err ? *ctx->vm->err : std::cerr;
+        e.write(bytes, n);
+        e.flush();
+    }
+    return Value::fromNil();
 }
 
 // f64ToBytes(x) -> Bytes: the 8 raw IEEE-754 bytes of x, little-endian (Plain). Enables a pure-Skarn
@@ -4285,5 +4329,7 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_FILE_WRITE]   = native_file_write;
     t[NATIVE_FILE_SYNC]    = native_file_sync;
     t[NATIVE_FILE_CLOSE]   = native_file_close;
+    t[NATIVE_FLUSH_OUTPUT] = native_flush_output;
+    t[NATIVE_WRITE_ERR]    = native_write_err;
     return t;
 }

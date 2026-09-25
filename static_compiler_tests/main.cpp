@@ -2588,6 +2588,66 @@ std::string cg_run_native(const std::string& src,
     return out.str();
 }
 
+// A string sink that remembers what it held at every flush: the order of the snapshots is the order
+// in which output was PUSHED to the stream, which a final string cannot show.
+class SyncLogBuf : public std::stringbuf {
+public:
+    std::vector<std::string> snapshots;
+protected:
+    int sync() override { snapshots.push_back(str()); return 0; }
+};
+
+// cg_run_native with that sink: the final output, and what it held at each flush.
+std::pair<std::string, std::vector<std::string>> cg_run_native_flushes(const std::string& src) {
+    const std::string full = "use std::io::*\nuse std::env::*\n" + src;
+    std::unique_ptr<svc::Module> compiled;
+    try {
+        compiled = std::make_unique<svc::Module>(svc::compile(full.c_str(), svc::builtin_prelude()));
+    } catch (const std::exception& e) {
+        return { std::string("[the test program does not compile] ") + e.what(), {} };
+    }
+    svc::Module& m = *compiled;
+    Heap heap;
+    StringInterner interner;
+    SyncLogBuf buf;
+    std::ostream out(&buf);
+    std::istringstream in;
+    static const std::vector<NativeFunc> natives = build_native_table();
+    const std::vector<std::string> no_args;
+    execute(m.bytecode, &heap, nullptr, &interner, m.top_frame_size,
+            &m.constants, &m.struct_types, &m.string_literals, &kNoAtoms,
+            &m.function_table, &out,
+            &m.trait_table, m.trait_table_width, m.trait_method_count,
+            &m.line_table, &m.function_names, &m.column_table,
+            &natives, &no_args, &in);
+    return { buf.str(), buf.snapshots };
+}
+
+// cg_run_native with the error stream captured too: { standard output, standard error }.
+std::pair<std::string, std::string> cg_run_native_err(const std::string& src) {
+    const std::string full = "use std::io::*\nuse std::env::*\n" + src;
+    std::unique_ptr<svc::Module> compiled;
+    try {
+        compiled = std::make_unique<svc::Module>(svc::compile(full.c_str(), svc::builtin_prelude()));
+    } catch (const std::exception& e) {
+        return { std::string("[the test program does not compile] ") + e.what(), {} };
+    }
+    svc::Module& m = *compiled;
+    Heap heap;
+    StringInterner interner;
+    std::ostringstream out, err;
+    std::istringstream in;
+    static const std::vector<NativeFunc> natives = build_native_table();
+    const std::vector<std::string> no_args;
+    execute(m.bytecode, &heap, nullptr, &interner, m.top_frame_size,
+            &m.constants, &m.struct_types, &m.string_literals, &kNoAtoms,
+            &m.function_table, &out,
+            &m.trait_table, m.trait_table_width, m.trait_method_count,
+            &m.line_table, &m.function_names, &m.column_table,
+            &natives, &no_args, &in, &m.function_modules, &m.const_arrays, /*task=*/nullptr, &err);
+    return { out.str(), err.str() };
+}
+
 void check_int(const char* name, const std::string& src, int64_t expect) {
     try {
         Value v = cg_run(src);
@@ -5725,6 +5785,113 @@ void test_codegen_natives() {
         const bool removed = std::filesystem::remove(f, rm);
         check_true("file_closed_at_end", first.empty() && removed && !rm);
     }
+    // ---- flushOutput (std::io) ----
+    // The root: a partial line reaches the stream at the flush, not at the end.
+    {
+        const auto [text, snaps] = cg_run_native_flushes(
+            "print(\"abc\")\nflushOutput()\nprint(\"def\")\n");
+        check_true("flush_output_root", text == "abcdef" && !snaps.empty() && snaps[0] == "abc");
+    }
+    // An actor: its partial line goes out with its flush, while the root still waits for it.
+    {
+        const auto [text, snaps] = cg_run_native_flushes(
+            "use std::actor::*\n"
+            "fn body(inbox: Inbox[Int], boss: Pid[Int]) -> () {\n"
+            "  print(\"part\")\n"
+            "  flushOutput()\n"
+            "  let _s = send(boss, 1)\n"
+            "  for _m in inbox.messages() {}\n"
+            "}\n"
+            "let me: Inbox[Int] = mainInbox()\n"
+            "let _p = spawnActor(body, me.pid())\n"
+            "let _m = me.receive()\n");
+        check_true("flush_output_actor", text == "part" && !snaps.empty() && snaps[0] == "part");
+    }
+    // A task: its output is handed over at join, so its flush changes nothing and nothing breaks.
+    {
+        const auto [text, snaps] = cg_run_native_flushes(
+            "use std::task::*\n"
+            "fn work(x: Int) -> Int {\n"
+            "  print(\"t\")\n"
+            "  flushOutput()\n"
+            "  x + 1\n"
+            "}\n"
+            "let t = spawn(work, 1)\n"
+            "println(\"|${unwrap(t.join())}\")\n");
+        check_true("flush_output_task", text == "t|2\n");
+        (void)snaps;
+    }
+    check_true("flush_output_gate", check_has_p("flushOutput()\n0", "std::io"));
+    // ---- eprint / eprintln (standard error) ----
+    // Several arguments without a separator, the empty eprintln, and nothing of it on standard output.
+    {
+        const auto [out, err] = cg_run_native_err(
+            "eprint(\"a\", 1, true)\neprintln(\" b\", 2.5)\neprintln()\nprintln(\"out\")\n"
+            "let c: Char = 'x'\neprintln(c, Some(3))\n");
+        check_true("eprint_basic", out == "out\n" && err == "a1true b2.5\n\nxSome(3)\n");
+    }
+    // Arguments that are calls, nested calls and interpolations: the joined text and every argument's
+    // string are live at once, which the frame measure has to cover.
+    {
+        const auto [out, err] = cg_run_native_err(
+            "fn twice(s: String) -> String { s + s }\n"
+            "fn n(x: Int) -> Int { x * 10 }\n"
+            "let k = 4\n"
+            "eprintln(twice(twice(\"ab\")), n(n(k)), \"${k}-${n(k)}\", [1, 2], (k, \"t\"))\n");
+        check_true("eprint_call_args", out.empty() && err == "abababab400" "4-40[1, 2](4, \"t\")\n");
+    }
+    // Four actors, 200 lines each: every line arrives whole (one call is one piece of text).
+    {
+        const auto [out, err] = cg_run_native_err(
+            "use std::actor::*\n"
+            "fn body(inbox: Inbox[Int], who: Int) -> () {\n"
+            "  let mut i = 0\n"
+            "  while i < 200 { eprintln(\"w\", who, \" n\", i, \" |\")\n i += 1 }\n"
+            "  for _m in inbox.messages() {}\n"
+            "}\n"
+            "let watch: Inbox[Int] = newInbox()\n"
+            "let mut w = 0\n"
+            "while w < 4 {\n"
+            "  let p = spawnActor(body, w)\n"
+            "  let _m = p.actorId().watch(watch)\n"
+            "  let _s = stopActor(p)\n"
+            "  w += 1\n"
+            "}\n"
+            "let mut ended = 0\n"
+            "while ended < 4 {\n"
+            "  match watch.receive() { Mail::Exited(_, _) => { ended += 1 }, _ => { ended = 4 } }\n"
+            "}\n");
+        int lines = 0, bad = 0;
+        std::istringstream ls(err);
+        for (std::string ln; std::getline(ls, ln);) {
+            ++lines;
+            if (ln.size() < 3 || ln[0] != 'w' || ln.find('|') != ln.size() - 1) ++bad;
+        }
+        check_true("eprint_actor_lines_whole", out.empty() && lines == 800 && bad == 0);
+    }
+    // A task writes to standard error at once -- before the root's own line after the join -- while
+    // its ordinary output still waits for the join.
+    {
+        const auto [out, err] = cg_run_native_err(
+            "use std::task::*\n"
+            "fn work(x: Int) -> Int {\n"
+            "  eprintln(\"task \", x)\n"
+            "  println(\"out \", x)\n"
+            "  x + 1\n"
+            "}\n"
+            "let t = spawn(work, 1)\n"
+            "let r = unwrap(t.join())\n"
+            "eprintln(\"root \", r)\n");
+        check_true("eprint_task", out == "out 1\n" && err == "task 1\nroot 2\n");
+    }
+    // A function of one's own named eprintln shadows the builtin in its module, as for every ambient name.
+    {
+        const auto [out, err] = cg_run_native_err(
+            "fn eprintln(s: String) -> () { println(\"mine: \" + s) }\n"
+            "eprintln(\"x\")\n");
+        check_true("eprint_shadowed", out == "mine: x\n" && err.empty());
+    }
+    check_true("eprint_needs_an_argument", check_has_p("eprint()\n0", "eprint expects at least one argument"));
     // The raw natives stay behind std::io's gate, and a File cannot be sent to another actor.
     check_true("file_native_gate", cg_check_fails("let _ = rawFileOpen(\"p\", 0)"));
     check_true("file_rejected_in_message", check_has_p(
@@ -11958,7 +12125,11 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // The file-handle five (ids 88-92: rawFileOpen / rawFileRead / rawFileWrite / rawFileSync /
 // rawFileClose) are NOT listed: they are file I/O (OS side effects, like writeFile and appendFile).
 // Pinned by test_file_handles in vm_tests and the file_* tests here.
-static_assert(NATIVE_COUNT == 93,
+// flushOutput (id 93) is NOT listed either: its whole effect is WHEN output reaches the stream, which
+// a model that compares the final text cannot see. Pinned by the flush_output_* tests here.
+// rawWriteErr (id 94) is NOT listed either, and needs no entry: it has no Skarn name. It is what the
+// builtins eprint / eprintln lower to, and the oracle models THOSE (its err_ text, compared by run_diff).
+static_assert(NATIVE_COUNT == 95,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 
@@ -12012,7 +12183,7 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
     // sources: a svc::CheckFailure (the checker rejected it -- ill-typed) vs. any other throw
     // from svc::compile (codegen: the frame emitter self-check / a CodegenError -- a well-typed
     // program lowering cannot handle). Only the former is a generator bug.
-    std::string vm_canon, vm_out, vm_err;
+    std::string vm_canon, vm_out, vm_err, vm_errout;
     bool vm_fault = false, vm_reject = false, vm_cgfail = false;
     try {
         svc::Module m = svc::compile(src.c_str(), prelude);
@@ -12029,6 +12200,7 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
             Heap heap;
             StringInterner interner;
             std::ostringstream oss;
+            std::ostringstream err_oss;   // eprint / eprintln
             // The native registry + the SAME fixed args/stdin the oracle sees, so a generated native
             // call is deterministic and cross-checkable. Harmless for programs with no native calls.
             static const std::vector<NativeFunc> natives = build_native_table();
@@ -12039,14 +12211,15 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
                                &img.trait_table, img.trait_table_width, img.trait_method_count,
                                &img.line_table, &img.function_names, &img.column_table,
                                &natives, &nenv.args, &vm_in,
-                               /*function_modules=*/nullptr, &img.const_arrays);
+                               /*function_modules=*/nullptr, &img.const_arrays, /*task=*/nullptr, &err_oss);
             vm_canon = refeval::canonicalize(vm_to_rt(res.get_reg_base()[0], m));
             vm_out = oss.str();
+            vm_errout = err_oss.str();
         } catch (const std::exception& e) { vm_fault = true; vm_err = e.what(); }   // runtime trap
     } catch (const svc::CheckFailure& e) { vm_reject = true; vm_err = e.what(); }   // checker rejected
       catch (const std::exception& e)    { vm_cgfail = true; vm_err = e.what(); }   // codegen threw
 
-    std::string rf_canon, rf_out, rf_err;
+    std::string rf_canon, rf_out, rf_err, rf_errout;
     bool rf_fault = false, rf_unsup = false, rf_gap = false, rf_reject = false;
     refeval::Coverage rf_cov;
     try {
@@ -12055,6 +12228,7 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
         rf_fault = rr.faulted; rf_unsup = rr.unsupported; rf_gap = rr.oracle_gap; rf_err = rr.fault_msg;
         rf_cov = rr.coverage;
         rf_out = rr.output;
+        rf_errout = rr.err_output;
         if (!rr.faulted) rf_canon = refeval::canonicalize(rr.value);
     } catch (const std::exception& e) { rf_reject = true; rf_err = e.what(); }
 
@@ -12068,15 +12242,17 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
         return { DiffOutcome::Unsupported, {}, {}, rf_err };
 
     const bool agree = (vm_fault == rf_fault) &&
-                       (vm_fault || (vm_canon == rf_canon && vm_out == rf_out));
+                       (vm_fault || (vm_canon == rf_canon && vm_out == rf_out && vm_errout == rf_errout));
     // Construct coverage is folded in ONLY on agreement, and here -- the single place both the corpus
     // (check_same) and the sweep (test_generated) pass through, so neither can be forgotten. "Covered"
     // therefore means the oracle evaluated the construct AND the bytecode produced the same answer.
     if (agree) merge_coverage(rf_cov);
     DiffOutcome o;
     o.kind    = agree ? DiffOutcome::Agree : DiffOutcome::Disagree;
-    o.vm_desc = vm_fault ? "<fault> " + vm_err : vm_canon + "  out=" + vm_out;
-    o.rf_desc = rf_fault ? "<fault> " + rf_err : rf_canon + "  out=" + rf_out;
+    o.vm_desc = vm_fault ? "<fault> " + vm_err
+                         : vm_canon + "  out=" + vm_out + (vm_errout.empty() ? "" : "  err=" + vm_errout);
+    o.rf_desc = rf_fault ? "<fault> " + rf_err
+                         : rf_canon + "  out=" + rf_out + (rf_errout.empty() ? "" : "  err=" + rf_errout);
     return o;
 }
 
@@ -13698,6 +13874,10 @@ void test_differential() {
     // multi-arg (no separator, newline once).
     check_same("diff_print_multi",   "print(\"a\", 1, \"b\")", true);
     check_same("diff_println_multi", "println(1, 2, 3)", true);
+    // eprint / eprintln: the error stream is compared as well.
+    check_same("diff_eprint",   "eprint(\"a\", 1)\n eprint(2.5, true)\n 0", true);
+    check_same("diff_eprintln", "eprintln(42)\n eprintln()\n eprintln(\"x\", [1, 2])\n println(\"out\")", true);
+    check_same("diff_eprint_loop", "for i in [1, 2, 3] { eprint(i, \" \") }\n eprintln(\"end\")", true);
 }
 
 } // namespace

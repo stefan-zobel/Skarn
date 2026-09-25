@@ -601,6 +601,41 @@ inline void test_native_stdin() {
 }
 
 // =============================================================================
+// test_native_write_err -- rawWriteErr(s), what eprint / eprintln lower to: the text goes to the
+// execution's ERROR stream (execute()'s trailing `err`), whole and at once, and nothing of it to the
+// output stream; the result is nil. A non-string argument writes nothing.
+// =============================================================================
+inline void test_native_write_err() {
+    std::cout << "=== native_write_err (rawWriteErr) ===\n";
+    try {
+        Assembler as;
+        as.label("main");
+        as.load_str(0, "first line\n");
+        as.call_native_id(1, 8, 0, 1, NATIVE_WRITE_ERR);    // r1 = rawWriteErr(r0)
+        as.load_str(2, "second");
+        as.call_native_id(3, 8, 2, 1, NATIVE_WRITE_ERR);    // r3 = rawWriteErr(r2)
+        as.J(OpCode::HALT);
+        const auto bytecode = as.assemble();
+
+        Heap heap;
+        StringInterner interner;
+        const auto slits = as.string_literals();
+        std::vector<NativeFunc> ntab = build_native_table();
+        std::ostringstream out, err;
+        std::istringstream in;
+        auto res = execute(bytecode, &heap, nullptr, &interner, 16, nullptr, nullptr,
+                           &slits, nullptr, nullptr, &out, nullptr, 0, 0,
+                           nullptr, nullptr, nullptr, &ntab, nullptr, &in,
+                           nullptr, nullptr, nullptr, &err);
+        auto* regs = res.get_reg_base();
+        std::cout << std::format("err = \"{}\" (expect \"first line\\nsecond\"), out empty: {}\n",
+            err.str() == "first line\nsecond" ? "match" : "MISMATCH", out.str().empty() ? "yes" : "no");
+        check(err.str() == "first line\nsecond" && out.str().empty() && regs[1].isNil() && regs[3].isNil());
+    }
+    catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
 // test_native_process -- rawRun(argv, input) at the id/registry path (the prelude's
 // run/runWith reshape its result into a ProcessOutput struct, tested at the compiler
 // level). rawRun returns a bare Array[3] {stdoutBytes, stderrBytes, exitInt} on a

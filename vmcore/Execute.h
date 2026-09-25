@@ -124,4 +124,9 @@ VM_Resources execute(const std::vector<uint32_t>&    bytecode,
                      const std::vector<std::vector<Value>>* const_arrays = nullptr,
                      // Set only when this execute() runs a fork-join task (see TaskEntry). Placed
                      // last, so existing positional callers are unaffected.
-                     const TaskEntry*                task              = nullptr);
+                     const TaskEntry*                task              = nullptr,
+                     // Error sink for eprint / eprintln: a caller-supplied std::ostream, or std::cerr
+                     // by default. Every task and actor of the world writes to the root's, a whole
+                     // call at a time. Non-owning. Placed last, so existing positional callers are
+                     // unaffected. See VM::err.
+                     std::ostream*                   err               = nullptr);

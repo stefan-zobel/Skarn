@@ -147,6 +147,7 @@ static_assert(static_cast<size_t>(svc::TokKind::Eof)     < 128, "Coverage::op to
 struct RunResult {
     RtValue     value;             // the program's top-level value
     std::string output;            // accumulated print/println text
+    std::string err_output;        // accumulated eprint/eprintln text
     bool        faulted = false;   // a panic / declined program / runtime error occurred
     bool        unsupported = false;   // declined BY DESIGN (see the header comment) -> an honest skip
     bool        oracle_gap  = false;   // declined because the oracle lacks the construct -> a FAILURE

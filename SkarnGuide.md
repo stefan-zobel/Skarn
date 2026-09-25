@@ -3682,6 +3682,21 @@ from the module, does not bring it in.
 `print(x)` and `println(x)` write text to standard output (`println` adds a newline). Both accept any value
 and stringify it, and both accept multiple arguments (printed back-to-back with no separator).
 
+Output goes out line by line, also into a pipe or a file, so a program that runs until it is stopped — a
+server, say — loses nothing it has finished printing. Text without a newline waits for one, or for
+`std::io`'s [`flushOutput()`](SkarnStdlib.md#standard-output).
+
+`eprint(x)` and `eprintln(x)` do the same for standard error, where diagnostics belong:
+
+```rust
+let input = "12x"
+match parseInt(input) {
+    Ok(n)  => println(n),
+    Err(_) => eprintln("not a number: ", input)   // on standard error, not in the output
+}
+println("done")              // => done
+```
+
 ```rust
 print("no newline ")
 println("with newline")      // => no newline with newline

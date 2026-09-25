@@ -117,6 +117,10 @@ struct VM {
     // a caller (tests, a future REPL/embedding) can point it at any std::istream to feed
     // input (e.g. an istringstream), which is exactly what makes the stdin natives testable.
     std::istream*     in                = nullptr;
+    // Error sink for eprint / eprintln (the rawWriteErr native). Non-owning; NOT a GC root.
+    // execute() wires it to the world's error stream (&std::cerr by default), which every isolate
+    // of the world shares; the native writes each call in one piece under the world's lock.
+    std::ostream*     err               = nullptr;
     // Process context: the script's command-line arguments (those AFTER the script path),
     // for the args() native. Non-owning; NOT a GC root (host std::strings, copied into
     // fresh heap strings on demand). Set by the driver (skarnvm); null => no args (empty).

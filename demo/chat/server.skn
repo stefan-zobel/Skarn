@@ -5,7 +5,8 @@
 // Run:   skarnvm demo/chat/server.skn [--port=P] [--port-file=F]
 //        skarnvm demo/chat/server.skn --selftest
 //   --port=P       port to listen on (default 7070; 0 lets the OS pick a free one)
-//   --port-file=F  write the port to file F once listening (for a harness; stdout may be buffered)
+//   --port-file=F  write the port to file F once listening (for a harness that starts the
+//                  server with --port=0 and must learn which port it got)
 //   --selftest     start the server on a free port, run a scripted conversation of several clients in
 //                  this process against it, print what each of them heard, and exit 0 if it all went
 //                  as expected (1 if not)

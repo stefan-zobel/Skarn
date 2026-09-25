@@ -158,13 +158,14 @@ void cref_expr(const Expr& e, RefSet r) {
             const auto& fld = static_cast<const FieldExpr&>(*c.callee);
             if (!fld.tuple_index) r.methods->insert(fld.name);
         }
-        // A `toString`/`print`/`println` (or `${}` desugars to toString) of a Char-typed argument is
+        // A `toString`/`print`/`println`/`eprint`/`eprintln` (or `${}` desugars to toString) of a Char-typed argument is
         // lowered by codegen to a SYNTHESIZED `codePointToStr(cp)` call (the glyph), so the fn name never
         // appears literally -- keep the shakeable prelude encoder here. (Conservative: the check is by the
         // "Char" short name, a superset of codegen's transparent-struct test -- never under-keeps.)
         if (c.callee && c.callee->kind == ExprKind::Ident) {
             const auto& id = static_cast<const IdentExpr&>(*c.callee);
-            if (id.qualifier.empty() && (id.name == "toString" || id.name == "print" || id.name == "println")) {
+            if (id.qualifier.empty() && (id.name == "toString" || id.name == "print" || id.name == "println" ||
+                                         id.name == "eprint" || id.name == "eprintln")) {
                 for (const auto& a : c.args)
                     if (a->ty && a->ty->kind == TyKind::Named && short_name(a->ty->name) == "Char") {
                         r.names->insert(std_codePointToStr());

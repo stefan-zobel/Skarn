@@ -163,7 +163,13 @@ enum NativeId : uint16_t {
     NATIVE_FILE_WRITE  = 90,    // rawFileWrite(fd, bytes) -> nil | String (one OS write; atomic per call in append mode)
     NATIVE_FILE_SYNC   = 91,    // rawFileSync(fd)         -> nil | String (FlushFileBuffers / fsync)
     NATIVE_FILE_CLOSE  = 92,    // rawFileClose(fd)        -> nil | String (frees the slot; the descriptor goes stale)
-    NATIVE_COUNT       = 93,
+    // Pushes this isolate's buffered output on to the program's stream now, a partial line included
+    // (a progress mark or a prompt printed without a newline).
+    NATIVE_FLUSH_OUTPUT = 93,   // flushOutput()           -> ()
+    // Standard error: what eprint / eprintln lower to (no Skarn name of its own -- codegen emits it).
+    // One call is one piece of text, written at once under the world's lock.
+    NATIVE_WRITE_ERR   = 94,    // rawWriteErr(s)          -> ()
+    NATIVE_COUNT       = 95,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -269,6 +275,8 @@ inline int native_id_of(const std::string& name) {
     if (name == "rawFileWrite") return NATIVE_FILE_WRITE;
     if (name == "rawFileSync") return NATIVE_FILE_SYNC;
     if (name == "rawFileClose") return NATIVE_FILE_CLOSE;
+    if (name == "flushOutput") return NATIVE_FLUSH_OUTPUT;
+    if (name == "rawWriteErr") return NATIVE_WRITE_ERR;
     return -1;
 }
 
@@ -337,6 +345,8 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_MONITOR: case NATIVE_STOP_REQUESTED: case NATIVE_SLEEP: case NATIVE_SELECT:
         case NATIVE_ACTIVE_CLOSE:
         case NATIVE_ACTIVE_SET_SEND_TIMEOUT:
+        case NATIVE_FLUSH_OUTPUT:
+        case NATIVE_WRITE_ERR:
         case NATIVE_READ_ALL_STDIN: return NRET_PLAIN;
         default:                 return NRET_RESULT;
     }
@@ -414,6 +424,7 @@ inline int native_arity(int id) {
         case NATIVE_ACTIVE_CLOSE:
         case NATIVE_FILE_SYNC:
         case NATIVE_FILE_CLOSE:
+        case NATIVE_WRITE_ERR:
         case NATIVE_SHA256:
         case NATIVE_F64_TO_BYTES: return 1;
         case NATIVE_NANO_TIME:
@@ -426,6 +437,7 @@ inline int native_arity(int id) {
         case NATIVE_MAIN_INBOX:
         case NATIVE_SELF_ID:
         case NATIVE_OS_ID:
+        case NATIVE_FLUSH_OUTPUT:
         case NATIVE_READ_ALL_STDIN: return 0;
         default:                return 0;
     }

@@ -67,13 +67,21 @@ helps where a definition of your own shadows it.
 | Function | Purpose |
 |----------|---------|
 | `print(a, ...)` / `println(a, ...)` | write values to standard output (`println` adds a newline) |
+| `eprint(a, ...)` / `eprintln(a, ...)` | the same to standard error, for diagnostics |
 | `toString(x)` | render any value as text |
 | `panic(msg)` | abort the program with a message |
 | `assert(cond, msg)` | abort if `cond` is false |
 | `gcStats()` / `gcResetStats()` | the garbage collector's counters since the start or the last reset → `GcStats` / clear them, so a region can be measured: `gcResetStats()`, the code, then `gcStats()` |
 
 `print` and `println` accept any value and several arguments; the guide shows them in
-[§22](SkarnGuide.md#printing). A `GcStats` is a plain struct of `Double` counters — `collections`,
+[§22](SkarnGuide.md#printing). Output goes out line by line, also into a pipe or a file: a line reaches
+the reader as soon as it is complete, and within a few milliseconds when many lines come in a row. Text
+without a newline waits for one, or for [`flushOutput()`](#standard-output) from `std::io`.
+
+`eprint` and `eprintln` take the same arguments and write to standard error, where a program's
+diagnostics belong: someone who redirects the output to a file still sees them. Each call goes out at
+once and in one piece, so lines from several actors never mix, and whatever the program printed to
+standard output before is written out first, so a terminal shows the two in the order they happened. A `GcStats` is a plain struct of `Double` counters — `collections`,
 `objectsAlloced`, `bytesAlloced`, `fromUsedSum`, `survivorsSum`, `gcNanosTotal`, `gcNanosMax` and
 `growEvents`; a `Double` holds them exactly, where a 48-bit `Int` might not.
 
@@ -334,6 +342,7 @@ standard input. `use std::io::*`
 | `f.sync()` | wait until the operating system has written the file's data to the storage device |
 | `f.close()` | close the file; any later use of `f` is an `Err` |
 | `readLine()` / `readAllStdin()` | read a line / all of standard input |
+| `flushOutput()` | write out now what the program has printed, a line without its newline included |
 
 ### Files
 
@@ -412,7 +421,29 @@ closed is closed when the program ends.
 ### Standard input
 
 `readLine()` reads one line as an `Option[String]` (`None` at end of input); `readAllStdin()` reads everything
-to end of input as one `String`.
+to end of input as one `String`. Both first write out whatever has been printed, so a prompt printed without a
+newline is shown before the program waits.
+
+### Standard output
+
+Complete lines need nothing: they go out on their own (see [§1](#1-core-and-output)). `flushOutput()`
+writes out now what the program has printed so far, including a line that has no newline yet — a progress
+mark, or a prompt before work that takes a while. In an actor it writes that actor's
+output. A task's output reaches the program when the task is joined, so there it changes nothing.
+
+```rust
+use std::io::*
+
+print("adding up ... ")
+flushOutput()                                             // on the screen before the loop runs
+let mut sum = 0
+let mut i = 1
+while i <= 1000 {
+    sum += i
+    i += 1
+}
+println(sum)                                              // => adding up ... 500500
+```
 
 ## 9. `std::env`: arguments, environment, clocks
 

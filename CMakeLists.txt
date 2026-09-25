@@ -140,6 +140,10 @@ if(TARGET skarnvm)
     add_test(NAME highlighters
              COMMAND "${Python3_EXECUTABLE}" tests/check_highlighters.py ${SKARN_DRIVER}
              WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # A running program's output reaches a pipe line by line, before the program ends.
+    add_test(NAME live_output
+             COMMAND "${Python3_EXECUTABLE}" tests/check_live_output.py ${SKARN_DRIVER}
+             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     # Sedis, the key-value server under Sedis/, has tests of its own; registered only where the
     # directory exists.
     if(EXISTS "${CMAKE_SOURCE_DIR}/Sedis/tests/run_tests.py")

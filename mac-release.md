@@ -34,9 +34,9 @@ This builds every target, the test suites included, which step 2 runs. Confirm t
 ctest --test-dir /tmp/skarn-release/build --output-on-failure
 ```
 
-All twelve entries must pass: the four suites (`vm_tests`, `vm_fault_probe`, `static_compiler_tests`,
-`skarn_lsp_selftest`) and the eight Python gates (`doc_claims`, `doc_examples`, `examples`, `doc_links`,
-`doc_anchors`, `demos`, `stdlib_reference`, `highlighters`, which need Python 3.9 or newer). Expected totals (Release, arm64) — these must
+All thirteen entries must pass: the four suites (`vm_tests`, `vm_fault_probe`, `static_compiler_tests`,
+`skarn_lsp_selftest`) and the nine Python gates (`doc_claims`, `doc_examples`, `examples`, `doc_links`,
+`doc_anchors`, `demos`, `stdlib_reference`, `highlighters`, `live_output`, which need Python 3.9 or newer). Expected totals (Release, arm64) — these must
 match the Windows numbers in the release notes:
 
 ```
@@ -139,7 +139,7 @@ git worktree remove /tmp/skarn-release
 ### Checklist
 
 - [ ] Built from the exact release tag, not a branch tip
-- [ ] All ten ctest entries green, totals match Windows
+- [ ] All thirteen ctest entries green, totals match Windows
 - [ ] Archive unpacks to a single `Skarn-<version>-macos-arm64/` folder
 - [ ] Executable bit set on `skarnvm` and `skarn_lsp` (`.tar.gz` preserves it; `.zip` does not)
 - [ ] `README.txt` inside the archive is the macOS-specific one (Gatekeeper note, `./skarnvm` rather than `skarnvm.exe`)

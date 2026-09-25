@@ -40,6 +40,10 @@
 #include <set>
 #include <optional>
 #include <exception>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #include "Compiler.h"   // svc::compile / svc::builtin_prelude / svc::CheckFailure / svc::Module / module_to_image
 #include "BytecodeIO.h"  // bcio::ModuleImage / serialize / deserialize / BytecodeError
@@ -51,6 +55,74 @@
 #include "Natives.h"     // build_native_table() -- the file/time/env/stdin native registry
 
 namespace {
+
+// The program's standard output, pushed to the OS line by line. The C runtime buffers stdout in blocks
+// when it is a pipe or a file (MSVC treats _IOLBF as full buffering, so setvbuf cannot ask for lines),
+// and a process that is killed -- the usual end of a server -- would lose everything still in that
+// block. So a completed line goes out at once when nothing was flushed during the last GAP, which is
+// every line a server, a progress report or a log writes. Inside a burst the lines are gathered and a
+// flusher thread pushes them at most GAP after the first, because a flush per line made a program that
+// prints a million lines 4 to 11 times slower; this way it pays 10-17 %. A line not yet ended waits for its newline or for std::io's flushOutput(). The VM's
+// actors hand their output to this stream a whole line at a time, so their lines go out the same way.
+class LineFlushBuf : public std::streambuf {
+public:
+    explicit LineFlushBuf(std::streambuf* target) : target_(target), flusher_([this] { run(); }) {}
+    ~LineFlushBuf() override {
+        { std::lock_guard<std::mutex> lk(m_); stop_ = true; }
+        cv_.notify_one();
+        flusher_.join();
+        std::lock_guard<std::mutex> lk(m_);
+        target_->pubsync();
+    }
+protected:
+    int_type overflow(int_type c) override {
+        if (traits_type::eq_int_type(c, traits_type::eof())) return traits_type::not_eof(c);
+        std::lock_guard<std::mutex> lk(m_);
+        if (traits_type::eq_int_type(target_->sputc(traits_type::to_char_type(c)), traits_type::eof()))
+            return traits_type::eof();
+        if (traits_type::to_char_type(c) == '\n') line_ended();
+        return c;
+    }
+    std::streamsize xsputn(const char* s, std::streamsize n) override {
+        std::lock_guard<std::mutex> lk(m_);
+        const std::streamsize done = target_->sputn(s, n);
+        if (done > 0 && std::char_traits<char>::find(s, static_cast<size_t>(done), '\n') != nullptr)
+            line_ended();
+        return done;
+    }
+    int sync() override {
+        std::lock_guard<std::mutex> lk(m_);
+        dirty_ = false;
+        last_  = Clock::now();
+        return target_->pubsync();
+    }
+private:
+    using Clock = std::chrono::steady_clock;
+    static constexpr std::chrono::milliseconds GAP{ 10 };
+    // m_ held. A line after a quiet GAP goes out at once; inside a burst the flusher pushes it at most
+    // GAP later, so bulk output pays one flush per GAP instead of one per line.
+    void line_ended() {
+        const auto now = Clock::now();
+        if (now - last_ >= GAP) { target_->pubsync(); last_ = now; dirty_ = false; }
+        else if (!dirty_)       { dirty_ = true; cv_.notify_one(); }
+    }
+    void run() {
+        std::unique_lock<std::mutex> lk(m_);
+        for (;;) {
+            cv_.wait(lk, [this] { return stop_ || dirty_; });
+            if (stop_) return;
+            cv_.wait_until(lk, last_ + GAP, [this] { return stop_; });
+            if (dirty_) { target_->pubsync(); last_ = Clock::now(); dirty_ = false; }
+        }
+    }
+    std::streambuf*         target_;
+    std::mutex              m_;
+    std::condition_variable cv_;
+    bool                    dirty_ = false;
+    bool                    stop_  = false;
+    Clock::time_point       last_{};
+    std::thread             flusher_;   // last: starts after everything it reads is built
+};
 
 // Reads the entire file at `path` into `out`. Returns false if it cannot be opened.
 // Binary mode so no newline translation happens (the lexer treats '\r' as whitespace).
@@ -241,9 +313,11 @@ int run_image(const bcio::ModuleImage& img,
         // Skarn has no atoms, but execute() gates the true/false/nil TO_STRING pool on a
         // non-null atom_names table (vmcore is unchanged). Pass an EMPTY one so that pool builds.
         const std::vector<std::string> no_atoms;
+        LineFlushBuf line_buf(std::cout.rdbuf());
+        std::ostream out(&line_buf);
         execute(img.bytecode, &heap, nullptr, &interner, img.top_frame_size,
                 &img.constants, &img.struct_types, &img.string_literals,
-                &no_atoms, &img.function_table, &std::cout,
+                &no_atoms, &img.function_table, &out,
                 &img.trait_table, img.trait_table_width, img.trait_method_count,
                 &img.line_table, &img.function_names, &img.column_table,
                 &natives,        // the file/time/env/stdin native registry
