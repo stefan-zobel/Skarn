@@ -1,0 +1,4 @@
+// CLAIM: exit lives in std::process: without the `use` it is not in scope.
+// GUIDE: SkarnStdlib.md §10 "Ending the program"
+// EXPECT: fail requires `use std::process
+exit(1)

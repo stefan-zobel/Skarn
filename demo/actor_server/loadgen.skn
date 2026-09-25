@@ -16,6 +16,7 @@ use std::net::*
 use std::task::*
 use std::cli::*
 use std::env::*
+use std::process::exit
 
 struct Job { port: Int, path: String, expect: String, requests: Int }
 
@@ -59,7 +60,10 @@ fn client(job: Job) -> Outcome {
 fn intOpt(opts: CliArgs, name: String, dflt: Int) -> Int {
     match parseInt(opts.getOptOr(name, toString(dflt))) {
         Ok(v) => v,
-        Err(_) => panic("--${name} needs a whole number"),
+        Err(_) => {
+            eprintln("--${name} needs a whole number")
+            exit(1)
+        },
     }
 }
 
@@ -73,7 +77,10 @@ fn pct(sorted: Vec[Int], p: Int) -> Int {
 
 let opts     = CliArgs::parse(args())
 let port     = intOpt(opts, "port", 0)
-if port == 0 { panic("--port is required") }
+if port == 0 {
+    eprintln("--port is required")
+    exit(1)
+}
 let clients  = intOpt(opts, "clients", 16)
 let requests = intOpt(opts, "requests", 100)
 let path     = opts.getOptOr("path", "/")

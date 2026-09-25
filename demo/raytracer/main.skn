@@ -33,6 +33,7 @@ use std::math::*
 use std::env::*
 use std::random::*
 use std::cli::*
+use std::process::exit
 use std::hash::*
 use std::task::*
 
@@ -427,7 +428,10 @@ let kernel  = if fast { 1 } else if inlined { 2 } else { 0 }
 let preview = opts.hasFlag("preview")
 let threads = match parseInt(opts.getOptOr("threads", "1")) {
     Ok(n)  => if n < 1 { 1 } else { n },
-    Err(_) => panic("--threads needs a whole number, e.g. --threads=4"),
+    Err(_) => {
+        eprintln("--threads needs a whole number, e.g. --threads=4")
+        exit(1)
+    },
 }
 
 println("Skarn raytracer -- three intersection kernels: idiomatic / compiler-inlined / hand-scalarized")

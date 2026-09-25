@@ -169,7 +169,10 @@ enum NativeId : uint16_t {
     // Standard error: what eprint / eprintln lower to (no Skarn name of its own -- codegen emits it).
     // One call is one piece of text, written at once under the world's lock.
     NATIVE_WRITE_ERR   = 94,    // rawWriteErr(s)          -> ()
-    NATIVE_COUNT       = 95,
+    // Ends the program with an exit code (0..255), running its ordinary end on the way: actors are told
+    // to stop, every thread is joined, output is flushed. The root only; in an actor or a task a fault.
+    NATIVE_EXIT        = 95,    // exit(code)              -> never returns (throws ProgramExit)
+    NATIVE_COUNT       = 96,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -277,6 +280,7 @@ inline int native_id_of(const std::string& name) {
     if (name == "rawFileClose") return NATIVE_FILE_CLOSE;
     if (name == "flushOutput") return NATIVE_FLUSH_OUTPUT;
     if (name == "rawWriteErr") return NATIVE_WRITE_ERR;
+    if (name == "exit") return NATIVE_EXIT;
     return -1;
 }
 
@@ -347,6 +351,7 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_ACTIVE_SET_SEND_TIMEOUT:
         case NATIVE_FLUSH_OUTPUT:
         case NATIVE_WRITE_ERR:
+        case NATIVE_EXIT:
         case NATIVE_READ_ALL_STDIN: return NRET_PLAIN;
         default:                 return NRET_RESULT;
     }
@@ -425,6 +430,7 @@ inline int native_arity(int id) {
         case NATIVE_FILE_SYNC:
         case NATIVE_FILE_CLOSE:
         case NATIVE_WRITE_ERR:
+        case NATIVE_EXIT:
         case NATIVE_SHA256:
         case NATIVE_F64_TO_BYTES: return 1;
         case NATIVE_NANO_TIME:

@@ -530,6 +530,11 @@ crashes, naming the child, and a shutdown abandons it. At its own `Stop` a super
 in **reverse** start order, each waited for before the next is told — the order a child that depends on an
 earlier one needs.
 
+The whole program ends the same way when the main program calls `std::process`'s `exit(code)`: every
+actor is told to stop and waited for before the process ends with that code. Only the main program may
+call it; in an actor, `exit` is a crash like any other ([§8](#8-when-an-actor-crashes)). An actor that
+decides the program must end sends the main program a message, and the main program calls `exit`.
+
 ## 13. Back-pressure
 
 A mailbox grows for as long as messages arrive faster than the actor reads them. A reader that is 10 %

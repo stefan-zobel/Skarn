@@ -149,6 +149,8 @@ struct RunResult {
     std::string output;            // accumulated print/println text
     std::string err_output;        // accumulated eprint/eprintln text
     bool        faulted = false;   // a panic / declined program / runtime error occurred
+    bool        exited  = false;   // the program called std::process's exit (not a fault)
+    int         exit_code = 0;     // its code, valid iff `exited`
     bool        unsupported = false;   // declined BY DESIGN (see the header comment) -> an honest skip
     bool        oracle_gap  = false;   // declined because the oracle lacks the construct -> a FAILURE
     std::string fault_msg;
@@ -178,6 +180,8 @@ inline constexpr std::string_view DIFFERENTIABLE_NATIVES[] = {
     "parseInt", "parseDouble",
     // The running platform -- one answer per machine, mirrored below with the same #ifdef
     "rawOsId",
+    // Ending the program -- deterministic: the code, and what was printed before it
+    "exit",
     // std::math -- pure libm, bit-identical on both sides
     "sqrt", "cbrt", "exp", "ln", "pow", "hypot", "abs",
     "sin", "cos", "tan", "asin", "acos", "atan",

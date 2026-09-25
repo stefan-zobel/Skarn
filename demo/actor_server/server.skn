@@ -37,6 +37,7 @@ use std::actor::*
 use std::cli::*
 use std::env::*
 use std::io::*
+use std::process::exit
 
 // Sum of the decimal digits of 1..n: plain interpreted arithmetic, a stand-in for real work.
 fn work(n: Int) -> Int {
@@ -160,7 +161,10 @@ fn runPull(srv: TcpListener, nWorkers: Int, limit: Int, credits: Int) -> Result[
 fn intOpt(opts: CliArgs, name: String, dflt: Int) -> Int {
     match parseInt(opts.getOptOr(name, toString(dflt))) {
         Ok(v) => v,
-        Err(_) => panic("--${name} needs a whole number"),
+        Err(_) => {
+            eprintln("--${name} needs a whole number")
+            exit(1)
+        },
     }
 }
 
@@ -204,5 +208,8 @@ fn run() -> Result[(), String] {
 
 match run() {
     Ok(_) => {},
-    Err(e) => panic("server: ${e}"),
+    Err(e) => {
+        eprintln("server: ${e}")
+        exit(1)
+    },
 }

@@ -297,7 +297,9 @@ bool write_file_binary(const std::string& path, const std::vector<uint8_t>& byte
 // Runs a ready-to-execute bytecode image on a fresh heap, wiring the native registry, the
 // program's args(), and stdin -- exactly as the compile path does. `src_for_caret` renders a
 // VmFault caret (empty when running a serialized image with no source on hand). Shared by the
-// normal run and the --run-bytecode path. Returns 0 on success, 1 on a runtime trap.
+// normal run and the --run-bytecode path. Returns 0 on success, 1 on a runtime trap, and the
+// program's own code when it called std::process's exit (ProgramExit: no message, no caret -- the
+// world's end has already run while the exception left execute()).
 // `module_sources` maps a module prefix ("" = entry, "std::core" / "net::http" = a std/imported
 // module) to its source text, so a VmFault caret renders against the RIGHT file (the frame carries
 // its owning module in `frame.module`). `fallback_src` is used when the frame's module is not in the
@@ -326,6 +328,9 @@ int run_image(const bcio::ModuleImage& img,
                 &img.function_modules,   // per-function module prefix -> per-module fault caret
                 &img.const_arrays);      // const-array literals -> the LOAD_CONST_ARRAY pool
         std::cout.flush();
+    } catch (const ProgramExit& e) {
+        std::cout.flush();
+        return e.code;
     } catch (const std::exception& e) {
         std::cout.flush();
         std::cerr << "error: " << e.what() << "\n";

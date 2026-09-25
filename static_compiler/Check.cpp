@@ -254,6 +254,7 @@ public:
     // What the builtins that infer_call special-cases accept, written by hand: no FnSig can state
     // them (polymorphic over container kinds, variadic, or a FnSig row that goes unused, as push /
     // pop). One line per accepted shape; keep in step with the check_* function named in infer_call.
+    // A native whose FnSig returns Never is listed too, so the listing says `Never`, as panic's does.
     static constexpr std::pair<std::string_view, std::string_view> SPECIAL_BUILTIN_SIGNATURES[] = {
         { "len",             "fn len(String | List[T] | Array[T] | Vec[T] | Bytes | Map[K, V]) -> Int" },
         { "print",           "fn print(T, ...)" },
@@ -261,6 +262,7 @@ public:
         { "eprint",          "fn eprint(T, ...)" },
         { "eprintln",        "fn eprintln(T, ...)" },
         { "panic",           "fn panic(String) -> Never" },
+        { "exit",            "fn exit(Int) -> Never" },
         { "has",             "fn has(Map[K, V], K) -> Bool" },
         { "delete",          "fn delete(Map[K, V], K) -> Bool" },
         { "get",             "fn get(Map[K, V], K) -> Option[V]\nfn get(Array[T], Int) -> Option[T]\n"
@@ -1345,6 +1347,10 @@ private:
         // rawRun, so the prelude's currentOs() wrapper reaches it as same-module code; that wrapper is
         // what sh() branches on to pick the platform's shell.
         add_native("rawOsId",      {},       ty_int(),                                        STD_PROCESS);
+        // Ends the program with an exit code, after its ordinary end (actors stopped, threads joined,
+        // output flushed). Never returns, so -- like panic -- it fits where any type is expected. The
+        // VM refuses it in an actor or a task and a code outside 0..255 (run-time faults).
+        add_native("exit",         { ty_int() }, ty_never(),                                STD_PROCESS);
         // TCP networking -- std::net (opt-in; the prelude connect/send/recv/... wrappers live there too,
         // so they may call the tcp* natives as same-module code). A socket is an Int descriptor; every
         // native returns a Result (success = Int/Bytes/unit, failure = a String error message).

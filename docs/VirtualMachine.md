@@ -74,7 +74,7 @@ compiler, the driver and the test programs include its headers and link it.
 | `GlobalEnv.h`, `StringInterner.h`, `HashTable.h`, `HashingPolicy.h` | globals, interning and the host-side hash table |
 | `StructType.h`, `FunctionTable.h`, `TypeUniverse.h` | struct descriptors, per-function metadata, type ids for trait dispatch |
 | `NativeRegistry.h`, `Natives.h` | the native-function registry |
-| `Fault.h` | `VmFault`, the structured runtime error |
+| `Fault.h` | `VmFault`, the structured runtime error, and `ProgramExit`, the program's own request to end |
 | `BytecodeIO.h` | the `.skbc` bytecode file format |
 | `ValueCodec.h` | copying a runtime value from one heap to another through a byte buffer |
 | `ByteIO.h` | the little-endian byte primitives both formats above share |
@@ -271,7 +271,9 @@ at the end as part of the write, as `appendFile` does, and `sync` is `FlushFileB
 out of messages. Two natives serve the program's own streams: `flushOutput` flushes its output stream,
 and `rawWriteErr` writes one string to its error stream — the compiler joins the arguments of `eprint` /
 `eprintln` into that one string, so a call arrives in one piece, and the native flushes the output stream
-first, so the two streams appear in the order they were written. `tcpConnect` gives up after 10 seconds: on POSIX
+first, so the two streams appear in the order they were written. `exit` ends the program: in the
+execution that owns the world it throws `ProgramExit` with the code (0 to 255, else a fault), and in a task
+or an actor it is a fault, since nothing could interrupt the root wherever it waits. `tcpConnect` gives up after 10 seconds: on POSIX
 through a non-blocking connect and `select()`, on Windows through a blocking connect bounded by `TCP_MAXRT`,
 because there the `select()` wait can add one timer tick (about 15 ms) even on loopback.
 
@@ -381,6 +383,13 @@ error: division by zero at line 2 (in boom)
 ```
 
 A frame replaced by a tail call does not appear in the trace.
+
+A program that ends itself with `std::process`'s `exit` is not a fault. The native throws `ProgramExit`
+(`Fault.h`), which leaves `execute()` the same way, so the world's destructor runs the ordinary end on
+the way out: the root's partial line is flushed, every actor is told to stop and every thread is joined.
+The driver catches it before any fault and returns its code as the process's exit code, printing
+nothing. A caller that catches only `std::exception` still sees the run end, as `ProgramExit` derives
+from it.
 
 The dispatch loop itself contains no exception handler. `run_switch` wraps it in one frame for the faults
 that cannot be located: an access violation, an illegal opcode, heap exhaustion. On Windows that frame is a

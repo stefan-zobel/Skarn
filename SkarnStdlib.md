@@ -69,7 +69,7 @@ helps where a definition of your own shadows it.
 | `print(a, ...)` / `println(a, ...)` | write values to standard output (`println` adds a newline) |
 | `eprint(a, ...)` / `eprintln(a, ...)` | the same to standard error, for diagnostics |
 | `toString(x)` | render any value as text |
-| `panic(msg)` | abort the program with a message |
+| `panic(msg)` | abort the program with a message, its source position and a call trace — for a bug; an error a user caused ends with [`exit`](#ending-the-program) |
 | `assert(cond, msg)` | abort if `cond` is false |
 | `gcStats()` / `gcResetStats()` | the garbage collector's counters since the start or the last reset → `GcStats` / clear them, so a region can be measured: `gcResetStats()`, the code, then `gcStats()` |
 
@@ -81,7 +81,9 @@ without a newline waits for one, or for [`flushOutput()`](#standard-output) from
 `eprint` and `eprintln` take the same arguments and write to standard error, where a program's
 diagnostics belong: someone who redirects the output to a file still sees them. Each call goes out at
 once and in one piece, so lines from several actors never mix, and whatever the program printed to
-standard output before is written out first, so a terminal shows the two in the order they happened. A `GcStats` is a plain struct of `Double` counters — `collections`,
+standard output before is written out first, so a terminal shows the two in the order they happened.
+
+A `GcStats` is a plain struct of `Double` counters — `collections`,
 `objectsAlloced`, `bytesAlloced`, `fromUsedSum`, `survivorsSum`, `gcNanosTotal`, `gcNanosMax` and
 `growEvents`; a `Double` holds them exactly, where a 48-bit `Int` might not.
 
@@ -485,16 +487,18 @@ println("elapsed >= 0: " + (t1 - t0 >= 0))   // => elapsed >= 0: true
 
 ## 10. `std::process`: running programs
 
-Run an external command and capture its output, and ask which platform you are on. `use std::process::*`
+Run an external command and capture its output, ask which platform you are on, and end the program with an
+exit code. `use std::process::*`
 
 | Function | Purpose |
 |----------|---------|
 | `run(argv)` / `runText(argv)` / `sh(cmdline)` | spawn a process and capture its output (`sh` goes through the platform's shell) |
 | `runWith(argv, input)` | as `run`, with `input: Bytes` fed to the child's standard input |
+| `currentOs()` | which platform the program is running on (`Os::Windows` / `Os::MacOS` / `Os::Other`) |
+| `exit(code)` | end the program with an exit code from 0 to 255 ([Ending the program](#ending-the-program)) |
 
 `run`, `runWith` and `sh` return a `ProcessOutput` — `stdout` and `stderr` as `Bytes`, and `exitCode` —
 and `runText` a `ProcessText`, the same with both streams decoded to `String`.
-| `currentOs()` | which platform the program is running on (`Os::Windows` / `Os::MacOS` / `Os::Other`) |
 
 ### Running processes
 
@@ -535,6 +539,40 @@ println("running on " + label)
 
 `Os::Other` covers everything that is neither: Skarn is built and tested on Windows x64 and macOS on Apple
 Silicon, and rather than guess at a third platform's name it puts them all in one arm.
+
+### Ending the program
+
+`exit(code)` ends the program with that exit code, and never returns — so, like `panic`, it has type
+`Never` and fits where any value is expected. It is how a program reports a failure its user caused, a
+bad option or a port already taken: the message goes to standard error with `eprintln`, the code tells a
+script or a shell that it failed, and nothing else is printed. `panic` is for bugs, and adds a source
+position and a call trace meant for the programmer.
+
+```rust
+use std::process::*
+
+fn port(text: String) -> Result[Int, String] {
+    let n = parseInt(text)?
+    if n < 1 || n > 65535 {
+        return Err("port out of range: ${n}")
+    }
+    Ok(n)
+}
+
+match port("8080") {
+    Ok(p) => println("listening on ${p}"),   // => listening on 8080
+    Err(e) => {
+        eprintln("server: " + e)
+        exit(2)
+    }
+}
+```
+
+The program ends the way it ends on its own: what it printed goes out, a line without a newline too,
+every actor is told to stop and waited for, and so is every task. The code must be between 0 and 255 —
+the range every platform keeps — or `exit` is a run-time error. Only the main program may call it: in an
+actor it is a crash, reported to the actor's starter, and in a task the `join` returns the error. An
+actor that decides the program must end tells the main program, which calls `exit`.
 
 ## 11. `std::math`
 

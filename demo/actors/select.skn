@@ -25,6 +25,7 @@
 use std::actor::*
 use std::cli::*
 use std::env::*
+use std::process::exit
 
 
 // What the control queue carries. Nothing about it matches the job type, and it does not have to.
@@ -87,7 +88,10 @@ fn say(me: Inbox[Note]) -> String {
 let opts = CliArgs::parse(toVec(args()))
 let jobs = match parseInt(opts.getOptOr("jobs", "4")) {
   Ok(n)  => if n > 0 { n } else { 4 },
-  Err(_) => panic("--jobs needs a whole number"),
+  Err(_) => {
+    eprintln("--jobs needs a whole number")
+    exit(1)
+  },
 }
 
 let me: Inbox[Note] = mainInbox()

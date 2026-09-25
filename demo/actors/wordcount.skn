@@ -25,6 +25,7 @@ use std::actor::*
 use std::cli::*
 use std::env::*
 use std::io::*
+use std::process::exit
 use std::random::*
 
 // What the reader sends a counter.
@@ -167,14 +168,20 @@ fn generate(n: Int) -> Vec[String] {
 fn fileLines(path: String) -> Vec[String] {
     match readFile(path) {
         Ok(b) => collect(lines(fromBytes(b))),
-        Err(e) => panic("could not read ${path}: ${e}"),
+        Err(e) => {
+            eprintln("could not read ${path}: ${e}")
+            exit(1)
+        },
     }
 }
 
 fn intOpt(opts: CliArgs, name: String, dflt: Int) -> Int {
     match parseInt(opts.getOptOr(name, toString(dflt))) {
         Ok(v) => if v < 1 { 1 } else { v },
-        Err(_) => panic("--${name} needs a whole number"),
+        Err(_) => {
+            eprintln("--${name} needs a whole number")
+            exit(1)
+        },
     }
 }
 
@@ -187,7 +194,10 @@ let counters = intOpt(opts, "counters", 4)
 let batch    = intOpt(opts, "batch", 250)
 let capacity = match parseInt(opts.getOptOr("capacity", "0")) {
     Ok(v) => if v < 0 { 0 } else { v },
-    Err(_) => panic("--capacity needs a whole number"),
+    Err(_) => {
+        eprintln("--capacity needs a whole number")
+        exit(1)
+    },
 }
 let text     = match opts.positionalAt(0) {
     Some(path) => fileLines(path),

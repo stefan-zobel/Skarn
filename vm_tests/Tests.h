@@ -3639,6 +3639,12 @@ inline void task_fns(Assembler& as) {
     as.load_const(0, 0);
     as.J(OpCode::RET);
 
+    // xexit(code): calls exit(code) -- as an actor or a task, which may not end the program.
+    as.label("xexit");
+    as.call_native_id(1, 5, 0, 1, NATIVE_EXIT);
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
     // tinbox(_): a TASK asking for an inbox (refused: tasks have no mail).
     as.label("tinbox");
     as.load_const(1, 0);
@@ -3668,6 +3674,7 @@ inline void declare_task_fns(Assembler& as) {
     as.declare_fn("agate",  12, 1);
     as.declare_fn("aflood", 8, 1);
     as.declare_fn("tinbox", 4, 1);
+    as.declare_fn("xexit",  8, 1);
 }
 
 // id -> r[rd]: spawnActorBounded fn(arg, capacity), where arg is already in r44.
@@ -4825,6 +4832,92 @@ inline void test_actor_stop_requested() {
                                      foreign_ok ? "PASS" : "FAIL", br.fault);
             check(quiet_ok && stop_ok && slot_ok && foreign_ok);
         }
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// exit(code) ends the ROOT with ProgramExit -- not a fault -- after the world's ordinary end: what was
+// printed is there, a partial line included, and an actor still running got Stop and was joined first.
+// A code outside 0..255 is a located fault. In an actor or a task it is a fault too (nothing could
+// interrupt the root wherever it waits), which reaches the starter as a crash and the joiner as an error.
+inline void test_native_exit() {
+    using namespace forkjoin;
+    std::cout << "=== native_exit ===\n";
+    try {
+        // Runs `as` as a root; returns the exit code (-1 if the run ended without ProgramExit), the
+        // printed text and a fault's message.
+        struct Ended { int code = -1; std::string printed, fault; };
+        auto run_root = [](Assembler& as) {
+            as.J(OpCode::HALT);
+            task_fns(as);
+            const auto code  = as.assemble();
+            const auto slits = as.string_literals();
+            const auto nat   = build_native_table();
+            Heap heap;
+            StringInterner interner;
+            std::ostringstream os;
+            Ended e;
+            try {
+                execute(code, &heap, nullptr, &interner, TF, nullptr, nullptr, &slits, nullptr,
+                        &as.function_table(), &os, nullptr, 0, 0, nullptr, nullptr, nullptr, &nat);
+            } catch (const ProgramExit& x) { e.code = x.code; }
+              catch (const std::exception& x) { e.fault = x.what(); }
+            e.printed = os.str();
+            return e;
+        };
+        auto exit_with = [&](int64_t n) {
+            Assembler as;
+            declare_task_fns(as);
+            as.label("main");
+            as.load_str(10, "before");
+            as.R6(OpCode::PRINT, 11, 10, 0);                 // no newline: the world's end flushes it
+            as.load_const(40, n);
+            as.call_native_id(12, 42, 40, 1, NATIVE_EXIT);
+            as.load_str(10, "after");
+            as.R6(OpCode::PRINTLN, 11, 10, 0);
+            return run_root(as);
+        };
+        const Ended three = exit_with(3);
+        const bool code_ok = three.code == 3 && three.fault.empty() && three.printed == "before";
+        const Ended zero = exit_with(0);
+        const bool zero_ok = zero.code == 0 && zero.printed == "before";
+        const Ended big = exit_with(256), neg = exit_with(-1);
+        const bool range_ok = big.code == -1 && big.fault.find("between 0 and 255, got 256") != std::string::npos
+                           && neg.code == -1 && neg.fault.find("got -1") != std::string::npos;
+        std::cout << std::format("  exit(3): code 3, partial line kept: {}  (\"{}\")\n",
+                                 code_ok ? "PASS" : "FAIL", three.printed);
+        std::cout << std::format("  exit(0):                           {}\n", zero_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  256 and -1 are faults:             {}  (\"{}\")\n",
+                                 range_ok ? "PASS" : "FAIL", big.fault);
+
+        Assembler world;                                     // an actor still runs: Stop, then joined
+        declare_task_fns(world);
+        world.label("main");
+        world.load_const(41, 0);  spawn_actor(world, 12, "astop");
+        world.load_const(40, 4);
+        world.call_native_id(13, 42, 40, 1, NATIVE_EXIT);
+        const Ended w = run_root(world);
+        const bool world_ok = w.code == 4 && w.printed == "stopped\n";
+        std::cout << std::format("  the actor was stopped and joined:  {}  (\"{}\")\n",
+                                 world_ok ? "PASS" : "FAIL", w.printed);
+
+        Assembler inner;                                     // an actor and a task may not end the program
+        declare_task_fns(inner);
+        inner.label("main");
+        main_inbox(inner, 10);
+        inner.load_const(41, 5);  spawn_actor(inner, 12, "xexit");
+        receive_main(inner, 14, -1);  mail_read(inner, 15, NATIVE_MAIL_REASON);
+        inner.load_const(41, 6);  spawn(inner, 16, "xexit");
+        join(inner, 16, 17, 18);
+        Heap heap;
+        const Run r = run(inner, heap);
+        const std::string why = "only the main program may call it";
+        const bool actor_ok = r.fault.empty() && str_of(r.regs[15]).find(why) != std::string::npos;
+        const bool task_ok  = r.fault.empty() && r.regs[17].isBool() && !r.regs[17].asBool()
+                           && str_of(r.regs[18]).find(why) != std::string::npos;
+        std::cout << std::format("  in an actor: a crash report:       {}  (\"{}\"){}\n", actor_ok ? "PASS" : "FAIL",
+                                 str_of(r.regs[15]), r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  in a task: an error at the join:   {}\n", task_ok ? "PASS" : "FAIL");
+        check(code_ok && zero_ok && range_ok && world_ok && actor_ok && task_ok);
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 

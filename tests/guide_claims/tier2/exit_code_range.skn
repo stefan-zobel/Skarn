@@ -1,0 +1,8 @@
+// CLAIM: an exit code must be between 0 and 255 (what every platform keeps); anything else is a
+//        run-time error.
+// GUIDE: SkarnStdlib.md §10 "Ending the program"
+// EXPECT: fail exit code must be between 0 and 255, got 256
+use std::process::*
+
+
+exit(256)

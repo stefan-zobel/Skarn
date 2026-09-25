@@ -1,0 +1,11 @@
+// CLAIM: std::process's exit ends the program with that exit code and no error message, after
+//        its ordinary end: what it printed before, a partial line too, is there; nothing after it
+//        runs.
+// GUIDE: SkarnStdlib.md §10 "Ending the program"; SkarnGuide.md §18 "`panic` and `assert`"
+// EXPECT: exit 3 partial line
+use std::process::*
+
+
+print("partial line")
+exit(3)
+println("never printed")

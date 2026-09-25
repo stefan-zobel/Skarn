@@ -68,7 +68,8 @@ native functions attached:
   (`eprint` / `eprintln`) is written at once.
 
 Exit code 0 means success. 1 means a compile error or a runtime fault, reported with a caret into the right
-source file. 2 means a driver error.
+source file. 2 means a driver error. A program that calls `std::process`'s `exit(code)` ends with that
+code, and the driver prints nothing.
 
 ## The language server: `skarn_lsp`
 

@@ -2648,6 +2648,40 @@ std::pair<std::string, std::string> cg_run_native_err(const std::string& src) {
     return { out.str(), err.str() };
 }
 
+// Compile+run `src` with `use std::process::*` and the real native registry, as a driver does: the
+// code std::process's exit ended it with (-1 if it did not), what it printed, and a fault's message.
+struct ExitRun { int code = -1; std::string out, err, fault; };
+ExitRun cg_run_exit(const std::string& src) {
+    const std::string full = "use std::process::*\n" + src;
+    ExitRun r;
+    std::unique_ptr<svc::Module> compiled;
+    try {
+        compiled = std::make_unique<svc::Module>(svc::compile(full.c_str(), svc::builtin_prelude()));
+    } catch (const std::exception& e) {
+        r.fault = std::string("[the test program does not compile] ") + e.what();
+        return r;
+    }
+    svc::Module& m = *compiled;
+    Heap heap;
+    StringInterner interner;
+    std::ostringstream out, err;
+    std::istringstream in;
+    static const std::vector<NativeFunc> natives = build_native_table();
+    const std::vector<std::string> no_args;
+    try {
+        execute(m.bytecode, &heap, nullptr, &interner, m.top_frame_size,
+                &m.constants, &m.struct_types, &m.string_literals, &kNoAtoms,
+                &m.function_table, &out,
+                &m.trait_table, m.trait_table_width, m.trait_method_count,
+                &m.line_table, &m.function_names, &m.column_table,
+                &natives, &no_args, &in, &m.function_modules, &m.const_arrays, /*task=*/nullptr, &err);
+    } catch (const ProgramExit& x) { r.code = x.code; }
+      catch (const std::exception& x) { r.fault = x.what(); }
+    r.out = out.str();
+    r.err = err.str();
+    return r;
+}
+
 void check_int(const char* name, const std::string& src, int64_t expect) {
     try {
         Value v = cg_run(src);
@@ -5892,6 +5926,78 @@ void test_codegen_natives() {
         check_true("eprint_shadowed", out == "mine: x\n" && err.empty());
     }
     check_true("eprint_needs_an_argument", check_has_p("eprint()\n0", "eprint expects at least one argument"));
+    // ---- exit (std::process) ----
+    // The code comes back; a partial line printed before it is there; nothing after it runs.
+    {
+        const auto r = cg_run_exit("print(\"before\")\nexit(3)\nprintln(\"after\")\n");
+        check_true("exit_code", r.code == 3 && r.out == "before" && r.fault.empty());
+    }
+    check_true("exit_zero", cg_run_exit("println(\"x\")\nexit(0)\n").code == 0);
+    // exit is Never: the else of an if in a fn returning String, and a match arm beside Int arms.
+    {
+        const auto r = cg_run_exit(
+            "fn name(n: Int) -> String { if n > 0 { \"pos\" } else { exit(7) } }\n"
+            "fn pick(n: Int) -> Int { match n { 0 => 10, 1 => 11, _ => exit(8) } }\n"
+            "println(name(1), pick(1))\n"
+            "println(pick(5))\n");
+        check_true("exit_is_never", r.code == 8 && r.out == "pos11\n" && r.fault.empty());
+    }
+    // Deep in a chain of non-tail calls.
+    {
+        const auto r = cg_run_exit(
+            "fn down(n: Int) -> Int { if n == 0 { exit(9) } else { 1 + down(n - 1) } }\n"
+            "println(down(50))\n");
+        check_true("exit_deep", r.code == 9 && r.out.empty() && r.fault.empty());
+    }
+    check_true("exit_code_too_big",
+        cg_run_exit("exit(256)\n").fault.find("between 0 and 255, got 256") != std::string::npos);
+    check_true("exit_code_negative",
+        cg_run_exit("exit(0 - 1)\n").fault.find("between 0 and 255, got -1") != std::string::npos);
+    // An actor may not end the program: it crashes, its starter is told why, and the root goes on.
+    {
+        const auto r = cg_run_exit(
+            "use std::actor::*\n"
+            "fn body(inbox: Inbox[Int], code: Int) -> () { exit(code) }\n"
+            "let me: Inbox[Int] = mainInbox()\n"
+            "let _p = spawnActor(body, 5)\n"
+            "match me.receive() { Mail::Exited(_, why) => println(why), _ => println(\"other\") }\n"
+            "println(\"root goes on\")\n");
+        check_true("exit_in_actor_is_a_crash", r.code == -1 && r.fault.empty() &&
+                   r.out.find("only the main program may call it") != std::string::npos &&
+                   r.out.find("root goes on") != std::string::npos);
+    }
+    // ... and a task gets an error at its join.
+    {
+        const auto r = cg_run_exit(
+            "use std::task::*\n"
+            "fn work(x: Int) -> Int { exit(x) }\n"
+            "let t = spawn(work, 6)\n"
+            "match t.join() { Ok(_) => println(\"ok\"), Err(e) => println(e) }\n"
+            "println(\"root goes on\")\n");
+        check_true("exit_in_task_is_an_error", r.code == -1 && r.fault.empty() &&
+                   r.out.find("only the main program may call it") != std::string::npos &&
+                   r.out.find("root goes on") != std::string::npos);
+    }
+    // The program's ordinary end runs: an actor still waiting is told to stop and waited for.
+    {
+        const auto r = cg_run_exit(
+            "use std::actor::*\n"
+            "fn body(inbox: Inbox[Int], unused: Int) -> () {\n"
+            "  for _m in inbox.messages() {}\n"
+            "  println(\"actor stopped\")\n"
+            "}\n"
+            "let _p = spawnActor(body, 0)\n"
+            "exit(4)\n");
+        check_true("exit_ends_the_world", r.code == 4 && r.out == "actor stopped\n" && r.fault.empty());
+    }
+    check_true("exit_gate", check_has_p("exit(1)\n0", "std::process"));
+    // A function of one's own named exit wins, as for every native name.
+    {
+        const auto r = cg_run_exit(
+            "fn exit(s: String) -> () { println(\"mine \" + s) }\n"
+            "exit(\"x\")\n");
+        check_true("exit_shadowed", r.code == -1 && r.out == "mine x\n" && r.fault.empty());
+    }
     // The raw natives stay behind std::io's gate, and a File cannot be sent to another actor.
     check_true("file_native_gate", cg_check_fails("let _ = rawFileOpen(\"p\", 0)"));
     check_true("file_rejected_in_message", check_has_p(
@@ -12129,7 +12235,9 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // a model that compares the final text cannot see. Pinned by the flush_output_* tests here.
 // rawWriteErr (id 94) is NOT listed either, and needs no entry: it has no Skarn name. It is what the
 // builtins eprint / eprintln lower to, and the oracle models THOSE (its err_ text, compared by run_diff).
-static_assert(NATIVE_COUNT == 95,
+// exit (id 95) IS listed: the code it ends with and what was printed before it are deterministic, and
+// run_diff compares both (ProgramExit on the VM side, ExitSignal in the oracle).
+static_assert(NATIVE_COUNT == 96,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 
@@ -12185,6 +12293,8 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
     // program lowering cannot handle). Only the former is a generator bug.
     std::string vm_canon, vm_out, vm_err, vm_errout;
     bool vm_fault = false, vm_reject = false, vm_cgfail = false;
+    bool vm_exited = false;
+    int  vm_exit_code = 0;
     try {
         svc::Module m = svc::compile(src.c_str(), prelude);
         try {
@@ -12205,14 +12315,16 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
             // call is deterministic and cross-checkable. Harmless for programs with no native calls.
             static const std::vector<NativeFunc> natives = build_native_table();
             std::istringstream vm_in(nenv.stdin_text);
-            auto res = execute(img.bytecode, &heap, nullptr, &interner, img.top_frame_size,
-                               &img.constants, &img.struct_types, &img.string_literals, &kNoAtoms,
-                               &img.function_table, &oss,
-                               &img.trait_table, img.trait_table_width, img.trait_method_count,
-                               &img.line_table, &img.function_names, &img.column_table,
-                               &natives, &nenv.args, &vm_in,
-                               /*function_modules=*/nullptr, &img.const_arrays, /*task=*/nullptr, &err_oss);
-            vm_canon = refeval::canonicalize(vm_to_rt(res.get_reg_base()[0], m));
+            try {
+                auto res = execute(img.bytecode, &heap, nullptr, &interner, img.top_frame_size,
+                                   &img.constants, &img.struct_types, &img.string_literals, &kNoAtoms,
+                                   &img.function_table, &oss,
+                                   &img.trait_table, img.trait_table_width, img.trait_method_count,
+                                   &img.line_table, &img.function_names, &img.column_table,
+                                   &natives, &nenv.args, &vm_in,
+                                   /*function_modules=*/nullptr, &img.const_arrays, /*task=*/nullptr, &err_oss);
+                vm_canon = refeval::canonicalize(vm_to_rt(res.get_reg_base()[0], m));
+            } catch (const ProgramExit& x) { vm_exited = true; vm_exit_code = x.code; }   // std::process's exit
             vm_out = oss.str();
             vm_errout = err_oss.str();
         } catch (const std::exception& e) { vm_fault = true; vm_err = e.what(); }   // runtime trap
@@ -12221,6 +12333,8 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
 
     std::string rf_canon, rf_out, rf_err, rf_errout;
     bool rf_fault = false, rf_unsup = false, rf_gap = false, rf_reject = false;
+    bool rf_exited = false;
+    int  rf_exit_code = 0;
     refeval::Coverage rf_cov;
     try {
         svc::Program prog = svc::parse_check(src.c_str(), prelude);   // check only (throws on reject)
@@ -12229,7 +12343,8 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
         rf_cov = rr.coverage;
         rf_out = rr.output;
         rf_errout = rr.err_output;
-        if (!rr.faulted) rf_canon = refeval::canonicalize(rr.value);
+        rf_exited = rr.exited; rf_exit_code = rr.exit_code;
+        if (!rr.faulted && !rr.exited) rf_canon = refeval::canonicalize(rr.value);
     } catch (const std::exception& e) { rf_reject = true; rf_err = e.what(); }
 
     if (vm_reject || rf_reject)   // ill-typed on either path
@@ -12241,14 +12356,18 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
     if (rf_unsup)                 // the oracle declines by design => an honest skip
         return { DiffOutcome::Unsupported, {}, {}, rf_err };
 
-    const bool agree = (vm_fault == rf_fault) &&
-                       (vm_fault || (vm_canon == rf_canon && vm_out == rf_out && vm_errout == rf_errout));
+    // An exit is compared by its code instead of the program's value (there is none).
+    const bool agree = (vm_fault == rf_fault) && (vm_exited == rf_exited) &&
+                       (vm_fault || ((vm_exited ? vm_exit_code == rf_exit_code : vm_canon == rf_canon) &&
+                                     vm_out == rf_out && vm_errout == rf_errout));
     // Construct coverage is folded in ONLY on agreement, and here -- the single place both the corpus
     // (check_same) and the sweep (test_generated) pass through, so neither can be forgotten. "Covered"
     // therefore means the oracle evaluated the construct AND the bytecode produced the same answer.
     if (agree) merge_coverage(rf_cov);
     DiffOutcome o;
     o.kind    = agree ? DiffOutcome::Agree : DiffOutcome::Disagree;
+    if (vm_exited) vm_canon = "<exit " + std::to_string(vm_exit_code) + ">";
+    if (rf_exited) rf_canon = "<exit " + std::to_string(rf_exit_code) + ">";
     o.vm_desc = vm_fault ? "<fault> " + vm_err
                          : vm_canon + "  out=" + vm_out + (vm_errout.empty() ? "" : "  err=" + vm_errout);
     o.rf_desc = rf_fault ? "<fault> " + rf_err
@@ -13878,6 +13997,11 @@ void test_differential() {
     check_same("diff_eprint",   "eprint(\"a\", 1)\n eprint(2.5, true)\n 0", true);
     check_same("diff_eprintln", "eprintln(42)\n eprintln()\n eprintln(\"x\", [1, 2])\n println(\"out\")", true);
     check_same("diff_eprint_loop", "for i in [1, 2, 3] { eprint(i, \" \") }\n eprintln(\"end\")", true);
+    check_same("diff_exit", "use std::process::*\n print(\"a\")\n eprintln(\"b\")\n exit(3)\n println(\"c\")", true);
+    check_same("diff_exit_in_match",
+        "use std::process::*\n fn f(n: Int) -> Int { match n { 0 => 1, _ => exit(n) } }\n"
+        " println(f(0))\n println(f(2))", true);
+    check_same("diff_exit_range", "use std::process::*\n exit(300)", true);
 }
 
 } // namespace

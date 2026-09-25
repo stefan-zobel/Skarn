@@ -207,6 +207,7 @@ int main(int argc, char** argv) {
     run("actor_monitor",            test_actor_monitor);
     run("actor_monitor_others",     test_actor_monitor_others);
     run("actor_stop_requested",     test_actor_stop_requested);
+    run("native_exit",              test_native_exit);
     run("actor_select",             test_actor_select);
     run("actor_select_stop",        test_actor_select_stop);
     run("actor_send_cycle",         test_actor_send_cycle);

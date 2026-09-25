@@ -881,6 +881,7 @@ struct IsolateLocal {
     int64_t                  id    = 0;
     int64_t                  main_box = 0;   // the id of its main inbox: its own, or the slot it runs in
     bool                     actor = false;
+    bool                     root  = false;   // the execute() that owns the world (not a task, not an actor)
     std::vector<std::pair<int64_t, std::shared_ptr<Mailbox>>> inboxes;
     // This isolate's wake pad: where rawSelect sleeps, and what every inbox above wakes. The same
     // object the World reaches through Isolate::pad -- the two ends a wait-for graph would need.
@@ -987,6 +988,7 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
         own_world->main_mailbox->pad = own_world->root_pad;   // the root's inbox wakes the root
         local.world       = &*own_world;
         local.pad         = own_world->root_pad;
+        local.root        = true;
     }
     vm.image   = &image;
     vm.isolate = &local;
@@ -1858,6 +1860,25 @@ static Value native_write_err(Value* args, uint8_t nargs, Context* ctx) {
         e.flush();
     }
     return Value::fromNil();
+}
+
+// exit(code) -> never returns. Ends the program with `code` by throwing ProgramExit out of the ROOT
+// execute(); the unwind destroys the world, which runs the program's ordinary end (the root's partial
+// line flushed, every actor told to stop, every thread joined, the I/O thread stopped). An actor or a
+// task cannot end the program: nothing could interrupt the root wherever it waits (a sleep, a join,
+// stdin, accept), so there it is a located fault -- a crash reported to the actor's starter, an Err at
+// the task's join. The code must fit every platform's exit status, 0..255. A hand-built test context
+// has no isolate record and counts as a root.
+static Value native_exit(Value* args, uint8_t nargs, Context* ctx) {
+    if (ctx->vm->isolate && !ctx->vm->isolate->root)
+        raise_located(ctx, "exit ends the whole program, so only the main program may call it; "
+                           "an actor or a task can send the main program a message instead");
+    const Value code = nargs >= 1 ? args[0] : Value::fromNil();
+    if (!code.isInt() || code.asSigned48() < 0 || code.asSigned48() > 255) {
+        const std::string got = code.isInt() ? std::to_string(code.asSigned48()) : std::string("a non-Int");
+        raise_located(ctx, ("exit code must be between 0 and 255, got " + got).c_str());
+    }
+    throw ProgramExit(static_cast<int>(code.asSigned48()));
 }
 
 // f64ToBytes(x) -> Bytes: the 8 raw IEEE-754 bytes of x, little-endian (Plain). Enables a pure-Skarn
@@ -4331,5 +4352,6 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_FILE_CLOSE]   = native_file_close;
     t[NATIVE_FLUSH_OUTPUT] = native_flush_output;
     t[NATIVE_WRITE_ERR]    = native_write_err;
+    t[NATIVE_EXIT]         = native_exit;
     return t;
 }

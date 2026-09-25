@@ -38,6 +38,7 @@ struct ReturnSignal { RtValue value; };
 struct BreakSignal { RtValue value; bool has_value = false; };
 struct ContinueSignal {};
 struct PanicSignal   { std::string msg; };
+struct ExitSignal    { int code; };        // std::process's exit: the program ends, not a fault
 // The two ways of declining a program. See the RefEval.h header comment for WHY they are distinct:
 // one silent category made the oracle fail by silence. `Unsupported` must be justified at its throw
 // site (there are only four such sites); every other decline is a gap and must be loud.
@@ -275,7 +276,8 @@ public:
             RtValue last;
             for (const Stmt* s : top_stmts_) last = exec_stmt(*s, top);
             res.value = last;
-        } catch (const PanicSignal& p)   { res.faulted = true; res.fault_msg = p.msg; }
+        } catch (const ExitSignal& x)    { res.exited = true; res.exit_code = x.code; }
+          catch (const PanicSignal& p)   { res.faulted = true; res.fault_msg = p.msg; }
           catch (const Unsupported& u)   { res.faulted = true; res.unsupported = true; res.fault_msg = u.what; }
           catch (const NotModelled& u)   { res.faulted = true; res.oracle_gap  = true; res.fault_msg = u.what; }
           catch (const ReturnSignal&)    { res.faulted = true; res.fault_msg = "return at top level"; }
@@ -302,6 +304,7 @@ private:
         bool        ok = false, joined = false;
     };
     std::vector<TaskRec> tasks_;
+    int task_depth_ = 0;   // > 0 while a task's function runs (at its join): there exit is a fault
     std::unordered_map<std::string, const FnItem*> fn_table_;
     std::unordered_map<std::string, const Expr*>   const_defs_;   // module const -> literal (S0; inlined)
     std::unordered_map<std::string, CtorInfo>      ctors_;
@@ -1367,6 +1370,8 @@ private:
             std::string error;
             bool        ok = false;
             try {
+                ++task_depth_;
+                struct Leave { int& d; ~Leave() { --d; } } leave{ task_depth_ };
                 result = deep_copy(call_fn(fn, std::move(args)));
                 ok     = true;
             } catch (const PanicSignal& p) {
@@ -1561,6 +1566,16 @@ private:
         if (name == "panic")    { RtValue m = ev(0);
                                   record_builtin_call(cov_, name);
                                   throw PanicSignal{ std::holds_alternative<std::string>(m) ? std::get<std::string>(m) : "panic" }; }
+        // `exit` diverges too, so it is marked the same way. Only the root may call it: in a task it is
+        // the VM's fault (the oracle models no actors), as is a code outside 0..255.
+        if (name == "exit")     { RtValue c = ev(0);
+                                  record_builtin_call(cov_, name);
+                                  if (task_depth_ > 0)
+                                      throw PanicSignal{ "exit ends the whole program, so only the main program may call it" };
+                                  const int64_t n = std::get<int64_t>(c);
+                                  if (n < 0 || n > 255)
+                                      throw PanicSignal{ "exit code must be between 0 and 255, got " + std::to_string(n) };
+                                  throw ExitSignal{ static_cast<int>(n) }; }
         // ---- differentiable natives (see NativeEnv): deterministic, side-effect-free, message-
         // independent. run_diff feeds the VM the SAME fixtures, so the two sides agree. Every OTHER
         // native (write/delete/mkdir/listDir/time/process) is left to fall through to `call_named`,

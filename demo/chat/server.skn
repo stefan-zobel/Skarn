@@ -23,6 +23,7 @@ use std::actor::*
 use std::cli::*
 use std::env::*
 use std::io::*
+use std::process::exit
 
 
 fn run() -> Result[(), String] {
@@ -52,5 +53,8 @@ fn run() -> Result[(), String] {
 
 match run() {
     Ok(_) => {},
-    Err(e) => panic("chat server: ${e}")
+    Err(e) => {
+        eprintln("chat server: ${e}")
+        exit(1)
+    }
 }

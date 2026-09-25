@@ -3000,6 +3000,11 @@ fn mustBePositive(n: Int) -> Int {
 println(mustBePositive(5))   // => 5
 ```
 
+An error the *user* caused — a missing file, a bad option — is not a bug, and a location and a call trace
+are no help to them. Report it with `eprintln` and end with `exit(1)` from `std::process`, which prints
+nothing of its own; see [Ending the program](SkarnStdlib.md#ending-the-program). `exit` never returns
+either, so it has type `Never` too.
+
 ---
 
 ## 19. Iterators
