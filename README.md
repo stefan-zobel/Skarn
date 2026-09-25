@@ -138,9 +138,10 @@ Run the driver without arguments for the full list. A multi-file program is a di
 
 ## Tests
 
-**macOS:** `ctest --test-dir build` runs all eleven entries: the VM suite, the hardware-fault probe, the
-compiler suite, the language-server self-test, and the seven documentation and demo gates of the table below
-(`doc_claims`, `doc_examples`, `examples`, `doc_links`, `doc_anchors`, `demos`, `stdlib_reference`). The individual binaries are
+**macOS:** `ctest --test-dir build` runs all twelve entries: the VM suite, the hardware-fault probe, the
+compiler suite, the language-server self-test, and the eight documentation and demo gates of the table below
+(`doc_claims`, `doc_examples`, `examples`, `doc_links`, `doc_anchors`, `demos`, `stdlib_reference`,
+`highlighters`). The individual binaries are
 `build/vm_tests`, `build/static_compiler_tests` and `build/skarn_lsp --selftest`. The Python scripts of the
 table (Python 3.9 or newer, no packages) also run by hand, as `python3 tests/...`; they find `build/skarnvm` on
 their own, and `--exe` names another driver.
@@ -151,7 +152,7 @@ their own, and `--exe` names another driver.
 |---|---|
 | `x64\Release\vm_tests.exe` | the VM: opcodes, the heap and the collector, natives, the bytecode format |
 | `x64\Release\static_compiler_tests.exe` | the compiler: checker, codegen, and differential runs against a reference interpreter over generated programs |
-| `python tests\guide_claims\run_guide_claims.py` | the documentation: guide claims, every guide example, every program under `examples/`, the guides' links, and that `SkarnStdlib.md` documents every public name of the standard library |
+| `python tests\guide_claims\run_guide_claims.py` | the documentation: guide claims, every guide example, every program under `examples/`, the guides' links, that `SkarnStdlib.md` documents every public name of the standard library, and that the three syntax highlighters agree and are complete |
 | `python tests\check_doc_anchors.py` | that every section name cited from source still exists in the `docs/` documents |
 | `python tests\run_demos.py` | the demos: every program under `demo/` type-checks, and the four that check themselves pass |
 | `x64\Release\skarn_lsp.exe --selftest` | the language server: JSON, message framing, diagnostics, error recovery, outline, hover, go to definition, references, rename, completion, signature help, formatting, a scripted session |

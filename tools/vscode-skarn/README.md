@@ -146,7 +146,8 @@ what makes one `.vsix` usable on every platform.
 
 `syntaxes/skarn.tmLanguage.json` is a copy of the portable, standalone grammar at
 [`docs/skarn.tmLanguage.json`](https://github.com/stefan-zobel/Skarn/blob/HEAD/docs/skarn.tmLanguage.json) (the canonical
-version — also consumable directly by Sublime Text, GitHub Linguist, etc.). Keep the
-two in sync; when the language's keyword / built-in set changes, update
-`docs/skarn.tmLanguage.json` first (it tracks `tools/skarn.npp-udl.xml`) and copy it
-here.
+version — also consumable directly by Sublime Text, GitHub Linguist, etc.). When the
+language's keyword / built-in set changes, update `docs/skarn.tmLanguage.json` and
+`tools/skarn.npp-udl.xml`, then run `python tests/check_highlighters.py --sync`: it copies
+the grammar here and checks that the three word lists agree with each other and with the
+compiler's list of callable names and types.

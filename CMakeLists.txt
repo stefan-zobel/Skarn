@@ -112,8 +112,8 @@ add_test(NAME skarn_lsp_selftest COMMAND skarn_lsp --selftest)
 # Python runners over the built driver: the guide claims, every code block of the guides,
 # the programs under examples/ (exact output), the guides' internal links, the section
 # names cited from source, the demos (type-check + self-tests), and the standard library
-# reference against the driver's own list of public names. Each exits non-zero on any
-# failure. They need only the Python 3 found above for the prelude embed.
+# reference and the syntax highlighters against the driver's own list of public names. Each
+# exits non-zero on any failure. They need only the Python 3 found above for the prelude embed.
 if(TARGET skarnvm)
     set(SKARN_DRIVER --exe $<TARGET_FILE:skarnvm>)
     add_test(NAME doc_claims
@@ -136,6 +136,9 @@ if(TARGET skarnvm)
              WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(NAME stdlib_reference
              COMMAND "${Python3_EXECUTABLE}" tests/check_stdlib_reference.py ${SKARN_DRIVER}
+             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME highlighters
+             COMMAND "${Python3_EXECUTABLE}" tests/check_highlighters.py ${SKARN_DRIVER}
              WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 endif()
 

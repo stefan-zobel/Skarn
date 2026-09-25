@@ -136,6 +136,23 @@ A name left out on purpose goes into the script's `UNDOCUMENTED` table, with the
 python tests/check_stdlib_reference.py
 ```
 
+`run_guide_claims.py` runs it after the anchor check.
+
+## The syntax highlighters — `tests/check_highlighters.py`
+
+Three editor highlighters keep hand-written word lists: `tools/skarn.npp-udl.xml` (Notepad++),
+`docs/skarn.tmLanguage.json` (the TextMate grammar, canonical) and the VS Code extension's copy of it. A name
+missing there is merely not coloured, so they drift unnoticed. The check asserts that the three agree (same
+functions, library types and built-in types, no duplicates, sorted, the two grammars byte-identical) and that
+they match `skarnvm --dump-names`: every callable name and every type of the standard library is listed, and
+nothing else. Two rules are judgements, written into the script with their reasons: the natives under the
+library's wrappers (`raw*`, `tcp*`) are never listed, and a new enum's type is listed but not its variants.
+
+```
+python tests/check_highlighters.py
+python tests/check_highlighters.py --sync   # after editing docs/skarn.tmLanguage.json: copy it into the extension
+```
+
 `run_guide_claims.py` runs it last.
 
 ## Tiers

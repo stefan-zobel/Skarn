@@ -34,9 +34,9 @@ This builds every target, the test suites included, which step 2 runs. Confirm t
 ctest --test-dir /tmp/skarn-release/build --output-on-failure
 ```
 
-All eleven entries must pass: the four suites (`vm_tests`, `vm_fault_probe`, `static_compiler_tests`,
-`skarn_lsp_selftest`) and the seven Python gates (`doc_claims`, `doc_examples`, `examples`, `doc_links`,
-`doc_anchors`, `demos`, `stdlib_reference`, which need Python 3.9 or newer). Expected totals (Release, arm64) — these must
+All twelve entries must pass: the four suites (`vm_tests`, `vm_fault_probe`, `static_compiler_tests`,
+`skarn_lsp_selftest`) and the eight Python gates (`doc_claims`, `doc_examples`, `examples`, `doc_links`,
+`doc_anchors`, `demos`, `stdlib_reference`, `highlighters`, which need Python 3.9 or newer). Expected totals (Release, arm64) — these must
 match the Windows numbers in the release notes:
 
 ```
