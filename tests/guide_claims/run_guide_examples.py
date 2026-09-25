@@ -1,7 +1,7 @@
 # run_guide_examples.py -- every ```rust block of the guides, extracted and run.
 #
-# The guides are the single source of truth: this runner reads SkarnGuide.md, SkarnIn30Minutes.md and
-# SkarnActors.md at run time, turns every ```rust fence into a program, runs it with the driver, and checks
+# The guides are the single source of truth: this runner reads SkarnGuide.md, SkarnIn30Minutes.md,
+# SkarnActors.md and SkarnStdlib.md at run time, turns every ```rust fence into a program, runs it with the driver, and checks
 # it against the annotations the reader sees. Nothing is copied into the repository, so an example cannot
 # drift from its test. (The hand-written claim fixtures next to this script are run by run_guide_claims.py.)
 #
@@ -47,7 +47,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from skarn_testlib import add_driver_options, find_driver, green, red, repo_root, run_driver, say, yellow  # noqa: E402
 
-GUIDES = ("SkarnGuide.md", "SkarnIn30Minutes.md", "SkarnActors.md")
+GUIDES = ("SkarnGuide.md", "SkarnIn30Minutes.md", "SkarnActors.md", "SkarnStdlib.md")
 EM_DASH = "—"
 
 
@@ -320,7 +320,7 @@ def test_program(exe, prog, directory, timeout):
 def main():
     ap = argparse.ArgumentParser(description="Extract every ```rust block of the guides and run it.")
     add_driver_options(ap)
-    ap.add_argument("--guide", nargs="+", default=[], help="markdown files (default: the three guides)")
+    ap.add_argument("--guide", nargs="+", default=[], help="markdown files (default: the four guides)")
     ap.add_argument("--only", type=int, default=0, help="run only the program containing this guide line")
     ap.add_argument("--emit", default="", help="also write every extracted program to this directory")
     opts = ap.parse_args()

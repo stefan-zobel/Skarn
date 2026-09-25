@@ -68,13 +68,15 @@ total 15.07
 ## Documentation
 
 - [Skarn in 30 minutes](SkarnIn30Minutes.md): the working core, enough to write a real program.
-- [The Skarn Language Guide](SkarnGuide.md): the whole language, the standard library and the cost model.
+- [The Skarn Language Guide](SkarnGuide.md): the whole language and the cost model.
+- [The Skarn Standard Library](SkarnStdlib.md): every function of every `std` module, with worked examples.
 - [Actors in Skarn](SkarnActors.md): long-lived workers that share nothing and talk by messages —
   supervision, back-pressure and the rest, for readers who have never used an actor system.
 - [`examples/`](examples/README.md): small but complete programs, such as a word counter, a JSON todo list, a
   calculator, a log analyzer, and Dijkstra over a generic heap.
-- [`demo/`](demo/README.md): one program per feature or standard-library module, plus a
-  [raytracer](demo/raytracer/README.md) and a small benchmark against CPython.
+- [`demo/`](demo/README.md): one program per language feature and most standard-library modules, larger
+  programs — a [path tracer](demo/raytracer/README.md) on tasks, a [chat server](demo/chat/README.md) and an
+  [HTTP server](demo/actor_server/README.md) on actors — and a small benchmark against CPython.
 - [docs/VirtualMachine.md](docs/VirtualMachine.md): how the VM works: values, bytecode, calls, the garbage collector.
 - [docs/Compiler.md](docs/Compiler.md): how the compiler works: checker, modules, code generation, verification.
 - [docs/LanguageServer.md](docs/LanguageServer.md): how the language server works: analysis, error recovery, queries, completion, signature help.
@@ -151,7 +153,7 @@ their own, and `--exe` names another driver.
 | `x64\Release\static_compiler_tests.exe` | the compiler: checker, codegen, and differential runs against a reference interpreter over generated programs |
 | `python tests\guide_claims\run_guide_claims.py` | the documentation: guide claims, every guide example, every program under `examples/`, and the guides' internal links |
 | `python tests\check_doc_anchors.py` | that every section name cited from source still exists in the `docs/` documents |
-| `python tests\run_demos.py` | the demos: every program under `demo/` type-checks, and the chat server's self-test passes |
+| `python tests\run_demos.py` | the demos: every program under `demo/` type-checks, and the four that check themselves pass |
 | `x64\Release\skarn_lsp.exe --selftest` | the language server: JSON, message framing, diagnostics, error recovery, outline, hover, go to definition, references, rename, completion, signature help, formatting, a scripted session |
 
 ## Editor support

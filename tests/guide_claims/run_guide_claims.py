@@ -20,7 +20,7 @@
 #
 # After the claims it runs run_guide_examples.py (every ```rust block of the guides), then
 # tests/run_examples.py (every program under examples/, exact output), then check_anchors.py over all
-# guides (every internal link resolves), so one command is the whole doc gate.
+# guides (every link to a heading resolves), so one command is the whole doc gate.
 # --no-examples skips all three, and so does a --dir subset.
 #
 # Exit code: 0 = all claims (and examples) held; 1 = at least one drifted (or a fixture was malformed).

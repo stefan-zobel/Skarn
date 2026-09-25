@@ -1,7 +1,7 @@
 # `tests/guide_claims/` — executable guide-claim checker
 
-Every categorical promise the guides — `SkarnGuide.md` (the full guide), `SkarnActors.md` (actors) and
-`SkarnIn30Minutes.md` (the introduction) — make, from *"a struct compares structurally"* to
+Every categorical promise the guides — `SkarnGuide.md` (the full guide), `SkarnStdlib.md` (the standard
+library), `SkarnActors.md` (actors) and `SkarnIn30Minutes.md` (the introduction) — make, from *"a struct compares structurally"* to
 *"`xs |> intoIter |> filter(p) |> collect`"*, is a claim about what the **compiler actually does**.
 Prose drifts silently: a guide goes on asserting behaviour after the compiler has changed. This
 directory turns the load-bearing claims into runnable checks so the drift fails here instead of
@@ -39,7 +39,7 @@ build registers each runner as a `ctest` entry.
 ## Every guide example — `run_guide_examples.py`
 
 The claims above are written by hand, so a guide example nobody wrote a fixture for is unguarded. So a
-second runner checks **every** ```` ```rust ```` block of all three guides. It extracts them **at run time** — the
+second runner checks **every** ```` ```rust ```` block of all four guides. It extracts them **at run time** — the
 guides are the single source of truth, and there are no copies in the repository that could drift from them.
 `run_guide_claims.py` calls it at the end (skip with `--no-examples`), so the one command above runs both.
 
@@ -100,18 +100,21 @@ python tests/run_examples.py --update      # rewrite expected.out; review the di
 
 ## Link integrity — `check_anchors.py`
 
-A sibling gate for a guide's *internal* cross-references. `SkarnGuide.md` links to its own
-sections with `[text](#slug)`; when a heading is renamed but a link is not, the link silently 404s a reader —
+A sibling gate for the guides' cross-references. `SkarnGuide.md` links to its own sections with
+`[text](#slug)`, and the guides link to each other with `[text](SkarnGuide.md#slug)`; when a heading is renamed
+but a link is not, the link silently 404s a reader —
 a blind spot the claim fixtures cannot cover (a link to `#14-maps` after the heading became `## 14. Collections`,
-which slugs to `#14-collections`). `check_anchors.py` mechanically validates every internal anchor against the GitHub slug
-of every heading (fence-aware, so code-block `#` lines and example `](#…)` are ignored):
+which slugs to `#14-collections`). `check_anchors.py` mechanically validates every anchor against the GitHub slug
+of every heading of the file it names — the same file, or a sibling `Name.md` (fence-aware, so code-block `#`
+lines and example `](#…)` are ignored):
 
 ```
 python tests/guide_claims/check_anchors.py
 ```
 
-Without arguments it checks all three guides; paths as arguments check other markdown files. Exit `0` iff
-every anchor resolves; a broken anchor prints `#slug (first at line N)` and the script exits `1`.
+Without arguments it checks all four guides; paths as arguments check other markdown files. Exit `0` iff
+every anchor resolves; a broken anchor prints `#slug (first at line N)` (or `Name.md#slug`, with `; no such
+file` when the file is missing) and the script exits `1`.
 `run_guide_claims.py` runs it at the end, with the other two runners.
 
 ## Tiers

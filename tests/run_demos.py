@@ -5,7 +5,8 @@
 # weaker things than tests/run_examples.py does:
 #   1. every ENTRY program type-checks (`--dump-ast`, exit 0, no `error:`). An entry program is a .skn
 #      file no other .skn file under demo/ imports; the imported ones are checked as its modules.
-#   2. the demos that carry a self-test run it and report success (the SELFTESTS table below).
+#   2. the demos that check themselves run and report success (the SELFTESTS table below): each exits 0
+#      and ends with its success line; on a mismatch it panics instead.
 #
 # Usage (repo root or anywhere; Python 3.9+):
 #   python tests/run_demos.py
@@ -24,6 +25,9 @@ from skarn_testlib import add_driver_options, find_driver, green, red, rel, repo
 
 # (entry program, arguments, a pattern the last line of standard output must match)
 SELFTESTS = [
+    ("demo/regex.skn", [], r"^all regex demo checks passed$"),
+    ("demo/const_crc_table.skn", [], r"^crc32 OK \(table-driven, via a const array\)$"),
+    ("demo/aes256.skn", [], r"^AES-256 demo: all known-answer tests passed\.$"),
     ("demo/chat/server.skn", ["--selftest"], r"^selftest: \d+ steps ok$"),
 ]
 
@@ -70,7 +74,7 @@ def main():
         r = run_driver(exe, [f] + args, cwd=f.parent, timeout=opts.timeout)
         lines = [ln for ln in r.out.split("\n") if ln.strip()]
         last = lines[-1] if lines else "<no output>"
-        label = "{} {}".format(path, " ".join(args))
+        label = " ".join([path] + args)
         if r.code == 0 and re.match(pattern, last):
             passed += 1
             say(green("PASS  {}  [selftest]  {}".format(label, last)))

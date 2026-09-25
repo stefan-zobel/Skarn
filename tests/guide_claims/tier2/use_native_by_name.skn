@@ -1,5 +1,5 @@
 // CLAIM: a standard-library native is imported like any other item -- `use std::math::sqrt` alone makes `sqrt` callable, no glob needed.
-// GUIDE: SkarnGuide.md 21 (Input, output, and the standard natives); SkarnIn30Minutes.md 12
+// GUIDE: SkarnGuide.md 22 (Input, output, and the standard natives); SkarnIn30Minutes.md 12
 // EXPECT: ok 3.0
 use std::math::sqrt
 println(sqrt(9.0))

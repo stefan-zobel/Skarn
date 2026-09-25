@@ -2,7 +2,10 @@
 
 Small Skarn programs, most of them one per language feature or standard-library module. Each file starts
 with a comment that explains what it shows. Unlike the programs under [`examples/`](../examples/README.md),
-the demos are not checked by the documentation harness, so their exact output is not guaranteed.
+whose output is compared byte for byte, the demos are only checked to compile: `tests/run_demos.py`
+type-checks every demo program and runs the four that check themselves (`regex.skn`, `const_crc_table.skn`,
+`aes256.skn` and the chat server's `--selftest`). The others are not run, so their exact output is not
+guaranteed.
 
 Run a demo from the repository root:
 

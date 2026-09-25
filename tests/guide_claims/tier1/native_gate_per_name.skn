@@ -1,5 +1,5 @@
 // CLAIM: a native is reachable only through `use M::*` or `use M::name` -- importing another item of the same module (`use std::math::PI`) does not unlock `sqrt`.
-// GUIDE: SkarnGuide.md 21 (Input, output, and the standard natives)
+// GUIDE: SkarnGuide.md 22 (Input, output, and the standard natives)
 // EXPECT: fail requires `use std::math::*` or `use std::math::sqrt`
 use std::math::PI
 println(PI)

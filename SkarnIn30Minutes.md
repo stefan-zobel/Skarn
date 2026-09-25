@@ -1,9 +1,9 @@
 # Skarn in 30 minutes
 
 This is the **working core** of Skarn — enough to write and finish a real program, not just to read one. It is
-deliberately not the whole language: traits and `impl` blocks, generics, `dyn`, the erasure types, and the full
-standard library are covered in the complete [Skarn Guide](SkarnGuide.md). Start here,
-reach for that when you hit something this page does not mention.
+deliberately not the whole language: traits and `impl` blocks, generics, `dyn` and the erasure types are covered
+in the complete [Skarn Guide](SkarnGuide.md), and the full standard library in
+[its reference](SkarnStdlib.md). Start here, reach for those when you hit something this page does not mention.
 
 If you know Java, C#, Kotlin, or a bit of Rust, almost everything below will look familiar. Run any snippet by
 saving it to a `.skn` file:
@@ -423,8 +423,9 @@ You now have enough to finish a program, not just start one. When you need more,
 - **Traits and methods** (§16) — give your own types behavior and a `.method()` API; the complete call-form picture.
 - **Generics** (§15) and **trait objects `dyn Trait`** (§17) — reusable code over many types.
 - **Iterators in full** (§19) — the remaining stages and terminals, and writing your own iterator.
-- **The standard library** (§20 and the reference in §27) — `std::json`, `std::time`, `std::random`,
-  `std::regex`, `std::net`, and every function's signature.
+- **The standard library** (modules and `use` in §20; every module in a reference of its own,
+  [The Skarn Standard Library](SkarnStdlib.md)) — `std::json`, `std::time`, `std::random`, `std::regex`,
+  `std::net`, and every function's signature.
 - **Doing several things at once** (§21) — one thread serving many connections, and one computation on
   several cores. For long-lived workers that talk by messages there is a guide of its own,
   [Actors in Skarn](SkarnActors.md).
