@@ -55,6 +55,11 @@ native functions attached:
 - `--dump-ast` type-checks and prints the typed AST without running. It is exactly the program the code
   generator would see, which makes it the quickest way to tell a checker problem from a code-generation
   problem.
+- `--dump-names` lists every public name of the built-in standard library, one per line with its module and
+  kind: functions, methods, types, traits, constants, enum variants, and the builtins and natives with the
+  module whose `use` makes each reachable. It is the checker's own view, the one editor completion uses, so it
+  covers the natives, which no `.skn` file declares. `tests/check_stdlib_reference.py` holds the standard
+  library reference, `SkarnStdlib.md`, against it.
 - `--emit-bytecode <file>` writes a `.skbc` image; `--run-bytecode <file>` runs one without compiling.
   `--strip-debug` omits the source-position tables.
 - `--no-inline` and `--sroa` switch the two optional code-generation transforms.

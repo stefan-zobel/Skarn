@@ -69,9 +69,22 @@ helps where a definition of your own shadows it.
 | `toString(x)` | render any value as text |
 | `panic(msg)` | abort the program with a message |
 | `assert(cond, msg)` | abort if `cond` is false |
+| `gcStats()` / `gcResetStats()` | the garbage collector's counters since the start or the last reset → `GcStats` / clear them, so a region can be measured: `gcResetStats()`, the code, then `gcStats()` |
 
 `print` and `println` accept any value and several arguments; the guide shows them in
-[§22](SkarnGuide.md#printing).
+[§22](SkarnGuide.md#printing). A `GcStats` is a plain struct of `Double` counters — `collections`,
+`objectsAlloced`, `bytesAlloced`, `fromUsedSum`, `survivorsSum`, `gcNanosTotal`, `gcNanosMax` and
+`growEvents`; a `Double` holds them exactly, where a 48-bit `Int` might not.
+
+Three marker traits of `std::core` have no methods and cost nothing at run time; they only restrict what
+a program may write. The guide lists every built-in trait in
+[Built-in traits at a glance](SkarnGuide.md#built-in-traits-at-a-glance).
+
+| Trait | Purpose |
+|----------|---------|
+| `Hashable` | what may be a `Map` key or a `Set` element: `Int`, `Double`, `Bool`, `String`. Sealed — a program cannot add a type |
+| `MustUse` | dropping a value of such a type unused is a warning (fatal under `--strict`); `let _ = value` discards it on purpose. Open: `impl MustUse for Outcome {}` on a type the program owns |
+| `Sendable` | what may be copied to another task or actor: plain data, no function values, `dyn` values or handles. Derived by the checker and sealed; generic code writes `M: Sendable` |
 
 ## 2. Numbers
 
@@ -85,8 +98,9 @@ The numeric model itself is [§6 of the guide](SkarnGuide.md#6-the-numeric-model
 | `round(d)` / `roundHalfToEven(d)` | round `Double` → `Double`, ties away from zero / ties to even |
 | `parseInt(s)` | `String` → `Result[Int, String]` |
 | `parseDouble(s)` | `String` → `Result[Double, String]` |
-| `toIntChecked(d)` *(`std::math`)* | `Double` → `Result[Int, String]` (`Err` on NaN / ∞ / overflow) |
 | `ordinal(e)` | Int-backed `enum` → its `Int` discriminant ([§12](SkarnGuide.md#integer-backed-enums); the pinned value, not the position) |
+
+The checked conversion, `toIntChecked`, is in [`std::math`](#11-stdmath).
 
 ## 3. Strings
 
@@ -162,6 +176,7 @@ println(hasControl("bad\ttab"))    // => true
 |----------|---------|
 | `len(x)` | length (bytes of a `String`, element count of a collection) |
 | `slice(s, start, end)` | substring over the byte range `[start, end)` |
+| `sliceBytes(b, start, end)` | the same over a `Bytes` already in hand — clamped to `[0, len]`, one bulk copy. Slicing many ranges out of one string this way is linear; `slice` converts the whole `String` on every call |
 | `charStr(byte)` | a one-byte `String` from an `Int` byte value |
 | `charAt(s, i)` / `isEmpty(s)` | the byte at index `i` (traps if out of range) / whether `s` is empty |
 | `indexOf(s, sub)` / `lastIndexOf(s, sub)` | first / last byte index of `sub`, or `-1` if absent |
@@ -171,16 +186,17 @@ println(hasControl("bad\ttab"))    // => true
 | `replace(s, from, to)` | replace **all** occurrences of `from` (empty `from` is a no-op) |
 | `padStart(s, width, padByte)` / `padEnd(s, width, padByte)` | pad to a byte `width` with a single `padByte` |
 | `repeatStr(s, n)` | `s` repeated `n` times (`n ≤ 0` → `""`) |
-| `isAsciiControl/Digit/Whitespace/Alpha/Alphanumeric/Upper/Lower/Printable(c)` | ASCII classify a byte `Int` → `Bool` (`≥ 128` → `false`) |
+| `isAsciiControl(c)` / `isAsciiDigit(c)` / `isAsciiWhitespace(c)` / `isAsciiAlpha(c)` / `isAsciiAlphanumeric(c)` / `isAsciiUpper(c)` / `isAsciiLower(c)` / `isAsciiPrintable(c)` | ASCII classify a byte `Int` → `Bool` (`≥ 128` → `false`) |
 | `hasControl(s)` | `Bool` — does `s` contain any ASCII control byte |
 | `toBytes(s)` / `fromBytes(b)` | convert between `String` and `Bytes` |
+| `appendBytes(b, src)` | append all of a `String` or `Bytes` to `b` in one copy; `b` must be `mut`, and is returned |
 | `split(s, sep)` | lazily split into fields on a literal separator (empties kept; inverse of `join`) |
 | `lines(s)` | lazily split into lines (terminator semantics; `CRLF` handled) |
 | `words(s)` | lazily split on RUNS of ASCII whitespace (no empty field ever; edges contribute none) |
 | `stringBuilder()` / `stringBuilderCap(n)` | a `StringBuilder` accumulator over `Bytes` (empty / pre-sized to `n`) |
 | `sb.append(s)` / `sb.appendByte(c)` | append a `String` / one byte to a `StringBuilder` (mutates in place; returns `sb`, so calls chain) |
 | `sb.build()` / `sb.len()` | the accumulated `String` / its current byte length |
-| `format(x, spec)` | format a scalar per a `${x:spec}` specifier (width/align/precision/base, sign `+`, `#` prefix, scientific `e`/`E`) → `String` |
+| `format(x, spec)` | the `Format` trait: format a scalar per a `${x:spec}` specifier (width/align/precision/base, sign `+`, `#` prefix, scientific `e`/`E`) → `String` |
 
 ## 4. Unicode code points
 
@@ -283,6 +299,15 @@ What is lazy and what is not, and how to write an iterator of your own, is
 | `sorted(v)` | new sorted `Vec` (`Ord`; non-mutating), stable |
 | `sort(v)` | sort a `mut` `Vec` in place (`Ord`), stable |
 | `sortBy(v, less)` | new `Vec` sorted by a `fn(T,T) -> Bool` comparator, stable |
+
+**The traits behind them** *(`std::iter`; implement them for your own types)*
+
+| Function | Purpose |
+|----------|---------|
+| `it.next()` | the `Iterator[T]` trait: the next element → `Option[T]`, `None` when the iterator is done (needs `mut`) |
+| `intoIter(x)` | the `IntoIterator[T]` trait: a fresh `dyn Iterator[T]` over `x`; what a lazy `for` and the stages call |
+| `iter(x)` | the `Iterable[T]` trait: an eager `Vec[T]` snapshot, which `toVec` returns |
+| `a.lessThan(b)` | the `Ord` trait: the total order `sorted`, `sort`, `min` and `max` use |
 
 ---
 
@@ -388,6 +413,10 @@ Run an external command and capture its output, and ask which platform you are o
 | Function | Purpose |
 |----------|---------|
 | `run(argv)` / `runText(argv)` / `sh(cmdline)` | spawn a process and capture its output (`sh` goes through the platform's shell) |
+| `runWith(argv, input)` | as `run`, with `input: Bytes` fed to the child's standard input |
+
+`run`, `runWith` and `sh` return a `ProcessOutput` — `stdout` and `stderr` as `Bytes`, and `exitCode` —
+and `runText` a `ProcessText`, the same with both streams decoded to `String`.
 | `currentOs()` | which platform the program is running on (`Os::Windows` / `Os::MacOS` / `Os::Other`) |
 
 ### Running processes
@@ -433,12 +462,13 @@ Silicon, and rather than guess at a third platform's name it puts them all in on
 ## 11. `std::math`
 
 Roots, powers, logarithms, trigonometry, `gcd`/`lcm`, generic `minOf`/`maxOf`/`clamp`, `PI`/`E`, and the
-fallible `toIntChecked` (listed with the [numbers](#2-numbers)). The rounding builtins `floor`/`ceil`/`trunc`/
+fallible `toIntChecked`. The rounding builtins `floor`/`ceil`/`trunc`/
 `round`/`roundHalfToEven`, `toInt` and `toDouble` are **always** available — no `use`. `use std::math::*`
 
 | Function | Purpose |
 |----------|---------|
 | `sqrt` / `cbrt` / `pow(x,y)` / `hypot(x,y)` | roots and powers |
+| `toIntChecked(d)` | `Double` → `Result[Int, String]` (`Err` on NaN / ∞ / overflow); `toInt` saturates instead |
 | `exp` / `ln` / `log2` / `log10` | exponential and logarithms (`ln` = natural log) |
 | `sin` / `cos` / `tan` / `asin` / `acos` / `atan` / `atan2(y,x)` | trigonometry |
 | `abs` / `absInt` / `sign` / `signInt` | magnitude and sign (`Double` and `Int` forms) |
@@ -697,6 +727,7 @@ CRC-32 and MurmurHash3 (fast, **not** secure) plus SHA-256 (cryptographic) and h
 | `sha256(bytes)` / `sha256Str(s)` | SHA-256 (FIPS 180-4) → the raw 32-byte digest as `Bytes` |
 | `sha256Hex(bytes)` / `sha256HexStr(s)` | SHA-256 as a 64-char lowercase hex `String` |
 | `toHex(bytes)` | lowercase hex encoding of any `Bytes` (2 chars/byte) |
+| `fromHex(s)` | the inverse: decode hex (either case) → `Result[Bytes, String]`; an odd digit count or a non-hex byte is an `Err` |
 
 A checksum of a string:
 
@@ -710,7 +741,8 @@ println(toString(crc32Str("123456789")))   // => 3421780262
 
 Blocking TCP (IPv4 + IPv6) and a minimal HTTP/1.0 `httpGet` — one connection at a time per thread, and a
 connection can be handed to an actor. **Plaintext only** (no TLS, so `http://` not `https://`); close sockets
-explicitly. `use std::net::*`
+explicitly. A connection or a listener can also be handed to the runtime to read or accept (active
+mode), so an actor waits on its socket and its inbox at once. `use std::net::*`
 
 | Function | Purpose |
 |----------|---------|
@@ -723,6 +755,23 @@ explicitly. `use std::net::*`
 | `l.localPort()` | the port actually bound → `Result[Int, String]`. Pass **`listen(0)`** to let the OS pick a free one and read it back here — safer than naming a fixed port, which may already be in use |
 | `httpGet(host, port, path)` | a minimal HTTP/1.0 GET → `Result[HttpResponse, String]` (`.status: Int`, `.body: String`; free) |
 | `c.handOff()` / `h.take()` | give a connection to another actor: detach it → `Result[SocketHandOff, String]`, a ticket that can be sent; redeem the ticket in the receiver, once → `Result[TcpConn, String]`. After the hand-off every use of the old `TcpConn` returns `Err` |
+
+**Active sockets.** Only an actor or the main program can activate a socket, neither half can be sent to
+another actor, and the runtime closes an active socket when its actor ends. [Actors in
+Skarn](SkarnActors.md#17-a-connection-that-also-listens-to-its-inbox) shows both at work.
+
+| Function | Purpose |
+|----------|---------|
+| `c.activate(framing, capacity)` | hand the READING of a connection to the runtime → `Result[(ActiveConn, SockEvents), String]`: write through the `ActiveConn`, receive what arrives from the `SockEvents`, an inbox of at most `capacity` events — while it is full the runtime stops reading and TCP holds the peer back. The `TcpConn` is dead from then on |
+| `Framing::Raw` / `Framing::Lines(max)` | how the input is cut into events: the chunks as they are read / every line without its terminator; a line longer than `max` bytes ends the stream with `Failed` |
+| `out.send(bytes)` / `out.sendStr(s)` / `out.close()` | write to an `ActiveConn` → `Result[(), String]` / close it; later sends are an `Err`, events not received yet are dropped, and closing twice is fine |
+| `out.setSendTimeout(ms)` | how long a send may wait for a peer that does not read. When it runs out, the send returns an `Err` and the connection is CLOSED; `0`, the default, waits without limit. A waiting send always ends when the actor is told to stop |
+| `events.receive()` / `events.receiveTimeout(ms)` / `events.ref()` | the next `SockEvent`, waiting for it / the same → `Option[SockEvent]`, `None` after `ms` milliseconds / the inbox as an `InboxRef` for `select` |
+| `SockEvent::Chunk(b)` / `Line(s)` / `Eof` / `Failed(why)` / `Stopping` | what arrives: data, per the framing / the peer closed the stream / an error. After `Eof` or `Failed` nothing more comes; `Stopping` is the actor's own `Stop` |
+| `l.activate(capacity)` | hand the ACCEPTING of a listener to the runtime → `Result[(ActiveListener, IncomingClients), String]`: every new connection arrives as a `SocketHandOff` ticket, which can be sent on to a worker unchanged; while the inbox of at most `capacity` events is full, new clients wait in the operating system's queue. The `TcpListener` is dead from then on |
+| `lst.close()` | stop an `ActiveListener`; connections accepted but not received yet are closed, and closing twice is fine |
+| `incoming.receive()` / `incoming.receiveTimeout(ms)` / `incoming.ref()` | the next `Incoming`, waiting for it / the same → `Option[Incoming]` / the inbox as an `InboxRef` for `select` |
+| `Incoming::NewClient(ticket)` / `AcceptFailed(why)` / `ListenerStopping` | a new connection / the listener failed, and nothing more comes / the actor's own `Stop` |
 
 Here a server and a client talk over loopback in one program (it runs
 on one thread, so this works because `connect` queues into the listen backlog and `accept` then picks it up):
@@ -830,6 +879,7 @@ to a restart limit; supervisors nest into trees. It builds on `std::actor`, and
 | `superviseWith(inbox, children, spec)` | the same loop with both choices spelled out: `SupervisorSpec { strategy, limit, stopTimeoutMs }`. `supervise` is this with `OneForOne` and no deadline |
 | `Strategy::OneForOne` / `OneForAll` / `RestForOne` | what a crash costs the siblings: nothing / stop them all, wait, start them all / the same for those started after the crashed one. A group restart counts as ONE restart |
 | `stopTimeoutMs` | how long a child may take to stop. `0` waits (the group stands still, the supervisor keeps receiving); more makes a RESTART give up and crash, naming the child, and a SHUTDOWN abandon it. A child that neither receives nor asks `stopRequested()` cannot be ended at all |
+| `s.start()` / `s.release()` | the `Supervised` trait, anything a supervisor can start whatever its message type — what a `Vec[dyn Supervised]` holds: start it once more → the `ActorId` its crash report will carry / give up its address, if it has one of its own, as a supervisor does when it stops supervising. `Child` and `SlotChild` implement it |
 
 ## 24. `std::regex`
 
@@ -883,9 +933,11 @@ none of the names `info`, `warn`, `error` or `debug`. `use std::log::*`
 | `Log::toActor(to, min)` | a logger sending its lines to `to: Pid[String]` instead. Costs a message, and buys one order for the whole program and, with a bounded inbox, back-pressure |
 | `log.debug(msg)` / `log.info(msg)` / `log.warn(msg)` / `log.error(msg)` | write one line at that level (also `Log::info(log, msg)`, as for any method) |
 | `log.at(level, msg)` | the same with the level as a value — the one place that filters, formats and writes |
-| `Level::Debug` / `Info` / `Warn` / `Error` | the four levels; `l.rank()` orders them, `l.atLeast(min)` is the filter, `l.label()` is the fixed-width text in the line |
+| `Level::Debug` / `Info` / `Warn` / `Error` | the four levels |
+| `l.rank()` / `l.atLeast(min)` / `l.label()` | a level's place in the order → `Int` / whether it is at least as important as `min` — the filter / the fixed-width text a line carries |
 | `startLogger(path, capacity)` | start a logger actor owning `path` → `Pid[String]`. Its inbox holds at most `capacity` lines, so a program logging faster than the disk writes is slowed rather than grown |
 
-A `Log` is plain data, so it is sendable: an actor is handed its logger in its start value. Stop a logger
+A `Log` — its `Sink`, `Sink::ToFile(path)` or `Sink::ToActor(pid)`, and its minimum level — is plain
+data, so it is sendable: an actor is handed its logger in its start value. Stop a logger
 actor **last** — `Stop` is queued at the end of a mailbox, so everything already sent is written, but a line
 sent after it has ended is dropped.

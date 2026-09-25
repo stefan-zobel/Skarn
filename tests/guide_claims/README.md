@@ -117,6 +117,27 @@ every anchor resolves; a broken anchor prints `#slug (first at line N)` (or `Nam
 file` when the file is missing) and the script exits `1`.
 `run_guide_claims.py` runs it at the end, with the other two runners.
 
+## The standard library reference — `tests/check_stdlib_reference.py`
+
+`SkarnStdlib.md` is written by hand, so a new library function would go undocumented and a renamed one would
+leave a stale table row. This check compares it with the compiler's own list of public names,
+`skarnvm --dump-names`:
+
+- every public name must appear in the section of its module — a function, builtin, native or constant in the
+  first column of a table (an associated function as `Type::name`, a method as `.name`), a type or trait
+  anywhere in the section;
+- every call-shaped name in a first column (`name(`, `.name(`, `Type::name(`) must exist in that module;
+- the natives under the library's wrappers (`raw*`, and `tcp*` in `std::net`) are never documented, and none
+  of them may appear in the guides or the README.
+
+A name left out on purpose goes into the script's `UNDOCUMENTED` table, with the reason.
+
+```
+python tests/check_stdlib_reference.py
+```
+
+`run_guide_claims.py` runs it last.
+
 ## Tiers
 
 - **`intro/`** — every runnable example of **`SkarnIn30Minutes.md`**, one fixture per claim, named

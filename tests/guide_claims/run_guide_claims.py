@@ -20,8 +20,9 @@
 #
 # After the claims it runs run_guide_examples.py (every ```rust block of the guides), then
 # tests/run_examples.py (every program under examples/, exact output), then check_anchors.py over all
-# guides (every link to a heading resolves), so one command is the whole doc gate.
-# --no-examples skips all three, and so does a --dir subset.
+# guides (every link to a heading resolves), then tests/check_stdlib_reference.py (SkarnStdlib.md names
+# every public std name), so one command is the whole doc gate.
+# --no-examples skips all four, and so does a --dir subset.
 #
 # Exit code: 0 = all claims (and examples) held; 1 = at least one drifted (or a fixture was malformed).
 
@@ -71,7 +72,7 @@ def main():
     add_driver_options(ap)
     ap.add_argument("--dir", default="", help="run only the claims under this directory (skips the rest)")
     ap.add_argument("--no-examples", action="store_true",
-                    help="skip the guide examples, examples/ and the anchor check")
+                    help="skip the guide examples, examples/, the anchor check and the stdlib reference check")
     opts = ap.parse_args()
 
     run_rest = not opts.no_examples and not opts.dir
@@ -126,6 +127,8 @@ def main():
         say()
         rest_failed = subprocess.run([sys.executable, str(SCRIPT_DIR / "check_anchors.py")]).returncode != 0 \
             or rest_failed
+        say()
+        rest_failed = not run_script(SCRIPT_DIR.parent / "check_stdlib_reference.py", exe) or rest_failed
     return 1 if fail_names or rest_failed else 0
 
 

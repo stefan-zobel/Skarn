@@ -29,6 +29,7 @@
 //   2  driver error   (bad usage / file not readable)
 // =============================================================================
 
+#include <algorithm> // sort -- the --dump-names listing
 #include <cstdlib>   // atoi -- the inliner tuning flags
 #include <iostream>
 #include <fstream>
@@ -36,6 +37,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <optional>
 #include <exception>
 
@@ -78,14 +80,99 @@ std::string dir_of(const std::string& path) {
     return slash == std::string::npos ? std::string() : path.substr(0, slash + 1);
 }
 
+// --dump-names: every public name of the embedded std, one line each, sorted, tab-separated:
+//   <module> <kind> <name> [<signature>]
+// The kinds: `fn` (a `pub fn`, or an associated fn of a public type as `Type::name`), `method` (a
+// method of a public type as `Type.name`, or a method a public trait declares as `Trait.name`),
+// `type`, `trait`, `const`, `variant` (`Enum::Variant`), and `ambient` -- a builtin or native, whose
+// module is the one whose `use` makes it reachable ("-" = always reachable) and which carries its
+// signature (a builtin typed per call has one per accepted shape, joined by "; "). Methods of trait
+// impls are not listed: the trait's own declaration names them. This is the checker's own view (the
+// one editor completion uses), so it covers the natives, which no .skn file declares.
+int dump_std_names() {
+    const svc::ModuleResolver no_imports =
+        [](const std::vector<std::string>&) -> std::optional<std::string> { return std::nullopt; };
+    svc::ToolCheck tc = svc::check_modules_for_tools(svc::load_modules("", no_imports), &svc::builtin_prelude());
+    if (!tc.errors.empty()) {
+        std::cerr << "error: the embedded std does not type-check: " << tc.errors.front().message << "\n";
+        return 1;
+    }
+    std::vector<std::string> lines;
+    auto emit = [&](const std::string& module, const char* kind, const std::string& name,
+                    const std::string& signature = std::string()) {
+        lines.push_back(module + "\t" + kind + "\t" + name + (signature.empty() ? "" : "\t" + signature));
+    };
+    auto in_std = [](const svc::Item& it) { return it.is_pub && it.module_prefix.rfind("std::", 0) == 0; };
+
+    std::set<std::pair<std::string, std::string>> pub_types;   // (module, type name): whose impls count
+    for (const svc::ItemPtr& ip : tc.program.items) {
+        if (!in_std(*ip)) continue;
+        const std::string& mod = ip->module_prefix;
+        switch (ip->kind) {
+        case svc::ItemKind::Fn:
+            emit(mod, "fn", svc::short_name(static_cast<const svc::FnItem&>(*ip).name));
+            break;
+        case svc::ItemKind::Const:
+            emit(mod, "const", svc::short_name(static_cast<const svc::ConstItem&>(*ip).name));
+            break;
+        case svc::ItemKind::Struct: {
+            const std::string name = svc::short_name(static_cast<const svc::StructItem&>(*ip).name);
+            emit(mod, "type", name);
+            pub_types.insert({ mod, name });
+            break;
+        }
+        case svc::ItemKind::Enum: {
+            const auto& e = static_cast<const svc::EnumItem&>(*ip);
+            const std::string name = svc::short_name(e.name);
+            emit(mod, "type", name);
+            pub_types.insert({ mod, name });
+            for (const svc::EnumVariant& v : e.variants) emit(mod, "variant", name + "::" + svc::short_name(v.name));
+            break;
+        }
+        case svc::ItemKind::Trait: {
+            const auto& t = static_cast<const svc::TraitDecl&>(*ip);
+            const std::string name = svc::short_name(t.name);
+            emit(mod, "trait", name);
+            for (const svc::Method& m : t.methods) emit(mod, "method", name + "." + m.name);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    // Inherent impls carry no `pub` of their own: their methods are public with their type.
+    for (const svc::ItemPtr& ip : tc.program.items) {
+        if (ip->kind != svc::ItemKind::Impl) continue;
+        const auto& impl = static_cast<const svc::ImplDecl&>(*ip);
+        if (!impl.is_inherent || !impl.target || impl.target->kind != svc::TypeKind::Named) continue;
+        const std::string type = svc::short_name(static_cast<const svc::NamedType&>(*impl.target).name);
+        if (!pub_types.count({ impl.module_prefix, type })) continue;
+        for (const svc::Method& m : impl.methods)
+            emit(impl.module_prefix, m.has_self ? "method" : "fn", type + (m.has_self ? "." : "::") + m.name);
+    }
+    for (const svc::AmbientFn& f : tc.ambient) {
+        std::string signature = f.signature;
+        for (size_t at = signature.find('\n'); at != std::string::npos; at = signature.find('\n', at))
+            signature.replace(at, 1, "; ");
+        emit(f.module.empty() ? "-" : f.module, "ambient", f.name, signature);
+    }
+    std::sort(lines.begin(), lines.end());
+    for (const std::string& l : lines) std::cout << l << "\n";
+    return 0;
+}
+
 void print_usage() {
     std::cerr << "usage: skarnvm [--no-prelude | --prelude <path>] [--strict] [--no-inline]\n"
                  "               [--emit-bytecode <file>] [--strip-debug] <script-file> [args...]\n"
                  "       skarnvm --run-bytecode <file> [args...]\n"
                  "       skarnvm --dump-ast [--no-prelude | --prelude <path>] <script-file>\n"
+                 "       skarnvm --dump-names\n"
                  "\n"
                  "  --dump-ast   type-check only, print the type-annotated AST of the program\n"
                  "               (prelude items omitted) to stdout and exit; nothing is run\n"
+                 "  --dump-names print every public name of the built-in standard library, one\n"
+                 "               per line: module, kind, name and, for a builtin or native, its\n"
+                 "               signature, separated by tabs; nothing else may be given\n"
                  "  --no-inline  do NOT inline small non-recursive direct calls. Inlining is a\n"
                  "               codegen-only transform (same values, fewer dispatches) and is ON\n"
                  "               by default; it costs code size and flattens a fault trace through\n"
@@ -194,6 +281,7 @@ int main(int argc, char** argv) {
     bool has_run_bc  = false;
     bool strip_debug = false;   // --strip-debug: omit the DBGL chunk when emitting
     bool dump_ast    = false;   // --dump-ast: check only, print the typed AST, exit
+    bool dump_names  = false;   // --dump-names: list the public names of the embedded std, exit
     // Seeded from the COMPILER's default rather than repeating it here: two copies of one default
     // is exactly the kind of thing that silently drifts (this one did -- the driver's unconditional
     // override kept inlining off after the library default was flipped on).
@@ -250,6 +338,8 @@ int main(int argc, char** argv) {
             strip_debug = true;
         } else if (arg == "--dump-ast") {
             dump_ast = true;
+        } else if (arg == "--dump-names") {
+            dump_names = true;
         } else if (arg == "--inline") {
             inline_on = true;  inline_given = true;
         } else if (arg == "--no-inline") {
@@ -302,6 +392,17 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    // ---- --dump-names: a listing of the embedded std, not of a program ----------
+    // Alone or not at all: any other option or a script path would be silently ignored.
+    if (dump_names) {
+        if (argc != 2) {
+            std::cerr << "error: --dump-names takes no other option and no script\n";
+            print_usage();
+            return 2;
+        }
+        return dump_std_names();
+    }
+
     // ---- --run-bytecode: skip compilation, deserialize + run a serialized image ----
     if (has_run_bc) {
         if (has_emit || no_prelude || has_prelude || strict || dump_ast || inline_given || sroa_given) {
