@@ -2762,6 +2762,8 @@ void test_import_matrix() {
         // std::log builds on THREE modules (std::io, std::time, std::actor) and re-exports none of
         // them; this row pins that its own items still travel every import form.
         { "std_log",     "std::log",     "Level",        "Log",          "match Level::Warn { Level::Warn => 2, _ => 0 }", 2 },
+        // std::resp builds on std::bytes and std::net; its own items travel every import form.
+        { "std_resp",    "std::resp",    "Resp",         "encodeCommand", "match Resp::Integer(4) { Resp::Integer(n) => n, _ => 0 }", 4 },
     };
     for (const auto& r : std_rows) {
         const std::string id = std::string("imx_") + r.id;
@@ -5601,6 +5603,133 @@ void test_codegen_natives() {
             "println(\"${n} ${bad}\")\n";
         check_true("native_append_is_atomic", cg_run_native(src) == "600 0\n");
     }
+    // ---- File handles (std::io: openFile / File) ----
+    // Write, sync and close; read back in pieces; the end of the file is an empty read; a second close
+    // and any use after close are Errs.
+    {
+        const std::string src =
+            "fn go(p: String) -> Result[String, String] {\n"
+            "  let w = openFile(p, FileMode::Write)?\n"
+            "  w.write(toBytes(\"abc\"))?\n"
+            "  w.writeStr(\"def\")?\n"
+            "  w.sync()?\n"
+            "  w.close()?\n"
+            "  let r = openFile(p, FileMode::Read)?\n"
+            "  let head = fromBytes(r.read(2)?)\n"
+            "  let rest = fromBytes(r.readAll()?)\n"
+            "  let eof = len(r.read(10)?)\n"
+            "  r.close()?\n"
+            "  let again = match r.close() { Ok(_) => \"ok\", Err(e) => e }\n"
+            "  let after = match r.read(1) { Ok(_) => \"ok\", Err(e) => e }\n"
+            "  Ok(\"${head}|${rest}|${eof}|${again}|${after}\")\n"
+            "}\n"
+            "match go(\"" + f + "\") { Ok(s) => println(s), Err(e) => println(\"error: \" + e) }\n";
+        check_true("file_roundtrip", cg_run_native(src) ==
+            "ab|cdef|0|close: file is closed or invalid|read: file is closed or invalid\n");
+    }
+    // Write truncates; Append adds at the end, also through two handles open at once.
+    {
+        const std::string src =
+            "fn go(p: String) -> Result[String, String] {\n"
+            "  let w = openFile(p, FileMode::Write)?\n"
+            "  w.writeStr(\"old contents\")?\n"
+            "  w.close()?\n"
+            "  let t = openFile(p, FileMode::Write)?\n"
+            "  t.writeStr(\"a\")?\n"
+            "  t.close()?\n"
+            "  let x = openFile(p, FileMode::Append)?\n"
+            "  let y = openFile(p, FileMode::Append)?\n"
+            "  x.writeStr(\"b\")?\n"
+            "  y.writeStr(\"c\")?\n"
+            "  x.writeStr(\"d\")?\n"
+            "  x.close()?\n"
+            "  y.close()?\n"
+            "  readTextFile(p)\n"
+            "}\n"
+            "match go(\"" + f + "\") { Ok(s) => println(s), Err(e) => println(\"error: \" + e) }\n";
+        check_true("file_write_truncates_append_appends", cg_run_native(src) == "abcd\n");
+    }
+    // A File kept after close() is refused even when a new file took its slot -- the generation in the
+    // descriptor, as for sockets.
+    {
+        const std::string src =
+            "fn go(p: String, q: String) -> Result[String, String] {\n"
+            "  let a = openFile(p, FileMode::Write)?\n"
+            "  a.close()?\n"
+            "  let b = openFile(q, FileMode::Write)?\n"
+            "  let stale = match a.writeStr(\"x\") { Ok(_) => \"written\", Err(e) => e }\n"
+            "  b.writeStr(\"y\")?\n"
+            "  b.close()?\n"
+            "  let text = readTextFile(q)?\n"
+            "  let size = fileSize(p)?\n"
+            "  Ok(\"${stale} ${text} ${size}\")\n"
+            "}\n"
+            "match go(\"" + f + "\", \"" + f + ".2\") { Ok(s) => println(s), Err(e) => println(\"error: \" + e) }\n";
+        check_true("file_stale_descriptor_refused", cg_run_native(src) == "write: file is closed or invalid y 0\n");
+    }
+    // Reading a file that does not exist, a non-positive max, and writing to a file opened for reading.
+    {
+        const std::string src =
+            "let m = match openFile(\"" + miss + "\", FileMode::Read) { Ok(_) => \"opened\", Err(e) => e }\n"
+            "println(m)\n"
+            "let w = unwrap(openFile(\"" + f + "\", FileMode::Write))\n"
+            "let _c = w.close()\n"
+            "let r = unwrap(openFile(\"" + f + "\", FileMode::Read))\n"
+            "println(match r.read(0) { Ok(_) => \"ok\", Err(e) => e })\n"
+            "println(match r.writeStr(\"x\") { Ok(_) => \"ok\", Err(e) => e })\n"
+            "let _d = r.close()\n";
+        check_true("file_errors", cg_run_native(src) ==
+            "could not open file: " + miss + "\nread: max must be a positive Int\nwrite: could not write the file\n");
+    }
+    // Append through File is atomic per write, like appendFile: four actors, each with its own File on
+    // the same path, lose and tear no line.
+    {
+        const std::string src =
+            "use std::actor::*\n"
+            "struct Job { path: String, who: Int }\n"
+            "fn writer(inbox: Inbox[Int], j: Job) -> () {\n"
+            "  let out = unwrap(openFile(j.path, FileMode::Append))\n"
+            "  let mut i = 0\n"
+            "  while i < 150 { let _r = out.writeStr(\"w${j.who} n${i}|\\n\")\n i += 1 }\n"
+            "  let _c = out.close()\n"
+            "  for _m in inbox.messages() {}\n"
+            "}\n"
+            "let _d = deleteFile(\"" + f + "\")\n"
+            "let mut kids: Vec[Pid[Int]] = vec()\n"
+            "let mut w = 0\n"
+            "while w < 4 { push(kids, spawnActor(writer, Job { path: \"" + f + "\", who: w }))\n w += 1 }\n"
+            "let watch: Inbox[Int] = newInbox()\n"
+            "for k in kids { let _m = k.actorId().watch(watch)\n let _s = stopActor(k) }\n"
+            "let mut ended = 0\n"
+            "while ended < 4 {\n"
+            "  match watch.receive() { Mail::Exited(_, _) => { ended += 1 }, _ => { ended = 4 } }\n"
+            "}\n"
+            "let text = match readTextFile(\"" + f + "\") { Ok(s) => s, Err(e) => panic(e) }\n"
+            "let mut n = 0\n"
+            "let mut bad = 0\n"
+            "for ln in lines(text) {\n"
+            "  if len(ln) > 0 { n += 1\n"
+            "    if indexOf(ln, \"|\") != len(ln) - 1 { bad += 1 } }\n"
+            "}\n"
+            "let _d2 = deleteFile(\"" + f + "\")\n"
+            "println(\"${n} ${bad}\")\n";
+        check_true("file_append_is_atomic", cg_run_native(src) == "600 0\n");
+    }
+    // A File left open is closed when the program ends: the file can be deleted afterwards.
+    {
+        const std::string src =
+            "let w = unwrap(openFile(\"" + f + "\", FileMode::Append))\n"
+            "let _r = w.writeStr(\"left open\")\n";
+        const std::string first = cg_run_native(src);
+        std::error_code rm;
+        const bool removed = std::filesystem::remove(f, rm);
+        check_true("file_closed_at_end", first.empty() && removed && !rm);
+    }
+    // The raw natives stay behind std::io's gate, and a File cannot be sent to another actor.
+    check_true("file_native_gate", cg_check_fails("let _ = rawFileOpen(\"p\", 0)"));
+    check_true("file_rejected_in_message", check_has_p(
+        "use std::io::*\nuse std::actor::*\n"
+        "fn f(inbox: Inbox[File], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0", "a file handle"));
     // mkdir + listDir: exactly one file in a fresh dir -> len 1.
     {
         const std::string src =
@@ -10832,6 +10961,177 @@ void test_std_supervisor() {
 // one line format. Every case reads the file back, so it checks what was WRITTEN, not what was
 // returned; the timestamp differs on every run, so only the rest of the line is compared.
 // =============================================================================
+// std::resp: RESP2 values, the encoder, the incremental decoder and the client. Pure Skarn.
+void test_std_resp() {
+    std::cout << "[codegen: std::resp]\n";
+    const std::string U = "use std::resp::*\nuse std::bytes::*\n";
+    // A sample of every kind of value, nested arrays and a bulk string with a line break included.
+    const std::string VALUES =
+        "let values: Vec[Resp] = toVec([\n"
+        "  Resp::Simple(\"OK\"), Resp::Error(\"ERR bad\"), Resp::Integer(-42), Resp::Integer(140737488355327),\n"
+        "  Resp::Bulk(\"line1\\r\\nline2\"), Resp::Bulk(\"\"), Resp::Null, Resp::NullArray,\n"
+        "  Resp::Arr(toVec([Resp::Integer(1), Resp::Arr(toVec([Resp::Bulk(\"x\"), Resp::Null])), Resp::Arr(vec())]))\n"
+        "])\n"
+        "let mut all = bytes()\n"
+        "for v in values { appendResp(all, v) }\n";
+    // Collects every complete value a reader holds.
+    const std::string DRAIN =
+        "fn drain(mut r: RespReader, mut into: Vec[Resp]) -> () {\n"
+        "  loop { match unwrap(r.next()) { Some(v) => push(into, v), None => break } }\n"
+        "}\n";
+    const std::string BAR =
+        "fn bar(ws: Vec[String]) -> String {\n"
+        "  let mut s = \"\"\n"
+        "  for w in ws { s = if len(s) == 0 { w } else { s + \"|\" + w } }\n"
+        "  s\n"
+        "}\n";
+
+    // The wire form of each kind.
+    check_str("resp_encode_each_kind", cg_run_native(U +
+        "let mut out = bytes()\n"
+        "appendSimple(out, \"OK\")\n appendError(out, \"ERR x\")\n appendInteger(out, -7)\n"
+        "appendBulk(out, \"a\\r\\nb\")\n appendNull(out)\n appendNullArray(out)\n appendArrayHeader(out, 2)\n"
+        "print(fromBytes(out))\n"
+        "print(fromBytes(encodeCommand(toVec([\"SET\", \"k\", \"\"]))))\n"),
+        "+OK\r\n-ERR x\r\n:-7\r\n$4\r\na\r\nb\r\n$-1\r\n*-1\r\n*2\r\n*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$0\r\n\r\n");
+    // A line break cannot end a simple string or an error early: it is written as a space.
+    check_str("resp_simple_line_break_replaced", cg_run_native(U +
+        "print(fromBytes(Resp::Simple(\"two\\r\\nlines\").encode()))\n"
+        "print(fromBytes(Resp::Error(\"ERR a\\nb\").encode()))\n"),
+        "+two  lines\r\n-ERR a b\r\n");
+    // Round trip, fed one byte at a time: every value comes out exactly once, equal to what went in.
+    check_str("resp_roundtrip_byte_at_a_time", cg_run_native(U + DRAIN + VALUES +
+        "let mut rd = RespReader::new()\n"
+        "let mut got: Vec[Resp] = vec()\n"
+        "let mut i = 0\n"
+        "while i < len(all) {\n"
+        "  rd.feed(subBytes(all, i, i + 1))\n"
+        "  drain(rd, got)\n"
+        "  i += 1\n"
+        "}\n"
+        "println(\"${len(got)} ${got == values} ${rd.buffered()}\")\n"),
+        "9 true 0\n");
+    // The whole stream cut in two at EVERY position decodes to the same values.
+    check_str("resp_every_split_point", cg_run_native(U + DRAIN + VALUES +
+        "let mut ok = 0\n"
+        "let mut cut = 0\n"
+        "while cut <= len(all) {\n"
+        "  let mut r = RespReader::new()\n"
+        "  let mut g: Vec[Resp] = vec()\n"
+        "  r.feed(subBytes(all, 0, cut))\n"
+        "  drain(r, g)\n"
+        "  r.feed(subBytes(all, cut, len(all)))\n"
+        "  drain(r, g)\n"
+        "  if g == values { ok += 1 }\n"
+        "  cut += 1\n"
+        "}\n"
+        "println(toString(ok == len(all) + 1))\n"),
+        "true\n");
+    // Commands: arrays of bulk strings and inline commands (spaces and tabs, "\n" or "\r\n", empty lines
+    // skipped), in the order they came.
+    check_str("resp_next_command", cg_run_native(U + BAR +
+        "let mut r = RespReader::new()\n"
+        "let mut b = encodeCommand(toVec([\"SET\", \"k\", \"v w\"]))\n"
+        "appendBytes(b, \"\\r\\nPING\\r\\n  ECHO \\t hi \\n*0\\r\\n\")\n"
+        "appendBytes(b, encodeCommand(toVec([\"GET\", \"k\"])))\n"
+        "r.feed(subBytes(b, 0, 20))\n"
+        "loop { match unwrap(r.nextCommand()) { Some(ws) => println(bar(ws)), None => break } }\n"
+        "println(\"--\")\n"
+        "r.feed(subBytes(b, 20, len(b)))\n"
+        "loop { match unwrap(r.nextCommand()) { Some(ws) => println(bar(ws)), None => break } }\n"
+        "println(toString(r.buffered()))\n"),
+        "--\nSET|k|v w\nPING\nECHO|hi\nGET|k\n0\n");
+    // Malformed input is an Err, never a trap: an unknown type byte, a bad integer, a bulk string of the
+    // wrong length, a "\r" without "\n", a negative length other than -1, an integer beyond 48 bits.
+    check_str("resp_malformed_is_err", cg_run_native(U +
+        "for bad in [\"?x\\r\\n\", \":12a\\r\\n\", \"$3\\r\\nabcd\\r\\n\", \":1\\rx\", \"$-2\\r\\n\", \":140737488355328\\r\\n\"] {\n"
+        "  let mut r = RespReader::new()\n"
+        "  r.feed(toBytes(bad))\n"
+        "  println(match r.next() { Ok(Some(v)) => \"value \" + v.render(), Ok(None) => \"more\", Err(e) => e })\n"
+        "}\n"
+        "let mut c = RespReader::new()\n"
+        "c.feed(toBytes(\"*1\\r\\n:1\\r\\n\"))\n"
+        "println(match c.nextCommand() { Ok(_) => \"accepted\", Err(e) => e })\n"),
+        "protocol error: unknown type byte 63\n"
+        "protocol error: invalid integer\n"
+        "protocol error: bulk string not followed by \\r\\n\n"
+        "protocol error: expected \\r\\n after \\r\n"
+        "protocol error: invalid bulk length\n"
+        "protocol error: invalid integer\n"
+        "protocol error: expected '$' in a command\n");
+    // The limits: a header line with no end in sight, arrays nested past 64, an inline line past 64 KiB.
+    check_str("resp_limits", cg_run_native(U +
+        "let mut r = RespReader::new()\n"
+        "r.feed(toBytes(\"+\" + repeatStr(\"a\", 70000)))\n"
+        "println(match r.next() { Ok(None) => \"more\", Ok(Some(_)) => \"value\", Err(e) => e })\n"
+        "let mut d = RespReader::new()\n"
+        "d.feed(toBytes(repeatStr(\"*1\\r\\n\", 70) + \":1\\r\\n\"))\n"
+        "println(match d.next() { Ok(None) => \"more\", Ok(Some(_)) => \"value\", Err(e) => e })\n"
+        "let mut i = RespReader::new()\n"
+        "i.feed(toBytes(repeatStr(\"a\", 70000)))\n"
+        "println(match i.nextCommand() { Ok(None) => \"more\", Ok(Some(_)) => \"command\", Err(e) => e })\n"),
+        "protocol error: line too long\nprotocol error: arrays nested too deep\n"
+        "protocol error: inline command too long\n");
+    // render: redis-cli's way of showing a value.
+    check_str("resp_render", cg_run_native(U +
+        "println(Resp::Arr(toVec([Resp::Bulk(\"a\"), Resp::Arr(toVec([Resp::Integer(1), Resp::Simple(\"OK\")])), Resp::Null])).render())\n"
+        "println(Resp::Arr(vec()).render())\n"
+        "println(Resp::Error(\"ERR no\").render())\n"),
+        "1) \"a\"\n2) 1) (integer) 1\n   2) OK\n3) (nil)\n(empty array)\n(error) ERR no\n");
+    // std::bytes' two helpers.
+    check_str("bytes_index_of_and_sub", cg_run_native("use std::bytes::*\n"
+        "let b = toBytes(\"a\\r\\nbc\\r\\n\")\n"
+        "println(\"${indexOfByte(b, 13, 0)} ${indexOfByte(b, 13, 2)} ${indexOfByte(b, 7, 0)} ${indexOfByte(b, 97, -5)}\")\n"
+        "println(fromBytes(subBytes(b, 3, 5)) + \"|\" + fromBytes(subBytes(b, -2, 1)) + \"|\" + toString(len(subBytes(b, 4, 2))) + \"|\" + toString(len(subBytes(b, 0, 99))))\n"),
+        "Some(1) Some(5) None Some(0)\nbc|a|0|7\n");
+    // The client against a small server in this process: one call at a time, then a pipeline of four.
+    // The server reads 7 bytes at a time, so every command reaches it in pieces.
+    check_str("resp_client_call_and_pipeline", cg_run_native(U +
+        "use std::net::*\nuse std::actor::*\n"
+        "fn server(inbox: Inbox[Int], boss: Pid[Int]) -> () {\n"
+        "  let l = unwrap(listen(0))\n"
+        "  let _s = send(boss, unwrap(l.localPort()))\n"
+        "  let c = unwrap(l.accept())\n"
+        "  let mut rd = RespReader::new()\n"
+        "  let mut going = true\n"
+        "  while going {\n"
+        "    let chunk = unwrap(c.recv(7))\n"
+        "    if len(chunk) == 0 { going = false }\n"
+        "    else {\n"
+        "      rd.feed(chunk)\n"
+        "      let mut more = true\n"
+        "      while more {\n"
+        "        match unwrap(rd.nextCommand()) {\n"
+        "          Some(args) => {\n"
+        "            let mut out = bytes()\n"
+        "            if args[0] == \"PING\" { appendSimple(out, \"PONG\") }\n"
+        "            else if args[0] == \"ECHO\" { appendBulk(out, args[1]) }\n"
+        "            else if args[0] == \"NIL\" { appendNull(out) }\n"
+        "            else { appendError(out, \"ERR unknown command '\" + args[0] + \"'\") }\n"
+        "            unwrap(c.send(out))\n"
+        "          },\n"
+        "          None => { more = false }\n"
+        "        }\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "  let _c = c.close()\n"
+        "}\n"
+        "let boss: Inbox[Int] = mainInbox()\n"
+        "let _p = spawnActor(server, boss.pid())\n"
+        "let port = match boss.receive() { Mail::Msg(p) => p, _ => 0 }\n"
+        "let mut cl = unwrap(RespClient::connect(\"127.0.0.1\", port))\n"
+        "println(unwrap(cl.call(toVec([\"PING\"]))).render())\n"
+        "println(unwrap(cl.call(toVec([\"ECHO\", \"hi\\r\\nthere\"]))).render())\n"
+        "let answers = unwrap(cl.pipeline(toVec([toVec([\"ECHO\", \"1\"]), toVec([\"NIL\"]), toVec([\"NOPE\"]), toVec([\"PING\"])])))\n"
+        "for a in answers { println(a.render()) }\n"
+        "let _x = cl.close()\n"),
+        "PONG\n\"hi\r\nthere\"\n\"1\"\n(nil)\n(error) ERR unknown command 'NOPE'\nPONG\n");
+    // std::resp builds on std::bytes and std::net and re-exports neither.
+    check_true("resp_does_not_reexport_bytes", cg_check_fails("use std::resp::*\nlet n = len(subBytes(bytes(), 0, 0))"));
+    check_true("resp_does_not_reexport_net", cg_check_fails("use std::resp::*\nlet c = connect(\"h\", 1)"));
+}
+
 void test_std_log() {
     std::cout << "[codegen: std::log]\n";
     namespace fs = std::filesystem;
@@ -11655,7 +11955,10 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // rawActiveSetSendTimeout (id 87) is NOT listed either: its whole effect is on how long a send to a
 // peer that does not read may wait, i.e. time and the network. Pinned by active_send_deadline in
 // vm_tests and the active_send_* tests here.
-static_assert(NATIVE_COUNT == 88,
+// The file-handle five (ids 88-92: rawFileOpen / rawFileRead / rawFileWrite / rawFileSync /
+// rawFileClose) are NOT listed: they are file I/O (OS side effects, like writeFile and appendFile).
+// Pinned by test_file_handles in vm_tests and the file_* tests here.
+static_assert(NATIVE_COUNT == 93,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 
@@ -13679,6 +13982,7 @@ int main(int argc, char** argv) {
     test_std_actor();
     test_std_supervisor();
     test_std_log();
+    test_std_resp();
     test_interpolation();
     test_format();
     test_string_iter();

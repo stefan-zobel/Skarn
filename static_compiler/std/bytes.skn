@@ -55,6 +55,31 @@ pub fn writeStr(mut b: Bytes, s: String) -> Bytes {
   appendBytes(b, s)
 }
 
+// --- searching and copying out ---
+// The index of the first byte equal to `x` at or after `from`, or None.
+pub fn indexOfByte(b: Bytes, x: Int, from: Int) -> Option[Int] {
+  let n = len(b)
+  let mut i = if from < 0 { 0 } else { from }
+  while i < n {
+    if b[i] == x { return Some(i) }
+    i = i + 1
+  }
+  None
+}
+// The bytes b[lo, hi) as a new buffer (one bulk copy). The bounds are clamped to the buffer, as
+// sliceBytes clamps them; an empty range gives empty Bytes.
+pub fn subBytes(b: Bytes, lo: Int, hi: Int) -> Bytes {
+  let n = len(b)
+  let l = if lo < 0 { 0 } else { lo }
+  let h = if hi > n { n } else { hi }
+  if h <= l { bytes() }
+  else {
+    let mut out = bytes(h - l)
+    _appendBytesRange(out, b, l, h)
+    out
+  }
+}
+
 // --- reader (inherent; over a ByteReader cursor; underrun -> Err) ---
 impl ByteReader {
   // A fresh cursor at position 0. An associated function (no `self`), so it is reached only as

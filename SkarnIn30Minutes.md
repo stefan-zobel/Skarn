@@ -323,7 +323,7 @@ has just worked.
 
 **Everything else is opt-in and has to be `use`d first**: `std::io` (files), `std::env` (arguments,
 environment, clocks), `std::process`, `std::math`, `std::json`, `std::time`, `std::random`, `std::set`,
-`std::bytes`, `std::cli`, `std::hash`, `std::net`, `std::regex`, `std::log`.
+`std::bytes`, `std::cli`, `std::hash`, `std::net`, `std::regex`, `std::log`, `std::resp`.
 
 ```rust
 use std::math::*

@@ -14,6 +14,7 @@ struct Context;
 struct StructType;
 struct FnInfo;
 struct NetRegistry;  // opaque per-execution TCP socket registry (defined in vmcore.cpp)
+struct FileRegistry; // opaque per-execution open-file registry (defined in vmcore.cpp)
 struct IsolateLocal; // this execution's place among the tasks and actors of its world (vmcore.cpp)
 struct ProgramImage; // the read-only program an execute() runs (Execute.h)
 
@@ -128,6 +129,10 @@ struct VM {
     // execute() always wires this; null only in the hand-built Contexts of vm_tests (which use no
     // net native), where a net native would return an "invalid socket" error rather than crash.
     NetRegistry* net = nullptr;
+    // Open files for the rawFile* natives (std::io's File): the same shape as `net` -- Int
+    // descriptors into a stack-local registry of execute() that closes what is still open at return.
+    // Null only in the hand-built Contexts of vm_tests, where a file native returns an error.
+    FileRegistry* files = nullptr;
     // Tasks and actors. `image` is the program this execute() runs. `isolate` is this execution's
     // place in its WORLD -- the tasks and actors started, directly or not, under one root
     // execute(), which owns the world and waits for all of them before it returns (see World in

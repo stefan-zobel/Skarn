@@ -1,0 +1,416 @@
+// RESP2, the protocol Redis speaks: a value type, an encoder, an incremental decoder and a client.
+// Pure Skarn over Bytes and std::net; no native. OPT-IN: `use std::resp::*`.
+//
+// On the wire every value starts with a type byte and ends its header line with "\r\n":
+//   +OK            a simple string            -ERR message   an error
+//   :42            an integer                 $5\r\nhello    a bulk string (length, then the bytes)
+//   $-1            the null bulk string       *2\r\n...      an array of N further values (*-1 = null)
+// A command is an array of bulk strings: SET k v is *3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n.
+//
+// The decoder is INCREMENTAL: bytes arrive in chunks that have nothing to do with the values in them,
+// so a RespReader collects them (`feed`) and hands out each value once it is complete (`next`,
+// `nextCommand`); `Ok(None)` means "not complete yet". Malformed input is an Err, never a trap, and the
+// limits below keep a peer from growing the buffer without end.
+//
+// LIMITS: a Skarn Int has 48 bits, so an integer beyond +-(2^47 - 1) is refused as malformed (Redis
+// allows 64 bits). A bulk string may hold at most 512 MiB, as in Redis; an array may nest 64 deep; a
+// header or inline line may be 64 KiB long.
+
+use std::bytes::*
+use std::net::*
+
+// A RESP2 value. Bulk strings are byte strings, as every Skarn String is.
+pub enum Resp { Simple(String), Error(String), Integer(Int), Bulk(String), Null, Arr(Vec[Resp]), NullArray }
+
+const MAX_BULK: Int = 536870912
+const MAX_DEPTH: Int = 64
+const MAX_LINE: Int = 65536
+const MAX_ITEMS: Int = 1048576
+
+// --- encoding: each appender writes one value onto `out` and returns it, so calls chain ---
+
+fn _crlf(mut out: Bytes) -> Bytes {
+  push(out, 13)
+  push(out, 10)
+}
+
+// A simple string or an error message must not contain a line break; one is written as a space.
+fn _appendLine(mut out: Bytes, s: String) -> Bytes {
+  let b = toBytes(s)
+  let mut clean = true
+  for c in b { if c == 13 || c == 10 { clean = false } }
+  if clean { appendBytes(out, b) }
+  else { for c in b { if c == 13 || c == 10 { push(out, 32) } else { push(out, c) } } }
+  _crlf(out)
+}
+
+// `+s\r\n`
+pub fn appendSimple(mut out: Bytes, s: String) -> Bytes {
+  push(out, 43)
+  _appendLine(out, s)
+}
+
+// `-message\r\n`. By convention the message starts with an upper-case code: "ERR ...", "WRONGTYPE ...".
+pub fn appendError(mut out: Bytes, message: String) -> Bytes {
+  push(out, 45)
+  _appendLine(out, message)
+}
+
+// `:n\r\n`
+pub fn appendInteger(mut out: Bytes, n: Int) -> Bytes {
+  push(out, 58)
+  appendBytes(out, toString(n))
+  _crlf(out)
+}
+
+// `$len\r\ns\r\n` -- any bytes, line breaks included.
+pub fn appendBulk(mut out: Bytes, s: String) -> Bytes {
+  push(out, 36)
+  appendBytes(out, toString(len(s)))
+  _crlf(out)
+  appendBytes(out, s)
+  _crlf(out)
+}
+
+// `$-1\r\n`, the null bulk string (Redis' answer to GET of a missing key).
+pub fn appendNull(mut out: Bytes) -> Bytes { appendBytes(out, "$-1\r\n") }
+
+// `*-1\r\n`, the null array.
+pub fn appendNullArray(mut out: Bytes) -> Bytes { appendBytes(out, "*-1\r\n") }
+
+// `*n\r\n`: an array of n values; append the n values after it.
+pub fn appendArrayHeader(mut out: Bytes, n: Int) -> Bytes {
+  push(out, 42)
+  appendBytes(out, toString(n))
+  _crlf(out)
+}
+
+// Any value, arrays included.
+pub fn appendResp(mut out: Bytes, r: Resp) -> Bytes {
+  match r {
+    Resp::Simple(s) => appendSimple(out, s),
+    Resp::Error(s) => appendError(out, s),
+    Resp::Integer(n) => appendInteger(out, n),
+    Resp::Bulk(s) => appendBulk(out, s),
+    Resp::Null => appendNull(out),
+    Resp::NullArray => appendNullArray(out),
+    Resp::Arr(items) => {
+      appendArrayHeader(out, len(items))
+      for it in items { appendResp(out, it) }
+      out
+    }
+  }
+}
+
+// A command as a client sends it: an array of bulk strings.
+pub fn encodeCommand(args: Vec[String]) -> Bytes {
+  let mut out = bytes()
+  appendArrayHeader(out, len(args))
+  for a in args { appendBulk(out, a) }
+  out
+}
+
+impl Resp {
+  // This value on the wire.
+  fn encode(self) -> Bytes {
+    let mut out = bytes()
+    appendResp(out, self)
+  }
+
+  // This value as redis-cli shows it: OK, "text", (integer) 3, (nil), (error) ERR ..., and an array
+  // as numbered lines.
+  fn render(self) -> String { _render(self, "") }
+}
+
+fn _render(r: Resp, indent: String) -> String {
+  match r {
+    Resp::Simple(s) => s,
+    Resp::Error(s) => "(error) " + s,
+    Resp::Integer(n) => "(integer) " + toString(n),
+    Resp::Bulk(s) => "\"" + s + "\"",
+    Resp::Null => "(nil)",
+    Resp::NullArray => "(nil)",
+    Resp::Arr(items) => {
+      if len(items) == 0 { "(empty array)" }
+      else {
+        let mut out = ""
+        let mut i = 0
+        for it in items {
+          let label = toString(i + 1) + ") "
+          let pad = indent + repeatStr(" ", len(label))
+          let line = (if i == 0 { "" } else { "\n" + indent }) + label + _render(it, pad)
+          out = out + line
+          i += 1
+        }
+        out
+      }
+    }
+  }
+}
+
+// --- decoding ---
+
+// One step of the parser: a complete value and the position after it, "not all there yet", or
+// malformed input.
+enum ParseStep { Got(Resp, Int), More, Bad(String) }
+
+// Where the line starting at `p` ends: the index of its "\r", -1 if the end has not arrived, -2 if a
+// "\r" is not followed by "\n".
+fn _lineEnd(b: Bytes, p: Int) -> Int {
+  let n = len(b)
+  let mut i = p
+  while i < n {
+    if b[i] == 13 {
+      if i + 1 >= n { return -1 }
+      return if b[i + 1] == 10 { i } else { -2 }
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// The decimal integer in b[lo, hi): an optional '-' and 1..15 digits, else None.
+fn _int(b: Bytes, lo: Int, hi: Int) -> Option[Int] {
+  let mut i = lo
+  let neg = i < hi && b[i] == 45
+  if neg { i = i + 1 }
+  if i >= hi || hi - i > 15 { return None }
+  let mut n = 0
+  while i < hi {
+    let d = b[i] - 48
+    if d < 0 || d > 9 { return None }
+    // 2^47 - 1 = 140737488355327; checked BEFORE the step, since the step itself would wrap
+    if n > 14073748835532 || (n == 14073748835532 && d > 7) { return None }
+    n = n * 10 + d
+    i = i + 1
+  }
+  Some(if neg { 0 - n } else { n })
+}
+
+// The end of a header line, or the step to report when there is none yet.
+fn _header(b: Bytes, p: Int) -> Result[Int, ParseStep] {
+  let e = _lineEnd(b, p)
+  if e == -2 { return Err(ParseStep::Bad("expected \\r\\n after \\r")) }
+  if e == -1 {
+    return Err(if len(b) - p > MAX_LINE { ParseStep::Bad("line too long") } else { ParseStep::More })
+  }
+  if e - p > MAX_LINE { return Err(ParseStep::Bad("line too long")) }
+  Ok(e)
+}
+
+fn _parse(b: Bytes, p: Int, depth: Int) -> ParseStep {
+  if p >= len(b) { return ParseStep::More }
+  let t = b[p]
+  let e = match _header(b, p + 1) { Ok(e) => e, Err(step) => return step }
+  let after = e + 2
+  if t == 43 { return ParseStep::Got(Resp::Simple(sliceBytes(b, p + 1, e)), after) }
+  if t == 45 { return ParseStep::Got(Resp::Error(sliceBytes(b, p + 1, e)), after) }
+  if t == 58 {
+    return match _int(b, p + 1, e) {
+      Some(n) => ParseStep::Got(Resp::Integer(n), after),
+      None => ParseStep::Bad("invalid integer")
+    }
+  }
+  if t == 36 {
+    let n = match _int(b, p + 1, e) { Some(n) => n, None => return ParseStep::Bad("invalid bulk length") }
+    if n == -1 { return ParseStep::Got(Resp::Null, after) }
+    if n < 0 || n > MAX_BULK { return ParseStep::Bad("invalid bulk length") }
+    if len(b) < after + n + 2 { return ParseStep::More }
+    if b[after + n] != 13 || b[after + n + 1] != 10 { return ParseStep::Bad("bulk string not followed by \\r\\n") }
+    return ParseStep::Got(Resp::Bulk(sliceBytes(b, after, after + n)), after + n + 2)
+  }
+  if t == 42 {
+    let n = match _int(b, p + 1, e) { Some(n) => n, None => return ParseStep::Bad("invalid array length") }
+    if n == -1 { return ParseStep::Got(Resp::NullArray, after) }
+    if n < 0 || n > MAX_ITEMS { return ParseStep::Bad("invalid array length") }
+    if depth >= MAX_DEPTH { return ParseStep::Bad("arrays nested too deep") }
+    let mut items: Vec[Resp] = vec()
+    let mut q = after
+    let mut i = 0
+    while i < n {
+      match _parse(b, q, depth + 1) {
+        ParseStep::Got(r, next) => {
+          push(items, r)
+          q = next
+        },
+        other => return other
+      }
+      i = i + 1
+    }
+    return ParseStep::Got(Resp::Arr(items), q)
+  }
+  ParseStep::Bad("unknown type byte " + toString(t))
+}
+
+// Drop the bytes before `to` (all of them once everything is taken, so the buffer does not grow).
+fn _take(mut r: RespReader, to: Int) -> () {
+  if to >= len(r.buf) {
+    r.buf = bytes()
+    r.pos = 0
+  } else { r.pos = to }
+}
+
+// An incremental decoder: `feed` it the bytes as they arrive, take complete values with `next` (any
+// value) or `nextCommand` (a command, as a server reads it).
+pub struct RespReader { buf: Bytes, pos: Int }
+
+impl RespReader {
+  // An empty reader.
+  fn new() -> RespReader { RespReader { buf: bytes(), pos: 0 } }
+
+  // Add the bytes that arrived.
+  fn feed(mut self, chunk: Bytes) -> () {
+    if self.pos > 0 && self.pos * 2 >= len(self.buf) {
+      self.buf = subBytes(self.buf, self.pos, len(self.buf))
+      self.pos = 0
+    }
+    appendBytes(self.buf, chunk)
+  }
+
+  // How many bytes are waiting that no value has taken yet.
+  fn buffered(self) -> Int { len(self.buf) - self.pos }
+
+  // The next complete value, Ok(None) if it has not fully arrived, or Err on malformed input (the
+  // stream cannot be trusted after that; close it).
+  fn next(mut self) -> Result[Option[Resp], String] {
+    match _parse(self.buf, self.pos, 0) {
+      ParseStep::Got(r, to) => {
+        _take(self, to)
+        Ok(Some(r))
+      },
+      ParseStep::More => Ok(None),
+      ParseStep::Bad(why) => Err("protocol error: " + why)
+    }
+  }
+
+  // The next complete command as its words. A command is an array of bulk strings, or an INLINE
+  // command -- a line of words separated by spaces, which is what a person types into telnet
+  // ("PING\r\n"); empty lines are skipped. Ok(None) if it has not fully arrived.
+  fn nextCommand(mut self) -> Result[Option[Vec[String]], String] {
+    loop {
+      let b = self.buf
+      let p = self.pos
+      if p >= len(b) { return Ok(None) }
+      if b[p] != 42 {
+        // an inline command, ended by "\n" or "\r\n"
+        let nl = match indexOfByte(b, 10, p) {
+          Some(i) => i,
+          None => {
+            if len(b) - p > MAX_LINE { return Err("protocol error: inline command too long") }
+            return Ok(None)
+          }
+        }
+        let end = if nl > p && b[nl - 1] == 13 { nl - 1 } else { nl }
+        let words = _words(b, p, end)
+        _take(self, nl + 1)
+        if len(words) > 0 { return Ok(Some(words)) }
+      } else {
+        let e = match _header(b, p + 1) {
+          Ok(e) => e,
+          Err(ParseStep::More) => return Ok(None),
+          Err(ParseStep::Bad(why)) => return Err("protocol error: " + why),
+          Err(_) => return Err("protocol error")
+        }
+        let n = match _int(b, p + 1, e) { Some(n) => n, None => return Err("protocol error: invalid array length") }
+        if n > MAX_ITEMS { return Err("protocol error: invalid array length") }
+        let mut q = e + 2
+        if n <= 0 {
+          _take(self, q)
+        } else {
+          let mut words: Vec[String] = vec()
+          let mut i = 0
+          while i < n {
+            if q >= len(b) { return Ok(None) }
+            if b[q] != 36 { return Err("protocol error: expected '$' in a command") }
+            let h = match _header(b, q + 1) {
+              Ok(h) => h,
+              Err(ParseStep::More) => return Ok(None),
+              Err(ParseStep::Bad(why)) => return Err("protocol error: " + why),
+              Err(_) => return Err("protocol error")
+            }
+            let m = match _int(b, q + 1, h) { Some(m) => m, None => return Err("protocol error: invalid bulk length") }
+            if m < 0 || m > MAX_BULK { return Err("protocol error: invalid bulk length") }
+            let start = h + 2
+            if len(b) < start + m + 2 { return Ok(None) }
+            if b[start + m] != 13 || b[start + m + 1] != 10 {
+              return Err("protocol error: bulk string not followed by \\r\\n")
+            }
+            push(words, sliceBytes(b, start, start + m))
+            q = start + m + 2
+            i = i + 1
+          }
+          _take(self, q)
+          return Ok(Some(words))
+        }
+      }
+    }
+  }
+}
+
+// The words of b[lo, hi), split on spaces and tabs.
+fn _words(b: Bytes, lo: Int, hi: Int) -> Vec[String] {
+  let mut out: Vec[String] = vec()
+  let mut i = lo
+  while i < hi {
+    while i < hi && (b[i] == 32 || b[i] == 9) { i = i + 1 }
+    let start = i
+    while i < hi && b[i] != 32 && b[i] != 9 { i = i + 1 }
+    if i > start { push(out, sliceBytes(b, start, i)) }
+  }
+  out
+}
+
+// --- a client ---
+
+// A connection to a RESP server, such as Redis. It blocks while it waits for an answer.
+pub struct RespClient { conn: TcpConn, reader: RespReader }
+
+impl RespClient {
+  // Connect to host:port.
+  fn connect(host: String, port: Int) -> Result[RespClient, String] {
+    let c = connect(host, port)?
+    Ok(RespClient { conn: c, reader: RespReader::new() })
+  }
+
+  // Send one command and wait for its answer. An error ANSWER from the server is Ok(Resp::Error(..));
+  // Err means the connection failed or the answer was malformed.
+  fn call(mut self, args: Vec[String]) -> Result[Resp, String] {
+    self.conn.send(encodeCommand(args))?
+    _answer(self)
+  }
+
+  // Send several commands at once and then read their answers, in order -- one round trip instead of
+  // one per command.
+  fn pipeline(mut self, commands: Vec[Vec[String]]) -> Result[Vec[Resp], String] {
+    let mut out = bytes()
+    for c in commands {
+      appendArrayHeader(out, len(c))
+      for a in c { appendBulk(out, a) }
+    }
+    self.conn.send(out)?
+    let mut answers: Vec[Resp] = vec()
+    let mut i = 0
+    while i < len(commands) {
+      push(answers, _answer(self)?)
+      i += 1
+    }
+    Ok(answers)
+  }
+
+  // Close the connection.
+  fn close(self) -> Result[(), String] { self.conn.close() }
+
+}
+
+// Read the next answer, receiving until it is complete.
+fn _answer(mut c: RespClient) -> Result[Resp, String] {
+  loop {
+    match c.reader.next()? {
+      Some(r) => return Ok(r),
+      None => {}
+    }
+    let chunk = c.conn.recv(65536)?
+    if len(chunk) == 0 { return Err("the server closed the connection") }
+    c.reader.feed(chunk)
+  }
+}

@@ -4310,6 +4310,57 @@ inline void test_active_send_deadline() {
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 
+// =============================================================================
+// test_file_handles -- the rawFile* natives (ids 88-92) over the per-execution FileRegistry: write,
+// sync, close; read back in pieces to the end; a second close and a stale descriptor are refused;
+// an unknown mode is an error; a file left open is closed when execute() returns.
+// =============================================================================
+inline void test_file_handles() {
+    using namespace forkjoin;
+    std::cout << "=== file_handles ===\n";
+    try {
+        const std::string path =
+            (std::filesystem::temp_directory_path() / "vm_tests_file_handles.bin").generic_string();
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        as.load_str(20, path);
+        as.load_const(21, 1);          call2(as, 22, NATIVE_FILE_OPEN, 20, 21);    // write
+        as.load_str(23, "hello");      as.BYTES_FROM_STR(24, 23);
+        call2(as, 25, NATIVE_FILE_WRITE, 22, 24);
+        call1(as, 26, NATIVE_FILE_SYNC, 22);
+        call1(as, 27, NATIVE_FILE_CLOSE, 22);
+        call1(as, 28, NATIVE_FILE_CLOSE, 22);                                      // twice: refused
+        as.load_const(21, 0);          call2(as, 29, NATIVE_FILE_OPEN, 20, 21);    // read (left open)
+        as.load_const(30, 3);          call2(as, 31, NATIVE_FILE_READ, 29, 30);
+        as.load_const(30, 100);        call2(as, 32, NATIVE_FILE_READ, 29, 30);
+        call2(as, 33, NATIVE_FILE_READ, 29, 30);                                   // the end
+        call2(as, 34, NATIVE_FILE_WRITE, 22, 24);                                  // stale descriptor
+        as.load_const(21, 7);          call2(as, 35, NATIVE_FILE_OPEN, 20, 21);    // unknown mode
+        Heap heap;
+        const Run r = run(as, heap);
+        std::error_code ec;
+        const bool removed = std::filesystem::remove(path, ec);   // fails while a handle is open (Windows)
+        const bool open_ok  = r.fault.empty() && r.regs[22].isInt() && r.regs[25].isNil() &&
+                              r.regs[26].isNil() && r.regs[27].isNil();
+        const bool twice_ok = r.fault.empty() && str_of(r.regs[28]) == "close: file is closed or invalid";
+        const bool read_ok  = r.fault.empty() && bytes_of(r.regs[31]) == "hel" && bytes_of(r.regs[32]) == "lo" &&
+                              r.regs[33].isPtr() && bytes_of(r.regs[33]).empty();
+        const bool stale_ok = r.fault.empty() && str_of(r.regs[34]) == "write: file is closed or invalid";
+        const bool mode_ok  = r.fault.empty() && str_of(r.regs[35]) == "openFile: unknown mode";
+        const bool end_ok   = removed && !ec;
+        std::cout << std::format("  write, sync, close:              {}{}\n", open_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  a second close is refused:       {}\n", twice_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  read in pieces, then the end:    {}\n", read_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  a stale descriptor is refused:   {}\n", stale_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  an unknown mode is an error:     {}\n", mode_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  closed when execute() returns:   {}\n", end_ok ? "PASS" : "FAIL");
+        check(open_ok && twice_ok && read_ok && stale_ok && mode_ok && end_ok);
+    }
+    catch (const std::exception& e) { record_fail(e.what()); }
+}
+
 // Misuse faults with a located message.
 inline void test_actor_misuse() {
     using namespace forkjoin;

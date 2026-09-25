@@ -53,6 +53,7 @@ but not run.
 23. [`std::supervisor`](#23-stdsupervisor)
 24. [`std::regex`](#24-stdregex)
 25. [`std::log`](#25-stdlog)
+26. [`std::resp`](#26-stdresp)
 
 ---
 
@@ -318,8 +319,8 @@ Each section below starts with the `use` that brings the module in. The guide's
 
 ## 8. `std::io`: files and standard input
 
-Files — read / write / append, copy, rename, delete, `mkdir`, `listDir`, stat — and standard input.
-`use std::io::*`
+Files — read / write / append, copy, rename, delete, `mkdir`, `listDir`, stat, files kept open — and
+standard input. `use std::io::*`
 
 | Function | Purpose |
 |----------|---------|
@@ -327,6 +328,11 @@ Files — read / write / append, copy, rename, delete, `mkdir`, `listDir`, stat 
 | `readTextFile` / `writeTextFile` / `appendTextFile` | the same as `String` (byte wrappers over the above) |
 | `fileExists` / `isFile` / `isDir` / `fileSize` | entry / regular-file / directory query, byte length |
 | `deleteFile` / `rename` / `copyFile` / `listDir` / `mkdir` | delete / move / copy / list / make directory |
+| `openFile(path, mode) -> Result[File, String]` | open a file and keep it open; `FileMode::Read` / `Write` / `Append` |
+| `f.read(max)` / `f.readAll()` | read at most `max` bytes (empty = end of file) / the rest of the file, as `Bytes` |
+| `f.write(bytes)` / `f.writeStr(s)` | write at the current position; in `Append` mode at the end, in one piece |
+| `f.sync()` | wait until the operating system has written the file's data to the storage device |
+| `f.close()` | close the file; any later use of `f` is an `Err` |
 | `readLine()` / `readAllStdin()` | read a line / all of standard input |
 
 ### Files
@@ -362,6 +368,46 @@ println("isFile: " + isFile(path))                        // => isFile: true   (
 `fileSize(path)` returns the byte length as a `Result[Int, String]`. `rename(from, to)` and
 `copyFile(from, to)` move / copy a file (both `Result[(), String]`); `copyFile` fails if the destination
 already exists.
+
+### Files that stay open
+
+The functions above open and close the file on every call. `openFile(path, mode)` returns a `File` that
+stays open until `f.close()`, which is what a log, or a large file read in pieces, wants:
+
+- `FileMode::Read` opens an existing file; `FileMode::Write` creates the file or empties it;
+  `FileMode::Append` creates it if absent and puts every write at its end.
+- `f.read(max)` returns at most `max` bytes, and empty `Bytes` at the end of the file; `f.readAll()`
+  returns the rest.
+- `f.sync()` returns once the operating system has written the file's data to the storage device — the
+  call to make before telling anyone that something is saved. Without it the data may still sit in the
+  operating system's cache when the machine loses power.
+- In `Append` mode each `f.write` lands at the end in one piece, even when other actors append to the
+  same file through their own `File`s.
+
+```rust
+use std::io::*
+
+fn logTwice(path: String) -> Result[String, String] {
+    let log = openFile(path, FileMode::Write)?
+    log.writeStr("first\n")?
+    log.writeStr("second\n")?
+    log.sync()?
+    log.close()?
+    let f = openFile(path, FileMode::Read)?
+    let head = fromBytes(f.read(5)?)                      // at most 5 bytes: "first"
+    let rest = fromBytes(f.readAll()?)                    // the rest: "\nsecond\n"
+    f.close()?
+    Ok(head + " / " + trim(rest))
+}
+
+match logTwice("log.txt") {
+    Ok(s)  => println(s),                                 // => first / second
+    Err(e) => println("failed: " + e)
+}
+```
+
+A `File` belongs to the actor or task that opened it and cannot be sent in a message. One that is never
+closed is closed when the program ends.
 
 ### Standard input
 
@@ -490,6 +536,8 @@ A little-endian binary reader/writer over `Bytes`, with varints and length-prefi
 | `writeVarI(b,v)` | append a signed `Int` as a zigzag varint (compact for small magnitudes); returns `b` |
 | `writeStr(b,s)` | append a length-prefixed `String` (varU byte-length + raw bytes); returns `b` |
 | `writeBytes(b,src)` | append the raw bytes of `src`; returns `b` |
+| `indexOfByte(b, x, from)` | the index of the first byte equal to `x` at or after `from` → `Option[Int]` |
+| `subBytes(b, lo, hi)` | the bytes `b[lo, hi)` as a new buffer (one bulk copy; the bounds are clamped, like `sliceBytes`'s) |
 | `ByteReader::new(b)` | a `ByteReader` cursor over `b` (`pos` starts at 0) |
 | `r.readU8()` / `r.readU16LE()` / `r.readU32LE()` / `r.readI32LE()` | read a 1/2/4-byte value → `Result[Int, String]` (`Err` on underrun) |
 | `r.readVarU()` / `r.readVarI()` | read an unsigned LEB128 / a signed zigzag varint → `Result[Int, String]` |
@@ -941,3 +989,73 @@ A `Log` — its `Sink`, `Sink::ToFile(path)` or `Sink::ToActor(pid)`, and its mi
 data, so it is sendable: an actor is handed its logger in its start value. Stop a logger
 actor **last** — `Stop` is queued at the end of a mailbox, so everything already sent is written, but a line
 sent after it has ended is dropped.
+
+## 26. `std::resp`
+
+RESP2, the protocol Redis speaks: a value type, an encoder, an incremental decoder for a server, and a
+blocking client. It builds on `std::bytes` and `std::net` and re-exports neither. `use std::resp::*`
+
+| Function | Purpose |
+|----------|---------|
+| `Resp::Simple(s)` / `Error(s)` / `Integer(n)` / `Bulk(s)` / `Null` / `Arr(items)` / `NullArray` | the seven kinds of value; a bulk string holds any bytes |
+| `appendSimple(out, s)` / `appendError(out, message)` / `appendInteger(out, n)` / `appendBulk(out, s)` | write one value onto `out: Bytes`; returns `out`. A line break in a simple string or an error is written as a space |
+| `appendNull(out)` / `appendNullArray(out)` / `appendArrayHeader(out, n)` | the null bulk string / the null array / the header of an array of `n` values, which follow |
+| `appendResp(out, r)` | any value, arrays included |
+| `r.encode()` | a value on the wire → `Bytes` |
+| `r.render()` | a value as redis-cli shows it: `OK`, `"text"`, `(integer) 3`, `(nil)`, `(error) ERR …`, numbered lines for an array |
+| `encodeCommand(args)` | a command, `Vec[String]`, as a client sends it: an array of bulk strings → `Bytes` |
+| `RespReader::new()` | an empty incremental decoder |
+| `rd.feed(chunk)` | add bytes as they arrive (`rd` must be `mut`) |
+| `rd.next()` | the next complete value → `Result[Option[Resp], String]`: `Ok(None)` until it has fully arrived, `Err` on malformed input |
+| `rd.nextCommand()` | the next complete command as its words → `Result[Option[Vec[String]], String]`; also reads an inline command, a line of words as typed into telnet |
+| `rd.buffered()` | bytes received that no value has taken yet |
+| `RespClient::connect(host, port)` | connect to a RESP server → `Result[RespClient, String]` |
+| `c.call(args)` | send one command and wait for its answer → `Result[Resp, String]`; an error answer is `Ok(Resp::Error(…))` |
+| `c.pipeline(commands)` | send several commands at once, then read their answers in order → `Result[Vec[Resp], String]` |
+| `c.close()` | close the connection |
+
+The decoder takes bytes in whatever pieces the network delivers them, which have nothing to do with where
+one value ends and the next begins; it hands out each value once it is complete. Malformed input is an
+`Err`, never a crash — after one, close the connection. The limits keep a peer from making the buffer grow
+without end: a bulk string holds at most 512 MiB, as in Redis, arrays nest at most 64 deep, and a header or
+an inline line is at most 64 KiB long. An integer must fit Skarn's 48 bits; a larger one, which Redis
+allows, is malformed here.
+
+```rust
+use std::resp::*
+
+let wire = encodeCommand(toVec(["SET", "greeting", "hello world"]))
+let mut rd = RespReader::new()
+rd.feed(wire)
+match rd.nextCommand() {
+    Ok(Some(words)) => println("${len(words)} words, the last: ${words[2]}"),  // => 3 words, the last: hello world
+    Ok(None)        => println("not complete yet"),
+    Err(e)          => println(e)
+}
+
+let mut reply = bytes()
+appendArrayHeader(reply, 2)
+appendBulk(reply, "a")
+appendInteger(reply, 42)
+rd.feed(reply)
+match rd.next() {
+    Ok(Some(r)) => println(r.render()),     // => 1) "a"
+    _           => println("no value")      // => 2) (integer) 42
+}
+```
+
+A client, against a Redis server or anything else that speaks RESP:
+
+```rust check
+use std::resp::*
+
+fn demo() -> Result[(), String] {
+    let mut c = RespClient::connect("127.0.0.1", 6379)?
+    println(c.call(toVec(["SET", "counter", "10"]))?.render())       // OK
+    let answers = c.pipeline(toVec([toVec(["INCR", "counter"]), toVec(["GET", "counter"])]))?
+    for a in answers { println(a.render()) }                         // (integer) 11, then "11"
+    c.close()
+}
+
+match demo() { Ok(_) => (), Err(e) => println("failed: " + e) }
+```

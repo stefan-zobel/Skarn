@@ -1295,6 +1295,12 @@ private:
         add_native("rename",       { S, S }, make_named(std_Result(), { ty_unit(), S }),       STD_IO);
         add_native("copyFile",     { S, S }, make_named(std_Result(), { ty_unit(), S }),       STD_IO);
         add_native("readAllStdin", {},       S,                                                STD_IO);
+        // File handles -- std::io's File wraps the descriptor; the raw natives stay internal.
+        add_native("rawFileOpen",  { S, ty_int() },        make_named(std_Result(), { ty_int(), S }),    STD_IO);
+        add_native("rawFileRead",  { ty_int(), ty_int() }, make_named(std_Result(), { B, S }),           STD_IO);
+        add_native("rawFileWrite", { ty_int(), B },        make_named(std_Result(), { ty_unit(), S }),   STD_IO);
+        add_native("rawFileSync",  { ty_int() },           make_named(std_Result(), { ty_unit(), S }),   STD_IO);
+        add_native("rawFileClose", { ty_int() },           make_named(std_Result(), { ty_unit(), S }),   STD_IO);
         // Environment / time -- std::env (opt-in).
         add_native("getEnv",       { S },    make_named(std_Option(), { S }),                  STD_ENV);
         add_native("nanoTime",     {},       ty_int(),                                         STD_ENV);
@@ -4617,6 +4623,9 @@ private:
             t->name == mangle_name(STD_POLL, "NbConn") || t->name == mangle_name(STD_POLL, "NbListener") ||
             t->name == mangle_name(STD_NET, "ActiveConn") || t->name == mangle_name(STD_NET, "ActiveListener"))
             return "a socket handle (" + r(t) + ")";
+        // A file descriptor names an entry in the sending isolate's own registry.
+        if (t->name == mangle_name(STD_IO, "File"))
+            return "a file handle (" + r(t) + ")";
         // An active connection's events arrive in an inbox of its owner; elsewhere it would be a reading
         // end of someone else's connection. (Its Inbox field would bar it too -- this names the cause.)
         if (t->name == mangle_name(STD_NET, "SockEvents"))

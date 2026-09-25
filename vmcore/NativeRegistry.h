@@ -155,7 +155,15 @@ enum NativeId : uint16_t {
     // A deadline for sending on an active connection: a send that cannot finish within it closes the
     // connection (0 = none, the default). A send also ends when its actor is told to stop.
     NATIVE_ACTIVE_SET_SEND_TIMEOUT = 87, // rawActiveSetSendTimeout(conn, ms) -> ()
-    NATIVE_COUNT       = 88,
+    // File handles: an open file stays open between calls, so a program can append to a log without
+    // reopening it and ask for the data to reach the disk. A descriptor is an Int into the per-execution
+    // FileRegistry (slot + generation, like a socket's), closed at the end of the execute() that opened it.
+    NATIVE_FILE_OPEN   = 88,    // rawFileOpen(path, mode) -> Int | String (mode 0 read, 1 write/truncate, 2 append)
+    NATIVE_FILE_READ   = 89,    // rawFileRead(fd, max)    -> Bytes | String (empty Bytes = end of file)
+    NATIVE_FILE_WRITE  = 90,    // rawFileWrite(fd, bytes) -> nil | String (one OS write; atomic per call in append mode)
+    NATIVE_FILE_SYNC   = 91,    // rawFileSync(fd)         -> nil | String (FlushFileBuffers / fsync)
+    NATIVE_FILE_CLOSE  = 92,    // rawFileClose(fd)        -> nil | String (frees the slot; the descriptor goes stale)
+    NATIVE_COUNT       = 93,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -256,6 +264,11 @@ inline int native_id_of(const std::string& name) {
     if (name == "rawActiveClose") return NATIVE_ACTIVE_CLOSE;
     if (name == "rawActivateListener") return NATIVE_ACTIVATE_LISTENER;
     if (name == "rawActiveSetSendTimeout") return NATIVE_ACTIVE_SET_SEND_TIMEOUT;
+    if (name == "rawFileOpen") return NATIVE_FILE_OPEN;
+    if (name == "rawFileRead") return NATIVE_FILE_READ;
+    if (name == "rawFileWrite") return NATIVE_FILE_WRITE;
+    if (name == "rawFileSync") return NATIVE_FILE_SYNC;
+    if (name == "rawFileClose") return NATIVE_FILE_CLOSE;
     return -1;
 }
 
@@ -289,6 +302,11 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_ACTIVATE:
         case NATIVE_ACTIVE_SEND:
         case NATIVE_ACTIVATE_LISTENER:
+        case NATIVE_FILE_OPEN:
+        case NATIVE_FILE_READ:
+        case NATIVE_FILE_WRITE:
+        case NATIVE_FILE_SYNC:
+        case NATIVE_FILE_CLOSE:
         case NATIVE_RUN_PROCESS: return NRET_RESULT;
         case NATIVE_GET_ENV:
         case NATIVE_READ_LINE:   return NRET_OPTION;
@@ -351,6 +369,9 @@ inline int native_arity(int id) {
         case NATIVE_ACTIVE_SEND:
         case NATIVE_ACTIVATE_LISTENER:
         case NATIVE_ACTIVE_SET_SEND_TIMEOUT:
+        case NATIVE_FILE_OPEN:
+        case NATIVE_FILE_READ:
+        case NATIVE_FILE_WRITE:
         case NATIVE_RUN_PROCESS: return 2;
         case NATIVE_ACTOR_SPAWN_BOUNDED:
         case NATIVE_SPAWN_INTO:
@@ -391,6 +412,8 @@ inline int native_arity(int id) {
         case NATIVE_STOP_REQUESTED:
         case NATIVE_SLEEP:
         case NATIVE_ACTIVE_CLOSE:
+        case NATIVE_FILE_SYNC:
+        case NATIVE_FILE_CLOSE:
         case NATIVE_SHA256:
         case NATIVE_F64_TO_BYTES: return 1;
         case NATIVE_NANO_TIME:

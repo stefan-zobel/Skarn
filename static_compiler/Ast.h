@@ -482,10 +482,11 @@ constexpr const char* STD_CORE    = "std::core";    // Option/Result + variants 
 constexpr const char* STD_ITER    = "std::iter";    // Iterator/IntoIterator/Iterable + combinators (ring)
 constexpr const char* STD_STRING  = "std::string";  // charStr/slice (+ future string helpers)    (ring)
 constexpr const char* STD_PROCESS = "std::process"; // ProcessOutput + run/sh/... + the rawRun native (opt-in)
-// Opt-in modules. STD_IO and STD_ENV have NO prelude source of their own -- they exist purely to gate
-// the ambient natives, which is why `use std::env::*` works with nothing to import. STD_BYTES DOES have
-// a source file (std/bytes.skn, in std/modules.manifest): the LE binary reader/writer shipped.
-constexpr const char* STD_IO      = "std::io";      // file/stdin natives (readFile/writeFile/...)  (gate only)
+// Opt-in modules. STD_ENV has NO prelude source of its own -- it exists purely to gate the ambient
+// natives, which is why `use std::env::*` works with nothing to import. STD_IO gates the file/stdin
+// natives AND has a source file (std/io.skn: the text-file wrappers and File). STD_BYTES likewise
+// (std/bytes.skn, in std/modules.manifest): the LE binary reader/writer shipped.
+constexpr const char* STD_IO      = "std::io";      // file/stdin natives + text wrappers + File      (opt-in)
 constexpr const char* STD_ENV     = "std::env";     // env/time natives (getEnv/args/nanoTime/...)  (gate only)
 constexpr const char* STD_BYTES   = "std::bytes";   // LE binary reader/writer + ByteReader          (opt-in)
 constexpr const char* STD_MATH    = "std::math";    // math natives (sqrt/pow/... ) + toIntChecked   (opt-in)

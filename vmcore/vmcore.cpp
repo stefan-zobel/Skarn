@@ -199,6 +199,73 @@ struct NetRegistry {
     }
 };
 
+// Open-file registry for the rawFile* natives (std::io's File) -- the file counterpart of
+// NetRegistry, with the same shape and for the same reasons: a file is exposed to Skarn as an Int
+// DESCRIPTOR (`slot | gen << SLOT_BITS`), never an OS handle; closing a file advances its slot's
+// generation, so a File kept after close() is refused instead of reaching the next file opened
+// into that slot; and execute() holds one as a stack local whose destructor closes whatever is
+// still open, on the fault path too. NOT a GC root (OS handles, no Values). One per execute(), so a
+// descriptor means nothing in another isolate -- which is why the checker keeps File out of
+// messages. The natives live next to native_append_file.
+struct FileRegistry {
+#ifdef _WIN32
+    using handle_t = HANDLE;
+    static inline const handle_t NO_FILE = INVALID_HANDLE_VALUE;
+#else
+    using handle_t = int;
+    static constexpr handle_t NO_FILE = -1;
+#endif
+    static constexpr int     SLOT_BITS = 24;
+    static constexpr int64_t SLOT_MASK = (int64_t{1} << SLOT_BITS) - 1;
+    struct Slot {
+        handle_t h   = NO_FILE;
+        int64_t  gen = 0;
+    };
+    std::vector<Slot> slots;
+    FileRegistry() = default;
+    FileRegistry(const FileRegistry&) = delete;
+    FileRegistry& operator=(const FileRegistry&) = delete;
+    ~FileRegistry() {
+        for (const Slot& sl : slots)
+            if (sl.h != NO_FILE) close_handle(sl.h);
+    }
+    static void close_handle(handle_t h) {
+#ifdef _WIN32
+        CloseHandle(h);
+#else
+        ::close(h);
+#endif
+    }
+    int64_t add(handle_t h) {
+        size_t i = 0;
+        while (i < slots.size() && slots[i].h != NO_FILE) ++i;
+        if (i == slots.size()) slots.push_back(Slot{});
+        slots[i].h = h;
+        return static_cast<int64_t>(i) | (slots[i].gen << SLOT_BITS);
+    }
+    // The live slot a descriptor names, or null (closed, never issued, or negative).
+    Slot* live(int64_t fd) {
+        if (fd < 0) return nullptr;
+        const auto i = static_cast<size_t>(fd & SLOT_MASK);
+        if (i >= slots.size() || slots[i].gen != (fd >> SLOT_BITS) || slots[i].h == NO_FILE)
+            return nullptr;
+        return &slots[i];
+    }
+    // Closes the file and retires the descriptor. False if `fd` was not live or the OS close failed.
+    bool close(int64_t fd) {
+        Slot* sl = live(fd);
+        if (!sl) return false;
+#ifdef _WIN32
+        const bool ok = CloseHandle(sl->h) != 0;
+#else
+        const bool ok = ::close(sl->h) == 0;
+#endif
+        sl->h   = NO_FILE;
+        sl->gen = (sl->gen + 1) & ((int64_t{1} << 23) - 1);   // stays within a positive 48-bit Int
+        return ok;
+    }
+};
+
 // =============================================================================
 // Tasks and actors -- one runtime for both (the "isolates" of concurrency stage 2).
 //
@@ -885,6 +952,9 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
     // still open when execute() returns (incl. the VmFault path) -- the safety net behind tcpClose.
     NetRegistry net_registry;
     vm.net                 = &net_registry;
+    // Open files (std::io's File), closed the same way when execute() returns.
+    FileRegistry file_registry;
+    vm.files               = &file_registry;
     // Tasks and actors: the image this call runs, built from its own arguments, and its WORLD. A
     // root (no `task`) owns a new world; a task or actor joins the one it was started in.
     // Declared in this order so the world is destroyed FIRST -- its destructor stops every actor
@@ -1446,6 +1516,147 @@ static Value native_append_file(Value* args, uint8_t nargs, Context* ctx) {
     if (wrote < 0 || static_cast<size_t>(wrote) != data.size())
         return native_make_error(ctx, "could not write file: " + path);
 #endif
+    return Value::fromNil();
+}
+
+// ---- File handles (ids 88-92): std::io's File, over the per-execution FileRegistry. ----------
+// All five are NRET_RESULT: a String is the error message. The descriptor argument is a bare Int;
+// std::io's File passes its field.
+
+// rawFileOpen(path, mode) -> Int descriptor | String. mode 0 = read an existing file, 1 = write
+// (create or truncate), 2 = append (create if absent; every write lands at the true end, as
+// appendFile's do, so several isolates may append to one file).
+static Value native_file_open(Value* args, uint8_t nargs, Context* ctx) {
+    if (nargs < 2 || !is_string(args[0]))
+        return native_make_error(ctx, "openFile: path must be a string");
+    if (!args[1].isInt())
+        return native_make_error(ctx, "openFile: mode must be an Int");
+    const int64_t mode = args[1].asSigned48();
+    if (mode < 0 || mode > 2)
+        return native_make_error(ctx, "openFile: unknown mode");
+    if (!ctx->vm->files)
+        return native_make_error(ctx, "openFile: no file registry");
+    std::string path;
+    {
+        GcObject* o = GcObject::from_slots(args[0].asPtr());
+        path.assign(o->bytes(), o->string_length());
+    }
+#ifdef _WIN32
+    // FILE_SHARE_DELETE lets another handle rename or delete the file while this one is open, as
+    // POSIX always allows (a log is rotated by renaming it).
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    const DWORD access = mode == 0 ? GENERIC_READ : mode == 1 ? GENERIC_WRITE : FILE_APPEND_DATA;
+    const DWORD disposition = mode == 0 ? OPEN_EXISTING : mode == 1 ? CREATE_ALWAYS : OPEN_ALWAYS;
+    const HANDLE h = CreateFileA(path.c_str(), access, share, nullptr, disposition,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return native_make_error(ctx, "could not open file: " + path);
+#else
+    const int flags = mode == 0 ? O_RDONLY
+                    : mode == 1 ? O_WRONLY | O_CREAT | O_TRUNC
+                    :             O_WRONLY | O_CREAT | O_APPEND;
+    const int h = ::open(path.c_str(), flags | O_CLOEXEC, 0644);
+    if (h < 0)
+        return native_make_error(ctx, "could not open file: " + path);
+#endif
+    return Value::fromSigned48(ctx->vm->files->add(h));
+}
+
+// The live registry slot behind a descriptor argument, or null (not an Int, closed, never issued).
+static FileRegistry::Slot* file_slot(Value v, Context* ctx) {
+    if (!v.isInt() || !ctx->vm->files) return nullptr;
+    return ctx->vm->files->live(v.asSigned48());
+}
+
+// rawFileRead(fd, max) -> Bytes | String. Reads at most `max` bytes (at most 16 MiB per call) from
+// the current position; empty Bytes means the end of the file.
+static Value native_file_read(Value* args, uint8_t nargs, Context* ctx) {
+    FileRegistry::Slot* sl = nargs >= 1 ? file_slot(args[0], ctx) : nullptr;
+    if (!sl)
+        return native_make_error(ctx, "read: file is closed or invalid");
+    if (nargs < 2 || !args[1].isInt() || args[1].asSigned48() <= 0)
+        return native_make_error(ctx, "read: max must be a positive Int");
+    const size_t max = static_cast<size_t>(std::min<int64_t>(args[1].asSigned48(), 16 << 20));
+    std::string buf(max, '\0');
+#ifdef _WIN32
+    DWORD got = 0;
+    if (!ReadFile(sl->h, buf.data(), static_cast<DWORD>(max), &got, nullptr))
+        return native_make_error(ctx, "read: could not read the file");
+    buf.resize(got);
+#else
+    ssize_t got;
+    do { got = ::read(sl->h, buf.data(), max); } while (got < 0 && errno == EINTR);
+    if (got < 0)
+        return native_make_error(ctx, "read: could not read the file");
+    buf.resize(static_cast<size_t>(got));
+#endif
+    Value result;
+    bytes_from_str(ctx, &result, buf);
+    return result;
+}
+
+// rawFileWrite(fd, bytes) -> nil | String. ONE OS write per call (WriteFile / write), so on a file
+// opened for appending the whole buffer lands at the end in one piece, as with appendFile. POSIX
+// may write a regular file only partly (a full disk, a signal); the rest is then written by
+// further calls, and a failure is reported.
+static Value native_file_write(Value* args, uint8_t nargs, Context* ctx) {
+    FileRegistry::Slot* sl = nargs >= 1 ? file_slot(args[0], ctx) : nullptr;
+    if (!sl)
+        return native_make_error(ctx, "write: file is closed or invalid");
+    if (nargs < 2 || !args[1].isPtr() ||
+        GcObject::from_slots(args[1].asPtr())->kind != GcObject::KIND_BYTES)
+        return native_make_error(ctx, "write: second argument must be a byte buffer");
+    std::string data;
+    {
+        GcObject*      hdr     = GcObject::from_slots(args[1].asPtr());
+        GcObject*      backing = GcObject::from_slots(hdr->slots()[BYTES_SLOT_BACKING].asPtr());
+        const uint32_t count   = static_cast<uint32_t>(hdr->slots()[BYTES_SLOT_COUNT].asSigned48());
+        data.assign(backing->bytes(), count);
+    }
+    if (data.empty())
+        return Value::fromNil();
+#ifdef _WIN32
+    DWORD wrote = 0;
+    if (!WriteFile(sl->h, data.data(), static_cast<DWORD>(data.size()), &wrote, nullptr) ||
+        wrote != data.size())
+        return native_make_error(ctx, "write: could not write the file");
+#else
+    size_t done = 0;
+    while (done < data.size()) {
+        const ssize_t n = ::write(sl->h, data.data() + done, data.size() - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0)
+            return native_make_error(ctx, "write: could not write the file");
+        done += static_cast<size_t>(n);
+    }
+#endif
+    return Value::fromNil();
+}
+
+// rawFileSync(fd) -> nil | String. Asks the OS to write the file's data out to the storage device
+// before returning (FlushFileBuffers / fsync) -- the call a log makes before it may say "saved".
+// On macOS fsync reaches the drive but not necessarily past the drive's own cache, as for every
+// program that uses it.
+static Value native_file_sync(Value* args, uint8_t nargs, Context* ctx) {
+    FileRegistry::Slot* sl = nargs >= 1 ? file_slot(args[0], ctx) : nullptr;
+    if (!sl)
+        return native_make_error(ctx, "sync: file is closed or invalid");
+#ifdef _WIN32
+    if (!FlushFileBuffers(sl->h))
+        return native_make_error(ctx, "sync: could not flush the file");
+#else
+    if (::fsync(sl->h) != 0)
+        return native_make_error(ctx, "sync: could not flush the file");
+#endif
+    return Value::fromNil();
+}
+
+// rawFileClose(fd) -> nil | String. The descriptor goes stale; closing it again is an error.
+static Value native_file_close(Value* args, uint8_t nargs, Context* ctx) {
+    if (nargs < 1 || !args[0].isInt() || !ctx->vm->files || !ctx->vm->files->live(args[0].asSigned48()))
+        return native_make_error(ctx, "close: file is closed or invalid");
+    if (!ctx->vm->files->close(args[0].asSigned48()))
+        return native_make_error(ctx, "close: could not close the file");
     return Value::fromNil();
 }
 
@@ -4069,5 +4280,10 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_ACTIVE_CLOSE] = native_active_close;
     t[NATIVE_ACTIVATE_LISTENER] = native_activate_listener;
     t[NATIVE_ACTIVE_SET_SEND_TIMEOUT] = native_active_set_send_timeout;
+    t[NATIVE_FILE_OPEN]    = native_file_open;
+    t[NATIVE_FILE_READ]    = native_file_read;
+    t[NATIVE_FILE_WRITE]   = native_file_write;
+    t[NATIVE_FILE_SYNC]    = native_file_sync;
+    t[NATIVE_FILE_CLOSE]   = native_file_close;
     return t;
 }

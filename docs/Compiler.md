@@ -318,7 +318,7 @@ copied. The checker therefore adds these rules at every call of `spawn`:
 - **The parameter type and the result type must be sendable.** Sendable means plain data: numbers, `Bool`,
   `String`, `Bytes`, and tuples, collections, structs and enums built only from sendable parts. It excludes
   function values, trait objects, type parameters without the bound `Sendable`, and handles — a socket
-  (`TcpConn`, `TcpListener`, `NbConn`, `NbListener`), a `Task` or an actor's `Inbox`. A handle is a struct
+  (`TcpConn`, `TcpListener`, `NbConn`, `NbListener`), an open `File`, a `Task` or an actor's `Inbox`. A handle is a struct
   over an integer that is meaningful only in the heap that created it. The check walks recursive types,
   treating a type met again as sendable so far, and caches nothing. A disallowed component behind a mutual
   recursion is therefore still found.
@@ -486,6 +486,10 @@ its own.
   - A child made with `child` has a new address after a restart; one made with `childIn` keeps the slot's.
   - A supervisor that gives up tells its children to stop and releases their addresses, but it cannot end
     one that never receives.
+
+`std::resp` is RESP2, the protocol Redis speaks, in plain Skarn over `std::bytes` and `std::net`: an
+encoder, an incremental decoder that takes bytes in whatever pieces they arrive and refuses malformed input
+with an `Err`, and a blocking client. It needs no rule and no native of its own.
 
 `std::log` is logging, also plain Skarn and also over `std::actor`, with no rule and no native of its own.
 A `Log` holds a sink and a minimum level; a line is a timestamp, a level and the text.

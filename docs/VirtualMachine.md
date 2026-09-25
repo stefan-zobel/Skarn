@@ -262,17 +262,30 @@ finding it and using it. What that does not cover is a write larger than the ope
 size, and it says nothing about `writeFile` or a read-modify-write, neither of which is one call.
 
 The socket natives work on small integer descriptors into a per-execution table, never on raw OS handles,
-and close whatever is still open when the execution ends. `tcpConnect` gives up after 10 seconds: on POSIX
+and close whatever is still open when the execution ends. A descriptor is a slot plus a generation: closing
+or handing off a socket advances its slot's generation, so a descriptor kept afterwards is refused instead of
+reaching whichever socket reuses the slot. The file-handle natives behind `std::io`'s `File` (open, read,
+write, sync, close) use a second table of the same shape. A file opened for appending positions every write
+at the end as part of the write, as `appendFile` does, and `sync` is `FlushFileBuffers` on Windows and
+`fsync` on POSIX. Neither kind of descriptor means anything in another isolate, so the checker keeps both
+out of messages. `tcpConnect` gives up after 10 seconds: on POSIX
 through a non-blocking connect and `select()`, on Windows through a blocking connect bounded by `TCP_MAXRT`,
 because there the `select()` wait can add one timer tick (about 15 ms) even on loopback.
 
 **Adding a native:**
 
-1. Append a `NativeId` and extend `native_id_of`, `native_return_of` and `native_arity`.
+1. Append a `NativeId`, raise `NATIVE_COUNT`, and extend `native_id_of`, `native_return_of` and
+   `native_arity`. List the id in `native_return_of` even when it returns a `Result`: an id missing there
+   falls to the default, `Result`, so a forgotten plain native would be wrapped in `Ok(...)` without any
+   error.
 2. Write the `NativeFunc` and add it to `build_native_table()`.
 3. Declare its Skarn signature and its standard-library module in the checker (`add_native` in
-   `static_compiler/Check.cpp`).
-4. Add a test.
+   `static_compiler/Check.cpp`). If it hands out a handle, add the handle's type to the types that
+   cannot be sent in a message (`send_blocker_in`).
+4. Update the `NATIVE_COUNT` pin in `static_compiler_tests`: decide whether the native is deterministic
+   and so belongs in the oracle's list of natives it models.
+5. Add a test. A public wrapper needs a row in `SkarnStdlib.md` and its names in the highlighters; the
+   doc gate checks both.
 
 No opcode is needed.
 

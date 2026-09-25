@@ -140,6 +140,13 @@ if(TARGET skarnvm)
     add_test(NAME highlighters
              COMMAND "${Python3_EXECUTABLE}" tests/check_highlighters.py ${SKARN_DRIVER}
              WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # Sedis, the key-value server under Sedis/, has tests of its own; registered only where the
+    # directory exists.
+    if(EXISTS "${CMAKE_SOURCE_DIR}/Sedis/tests/run_tests.py")
+        add_test(NAME sedis
+                 COMMAND "${Python3_EXECUTABLE}" Sedis/tests/run_tests.py ${SKARN_DRIVER}
+                 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    endif()
 endif()
 
 # ---- stack reserve for the front-end executables ----------------------------

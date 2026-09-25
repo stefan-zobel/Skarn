@@ -182,9 +182,9 @@ fn keeper(inbox: Inbox[Inbox[Int]], unused: Int) -> () {}
 let k = spawnActor(keeper, 0)   // error: cannot be sent to an actor
 ```
 
-Function values, trait objects and open sockets are out for the same reason: each means something only in
-the memory it came from. A lambda captures variables that live in *your* memory; a socket is a number the
-operating system gave to *your* thread.
+Function values, trait objects, open sockets and open files are out for the same reason: each means
+something only in the memory it came from. A lambda captures variables that live in *your* memory; a socket
+or a `File` is a number the runtime gave to *your* actor.
 
 Notice **when** the compiler said no. Not at the `send`, but at `spawnActor` — where the address was made.
 That is the rule throughout: a `Pid[M]` is proof that `M` can be sent, so by the time you hold one, every
