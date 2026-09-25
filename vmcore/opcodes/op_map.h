@@ -147,7 +147,8 @@ map_probe(const Value* s, uint32_t cap, Value key, uint32_t h) noexcept {
 //     GC root (the tombstone key is an immediate, so it pins nothing).
 //   * `count` (live) drops by one; `used` (live + tombstones, the load-factor driver)
 //     is left unchanged -- the tombstone still occupies a probe slot until a future
-//     map_grow rehashes and drops it.
+//     map_grow rehashes and drops it. Deleting never shrinks the backing by itself; the
+//     next insert that finds the table full does (map_rehash_cap).
 [[nodiscard]] SKARN_FORCEINLINE inline bool
 map_delete(GcObject* map_obj, Value key) noexcept {
     GcObject*      backing = GcObject::from_slots(map_obj->slots()[MAP_SLOT_BACKING].asPtr());
@@ -183,14 +184,33 @@ inline void map_new(Context* ctx, Value* dst) SKARN_ALLOC_NOEXCEPT {
     hdr->slots()[MAP_SLOT_BACKING] = Value::fromPtr(backing->slots());
 }
 
-// Grow the backing to 2x capacity and rehash the live entries (tombstones dropped).
+// The capacity map_grow rehashes into, chosen from what is LIVE:
+//   * mostly live (count >= used / 2): twice the old capacity, as always -- a map that never
+//     deletes has count == used and takes this branch every time, so its capacities (and with
+//     them its iteration order) are exactly what they were before this rule existed;
+//   * mostly tombstones: the smallest power of two >= MAP_INITIAL_CAP that leaves the live
+//     entries at most 35 % full, never more than the old capacity -- the same size or smaller.
+// Always doubling was the defect: a map whose keys keep changing (a new key in, an old one out)
+// held one live entry in a backing that grew with every key it had ever held and never shrank,
+// and a walk over it scans the whole backing.
+// Either way at most 35 % of the new table is used after the rehash, and the next one comes at
+// 70 %, so the scan of the old backing is paid for by the >= 35 % of inserts in between.
+[[nodiscard]] inline uint32_t map_rehash_cap(uint32_t old_cap, int64_t count, int64_t used) noexcept {
+    if (count * 2 >= used) return old_cap * 2;
+    uint32_t cap = MAP_INITIAL_CAP;
+    while (cap < old_cap && static_cast<int64_t>(cap) * 7 / 20 < count + 1) cap *= 2;
+    return cap;
+}
+
+// Rehash the live entries into a new backing of map_rehash_cap's size (tombstones dropped).
 // Allocates -> may collect; `map_slot` (a register) roots the header, re-fetched
 // after. RAISES on heap exhaustion.
 SKARN_NOINLINE inline void map_grow(Context* ctx, Value* map_slot) SKARN_ALLOC_NOEXCEPT {
     GcObject*      hdr     = GcObject::from_slots(map_slot->asPtr());
     GcObject*      old_b   = GcObject::from_slots(hdr->slots()[MAP_SLOT_BACKING].asPtr());
     const uint32_t old_cap = old_b->slot_count() / 2;
-    const uint32_t new_cap = old_cap * 2;
+    const uint32_t new_cap = map_rehash_cap(old_cap, hdr->slots()[MAP_SLOT_COUNT].asSigned48(),
+                                            hdr->slots()[MAP_SLOT_USED].asSigned48());
 
     GcObject* new_b = ctx->vm->heap->alloc_slots_gc(GcObject::KIND_ARRAY, 2 * new_cap, ctx);
     if (!new_b) RaiseException(VM_EXC_HEAP_EXHAUSTED, EXCEPTION_NONCONTINUABLE, 0, nullptr);
@@ -231,9 +251,11 @@ inline void map_set(Context* ctx, Value* map_slot, Value* key_slot, Value* val_s
         return;
     }
 
-    // New insertion. Grow if the table (live + tombstones) would be too full. The
-    // early-return for an update above is what keeps repeated updates of the same
-    // key from triggering unbounded growth near the load-factor boundary.
+    // New insertion. Rehash if the table (live + tombstones) would be too full --
+    // into a larger table, or into one of the same size or smaller when most of it
+    // is tombstones (map_rehash_cap). The early-return for an update above is what
+    // keeps repeated updates of the same key from triggering unbounded growth near
+    // the load-factor boundary.
     const uint32_t used = static_cast<uint32_t>(hdr->slots()[MAP_SLOT_USED].asSigned48());
     if (used + 1u > (cap * 7u) / 10u) {          // load factor 0.70
         map_grow(ctx, map_slot);                 // allocates; re-fetch everything below

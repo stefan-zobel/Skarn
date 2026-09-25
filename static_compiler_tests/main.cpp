@@ -5132,6 +5132,17 @@ void test_codegen_combinators() {
         "let mut m: Map[Int, Int] = #{}\n m[1] = 100  m[2] = 200\n sum(map(intoIter(m), fn(kv: (Int, Int)) -> Int { let (k, v) = kv  v }))", 300);
     check_int_p("map_for_after_delete",     // a tombstone in the backing is skipped by the cursor
         "let mut m: Map[Int, Int] = #{}\n m[1] = 1  m[2] = 2  m[3] = 3\n delete(m, 2)\n let mut s = 0\n for (k, v) in m { s = s + v }\n s", 4);
+    // Keys that keep changing: the backing is rehashed to what is live (not doubled on every
+    // rehash), and nothing live is lost on the way -- values, len and a walk all agree.
+    check_int_p("map_churn_values",         // one live key at a time, 50 000 through
+        "let mut m: Map[Int, Int] = #{}\n let mut i = 0\n"
+        " while i < 50000 { m[i] = i * 2  delete(m, i - 1)  i += 1 }\n"
+        " len(m) * 1000000 + m[49999]", 1000000 + 99998);
+    check_int_p("map_churn_iterate",        // 1000 fixed keys, 20 000 passing beside them
+        "let mut m: Map[Int, Int] = #{}\n let mut j = 0\n while j < 1000 { m[j] = 1  j += 1 }\n"
+        " let mut k = 100000\n while k < 120000 { m[k] = 0  delete(m, k - 1)  k += 1 }\n"
+        " let mut n = 0\n let mut s = 0\n for (_, v) in m { n += 1  s += v }\n"
+        " n * 10000 + s", 1001 * 10000 + 1000);
 }
 
 // Lazy iteration: the Iterator / IntoIterator cursor pipeline in the tree-shakeable prelude --
@@ -13073,6 +13084,14 @@ void test_torture() {
         "let mut m: Map[Int, Int] = #{}\n m[1] = 10  m[2] = 20  m[3] = 30\n let mut s = 0\n for (k, v) in m { s = s + k + v }\n s", true);
     check_same("diff_map_intoiter_sum",
         "let mut m: Map[Int, Int] = #{}\n m[7] = 1  m[8] = 2  m[9] = 3\n fold(intoIter(m), 0, fn(a: Int, kv: (Int, Int)) -> Int { let (k, v) = kv  a + k + v })", true);
+    // Keys that keep changing, beside fixed ones: the rehashes that shrink the backing must keep
+    // every live entry (a walk's sum, len and a read of each fixed key).
+    check_same("diff_map_churn",
+        "let mut m: Map[Int, Int] = #{}\n let mut j = 0\n while j < 300 { m[j] = j  j += 1 }\n"
+        " let mut k = 5000\n while k < 9000 { m[k] = k  delete(m, k - 1)  k += 1 }\n"
+        " let mut s = 0\n for (key, v) in m { s = s + key + v }\n"
+        " let mut r = 0\n j = 0\n while j < 300 { r = r + m[j]  j += 1 }\n"
+        " s * 1000 + len(m) * 7 + r", true);
     // String streaming (split / lines): pure prelude, cross-checked vs the reference interpreter.
     check_same("diff_split_empties",
         "let v = collect(split(\"a,,b,\", \",\"))  len(v) * 10 + len(v[1]) + len(v[3])", true);

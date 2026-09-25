@@ -124,6 +124,7 @@ int main(int argc, char** argv) {
     run("bytes_append",             test_bytes_append);
     run("map",                      test_map);
     run("map_iter_next",            test_map_iter_next);
+    run("map_churn",                test_map_churn);
     run("eq_deep",                  test_eq_deep);
     run("closure_gc",               test_closure_gc);
     run("closure_roots",            test_closure_roots);

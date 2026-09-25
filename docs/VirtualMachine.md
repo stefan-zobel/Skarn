@@ -341,6 +341,11 @@ Growth replaces the backing without changing the header, so every reference to t
 
 - **Map** (`op_map.h`): the header holds the backing, the live count and the used-slot count. The backing is
   a `KIND_ARRAY` of interleaved keys and values, probed linearly, with tombstones for deleted entries.
+  - An insert that would fill the table past 70 % (live entries and tombstones) rehashes it and drops the
+    tombstones. When most of the used slots are live the new table is twice the size; when most are
+    tombstones it is the smallest one that leaves the live entries at most 35 % full, never larger than
+    before. So a map whose keys keep changing stays the size of what it holds. Deleting alone never
+    shrinks the backing; the next insert that finds the table full does.
   - String keys hash and compare by content, which a moving collector cannot change. Other immediates key by
     their bits (`SameValueZero`).
   - A non-string heap object is not a valid key and traps: its address changes when the collector moves it.

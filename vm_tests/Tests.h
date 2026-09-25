@@ -8459,6 +8459,165 @@ inline void test_map_iter_next() {
 }
 
 // =============================================================================
+// test_map_churn -- a map whose keys keep changing keeps a backing the size of what is
+// LIVE. map_grow used to double on every rehash, tombstones or not, so a map holding one
+// entry at a time grew with every key it had ever held and never shrank, and a walk over it
+// scanned the whole backing (found by a key-value server whose per-connection maps are keyed
+// by numbers that only count up). A map that never deletes must still double exactly as
+// before -- its capacities, and with them its iteration order, are pinned in Block C.
+// =============================================================================
+inline uint32_t map_capacity_of(Value m) {
+    GcObject* hdr = GcObject::from_slots(m.asPtr());
+    return static_cast<uint32_t>(
+        GcObject::from_slots(hdr->slots()[MAP_SLOT_BACKING].asPtr())->slot_count() / 2);
+}
+
+inline void test_map_churn() {
+    std::cout << "=== map churn (rehash sized by the live entries) ===\n";
+    constexpr int64_t N   = 100000;      // keys that pass through
+    constexpr int64_t OFF = 1000000;     // the passing keys start here, clear of the fixed ones
+
+    // ---- Block A: one live key at a time, N keys through ----
+    {
+        Heap heap(1 << 20);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);                                   // r0 = map
+        as.load_const(1, 0);                             // r1 = i
+        as.load_constant(2, Value::fromSigned48(N));     // r2 = N
+        as.load_const(3, 1);                             // r3 = 1
+        as.label("loop");
+        as.B(OpCode::BGE_INT, 1, 2, "end");
+        as.MAP_SET(0, 1, 1);                             // m[i] = i
+        as.R6(OpCode::SUB_INT, 4, 1, 3);
+        as.MAP_DELETE(5, 0, 4);                          // delete m[i - 1]
+        as.R6(OpCode::ADD_INT, 1, 1, 3);
+        as.J(OpCode::J, "loop");
+        as.label("end");
+        as.LEN(6, 0);                                    // r6 = 1
+        as.load_constant(7, Value::fromSigned48(N - 1));
+        as.MAP_GET(8, 0, 7);                             // r8 = m[N - 1] = N - 1
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block A (one live key, " << N << " through)...\n";
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, nullptr, 10, &as.constant_pool());
+            auto* regs = res.get_reg_base();
+            const uint32_t cap = map_capacity_of(regs[0]);
+            const bool len_ok  = regs[6].isInt() && regs[6].asSigned48() == 1;
+            const bool get_ok  = regs[8].isInt() && regs[8].asSigned48() == N - 1;
+            const bool cap_ok  = cap <= 16;
+            std::cout << std::format("  len = 1              : {}\n", len_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  m[N-1] = N-1         : {}\n", get_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  capacity {} <= 16     : {}\n", cap, cap_ok ? "PASS" : "FAIL");
+            check(len_ok && get_ok && cap_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Blocks B + D: 1000 fixed keys, N keys through beside them, then a walk ----
+    {
+        Heap heap(1 << 20);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);                                   // r0 = map
+        as.load_const(3, 1);                             // r3 = 1
+        as.load_const(1, 0);                             // r1 = j
+        as.load_const(2, 1000);                          // r2 = 1000
+        as.label("fixed");
+        as.B(OpCode::BGE_INT, 1, 2, "fixed_done");
+        as.MAP_SET(0, 1, 1);                             // m[j] = j
+        as.R6(OpCode::ADD_INT, 1, 1, 3);
+        as.J(OpCode::J, "fixed");
+        as.label("fixed_done");
+        as.load_constant(1, Value::fromSigned48(OFF));            // r1 = k
+        as.load_constant(2, Value::fromSigned48(OFF + N));        // r2 = end
+        as.label("pass");
+        as.B(OpCode::BGE_INT, 1, 2, "pass_done");
+        as.MAP_SET(0, 1, 1);                             // m[k] = k
+        as.R6(OpCode::SUB_INT, 4, 1, 3);
+        as.MAP_DELETE(5, 0, 4);                          // delete m[k - 1] (a no-op for k = OFF)
+        as.R6(OpCode::ADD_INT, 1, 1, 3);
+        as.J(OpCode::J, "pass");
+        as.label("pass_done");
+        // every fixed key still found: r6 = sum of m[j], j < 1000
+        as.load_const(6, 0);
+        as.load_const(1, 0);
+        as.load_const(2, 1000);
+        as.label("read");
+        as.B(OpCode::BGE_INT, 1, 2, "read_done");
+        as.MAP_GET(7, 0, 1);
+        as.R6(OpCode::ADD_INT, 6, 6, 7);
+        as.R6(OpCode::ADD_INT, 1, 1, 3);
+        as.J(OpCode::J, "read");
+        as.label("read_done");
+        as.LEN(8, 0);                                    // r8 = 1001
+        // walk: r12 visits, r13 key sum
+        as.load_const(10, 0);                            // cursor
+        as.load_const(12, 0);
+        as.load_const(13, 0);
+        as.load_const(17, 0);
+        as.label("walk");
+        as.MAP_ITER_NEXT(11, 0, 10);
+        as.B(OpCode::BLT_INT, 11, 17, "walk_done");
+        as.MAP_KEY_AT(14, 0, 11);
+        as.R6(OpCode::ADD_INT, 13, 13, 14);
+        as.R6(OpCode::ADD_INT, 12, 12, 3);
+        as.R6(OpCode::ADD_INT, 10, 11, 3);
+        as.J(OpCode::J, "walk");
+        as.label("walk_done");
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Blocks B + D (1000 fixed keys, " << N << " through, then a walk)...\n";
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, nullptr, 20, &as.constant_pool());
+            auto* regs = res.get_reg_base();
+            auto I = [&](int i, int64_t want) { return regs[i].isInt() && regs[i].asSigned48() == want; };
+            const uint32_t cap = map_capacity_of(regs[0]);
+            const bool fixed_ok = I(6, 999 * 1000 / 2);
+            const bool len_ok   = I(8, 1001);
+            const bool cap_ok   = cap <= 4096;
+            const bool walk_ok  = I(12, 1001) && I(13, 999 * 1000 / 2 + OFF + N - 1);
+            std::cout << std::format("  fixed keys all found : {}\n", fixed_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  len = 1001           : {}\n", len_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  capacity {} <= 4096 : {}\n", cap, cap_ok ? "PASS" : "FAIL");
+            std::cout << std::format("  walk: 1001 live keys : {}\n", walk_ok ? "PASS" : "FAIL");
+            check(fixed_ok && len_ok && cap_ok && walk_ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+
+    // ---- Block C: a map that never deletes doubles exactly as before ----
+    {
+        Heap heap(1 << 20);
+        Assembler as;
+        as.label("main");
+        as.MAP_NEW(0);
+        as.load_const(1, 0);
+        as.load_const(2, 1000);
+        as.load_const(3, 1);
+        as.label("loop");
+        as.B(OpCode::BGE_INT, 1, 2, "end");
+        as.MAP_SET(0, 1, 1);
+        as.R6(OpCode::ADD_INT, 1, 1, 3);
+        as.J(OpCode::J, "loop");
+        as.label("end");
+        as.J(OpCode::HALT);
+
+        std::cout << "Running Block C (1000 inserts, no delete)...\n";
+        try {
+            auto res   = execute(as.assemble(), &heap, nullptr, nullptr, 4, &as.constant_pool());
+            auto* regs = res.get_reg_base();
+            const uint32_t cap = map_capacity_of(regs[0]);
+            const bool ok = cap == 2048;                 // 8, 16, ... 1024 holds 716 -> 2048
+            std::cout << std::format("  capacity {} == 2048  : {}\n", cap, ok ? "PASS" : "FAIL");
+            check(ok);
+        }
+        catch (const std::exception& e) { record_fail(e.what()); }
+    }
+}
+
+// =============================================================================
 // test_closure_gc -- the moving-GC guard for KIND_CLOSURE (Milestone A1). A
 // closure's by-value CAPTURE that is itself a heap pointer must be forwarded
 // through the Cheney scan of the closure payload (which is scanned like a
