@@ -3717,6 +3717,29 @@ inline void task_fns(Assembler& as) {
     as.load_const(0, 0);
     as.J(OpCode::RET);
 
+    // aselectio(_): parks in a SELECT_IO over its own inbox alone, with no deadline and no socket.
+    // Stop must reach it exactly as it reaches a select -- an actor that cannot be stopped holds up
+    // ~World, which is the defect a blocking tcpRecv still has and the reason this wait is a native.
+    as.label("aselectio");
+    as.call_native_id(1, 9, 0, 0, NATIVE_SELF_ID);
+    as.VEC_NEW(6);
+    as.VEC_PUSH(6, 1);
+    as.VEC_NEW(7);                                       // no sockets
+    as.VEC_NEW(8);                                       // and no interest
+    as.R6(OpCode::MOV, 2, 6, 0);                         // four arguments: r2 .. r5
+    as.R6(OpCode::MOV, 3, 7, 0);
+    as.R6(OpCode::MOV, 4, 8, 0);
+    as.load_const(5, -1);
+    as.call_native_id(10, 9, 2, 4, NATIVE_SELECT_IO);    // r10 = the flag array; r9 holds the id
+    as.R6(OpCode::MOV, 2, 1, 0);
+    as.load_const(3, 0);
+    as.call_native_id(4, 9, 2, 2, NATIVE_RECEIVE);       // cannot wait: selectIo said it is ready
+    as.load_const(2, 0);
+    as.R6(OpCode::MOV, 3, 4, 0);
+    as.call_native_id(7, 9, 2, 2, NATIVE_SEND);          // the mail KIND, to the main program
+    as.load_const(0, 0);
+    as.J(OpCode::RET);
+
     // aslot(inbox_id): like aecho, but it receives on the inbox its ARGUMENT names -- the slot it was
     // started into, whose id is not its own (rawSpawnInto). Doubles each message to the main program.
     as.label("aslot");
@@ -3924,6 +3947,7 @@ inline void declare_task_fns(Assembler& as) {
     as.declare_fn("awatch", 8, 1);
     as.declare_fn("abusy",  8, 1);
     as.declare_fn("aselect", 8, 1);
+    as.declare_fn("aselectio", 12, 1);
     as.declare_fn("afill",  8, 1);
     as.declare_fn("astop",  8, 1);
     as.declare_fn("aconn",  8, 1);
@@ -5281,6 +5305,159 @@ inline void test_actor_select_stop() {
         const bool ok = r.fault.empty() && r.regs[12].isBool() && r.regs[12].asBool() &&
                         is_int(13, 1) && is_int(14, 3);          // MAIL_STOP, seen through the select
         std::cout << std::format("  Stop wakes a parked select:     {}{}\n", ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        check(ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// rawSelectIo: the ONE wait that covers inboxes and sockets together, which is what lets an actor
+// read its own socket instead of taking the bytes from the world's I/O thread. Neither other wait can:
+// receive and select park on a condition variable no socket can wake, and rawPoll watches only
+// sockets. A loopback pair stands in for a client, and the root does the waiting.
+//
+// The LEVEL-triggered check is the one that would break silently: on Windows the socket's readiness is
+// a WSAEventSelect event, and FD_READ fires on an EDGE, so an implementation that took its flags from
+// the event would stop reporting a buffer its caller had not fully drained. It takes them from a
+// zero-timeout poll instead, and reading ONE of four bytes here is what proves it.
+inline void test_select_io() {
+    using namespace forkjoin;
+    std::cout << "=== select_io ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        as.load_const(20, 0);          call1(as, 21, NATIVE_TCP_LISTEN, 20);        // listener
+        call1(as, 22, NATIVE_TCP_LOCAL_PORT, 21);
+        as.load_str(23, "127.0.0.1");  call2(as, 24, NATIVE_TCP_CONNECT, 23, 22);   // the "client"
+        call1(as, 25, NATIVE_TCP_ACCEPT, 21);                                       // our end
+        as.load_const(20, 1);          call2(as, 26, NATIVE_SET_NON_BLOCKING, 25, 20);
+        main_inbox(as, 10);                                                          // address 0
+        as.VEC_NEW(11);  as.load_const(12, 0);  as.VEC_PUSH(11, 12);                // boxes = [ 0 ]
+        as.VEC_NEW(13);  as.VEC_PUSH(13, 25);                                       // fds   = [ ours ]
+        as.VEC_NEW(14);  as.load_const(15, 1);  as.VEC_PUSH(14, 15);                // want  = [ READABLE ]
+        auto select_io = [&](uint8_t rd, uint8_t rboxes, uint8_t rfds, uint8_t rwant, int64_t ms) {
+            as.R6(OpCode::MOV, 43, rboxes, 0);
+            as.R6(OpCode::MOV, 44, rfds, 0);
+            as.R6(OpCode::MOV, 45, rwant, 0);
+            as.load_const(46, ms);
+            as.call_native_id(rd, 42, 43, 4, NATIVE_SELECT_IO);
+        };
+        auto at = [&](uint8_t rd, uint8_t rarr, int64_t i) {
+            as.load_const(17, i);
+            as.R6(OpCode::ARRAY_GET, rd, rarr, 17);
+        };
+        select_io(27, 11, 13, 14, 50);                       // nothing yet: the deadline, all zeros
+        as.R6(OpCode::LEN, 28, 27, 0);
+        at(29, 27, 0);  at(30, 27, 1);
+        as.load_str(31, "wxyz");  as.BYTES_FROM_STR(32, 31);
+        call2(as, 33, NATIVE_TCP_SEND, 24, 32);              // the client writes four bytes
+        select_io(34, 11, 13, 14, 5000);                     // the SOCKET fires, the inbox does not
+        at(35, 34, 0);  at(36, 34, 1);
+        as.load_const(20, 1);  call2(as, 37, NATIVE_RECV_NB, 25, 20);   // read ONE, leave three
+        select_io(38, 11, 13, 14, 5000);                     // still readable: level-triggered
+        at(39, 38, 1);
+        as.load_const(20, 4096);  call2(as, 40, NATIVE_RECV_NB, 25, 20);  // drain the rest
+        as.load_const(18, 0);  send_int(as, 19, 18, 7);      // mail into our own inbox
+        select_io(1, 11, 13, 14, 5000);                      // now the INBOX fires and the socket does not
+        at(2, 1, 0);  at(3, 1, 1);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool shape_ok = r.fault.empty() && is_int(28, 2) && is_int(29, 0) && is_int(30, 0);
+        const bool sock_ok  = r.fault.empty() && is_int(35, 0) && is_int(36, 1);
+        const bool level_ok = r.fault.empty() && is_int(39, 1);
+        const bool box_ok   = r.fault.empty() && is_int(2, 1) && is_int(3, 0);
+        std::cout << std::format("  a deadline with nothing ready:      {}{}\n", shape_ok ? "PASS" : "FAIL",
+                                 r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
+        std::cout << std::format("  the socket wakes it, alone:         {}\n", sock_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  a PARTIAL read stays readable:      {}\n", level_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  the inbox wakes it, alone:          {}\n", box_ok ? "PASS" : "FAIL");
+        bool rules_ok = true;
+        {   // fds and interest of different lengths: an error in the value, as rawPoll answers
+            Assembler bad;
+            declare_task_fns(bad);
+            bad.label("main");
+            main_inbox(bad, 10);
+            bad.VEC_NEW(11);  bad.load_const(12, 0);  bad.VEC_PUSH(11, 12);
+            bad.VEC_NEW(13);  bad.load_const(14, 3);  bad.VEC_PUSH(13, 14);
+            bad.VEC_NEW(15);
+            bad.R6(OpCode::MOV, 43, 11, 0);
+            bad.R6(OpCode::MOV, 44, 13, 0);
+            bad.R6(OpCode::MOV, 45, 15, 0);
+            bad.load_const(46, 0);
+            bad.call_native_id(16, 42, 43, 4, NATIVE_SELECT_IO);
+            Heap bad_heap;
+            const Run br = run(bad, bad_heap);
+            const bool len_ok = br.fault.empty() &&
+                                str_of(br.regs[16]).find("same length") != std::string::npos;
+            std::cout << std::format("  fds and interest of equal length:   {}  (\"{}\")\n",
+                                     len_ok ? "PASS" : "FAIL", str_of(br.regs[16]));
+            rules_ok = rules_ok && len_ok;
+        }
+        {   // nothing to watch at all, and no deadline: nothing could ever end it
+            Assembler bad;
+            declare_task_fns(bad);
+            bad.label("main");
+            main_inbox(bad, 10);
+            bad.VEC_NEW(11);  bad.VEC_NEW(12);  bad.VEC_NEW(13);
+            bad.R6(OpCode::MOV, 43, 11, 0);
+            bad.R6(OpCode::MOV, 44, 12, 0);
+            bad.R6(OpCode::MOV, 45, 13, 0);
+            bad.load_const(46, -1);
+            bad.call_native_id(14, 42, 43, 4, NATIVE_SELECT_IO);
+            Heap bad_heap;
+            const Run br = run(bad, bad_heap);
+            const bool empty_ok = br.fault.empty() &&
+                                  str_of(br.regs[14]).find("wait forever") != std::string::npos;
+            std::cout << std::format("  nothing to watch, no deadline:      {}  (\"{}\")\n",
+                                     empty_ok ? "PASS" : "FAIL", str_of(br.regs[14]));
+            rules_ok = rules_ok && empty_ok;
+        }
+        {   // someone else's inbox: refused exactly as a receive on it would be
+            Assembler bad;
+            declare_task_fns(bad);
+            bad.label("main");
+            main_inbox(bad, 10);
+            bad.load_const(41, 0);  spawn_actor(bad, 11, "aecho");
+            bad.VEC_NEW(12);  bad.VEC_PUSH(12, 11);
+            bad.VEC_NEW(13);  bad.VEC_NEW(14);
+            bad.R6(OpCode::MOV, 43, 12, 0);
+            bad.R6(OpCode::MOV, 44, 13, 0);
+            bad.R6(OpCode::MOV, 45, 14, 0);
+            bad.load_const(46, 0);
+            bad.call_native_id(15, 42, 43, 4, NATIVE_SELECT_IO);
+            Heap bad_heap;
+            const Run br = run(bad, bad_heap);
+            const bool foreign_ok = br.fault.find("belongs to another actor") != std::string::npos;
+            std::cout << std::format("  someone else's inbox: a fault:      {}  (\"{}\")\n",
+                                     foreign_ok ? "PASS" : "FAIL", br.fault);
+            rules_ok = rules_ok && foreign_ok;
+        }
+        check(shape_ok && sock_ok && level_ok && box_ok && rules_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// A selectIo is not a receive either, so every way an actor is ENDED must reach it. Stop goes into
+// every inbox an actor owns and each of them wakes the pad -- and since selectIo parks on the pad's
+// POLLABLE half, this is the test that the second wake object is signalled as well as `gen` bumped.
+inline void test_select_io_stop() {
+    using namespace forkjoin;
+    std::cout << "=== select_io_stop ===\n";
+    try {
+        Assembler as;
+        declare_task_fns(as);
+        as.label("main");
+        main_inbox(as, 10);
+        as.load_const(41, 0);  spawn_actor(as, 11, "aselectio");   // parks in a selectIo, forever
+        call1(as, 12, NATIVE_STOP_ACTOR, 11);
+        receive_main(as, 13, 10000);                                // it reports what woke it
+        mail_read(as, 14, NATIVE_MAIL_MSG);
+        Heap heap;
+        const Run r = run(as, heap);
+        auto is_int = [&](int reg, int64_t v) { return r.regs[reg].isInt() && r.regs[reg].asSigned48() == v; };
+        const bool ok = r.fault.empty() && r.regs[12].isBool() && r.regs[12].asBool() &&
+                        is_int(13, 1) && is_int(14, 3);             // MAIL_STOP, seen through selectIo
+        std::cout << std::format("  Stop wakes a parked selectIo:   {}{}\n", ok ? "PASS" : "FAIL",
                                  r.fault.empty() ? "" : "  (fault: " + r.fault + ")");
         check(ok);
     } catch (const std::exception& e) { record_fail(e.what()); }

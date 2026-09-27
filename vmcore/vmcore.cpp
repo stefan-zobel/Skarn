@@ -312,15 +312,125 @@ struct Mail {
 //     holding NO pad lock, so mail can arrive in between; it then parks only if `gen` is unchanged.
 //   * A notifier takes the mailbox mutex and this one in SEQUENCE, never nested (put/offer release
 //     the box before waking) -- so no lock order between the two exists to get wrong.
+//   * `pollers` and the wake object below are the pollable half, for rawSelectIo: a wait that must
+//     also cover a SOCKET cannot park on `cv`, because no socket can wake a condition variable. It is
+//     made on the first rawSelectIo of this isolate and never before, so a program that does not use
+//     it pays one further relaxed load per wake and nothing else. NOT the loopback socket pair the
+//     I/O hub uses, which would be one code path for both platforms: measured, a wake through it
+//     costs 6.3-7.3 us against 1.4-1.7 us for the platform's own primitive, and WSAPoll itself is the
+//     expensive half (a UDP pair is worse again). See "Waiting on inboxes and sockets at once" in
+//     docs/VirtualMachine.md.
 struct WaitPad {
     std::mutex              m;
     std::condition_variable cv;
     uint64_t                gen = 0;        // guarded by m; bumped on every wake
-    std::atomic<int>        waiters{ 0 };
+    std::atomic<int>        waiters{ 0 };   // parked on `cv`     (receive / select)
+    std::atomic<int>        pollers{ 0 };   // parked on the wake object below (selectIo)
+#ifdef _WIN32
+    HANDLE                  ev = nullptr;   // manual-reset, so a reset is the drain
+    // One WSAEVENT per socket, kept ACROSS calls: associating a socket with an event is free once it
+    // is cached and a kernel-object creation if it is not. Keyed by the OS socket, since that is what
+    // the association belongs to. Bounded: a caller that watches an unbounded number of different
+    // sockets over its life gets the cache rebuilt rather than grown.
+    struct SockEv { socket_t s; WSAEVENT ev; long mask; };
+    std::vector<SockEv>     sock_ev;        // guarded by m
+    static constexpr size_t SOCK_EV_MAX = 64;
+#else
+    int                     wake_rd = -1, wake_wr = -1;   // a pipe: macOS has no eventfd
+#endif
+
+    ~WaitPad() {
+#ifdef _WIN32
+        for (SockEv& e : sock_ev) WSACloseEvent(e.ev);
+        if (ev) CloseHandle(ev);
+#else
+        if (wake_rd >= 0) ::close(wake_rd);
+        if (wake_wr >= 0) ::close(wake_wr);
+#endif
+    }
+
+    // Make the pollable half, once. Called only by rawSelectIo, and BEFORE `pollers` is raised -- so a
+    // notifier that sees `pollers > 0` has taken `m` after this released it and reads a made object.
+    bool ensure_pollable() {
+        std::lock_guard<std::mutex> lk(m);
+#ifdef _WIN32
+        if (!ev) ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        return ev != nullptr;
+#else
+        if (wake_rd < 0) {
+            int fd[2];
+            if (::pipe(fd) != 0) return false;
+            for (int i = 0; i < 2; ++i) {
+                const int fl = ::fcntl(fd[i], F_GETFL, 0);
+                if (fl >= 0) ::fcntl(fd[i], F_SETFL, fl | O_NONBLOCK);
+            }
+            wake_rd = fd[0];
+            wake_wr = fd[1];
+        }
+        return wake_rd >= 0;
+#endif
+    }
+
+#ifdef _WIN32
+    // The event a socket's readiness signals. WSAEventSelect's FD_* are EDGE-triggered, which is why
+    // rawSelectIo never reads its FLAGS from here -- it takes them from a zero-timeout sock_poll. This
+    // event only has to WAKE the wait.
+    WSAEVENT event_for(socket_t sock, short want) {
+        const long mask = FD_CLOSE |
+                          ((want & POLL_READ)  ? (FD_READ | FD_ACCEPT)   : 0) |
+                          ((want & POLL_WRITE) ? (FD_WRITE | FD_CONNECT) : 0);
+        std::lock_guard<std::mutex> lk(m);
+        for (size_t i = 0; i < sock_ev.size(); ++i) {
+            if (sock_ev[i].s != sock) continue;
+            if (sock_ev[i].mask == mask) return sock_ev[i].ev;
+            if (WSAEventSelect(sock, sock_ev[i].ev, mask) == 0) {
+                sock_ev[i].mask = mask;
+                return sock_ev[i].ev;
+            }
+            WSACloseEvent(sock_ev[i].ev);          // the descriptor was reused or closed: start over
+            sock_ev.erase(sock_ev.begin() + static_cast<ptrdiff_t>(i));
+            break;
+        }
+        if (sock_ev.size() >= SOCK_EV_MAX) {
+            for (SockEv& e : sock_ev) WSACloseEvent(e.ev);
+            sock_ev.clear();
+        }
+        WSAEVENT we = WSACreateEvent();
+        if (we == WSA_INVALID_EVENT) return we;
+        if (WSAEventSelect(sock, we, mask) != 0) {
+            WSACloseEvent(we);
+            return WSA_INVALID_EVENT;
+        }
+        sock_ev.push_back(SockEv{ sock, we, mask });
+        return we;
+    }
+#endif
+
+    void poke() {                               // one signal, never blocking, outside every lock
+#ifdef _WIN32
+        if (ev) SetEvent(ev);
+#else
+        if (wake_wr < 0) return;
+        const char b = 1;
+        (void)!::write(wake_wr, &b, 1);
+#endif
+    }
+    void drain() {                              // BEFORE the scan, so a signal after it is not lost
+#ifdef _WIN32
+        if (ev) ResetEvent(ev);
+#else
+        if (wake_rd < 0) return;
+        char b[64];
+        while (::read(wake_rd, b, sizeof(b)) > 0) {}
+#endif
+    }
     void wake() {
-        if (waiters.load(std::memory_order_relaxed) == 0) return;
+        const int w = waiters.load(std::memory_order_relaxed);
+        const int p = pollers.load(std::memory_order_relaxed);
+        if (w == 0 && p == 0) return;
         { std::lock_guard<std::mutex> lk(m); ++gen; }
-        cv.notify_all();
+        if (w) cv.notify_all();
+        if (p) poke();
     }
 };
 
@@ -2523,6 +2633,15 @@ static constexpr int64_t SK_POLL_READABLE = 1;
 static constexpr int64_t SK_POLL_WRITABLE = 2;
 static constexpr int64_t SK_POLL_CLOSED   = 4;
 
+// One place turns a poll result into the Skarn flag word, for rawPoll and rawSelectIo alike.
+static inline int64_t sk_poll_flags(short revents) {
+    int64_t flags = 0;
+    if (revents & POLL_READ)                      flags |= SK_POLL_READABLE;
+    if (revents & POLL_WRITE)                     flags |= SK_POLL_WRITABLE;
+    if (revents & (POLLERR | POLLHUP | POLLNVAL)) flags |= SK_POLL_CLOSED;
+    return flags;
+}
+
 // Read a Vec[Int] or Array[Int] argument into host memory. Same shape as rawRun's argv walk: the
 // whole read happens BEFORE any allocation, so nothing here can be moved out from under us.
 static bool read_int_seq(Value v, std::vector<int64_t>* out) {
@@ -2635,14 +2754,8 @@ static Value native_raw_poll(Value* args, uint8_t nargs, Context* ctx) {
     GcObject* arrObj = ctx->vm->heap->alloc_slots_gc(GcObject::KIND_ARRAY, n, ctx);
     Value     arr    = Value::fromPtr(arrObj->payload());
     Value*    slots  = GcObject::from_slots(arr.asPtr())->slots();
-    for (uint32_t i = 0; i < n; ++i) {
-        const short re = pfds[i].revents;
-        int64_t flags = 0;
-        if (re & POLL_READ)                            flags |= SK_POLL_READABLE;
-        if (re & POLL_WRITE)                           flags |= SK_POLL_WRITABLE;
-        if (re & (POLLERR | POLLHUP | POLLNVAL))       flags |= SK_POLL_CLOSED;
-        slots[i] = Value::fromSigned48(flags);   // immediates only -> no further allocation, no root
-    }
+    for (uint32_t i = 0; i < n; ++i)
+        slots[i] = Value::fromSigned48(sk_poll_flags(pfds[i].revents));   // immediates: no root needed
     return arr;
 }
 
@@ -3772,6 +3885,168 @@ static Value native_select(Value* args, uint8_t nargs, Context* ctx) {
     return Value::fromSigned48(found);
 }
 
+// rawSelectIo(boxes, fds, interest, timeoutMs) -> Array[Int] (success) | String (error).
+//
+// The one wait that covers an actor's INBOXES and its SOCKETS together, which neither existing wait
+// can: rawReceive and rawSelect park on a condition variable, which no socket can wake, and rawPoll
+// watches only sockets. It exists so a connection actor can read its own socket instead of having the
+// world's I/O thread read it and forward the bytes -- one thread crossing per request fewer.
+//
+// The answer is INDEX-PARALLEL to `boxes` ++ `fds`: the first boxes.size() entries are 1 when that
+// inbox has something to read (mail, or the actor's Stop) and 0 otherwise; the rest are rawPoll's flag
+// words for the sockets. Readiness only -- nothing is taken out, so the rawReceive or rawRecvNb that
+// follows cannot block. Unlike rawSelect, which answers ONE index and makes the lowest one a priority,
+// this reports EVERYTHING that is ready: a socket and an inbox are not ranked by the VM.
+//
+// The loop is rawSelect's -- drain, scan, park on an unchanged generation -- with two differences:
+//   * the socket flags always come from a ZERO-TIMEOUT sock_poll, on both platforms. That is what
+//     makes the two agree: Windows' WSAEventSelect signals FD_READ / FD_WRITE on an EDGE, so an event
+//     alone would lose a readiness its caller did not fully consume, while poll() is level-triggered.
+//     Measured, the extra zero-timeout poll costs nothing next to the park.
+//   * the park is the platform's own. POSIX: one sock_poll over the pad's pipe and the sockets.
+//     Windows: WaitForMultipleObjects over the pad's event and one cached WSAEVENT per socket, so at
+//     most MAXIMUM_WAIT_OBJECTS - 1 sockets in one call.
+// See "Waiting on inboxes and sockets at once" in docs/VirtualMachine.md.
+static Value native_select_io(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!ctx->vm->net) return native_make_error(ctx, "rawSelectIo: networking unavailable");
+    if (nargs < 4 || !args[3].isInt())
+        return native_make_error(ctx, "rawSelectIo: expected (boxes: Vec[InboxRef], fds: Vec[Int], "
+                                      "interest: Vec[Int], timeoutMs: Int)");
+    std::vector<int64_t> ids, fds, interest;
+    if (!read_handle_seq(args[0], &ids))
+        return native_make_error(ctx, "rawSelectIo: boxes must be a sequence of InboxRef");
+    if (!read_int_seq(args[1], &fds) || !read_int_seq(args[2], &interest))
+        return native_make_error(ctx, "rawSelectIo: fds and interest must be sequences of Int");
+    if (fds.size() != interest.size())
+        return native_make_error(ctx, "rawSelectIo: fds and interest must have the same length");
+    const int64_t ms = args[3].asSigned48();
+    // Nothing to watch and no deadline: no event could ever end this wait, so it is an error rather
+    // than a program that hangs indistinguishably from a crash. rawPoll and rawSelect both refuse it.
+    if (ids.empty() && fds.empty() && ms < 0)
+        return native_make_error(ctx, "rawSelectIo: a negative timeout with nothing to watch would "
+                                      "wait forever");
+    // Every inbox must be one of ours, checked before anything waits; own_mailbox words the two
+    // refusals (someone else's, or closed) exactly as receive and select do.
+    std::vector<Mailbox*> boxes;
+    boxes.reserve(ids.size());
+    for (const int64_t id : ids)
+        boxes.push_back(&own_mailbox(Value::fromSigned48(id), ctx, "selectIo"));
+    if (!local || !local->pad)
+        return native_make_error(ctx, "rawSelectIo: this execution has no inbox (mainInbox first?)");
+    // The sockets, resolved once, as rawPoll resolves them.
+    std::vector<socket_t> socks(fds.size());
+    std::vector<short>    want(fds.size());
+    for (size_t i = 0; i < fds.size(); ++i) {
+        socks[i] = ctx->vm->net->get(fds[i]);
+        if (socks[i] == INVALID_SOCK)
+            return native_make_error(ctx, std::string("rawSelectIo: ")
+                                          + ctx->vm->net->invalid_reason(fds[i]));
+        want[i] = static_cast<short>(((interest[i] & SK_POLL_READABLE) ? POLL_READ  : 0) |
+                                     ((interest[i] & SK_POLL_WRITABLE) ? POLL_WRITE : 0));
+    }
+#ifdef _WIN32
+    if (socks.size() + 1 > MAXIMUM_WAIT_OBJECTS)
+        return native_make_error(ctx, "rawSelectIo: at most 63 sockets in one call on this platform");
+#endif
+    WaitPad& pad = *local->pad;
+    if (!pad.ensure_pollable())
+        return native_make_error(ctx, "rawSelectIo: could not make this isolate's wake");
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms < 0 ? 0 : ms);
+    std::vector<int64_t>  ready(boxes.size() + socks.size(), 0);
+    std::vector<pollfd_t> pf;
+    std::string           err;
+    bool                  any = false;
+
+    pad.pollers.fetch_add(1, std::memory_order_relaxed);
+    for (;;) {
+        pad.drain();                       // BEFORE the scan: a wake after this cannot be lost
+        for (size_t i = 0; i < boxes.size(); ++i) {
+            std::lock_guard<std::mutex> lk(boxes[i]->m);
+            if (!boxes[i]->q.empty() || boxes[i]->stop_seen) { ready[i] = 1; any = true; }
+        }
+        if (!socks.empty()) {              // the flags, level-triggered, on both platforms
+            pf.clear();
+            for (size_t i = 0; i < socks.size(); ++i) {
+                pollfd_t p{};
+                p.fd     = socks[i];
+                p.events = want[i];
+                pf.push_back(p);
+            }
+            if (sock_poll(pf.data(), static_cast<unsigned>(pf.size()), 0) < 0) {
+                err = "rawSelectIo: " + net_error_msg("poll");
+                break;
+            }
+            for (size_t i = 0; i < pf.size(); ++i) {
+                const int64_t f = sk_poll_flags(pf[i].revents);
+                if (f) { ready[boxes.size() + i] = f; any = true; }
+            }
+        }
+        if (any) break;
+        int rem = -1;
+        if (ms >= 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) break;    // the deadline passed with nothing to read
+            rem = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       deadline - now).count());
+        }
+#ifdef _WIN32
+        {
+            HANDLE hs[MAXIMUM_WAIT_OBJECTS];
+            DWORD  nh = 0;
+            hs[nh++] = pad.ev;
+            bool ok = true;
+            for (size_t i = 0; i < socks.size(); ++i) {
+                const WSAEVENT we = pad.event_for(socks[i], want[i]);
+                if (we == WSA_INVALID_EVENT) { ok = false; break; }
+                hs[nh++] = we;
+            }
+            if (!ok) { err = "rawSelectIo: " + net_error_msg("WSAEventSelect"); break; }
+            const DWORD rc = WaitForMultipleObjects(nh, hs, FALSE,
+                                                    rem < 0 ? INFINITE : static_cast<DWORD>(rem));
+            if (rc == WAIT_FAILED)  { err = "rawSelectIo: WaitForMultipleObjects failed"; break; }
+            if (rc == WAIT_TIMEOUT) break;
+            // A socket's event is edge-triggered and only enumerating it re-arms the association; the
+            // FLAGS come from the zero-timeout poll at the top of the loop, never from here.
+            if (rc > WAIT_OBJECT_0 && rc < WAIT_OBJECT_0 + nh) {
+                const size_t k = static_cast<size_t>(rc - WAIT_OBJECT_0) - 1;
+                WSANETWORKEVENTS ne{};
+                WSAEnumNetworkEvents(socks[k], hs[rc - WAIT_OBJECT_0], &ne);
+            }
+        }
+#else
+        {
+            pf.clear();
+            pollfd_t w{};
+            w.fd     = pad.wake_rd;
+            w.events = POLL_READ;
+            pf.push_back(w);
+            for (size_t i = 0; i < socks.size(); ++i) {
+                pollfd_t p{};
+                p.fd     = socks[i];
+                p.events = want[i];
+                pf.push_back(p);
+            }
+            const int rc = sock_poll(pf.data(), static_cast<unsigned>(pf.size()), rem);
+            if (rc < 0) { err = "rawSelectIo: " + net_error_msg("poll"); break; }
+            if (rc == 0) break;            // the deadline passed
+        }
+#endif
+    }
+    pad.pollers.fetch_sub(1, std::memory_order_relaxed);
+    if (!err.empty()) return native_make_error(ctx, err);
+
+    // One allocation, elements all immediates -- so nothing can move after the array exists and no
+    // rooting is needed (the rawPoll shape).
+    const uint32_t n = static_cast<uint32_t>(ready.size());
+    GcObject* arrObj = ctx->vm->heap->alloc_slots_gc(GcObject::KIND_ARRAY, n, ctx);
+    Value     arr    = Value::fromPtr(arrObj->payload());
+    Value*    slots  = GcObject::from_slots(arr.asPtr())->slots();
+    for (uint32_t i = 0; i < n; ++i) slots[i] = Value::fromSigned48(ready[i]);
+    return arr;
+}
+
 // rawMailMsg(inbox) -> the message rawReceive took, decoded into THIS heap. Once per message.
 static Value native_mail_msg(Value* args, uint8_t nargs, Context* ctx) {
     (void)own_mailbox(nargs >= 1 ? args[0] : Value::fromNil(), ctx, "receive");
@@ -4442,6 +4717,7 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_STOP_REQUESTED] = native_stop_requested;
     t[NATIVE_SLEEP]        = native_sleep;
     t[NATIVE_SELECT]       = native_select;
+    t[NATIVE_SELECT_IO]    = native_select_io;
     t[NATIVE_ACTIVATE]     = native_activate;
     t[NATIVE_ACTIVE_SEND]  = native_active_send;
     t[NATIVE_ACTIVE_CLOSE] = native_active_close;

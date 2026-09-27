@@ -9230,6 +9230,37 @@ void test_std_poll() {
                       "match probe() { Ok(b) => println(b), Err(e) => println(\"ERR: \" + e) }\n"),
         "true\n");
 
+    // ... and a send to a peer that does not read EVENTUALLY returns less than it was offered, which is
+    // the whole reason this module has no send-all. The test above only pinned "some bytes went", which a
+    // send that always takes everything satisfies just as well -- so the partial-write contract every
+    // caller has to honour was unguarded. It was written while a caller that depends on it was being
+    // tried (a connection actor keeping its own unwritten tail); that caller was measured away again, but
+    // the contract is the module's and every future caller needs it pinned. On this machine it refuses
+    // ~2.7 MB; the assertion is only that it refuses WITHIN 160 MB, which any bounded buffer satisfies.
+    check_str("poll_send_short_write", cg_run_native(R"SKN(
+use std::net::*
+use std::poll::*
+
+fn probe() -> Result[Bool, String] {
+  let lst = listen(0)?
+  let _peer = connect("127.0.0.1", lst.localPort()?)?      // connected, and it never reads
+  let nb = nonBlockingConn(lst.accept()?)?
+  let mut sb = stringBuilder()
+  for _ in range(0, 1024) { sb = sb.append("xxxxxxxx") }   // 8 KiB a go
+  let block = toBytes(sb.build())
+  let mut tries = 0
+  let mut short = false
+  while tries < 20000 && !short {
+    short = nb.send(block)? < len(block)
+    tries = tries + 1
+  }
+  nb.close()?
+  lst.close()?
+  Ok(short)
+}
+match probe() { Ok(b) => println(b), Err(e) => println("ERR: " + e) }
+)SKN"), "true\n");
+
     // poll must WAIT. These four exist because the first version of the two "no interest" guards
     // asserted only that no error came back -- which a call returning instantly satisfies just as
     // well as a correct one. They were green against a live defect (an empty interest set skipped the
@@ -9763,6 +9794,124 @@ fn run() -> Result[(), String] {
   Ok(())
 }
 )SKN" + RUN_END), "line:hello\nclient got pushed\nline:bye\nclosed\n");
+    // The SAME job through the other mechanism: the actor takes the socket over itself
+    // (std::poll's nonBlockingConn) and waits on it AND its inbox with selectIo -- no I/O thread, one
+    // thread crossing per request fewer. Read beside active_select_socket_and_inbox: the transcript is
+    // identical, the framing is the program's own, and the answer is a flag ARRAY over
+    // boxes ++ fds rather than one index.
+    check_str("select_io_socket_and_inbox", cg_run_native(NET + "use std::poll::*\nuse std::bytes::*\n" + R"SKN(
+struct Start { ticket: SocketHandOff, boss: Pid[String] }
+fn session(inbox: Inbox[String], s: Start) -> () {
+  let conn = match s.ticket.take() { Ok(c) => c, Err(e) => panic(e) }
+  let nb = match nonBlockingConn(conn) { Ok(n) => n, Err(e) => panic(e) }
+  let boxes = toVec([inbox.ref()])
+  let fds = toVec([nb.fd])
+  let want = toVec([READABLE])
+  let mut buf = bytes()
+  loop {
+    match selectIo(boxes, fds, want, 5000) {
+      Ok(r) => {
+        if r[0] != 0 {
+          match inbox.receive() {
+            Mail::Msg(m) => { let _ = nb.sendStr(m + "\n") },
+            _ => return ()
+          }
+        } else if (r[1] & (READABLE | CLOSED)) != 0 {
+          match nb.recv(4096) {
+            Ok(Received::Data(b)) => {
+              appendBytes(buf, b)
+              loop {
+                let i = rawIndexOfByte(buf, 10, 0)
+                if i < 0 { break }
+                send(s.boss, "line:" + sliceBytes(buf, 0, i))
+                buf = subBytes(buf, i + 1, len(buf))
+              }
+            },
+            Ok(Received::Closed) => {
+              send(s.boss, "closed")
+              return ()
+            },
+            Ok(Received::WouldBlock) => {},
+            Err(e) => {
+              send(s.boss, "err:" + e)
+              return ()
+            }
+          }
+        } else {
+          send(s.boss, "timeout")
+          return ()
+        }
+      },
+      Err(e) => {
+        send(s.boss, "selectIo:" + e)
+        return ()
+      }
+    }
+  }
+}
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  client.setTimeout(5000)?
+  let conn = srv.accept()?
+  let pid = spawnActor(session, Start { ticket: conn.handOff()?, boss: boss.pid() })
+  client.sendStr("hello\n")?
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  send(pid, "pushed")
+  match client.recvLine()? { Some(l) => println("client got " + l), None => println("EOF") }
+  client.sendStr("bye\n")?
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  client.close()?
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  Ok(())
+}
+)SKN" + RUN_END), "line:hello\nclient got pushed\nline:bye\nclosed\n");
+
+    // Readiness is LEVEL-triggered, and this is the test that would catch it silently becoming edge-
+    // triggered. The reader takes ONE byte per wake and leaves the rest buffered; on Windows the
+    // socket's readiness is a WSAEventSelect event, whose FD_READ fires on an edge, so a version that
+    // read its flags from the event would report the first byte and then wait for ever.
+    check_str("select_io_partial_read_stays_readable", cg_run_native(NET + "use std::poll::*\n" + R"SKN(
+fn nibbler(inbox: Inbox[Int], s: SocketHandOff) -> () {
+  let conn = match s.take() { Ok(c) => c, Err(e) => panic(e) }
+  let nb = match nonBlockingConn(conn) { Ok(n) => n, Err(e) => panic(e) }
+  let boxes = toVec([inbox.ref()])
+  let fds = toVec([nb.fd])
+  let want = toVec([READABLE])
+  let mut got = 0
+  let mut rounds = 0
+  while got < 4 && rounds < 40 {
+    rounds = rounds + 1
+    match selectIo(boxes, fds, want, 5000) {
+      Ok(r) => {
+        if (r[1] & READABLE) != 0 {
+          match nb.recv(1) {
+            Ok(Received::Data(b)) => { got = got + len(b) },
+            _ => { rounds = 40 }
+          }
+        }
+      },
+      Err(_) => { rounds = 40 }
+    }
+  }
+  println("read " + toString(got) + " in " + toString(rounds) + " rounds")
+  let _ = nb.close()
+}
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let _ = spawnActor(nibbler, conn.handOff()?)
+  client.sendStr("wxyz")?
+  let me: Inbox[Int] = mainInbox()
+  match me.receiveTimeout(5000) { _ => {} }
+  client.close()?
+  srv.close()?
+  Ok(())
+}
+)SKN" + RUN_END), "read 4 in 4 rounds\n");
+
     // Lines: "\n" and "\r\n" both end a line, a last line without one still arrives at the end of the
     // stream, and Eof comes after it. Raw: the chunks, joined, are exactly what was sent.
     check_str("active_lines_and_raw", cg_run_native(NET + R"SKN(
@@ -12270,7 +12419,11 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // implementations can be held to the same answer, which is the whole test here. The oracle models
 // them in RefEval.cpp, and they are exercised through their std wrappers (indexOfByte, indexOf,
 // split, replace, and std::resp's reader) and directly by byte_index_of_byte / byte_parse_int_range.
-static_assert(NATIVE_COUNT == 99,
+// rawSelectIo (id 99) is NOT listed: it answers which inboxes have mail and which sockets are ready,
+// i.e. how the isolates interleave AND what the network did -- the two things a model cannot reproduce.
+// It is rawSelect's and rawPoll's category, and both are out for the same reason. Pinned by
+// test_select_io in vm_tests and the select_io_* tests here.
+static_assert(NATIVE_COUNT == 100,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 

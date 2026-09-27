@@ -1401,6 +1401,15 @@ private:
         add_native("rawRecvNb",    { ty_int(), ty_int() },
                                    make_named(std_Result(), { make_named("Array", { B }), S }), STD_POLL);
         add_native("rawSendNb",    { ty_int(), B },  make_named(std_Result(), { ty_int(),  S }), STD_POLL);
+        // The one wait that covers inboxes AND sockets. It belongs here rather than in
+        // std::actor because everything it adds over `select` is std::poll's: raw descriptors,
+        // the READABLE / WRITABLE flag words, and an index-parallel answer. poll.skn therefore
+        // gains a `use std::actor::*` for InboxRef, as net.skn already has one.
+        add_native("rawSelectIo",  { make_named("Vec", { make_named(std_InboxRef(), {}) }),
+                                     make_named("Vec", { ty_int() }),
+                                     make_named("Vec", { ty_int() }), ty_int() },
+                                   make_named(std_Result(), { make_named("Array", { ty_int() }), S }),
+                                   STD_POLL);
 
         // Fork-join tasks -- std::task (opt-in). The only GENERIC natives: a task's argument and result
         // have the types of the function it runs, which one monomorphic signature cannot state. They are

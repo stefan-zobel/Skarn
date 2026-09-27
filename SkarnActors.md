@@ -835,6 +835,59 @@ connections are closed with it.
 One thread of the runtime reads every active connection of the program. It starts with the first
 `activate`, so a program that never calls it has no such thread at all.
 
+**The other way, and when to prefer it.** That thread is convenient and it is not free: every chunk it
+reads crosses from it into your actor. `std::poll`'s `selectIo` lets the actor keep the socket and wait on
+it *and* its inboxes itself, so nothing forwards the bytes:
+
+```rust
+use std::actor::*
+use std::net::*
+use std::poll::*
+
+fn session(inbox: Inbox[String], t: SocketHandOff) -> () {
+  let conn = match t.take() { Ok(c) => c, Err(e) => panic(e) }
+  let nb = match nonBlockingConn(conn) { Ok(n) => n, Err(e) => panic(e) }
+  let boxes = toVec([inbox.ref()])
+  let fds = toVec([nb.fd])
+  let want = toVec([READABLE])
+  loop {
+    match selectIo(boxes, fds, want, -1) {
+      Ok(r) => {
+        if r[0] != 0 {                                   // an entry per inbox, then one per socket
+          match inbox.receive() { Mail::Msg(m) => { let _ = nb.sendStr(m) }, _ => return () }
+        } else if (r[1] & (READABLE | CLOSED)) != 0 {
+          match nb.recv(4096) {
+            Ok(Received::Data(_b)) => { /* your own framing */ }
+            _ => return ()
+          }
+        }
+      }
+      Err(e) => {
+        println(e)
+        return ()
+      }
+    }
+  }
+}
+```
+
+The answer is a flag array over the inboxes **followed by** the sockets, so you test the entries in the
+order that matters to you — unlike `select`, which answers one index and makes the lowest a priority.
+
+**Which of the two.** `activate` does more for you, and for most servers that is the point: it cuts lines,
+its inbox's capacity is back-pressure on the socket, a LISTENER can be activated the same way, and
+`setSendTimeout` closes a client that stopped reading. `selectIo` does none of that — you frame the bytes,
+you keep the tail of a partial write, you decide when a silent peer has waited long enough — and in
+exchange the bytes reach you without a hop. There is also a case where it is plainly the wrong choice: an
+inbox-only wait spins briefly before it sleeps and a wait that includes a socket does not, so an actor whose
+partner answers within a few microseconds is *slower* with `selectIo` than with `select`. And it does not
+scale the way it reads: one runtime thread polling every active connection covers them all in a single
+wait, so with many connections at once `activate` is the cheaper arrangement, not the dearer one --
+measured on a server with sixteen clients, doing the reading per actor cost about a tenth of its
+throughput while making a single client's round trip markedly faster. Reach for `selectIo` when an actor
+really must watch a socket and its inbox together and latency with few connections in flight is what
+matters; keep `activate` otherwise.
+
 ### A listener that stays reachable
 
 The acceptor in §16 has the same problem one step earlier: while it waits in `accept()`, it cannot see its

@@ -213,6 +213,8 @@ int main(int argc, char** argv) {
     run("native_exit",              test_native_exit);
     run("actor_select",             test_actor_select);
     run("actor_select_stop",        test_actor_select_stop);
+    run("select_io",                test_select_io);
+    run("select_io_stop",           test_select_io_stop);
     run("actor_send_cycle",         test_actor_send_cycle);
     // Registered LAST on purpose: on the switch dispatcher a runaway loop can no
     // longer overflow the native stack, but the canary still guards its ~10M-instr

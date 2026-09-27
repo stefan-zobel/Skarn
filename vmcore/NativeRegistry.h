@@ -178,7 +178,12 @@ enum NativeId : uint16_t {
     NATIVE_INDEX_OF_BYTE  = 96, // rawIndexOfByte(b, target, from)  -> Int (index, -1 = absent; Plain)
     NATIVE_PARSE_INT_RANGE = 97,// rawParseIntRange(b, lo, hi)      -> Int | nil (Option; nil = malformed)
     NATIVE_INDEX_OF_BYTES = 98, // rawIndexOfBytes(b, sub, from)    -> Int (index, -1 = absent; Plain)
-    NATIVE_COUNT       = 99,
+    // The one wait that covers an actor's INBOXES and its SOCKETS at once, so a connection actor can
+    // read its own socket instead of having the world's I/O thread read it and forward the bytes --
+    // one thread crossing per request fewer. Neither existing wait could do it: a receive and a select
+    // park on a condition variable, which no socket can wake, and rawPoll watches only sockets.
+    NATIVE_SELECT_IO   = 99,    // rawSelectIo(boxes, fds, interest, timeoutMs) -> Array[Int] (Result)
+    NATIVE_COUNT       = 100,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -290,6 +295,7 @@ inline int native_id_of(const std::string& name) {
     if (name == "rawIndexOfByte") return NATIVE_INDEX_OF_BYTE;
     if (name == "rawParseIntRange") return NATIVE_PARSE_INT_RANGE;
     if (name == "rawIndexOfBytes") return NATIVE_INDEX_OF_BYTES;
+    if (name == "rawSelectIo") return NATIVE_SELECT_IO;
     return -1;
 }
 
@@ -328,7 +334,8 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_FILE_WRITE:
         case NATIVE_FILE_SYNC:
         case NATIVE_FILE_CLOSE:
-        case NATIVE_RUN_PROCESS: return NRET_RESULT;
+        case NATIVE_RUN_PROCESS:
+        case NATIVE_SELECT_IO:   return NRET_RESULT;
         case NATIVE_GET_ENV:
         case NATIVE_READ_LINE:
         case NATIVE_PARSE_INT_RANGE: return NRET_OPTION;
@@ -406,6 +413,7 @@ inline int native_arity(int id) {
         case NATIVE_PARSE_INT_RANGE:
         case NATIVE_INDEX_OF_BYTES:
         case NATIVE_POLL:        return 3;
+        case NATIVE_SELECT_IO:   return 4;
         case NATIVE_ACTIVATE:    return 5;
         case NATIVE_READ_FILE:
         case NATIVE_GET_ENV:

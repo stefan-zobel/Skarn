@@ -616,6 +616,42 @@ Erlang's "active mode".
   yet delivered are closed when the inbox closes, the listener is closed or its owner ends, so no client is
   left waiting; a ticket already in the inbox is closed, like any untaken ticket, when the world ends.
 
+**Waiting on inboxes and sockets at once.** Active mode above hands the reading to the runtime, which
+costs one thread crossing per request. `rawSelectIo(boxes, fds, interest, timeoutMs)` is the other answer:
+the actor keeps its socket and waits on it AND its inboxes in one call, so nothing forwards the bytes for
+it. Neither other wait can do this -- a receive and a select park on a condition variable, which no socket
+can wake, and the readiness scan watches only sockets.
+- **The answer is a flag array over `boxes` followed by `fds`.** The first entries are 1 where that inbox
+  has something to read (a message, a crash report, or the actor's `Stop`) and 0 otherwise; the rest are
+  the readiness scan's own flag words. Readiness only -- nothing is taken out, so the receive or the read
+  that follows cannot wait. Unlike the select over inboxes it ranks nothing: a socket and an inbox have no
+  natural order, so everything ready is reported and the caller decides.
+- **The wake pad grows a second half**, made the first time an isolate calls this and never before, which
+  every mailbox signals in addition to the generation counter. A program that never calls it pays one more
+  atomic read per wake. It is NOT the loopback socket pair the I/O thread is woken through, which would be
+  one code path for both platforms: a wake through it measures four to five times dearer, because the
+  readiness scan itself is the expensive half. So the wake is the platform's own -- an event object on
+  Windows, a pipe elsewhere.
+- **Readiness is level-triggered on both platforms**, and that is deliberate. The flags always come from a
+  zero-timeout readiness scan, never from the wake object, because Windows signals a socket's event on an
+  EDGE: an implementation that read the flags from the event would stop reporting a buffer whose reader had
+  not drained it. The extra scan costs nothing next to the park.
+- **Everything that ends an actor still reaches it.** `Stop` goes into every inbox an actor owns, and each
+  of them signals both halves of the pad, so an actor parked here can be stopped exactly as one parked in a
+  select can. This matters: a blocking read cannot be interrupted at all, which is why a program that must
+  stay stoppable reads through this call and not through the blocking one.
+- **Limits.** On Windows at most 63 sockets in one call. The wait does not spin before it parks, while the
+  condition variable underneath an inbox-only wait does, so an actor whose partner answers within a few
+  microseconds is better off waiting on inboxes alone -- this call is for an actor that really has to watch
+  both. Active mode also remains the better answer for line framing, for back-pressure through an inbox's
+  capacity, for an activated listener, and for a deadline that closes a peer that stopped reading.
+- **And it does not scale the way it reads.** One runtime thread polling every active connection is not the
+  serial bottleneck it appears to be: a single wait covers all of them, and one wake of it serves every
+  socket that became ready at the same moment. A program that gives each of many connections its own wait
+  pays a park per connection instead, which costs more under load than the forwarding it saves. Measured on
+  a server with sixteen clients, this call made one client's round trip markedly faster and concurrent
+  throughput about a tenth slower. Use it where latency with few connections in flight is what matters.
+
 ## Embedding the VM
 
 A compiler's entire contract with the VM is the instruction set plus the `Assembler` that emits it. It never

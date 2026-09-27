@@ -937,6 +937,7 @@ program; builds on `std::net`, and `connect` stays blocking. The guide shows it 
 | `c.send(bytes)` / `c.sendStr(s)` | offer bytes → `Result[Int, String]`, the count the kernel **accepted** (may be short, or 0). There is no send-all: keep the tail and retry when `WRITABLE` |
 | `l.close()` / `c.close()` | close and free the descriptor → `Result[(), String]`. A closed descriptor must leave the `fds` vector |
 | `l.fd` / `c.fd` | the descriptor — what goes into `fds`, and the natural key for the program's own state `Map` |
+| `selectIo(boxes, fds, interest, ms)` | wait until one of an actor's inboxes has something OR one of `fds` is ready → `Result[Array[Int], String]`, **index-parallel to `boxes` followed by `fds`** (free). `boxes` holds `inbox.ref()` tokens as `select` takes them; the first `len(boxes)` entries are 1 when that inbox has something and 0 otherwise, the rest are `poll`'s flag words. Test them in the order that matters to you — unlike `select` it ranks nothing. It is the one wait that covers both, so an actor can read its own socket instead of handing the reading to the runtime. **Not always the right one:** waiting on a socket does not spin first, so an actor whose partner answers within a few microseconds is measurably better off in `select`, and `c.activate` stays the answer for line framing, back-pressure, an activated listener or a deadline that closes a client that stopped reading. At most 63 sockets per call on Windows |
 
 ## 21. `std::task`: parallel tasks
 
