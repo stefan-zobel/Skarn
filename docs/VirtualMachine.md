@@ -277,6 +277,15 @@ or an actor it is a fault, since nothing could interrupt the root wherever it wa
 through a non-blocking connect and `select()`, on Windows through a blocking connect bounded by `TCP_MAXRT`,
 because there the `select()` wait can add one timer tick (about 15 ms) even on loopback.
 
+Three natives search or read a byte buffer without allocating: the first byte equal to a given one, the
+first occurrence of a byte sequence, and the decimal integer in a range of the buffer. They exist because
+the loops they replace ran one bytecode operation per byte, and they carry no name of their own — the
+library functions over them are unchanged. The integer one answers through an option, so a malformed range
+is an ordinary absent value rather than an error channel; its magnitude is capped at the language's
+integer range in both signs. One consequence reaches every embedder: because ordinary string handling now
+calls a native, running a program built against the standard library WITHOUT a native table is no longer a
+valid configuration.
+
 **Adding a native:**
 
 1. Append a `NativeId`, raise `NATIVE_COUNT`, and extend `native_id_of`, `native_return_of` and

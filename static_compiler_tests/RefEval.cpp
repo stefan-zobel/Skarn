@@ -1611,6 +1611,69 @@ private:
             else out = ok(v);
             return true;
         }
+        // The byte three (NativeRegistry.h ids 96-98): pure functions of a buffer and three Ints. These
+        // mirror the C++ natives statement for statement, INCLUDING the clamping and the malformed
+        // answers, because the whole point of the differential is that the two sides cannot drift.
+        if (name == "rawIndexOfByte" || name == "rawIndexOfBytes" || name == "rawParseIntRange") {
+            // The RtValue must OUTLIVE the view: it owns the shared_ptr, and a view taken from a
+            // temporary would point into a buffer already freed.
+            auto view = [&](const RtValue& v) -> const std::vector<uint8_t>* {
+                if (auto p = std::get_if<std::shared_ptr<Obj>>(&v))
+                    if (*p && (*p)->kind == ObjKind::Bytes) return &(*p)->bytes;
+                return nullptr;
+            };
+            const RtValue                buf = ev(0);
+            const std::vector<uint8_t>*  b   = view(buf);
+            if (name == "rawParseIntRange") {
+                const int64_t lo0 = std::get<int64_t>(ev(1));
+                const int64_t hi  = std::get<int64_t>(ev(2));
+                const int64_t n   = b ? (int64_t)b->size() : 0;
+                int64_t i = lo0;
+                if (!b || i < 0 || hi > n || i >= hi) { out = none(); return true; }
+                const bool neg = (*b)[(size_t)i] == '-';
+                if (neg) ++i;
+                if (i >= hi || hi - i > 15) { out = none(); return true; }
+                constexpr int64_t MAX_48 = 140737488355327LL;
+                int64_t v = 0;
+                for (; i < hi; ++i) {
+                    const int digit = (int)(*b)[(size_t)i] - '0';
+                    if (digit < 0 || digit > 9) { out = none(); return true; }
+                    if (v > MAX_48 / 10 || (v == MAX_48 / 10 && digit > MAX_48 % 10)) { out = none(); return true; }
+                    v = v * 10 + digit;
+                }
+                out = some((int64_t)(neg ? -v : v));
+                return true;
+            }
+            if (name == "rawIndexOfByte") {
+                const int64_t target = std::get<int64_t>(ev(1));
+                int64_t       from   = std::get<int64_t>(ev(2));
+                const int64_t n      = b ? (int64_t)b->size() : 0;
+                if (from < 0) from = 0;
+                int64_t answer = -1;
+                if (b && from < n && target >= 0 && target <= 255)
+                    for (int64_t i = from; i < n; ++i)
+                        if ((int64_t)(*b)[(size_t)i] == target) { answer = i; break; }
+                out = answer;
+                return true;
+            }
+            const RtValue               needle = ev(1);
+            const std::vector<uint8_t>* sub    = view(needle);
+            int64_t       from = std::get<int64_t>(ev(2));
+            const int64_t n    = b ? (int64_t)b->size() : 0;
+            const int64_t m    = sub ? (int64_t)sub->size() : 0;
+            if (from < 0) from = 0;
+            int64_t answer = -1;
+            if (b && sub && from + m <= n) {
+                for (int64_t i = from; i + m <= n; ++i) {
+                    bool hit = true;
+                    for (int64_t j = 0; j < m; ++j)
+                        if ((*b)[(size_t)(i + j)] != (*sub)[(size_t)j]) { hit = false; break; }
+                    if (hit) { answer = i; break; }
+                }
+            }
+            out = answer;
+            return true;
+        }
         if (name == "fileExists") { out = false; return true; }   // generator only queries KNOWN-ABSENT paths
         if (name == "isFile") { out = false; return true; }       // absent path -> not a regular file
         if (name == "isDir")  { out = false; return true; }       // absent path -> not a directory

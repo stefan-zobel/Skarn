@@ -172,7 +172,13 @@ enum NativeId : uint16_t {
     // Ends the program with an exit code (0..255), running its ordinary end on the way: actors are told
     // to stop, every thread is joined, output is flushed. The root only; in an actor or a task a fault.
     NATIVE_EXIT        = 95,    // exit(code)              -> never returns (throws ProgramExit)
-    NATIVE_COUNT       = 96,
+    // Byte-buffer searching and decimal parsing -- the loops std::bytes, std::resp, std::net and
+    // std::string ran one bytecode op per byte, and the substring search two Skarn calls per byte. All
+    // three are pure, total and non-allocating: no safepoint, and no host copy of the buffer.
+    NATIVE_INDEX_OF_BYTE  = 96, // rawIndexOfByte(b, target, from)  -> Int (index, -1 = absent; Plain)
+    NATIVE_PARSE_INT_RANGE = 97,// rawParseIntRange(b, lo, hi)      -> Int | nil (Option; nil = malformed)
+    NATIVE_INDEX_OF_BYTES = 98, // rawIndexOfBytes(b, sub, from)    -> Int (index, -1 = absent; Plain)
+    NATIVE_COUNT       = 99,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -281,6 +287,9 @@ inline int native_id_of(const std::string& name) {
     if (name == "flushOutput") return NATIVE_FLUSH_OUTPUT;
     if (name == "rawWriteErr") return NATIVE_WRITE_ERR;
     if (name == "exit") return NATIVE_EXIT;
+    if (name == "rawIndexOfByte") return NATIVE_INDEX_OF_BYTE;
+    if (name == "rawParseIntRange") return NATIVE_PARSE_INT_RANGE;
+    if (name == "rawIndexOfBytes") return NATIVE_INDEX_OF_BYTES;
     return -1;
 }
 
@@ -321,7 +330,8 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_FILE_CLOSE:
         case NATIVE_RUN_PROCESS: return NRET_RESULT;
         case NATIVE_GET_ENV:
-        case NATIVE_READ_LINE:   return NRET_OPTION;
+        case NATIVE_READ_LINE:
+        case NATIVE_PARSE_INT_RANGE: return NRET_OPTION;
         case NATIVE_NANO_TIME:
         case NATIVE_MILLIS_TIME:
         case NATIVE_ARGS:
@@ -352,6 +362,8 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_FLUSH_OUTPUT:
         case NATIVE_WRITE_ERR:
         case NATIVE_EXIT:
+        case NATIVE_INDEX_OF_BYTE:
+        case NATIVE_INDEX_OF_BYTES:
         case NATIVE_READ_ALL_STDIN: return NRET_PLAIN;
         default:                 return NRET_RESULT;
     }
@@ -390,6 +402,9 @@ inline int native_arity(int id) {
         case NATIVE_RUN_PROCESS: return 2;
         case NATIVE_ACTOR_SPAWN_BOUNDED:
         case NATIVE_SPAWN_INTO:
+        case NATIVE_INDEX_OF_BYTE:
+        case NATIVE_PARSE_INT_RANGE:
+        case NATIVE_INDEX_OF_BYTES:
         case NATIVE_POLL:        return 3;
         case NATIVE_ACTIVATE:    return 5;
         case NATIVE_READ_FILE:

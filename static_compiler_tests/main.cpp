@@ -2533,10 +2533,18 @@ std::string cg_run_out(const std::string& src) {
     Heap heap;
     StringInterner interner;
     std::ostringstream oss;
+    // The native table is NOT optional for a prelude-linked program. Ordinary string handling lowers
+    // to natives -- std::string's indexOf / hasSubstr / replace and std::iter's split / lines all call
+    // rawIndexOfBytes -- so a run without one reaches CALL_NATIVE with no table to call through. In
+    // Debug that is an assert; in Release it is a wild jump, which is what it cost to find out.
+    static const std::vector<NativeFunc> natives = build_native_table();
     execute(m.bytecode, &heap, nullptr, &interner, m.top_frame_size,
             &m.constants, &m.struct_types, &m.string_literals, &kNoAtoms,
             &m.function_table, /*out=*/&oss,
-            &m.trait_table, m.trait_table_width, m.trait_method_count);
+            &m.trait_table, m.trait_table_width, m.trait_method_count,
+            &m.line_table, &m.function_names, &m.column_table,
+            &natives, /*script_args=*/nullptr, /*in=*/nullptr,
+            /*function_modules=*/nullptr, &m.const_arrays);
     return oss.str();
 }
 
@@ -6350,6 +6358,15 @@ void test_std_bytes() {
             "let a = unwrap(r.readVarI())\n let c = unwrap(r.readVarI())\n a + c", true);
     check_same("diff_bytes_str",
         U + "let mut b = bytes()\n writeStr(b, \"vMachine\")\n let mut r = ByteReader::new(b)\n len(unwrap(r.readStr()))", true);
+
+    // The byte three (NativeRegistry.h 96-98) under the oracle. indexOfByte IS rawIndexOfByte and
+    // rawParseIntRange is what std::resp's header parsing reads its lengths with, so these two hold
+    // the native and the model to one answer over the shapes that differ: found, absent, a `from`
+    // past the buffer, a negative `from`, an empty buffer, a sign, a non-digit and the 2^47-1 cap.
+    check_same("byte_index_of_byte",
+        U + "let b = toBytes(\"alpha,beta,,gamma\")\n let mut acc = 0\n acc = acc * 100 + (match indexOfByte(b, 44, 0) { Some(i) => i, None => 0 - 1 })\n acc = acc * 100 + (match indexOfByte(b, 44, 6) { Some(i) => i, None => 0 - 1 })\n acc = acc * 100 + (match indexOfByte(b, 99, 0) { Some(i) => i, None => 0 - 1 })\n acc = acc * 100 + (match indexOfByte(b, 44, 0 - 5) { Some(i) => i, None => 0 - 1 })\n acc = acc * 100 + (match indexOfByte(b, 44, 99) { Some(i) => i, None => 0 - 1 })\n acc = acc * 100 + (match indexOfByte(bytes(), 44, 0) { Some(i) => i, None => 0 - 1 })\n acc", true);
+    check_same("byte_parse_int_range",
+        U + "let d = toBytes(\"x-1234y99z140737488355328w\")\n let mut acc = 0\n acc = acc * 10 + (match rawParseIntRange(d, 1, 6) { Some(v) => v, None => 0 - 1 })\n acc = acc * 10 + (match rawParseIntRange(d, 7, 9) { Some(v) => v, None => 0 - 1 })\n acc = acc * 10 + (match rawParseIntRange(d, 0, 6) { Some(v) => v, None => 0 - 1 })\n acc = acc * 10 + (match rawParseIntRange(d, 10, 25) { Some(v) => v, None => 0 - 1 })\n acc = acc * 10 + (match rawParseIntRange(d, 5, 5) { Some(v) => v, None => 0 - 1 })\n acc = acc * 10 + (match rawParseIntRange(d, 1, 99) { Some(v) => v, None => 0 - 1 })\n acc", true);
 }
 
 // End-to-end (codegen + VM) values for radix literals, incl. the negative-valued (sign-extended)
@@ -12248,7 +12265,12 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // builtins eprint / eprintln lower to, and the oracle models THOSE (its err_ text, compared by run_diff).
 // exit (id 95) IS listed: the code it ends with and what was printed before it are deterministic, and
 // run_diff compares both (ProgramExit on the VM side, ExitSignal in the oracle).
-static_assert(NATIVE_COUNT == 96,
+// The byte three (ids 96-98: rawIndexOfByte / rawIndexOfBytes / rawParseIntRange) ARE listed: they
+// are pure functions of a buffer and three Ints -- no I/O, no time, no other isolate -- so two
+// implementations can be held to the same answer, which is the whole test here. The oracle models
+// them in RefEval.cpp, and they are exercised through their std wrappers (indexOfByte, indexOf,
+// split, replace, and std::resp's reader) and directly by byte_index_of_byte / byte_parse_int_range.
+static_assert(NATIVE_COUNT == 99,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 

@@ -1315,6 +1315,16 @@ private:
         // Ambient / ring natives (always available -- no `use` needed).
         add_native("parseInt",     { S },    make_named(std_Result(), { ty_int(),    S }));
         add_native("parseDouble",  { S },    make_named(std_Result(), { ty_double(), S }));
+        // Byte-buffer searching and decimal parsing over a range -- the loops std::bytes, std::resp,
+        // std::net and std::string used to run in Skarn one bytecode op per byte. AMBIENT on purpose:
+        // their callers sit in five different std modules, two of them (std::string, std::iter) in the
+        // always-reachable ring, so no single owner could gate them. They are `raw*`, so no user
+        // document may name them and no highlighter may list them; the wrappers around them are the
+        // public surface (std::bytes' indexOfByte, std::string's indexOf, ...) and are unchanged.
+        add_native("rawIndexOfByte",   { B, ty_int(), ty_int() }, ty_int());
+        add_native("rawIndexOfBytes",  { B, B, ty_int() },        ty_int());
+        add_native("rawParseIntRange", { B, ty_int(), ty_int() },
+                                       make_named(std_Option(), { ty_int() }));
         // GC introspection. rawGcStats returns the 8 GcStats counters as an Array[Double] (Double's
         // 53-bit exact-integer range carries a uint64 counter for any realistic run); the prelude
         // gcStats() wrapper unpacks it into a GcStats struct. gcResetStats clears the counters. Ambient.

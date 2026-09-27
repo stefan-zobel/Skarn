@@ -1072,6 +1072,7 @@ blocking client. It builds on `std::bytes` and `std::net` and re-exports neither
 | `appendResp(out, r)` | any value, arrays included |
 | `r.encode()` | a value on the wire → `Bytes` |
 | `r.render()` | a value as redis-cli shows it: `OK`, `"text"`, `(integer) 3`, `(nil)`, `(error) ERR …`, numbered lines for an array |
+| `appendCommand(out, args)` | a command, `Vec[String]`, onto `out`: the array header and one bulk string per word. Cheaper than `encodeCommand` wherever the result is appended to something anyway, since it needs no buffer of its own |
 | `encodeCommand(args)` | a command, `Vec[String]`, as a client sends it: an array of bulk strings → `Bytes` |
 | `RespReader::new()` | an empty incremental decoder |
 | `rd.feed(chunk)` | add bytes as they arrive (`rd` must be `mut`) |

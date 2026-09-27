@@ -79,6 +79,7 @@ int main(int argc, char** argv) {
     run("set_and_branch",           test_set_and_branch);
     run("cmov",                     test_cmov);
     run("native_registry",          test_native_registry);
+    run("byte_natives",             test_byte_natives);
     run("call_native_high_regs",    test_call_native_high_registers);
     run("native_time",              test_native_time);
     run("native_procctx",           test_native_procctx);

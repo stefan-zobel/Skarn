@@ -178,6 +178,8 @@ inline constexpr std::string_view DIFFERENTIABLE_NATIVES[] = {
     "fileExists", "isFile", "isDir", "fileSize", "readFile",
     // Pure parsing
     "parseInt", "parseDouble",
+    // Pure byte searching and range parsing -- functions of a buffer and three Ints, nothing else
+    "rawIndexOfByte", "rawIndexOfBytes", "rawParseIntRange",
     // The running platform -- one answer per machine, mirrored below with the same #ifdef
     "rawOsId",
     // Ending the program -- deterministic: the code, and what was printed before it

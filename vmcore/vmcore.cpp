@@ -35,6 +35,7 @@
 #include <optional>   // the world a root execute() owns
 #include <algorithm>  // std::find -- a mailbox's list of senders waiting for room
 #include <utility>    // std::exchange -- a receive takes the I/O thread's pause mark
+#include <cstring>    // std::memchr / std::memcmp -- the byte-search natives
 #ifdef _WIN32
 // Winsock MUST precede <windows.h> to avoid winsock.h/winsock2.h redefinition errors.
 #  include <winsock2.h>
@@ -2802,6 +2803,107 @@ static Value native_sha256(Value* args, uint8_t nargs, Context* ctx) {
 }
 
 // =============================================================================
+// Byte-buffer searching and decimal parsing
+//
+// These three replace loops that std::bytes, std::resp, std::net and std::string used to run in
+// Skarn, one bytecode op per byte. All of them are PURE, TOTAL and NON-ALLOCATING: no safepoint, no
+// GC interaction, and therefore no host copy of the buffer (unlike sha256 above, which allocates its
+// result and so must copy first). Each mirrors the Skarn function it replaces EXACTLY -- malformed
+// input and clamping included -- so the change is invisible to every caller.
+//
+// The checker guarantees the argument types; a wrong kind is only reachable through hand-assembled
+// bytecode and reads as an empty buffer, which is why none of them can trap.
+
+// A read-only view of a KIND_BYTES argument. False (and an empty view) for anything else; TRUE with
+// an empty view for an EMPTY buffer, which is an ordinary argument -- indexOf(s, "") is 0.
+//
+// An empty KIND_BYTES need not own a backing object at all, so the count is read FIRST and the
+// backing slot is only followed when there is something in it. ARRAY_GET does the same thing by
+// bounds-checking before it reads the backing (Interpreter.h).
+static inline bool bytes_view(const Value& v, const char** data, int64_t* size) {
+    *data = nullptr;
+    *size = 0;
+    if (!v.isPtr()) return false;
+    GcObject* hdr = GcObject::from_slots(v.asPtr());
+    if (hdr->kind != GcObject::KIND_BYTES) return false;
+    const int64_t count   = hdr->slots()[BYTES_SLOT_COUNT].asSigned48();
+    const Value   backing = hdr->slots()[BYTES_SLOT_BACKING];
+    if (count <= 0 || !backing.isPtr()) return true;
+    *data = GcObject::from_slots(backing.asPtr())->bytes();
+    *size = count;
+    return true;
+}
+
+// rawIndexOfByte(b: Bytes, target: Int, from: Int) -> Int (Plain; -1 = absent). The body of
+// std::bytes' indexOfByte, which wraps the -1 back into an Option. `from` is clamped up to 0 as that
+// function documents; a target outside 0..255 can never equal a byte, so it answers -1.
+static Value native_index_of_byte(Value* args, uint8_t nargs, Context*) {
+    const char* d;
+    int64_t     n;
+    if (nargs < 3 || !bytes_view(args[0], &d, &n)) return Value::fromSigned48(-1);
+    const int64_t target = args[1].asSigned48();
+    int64_t       from   = args[2].asSigned48();
+    if (from < 0) from = 0;
+    if (from >= n || target < 0 || target > 255) return Value::fromSigned48(-1);
+    const void* hit = std::memchr(d + from, static_cast<int>(target), static_cast<size_t>(n - from));
+    if (!hit) return Value::fromSigned48(-1);
+    return Value::fromSigned48(static_cast<const char*>(hit) - d);
+}
+
+// rawIndexOfBytes(b: Bytes, sub: Bytes, from: Int) -> Int (Plain; -1 = absent). The body of
+// std::string's _strIndexOf, which took one Skarn call per candidate start and one more per byte
+// compared. An EMPTY needle matches at `from` -- indexOf(s, "") == 0, as the guide claims.
+static Value native_index_of_bytes(Value* args, uint8_t nargs, Context*) {
+    const char* d;
+    const char* sub;
+    int64_t     n;
+    int64_t     m;
+    if (nargs < 3 || !bytes_view(args[0], &d, &n) || !bytes_view(args[1], &sub, &m))
+        return Value::fromSigned48(-1);
+    int64_t from = args[2].asSigned48();
+    if (from < 0) from = 0;
+    if (from + m > n) return Value::fromSigned48(-1);
+    if (m == 0) return Value::fromSigned48(from);
+    const char* p    = d + from;
+    const char* last = d + n - m;                       // the last start a match could have
+    while (p <= last) {
+        const void* c = std::memchr(p, static_cast<unsigned char>(sub[0]),
+                                   static_cast<size_t>(last - p + 1));
+        if (!c) break;
+        p = static_cast<const char*>(c);
+        if (std::memcmp(p, sub, static_cast<size_t>(m)) == 0) return Value::fromSigned48(p - d);
+        ++p;
+    }
+    return Value::fromSigned48(-1);
+}
+
+// rawParseIntRange(b: Bytes, lo: Int, hi: Int) -> Int | nil (Option; nil = malformed). The body of
+// std::resp's _int: the decimal integer in b[lo, hi) -- an optional '-' then 1..15 digits -- without
+// the String a parseInt(s) call would need. Deliberately NOT parseInt's domain: the magnitude is
+// capped at 2^47 - 1 in BOTH signs, because the Skarn loop built the value positively and negated it
+// at the end, so -2^47 was already out of reach. An out-of-range window answers None, never a trap.
+static Value native_parse_int_range(Value* args, uint8_t nargs, Context*) {
+    const char* d;
+    int64_t     n;
+    if (nargs < 3 || !bytes_view(args[0], &d, &n)) return Value::fromNil();
+    int64_t i  = args[1].asSigned48();
+    int64_t hi = args[2].asSigned48();
+    if (i < 0 || hi > n || i >= hi) return Value::fromNil();
+    const bool neg = d[i] == '-';
+    if (neg) ++i;
+    if (i >= hi || hi - i > 15) return Value::fromNil();
+    constexpr int64_t MAX_48 = 140737488355327LL;       // 2^47 - 1
+    int64_t v = 0;
+    for (; i < hi; ++i) {
+        const int digit = static_cast<unsigned char>(d[i]) - '0';
+        if (digit < 0 || digit > 9) return Value::fromNil();
+        if (v > MAX_48 / 10 || (v == MAX_48 / 10 && digit > MAX_48 % 10)) return Value::fromNil();
+        v = v * 10 + digit;
+    }
+    return Value::fromSigned48(neg ? -v : v);           // Some payload (immediate)
+}
+
+// =============================================================================
 // Isolate natives -- tasks (rawSpawn / rawJoin / rawTaskTake), actors (rawSpawnActor / rawSend /
 // rawReceive / rawMailMsg / rawMailFrom / rawMailReason / rawMainInbox), their extra and bounded
 // inboxes (rawNewInbox / rawCloseInbox / rawTrySend / rawSpawnActorBounded), and for both
@@ -4353,5 +4455,8 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_FLUSH_OUTPUT] = native_flush_output;
     t[NATIVE_WRITE_ERR]    = native_write_err;
     t[NATIVE_EXIT]         = native_exit;
+    t[NATIVE_INDEX_OF_BYTE]   = native_index_of_byte;
+    t[NATIVE_PARSE_INT_RANGE] = native_parse_int_range;
+    t[NATIVE_INDEX_OF_BYTES]  = native_index_of_bytes;
     return t;
 }

@@ -34,6 +34,32 @@ fn _crlf(mut out: Bytes) -> Bytes {
   push(out, 10)
 }
 
+// The decimal digits of `n` straight onto `out` -- what `appendBytes(out, toString(n))` does, without the
+// String it allocates only to copy. Every RESP header is a number, so that String was one allocation per
+// value encoded. It counts the digits first and then emits them most-significant-first, so it needs no
+// scratch buffer either, and it works on the NEGATIVE side throughout: the most negative Int cannot be
+// negated (48-bit range), while -n is always representable. Division truncates and the remainder carries
+// the dividend's sign, which is what makes the negative side exact.
+fn _appendInt(mut out: Bytes, n: Int) -> Bytes {
+  if n == 0 { return push(out, 48) }
+  let neg = n < 0
+  let mut m = if neg { n } else { 0 - n }          // m < 0 from here on
+  if neg { push(out, 45) }
+  let mut digits = 1
+  let mut t = m
+  while t / 10 != 0 { t = t / 10  digits = digits + 1 }
+  let mut div = 1
+  let mut k = 1
+  while k < digits { div = div * 10  k = k + 1 }
+  while div != 0 {
+    let d = 0 - (m / div)                          // 0..9; d * div <= -m, so it cannot overflow
+    push(out, 48 + d)
+    m = m + d * div
+    div = div / 10
+  }
+  out
+}
+
 // A simple string or an error message must not contain a line break; one is written as a space.
 fn _appendLine(mut out: Bytes, s: String) -> Bytes {
   let b = toBytes(s)
@@ -59,14 +85,14 @@ pub fn appendError(mut out: Bytes, message: String) -> Bytes {
 // `:n\r\n`
 pub fn appendInteger(mut out: Bytes, n: Int) -> Bytes {
   push(out, 58)
-  appendBytes(out, toString(n))
+  _appendInt(out, n)
   _crlf(out)
 }
 
 // `$len\r\ns\r\n` -- any bytes, line breaks included.
 pub fn appendBulk(mut out: Bytes, s: String) -> Bytes {
   push(out, 36)
-  appendBytes(out, toString(len(s)))
+  _appendInt(out, len(s))
   _crlf(out)
   appendBytes(out, s)
   _crlf(out)
@@ -81,7 +107,7 @@ pub fn appendNullArray(mut out: Bytes) -> Bytes { appendBytes(out, "*-1\r\n") }
 // `*n\r\n`: an array of n values; append the n values after it.
 pub fn appendArrayHeader(mut out: Bytes, n: Int) -> Bytes {
   push(out, 42)
-  appendBytes(out, toString(n))
+  _appendInt(out, n)
   _crlf(out)
 }
 
@@ -102,12 +128,19 @@ pub fn appendResp(mut out: Bytes, r: Resp) -> Bytes {
   }
 }
 
-// A command as a client sends it: an array of bulk strings.
-pub fn encodeCommand(args: Vec[String]) -> Bytes {
-  let mut out = bytes()
+// A command onto a buffer the caller already has: the array header, then one bulk string per word. Prefer
+// this over encodeCommand wherever the result is appended to something anyway -- a log, a pipeline, a send
+// buffer -- because it saves the intermediate Bytes and the copy out of it.
+pub fn appendCommand(mut out: Bytes, args: Vec[String]) -> Bytes {
   appendArrayHeader(out, len(args))
   for a in args { appendBulk(out, a) }
   out
+}
+
+// A command as a client sends it: an array of bulk strings, on a buffer of its own.
+pub fn encodeCommand(args: Vec[String]) -> Bytes {
+  let mut out = bytes()
+  appendCommand(out, args)
 }
 
 impl Resp {
@@ -157,35 +190,16 @@ enum ParseStep { Got(Resp, Int), More, Bad(String) }
 // Where the line starting at `p` ends: the index of its "\r", -1 if the end has not arrived, -2 if a
 // "\r" is not followed by "\n".
 fn _lineEnd(b: Bytes, p: Int) -> Int {
-  let n = len(b)
-  let mut i = p
-  while i < n {
-    if b[i] == 13 {
-      if i + 1 >= n { return -1 }
-      return if b[i + 1] == 10 { i } else { -2 }
-    }
-    i = i + 1
-  }
-  return -1
+  let i = rawIndexOfByte(b, 13, p)
+  if i < 0 { return -1 }
+  if i + 1 >= len(b) { return -1 }
+  return if b[i + 1] == 10 { i } else { -2 }
 }
 
-// The decimal integer in b[lo, hi): an optional '-' and 1..15 digits, else None.
-fn _int(b: Bytes, lo: Int, hi: Int) -> Option[Int] {
-  let mut i = lo
-  let neg = i < hi && b[i] == 45
-  if neg { i = i + 1 }
-  if i >= hi || hi - i > 15 { return None }
-  let mut n = 0
-  while i < hi {
-    let d = b[i] - 48
-    if d < 0 || d > 9 { return None }
-    // 2^47 - 1 = 140737488355327; checked BEFORE the step, since the step itself would wrap
-    if n > 14073748835532 || (n == 14073748835532 && d > 7) { return None }
-    n = n * 10 + d
-    i = i + 1
-  }
-  Some(if neg { 0 - n } else { n })
-}
+// The decimal integer in a header line is read by the rawParseIntRange native: the digits in
+// b[lo, hi) -- an optional '-' and then 1..15 of them -- with the magnitude capped at 2^47 - 1, and
+// None for anything else. It exists because parseInt takes a String, and making one of the digits
+// would allocate per header; the loop it replaces was the largest single piece of a parsed command.
 
 // The end of a header line, or the step to report when there is none yet.
 fn _header(b: Bytes, p: Int) -> Result[Int, ParseStep] {
@@ -206,13 +220,13 @@ fn _parse(b: Bytes, p: Int, depth: Int) -> ParseStep {
   if t == 43 { return ParseStep::Got(Resp::Simple(sliceBytes(b, p + 1, e)), after) }
   if t == 45 { return ParseStep::Got(Resp::Error(sliceBytes(b, p + 1, e)), after) }
   if t == 58 {
-    return match _int(b, p + 1, e) {
+    return match rawParseIntRange(b, p + 1, e) {
       Some(n) => ParseStep::Got(Resp::Integer(n), after),
       None => ParseStep::Bad("invalid integer")
     }
   }
   if t == 36 {
-    let n = match _int(b, p + 1, e) { Some(n) => n, None => return ParseStep::Bad("invalid bulk length") }
+    let n = match rawParseIntRange(b, p + 1, e) { Some(n) => n, None => return ParseStep::Bad("invalid bulk length") }
     if n == -1 { return ParseStep::Got(Resp::Null, after) }
     if n < 0 || n > MAX_BULK { return ParseStep::Bad("invalid bulk length") }
     if len(b) < after + n + 2 { return ParseStep::More }
@@ -220,7 +234,7 @@ fn _parse(b: Bytes, p: Int, depth: Int) -> ParseStep {
     return ParseStep::Got(Resp::Bulk(sliceBytes(b, after, after + n)), after + n + 2)
   }
   if t == 42 {
-    let n = match _int(b, p + 1, e) { Some(n) => n, None => return ParseStep::Bad("invalid array length") }
+    let n = match rawParseIntRange(b, p + 1, e) { Some(n) => n, None => return ParseStep::Bad("invalid array length") }
     if n == -1 { return ParseStep::Got(Resp::NullArray, after) }
     if n < 0 || n > MAX_ITEMS { return ParseStep::Bad("invalid array length") }
     if depth >= MAX_DEPTH { return ParseStep::Bad("arrays nested too deep") }
@@ -311,7 +325,7 @@ impl RespReader {
           Err(ParseStep::Bad(why)) => return Err("protocol error: " + why),
           Err(_) => return Err("protocol error")
         }
-        let n = match _int(b, p + 1, e) { Some(n) => n, None => return Err("protocol error: invalid array length") }
+        let n = match rawParseIntRange(b, p + 1, e) { Some(n) => n, None => return Err("protocol error: invalid array length") }
         if n > MAX_ITEMS { return Err("protocol error: invalid array length") }
         let mut q = e + 2
         if n <= 0 {
@@ -328,7 +342,7 @@ impl RespReader {
               Err(ParseStep::Bad(why)) => return Err("protocol error: " + why),
               Err(_) => return Err("protocol error")
             }
-            let m = match _int(b, q + 1, h) { Some(m) => m, None => return Err("protocol error: invalid bulk length") }
+            let m = match rawParseIntRange(b, q + 1, h) { Some(m) => m, None => return Err("protocol error: invalid bulk length") }
             if m < 0 || m > MAX_BULK { return Err("protocol error: invalid bulk length") }
             let start = h + 2
             if len(b) < start + m + 2 { return Ok(None) }
@@ -383,10 +397,7 @@ impl RespClient {
   // one per command.
   fn pipeline(mut self, commands: Vec[Vec[String]]) -> Result[Vec[Resp], String] {
     let mut out = bytes()
-    for c in commands {
-      appendArrayHeader(out, len(c))
-      for a in c { appendBulk(out, a) }
-    }
+    for c in commands { appendCommand(out, c) }
     self.conn.send(out)?
     let mut answers: Vec[Resp] = vec()
     let mut i = 0

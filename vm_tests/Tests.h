@@ -308,6 +308,93 @@ inline void test_cmov() {
 // =============================================================================
 
 // =============================================================================
+// test_byte_natives -- the three pure byte natives (NativeRegistry.h 96-98) through the REAL
+// registry: rawIndexOfByte, rawIndexOfBytes and rawParseIntRange. At this level a native returns
+// its bare value -- the Option wrapping of rawParseIntRange is the compiler's job -- so nil IS the
+// malformed answer and can be asserted directly.
+//
+// The cases are the ones where an implementation can differ from the Skarn loop it replaced: a hit,
+// a miss, a `from` past the end, a negative `from` (clamped up to 0), an empty buffer (which owns no
+// backing object at all, so a view must read the count before it follows the backing slot), an empty
+// needle (which matches at `from`), a sign, and a non-digit.
+// =============================================================================
+inline void test_byte_natives() {
+    std::cout << "=== byte natives (rawIndexOfByte / rawIndexOfBytes / rawParseIntRange) ===\n";
+    Heap heap(64 * 1024);
+    Assembler as;
+    as.label("main");
+
+    // r0 = the buffer "ab,cd" ; r10 = the needle "cd" ; r11 = an empty buffer
+    as.load_const(9, 5);  as.BYTES_NEW_CAP(0, 9);
+    const int16_t hay[5] = { 'a', 'b', ',', 'c', 'd' };
+    for (int k = 0; k < 5; ++k) { as.load_const(1, hay[k]); as.VEC_PUSH(0, 1); }
+    as.load_const(9, 2);  as.BYTES_NEW_CAP(10, 9);
+    as.load_const(1, 'c'); as.VEC_PUSH(10, 1);
+    as.load_const(1, 'd'); as.VEC_PUSH(10, 1);
+    as.load_const(9, 0);  as.BYTES_NEW_CAP(11, 9);          // empty: no backing of its own
+    as.load_const(9, 0);  as.BYTES_NEW_CAP(12, 9);          // an empty needle
+
+    // r20 = rawIndexOfByte(hay, ',', 0)            -> 2
+    as.R6(OpCode::MOV, 30, 0, 0); as.load_const(31, ','); as.load_const(32, 0);
+    as.call_native_id(20, 40, 30, 3, NATIVE_INDEX_OF_BYTE);
+    // r21 = rawIndexOfByte(hay, 'z', 0)            -> -1
+    as.R6(OpCode::MOV, 30, 0, 0); as.load_const(31, 'z'); as.load_const(32, 0);
+    as.call_native_id(21, 40, 30, 3, NATIVE_INDEX_OF_BYTE);
+    // r22 = rawIndexOfByte(hay, 'a', -4)           -> 0   (`from` clamped up)
+    as.R6(OpCode::MOV, 30, 0, 0); as.load_const(31, 'a'); as.load_const(32, -4);
+    as.call_native_id(22, 40, 30, 3, NATIVE_INDEX_OF_BYTE);
+    // r23 = rawIndexOfByte(empty, 'a', 0)          -> -1  (must not follow a missing backing)
+    as.R6(OpCode::MOV, 30, 11, 0); as.load_const(31, 'a'); as.load_const(32, 0);
+    as.call_native_id(23, 40, 30, 3, NATIVE_INDEX_OF_BYTE);
+
+    // r24 = rawIndexOfBytes(hay, "cd", 0)          -> 3
+    as.R6(OpCode::MOV, 30, 0, 0); as.R6(OpCode::MOV, 31, 10, 0); as.load_const(32, 0);
+    as.call_native_id(24, 40, 30, 3, NATIVE_INDEX_OF_BYTES);
+    // r25 = rawIndexOfBytes(hay, "cd", 4)          -> -1  (no room left for a match)
+    as.R6(OpCode::MOV, 30, 0, 0); as.R6(OpCode::MOV, 31, 10, 0); as.load_const(32, 4);
+    as.call_native_id(25, 40, 30, 3, NATIVE_INDEX_OF_BYTES);
+    // r26 = rawIndexOfBytes(hay, "", 2)            -> 2   (the empty needle matches at `from`)
+    as.R6(OpCode::MOV, 30, 0, 0); as.R6(OpCode::MOV, 31, 12, 0); as.load_const(32, 2);
+    as.call_native_id(26, 40, 30, 3, NATIVE_INDEX_OF_BYTES);
+
+    // r13 = "-27x" ; the range [0,3) parses, [0,4) does not
+    as.load_const(9, 4);  as.BYTES_NEW_CAP(13, 9);
+    const int16_t num[4] = { '-', '2', '7', 'x' };
+    for (int k = 0; k < 4; ++k) { as.load_const(1, num[k]); as.VEC_PUSH(13, 1); }
+    // r27 = rawParseIntRange("-27x", 0, 3)         -> -27
+    as.R6(OpCode::MOV, 30, 13, 0); as.load_const(31, 0); as.load_const(32, 3);
+    as.call_native_id(27, 40, 30, 3, NATIVE_PARSE_INT_RANGE);
+    // r28 = rawParseIntRange("-27x", 0, 4)         -> nil (the 'x')
+    as.R6(OpCode::MOV, 30, 13, 0); as.load_const(31, 0); as.load_const(32, 4);
+    as.call_native_id(28, 40, 30, 3, NATIVE_PARSE_INT_RANGE);
+    // r29 = rawParseIntRange("-27x", 1, 99)        -> nil (the window leaves the buffer)
+    as.R6(OpCode::MOV, 30, 13, 0); as.load_const(31, 1); as.load_const(32, 99);
+    as.call_native_id(29, 40, 30, 3, NATIVE_PARSE_INT_RANGE);
+
+    as.J(OpCode::HALT);
+    const auto bytecode = as.assemble();
+    try {
+        std::vector<NativeFunc> ntab = build_native_table();
+        auto  res  = execute(bytecode, &heap, nullptr, nullptr, 48, nullptr, nullptr,
+                             nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                             nullptr, nullptr, nullptr, &ntab);
+        auto* regs = res.get_reg_base();
+        auto I = [&](int i, int64_t want) { return regs[i].isInt() && regs[i].asSigned48() == want; };
+        std::cout << std::format(
+            "indexOfByte: hit {} miss {} clamped {} empty {}   indexOfBytes: hit {} short {} empty-needle {}"
+            "   parseIntRange: {} bad {} out-of-range {}\n",
+            regs[20].asSigned48(), regs[21].asSigned48(), regs[22].asSigned48(), regs[23].asSigned48(),
+            regs[24].asSigned48(), regs[25].asSigned48(), regs[26].asSigned48(),
+            regs[27].asSigned48(), regs[28].isNil() ? "nil" : "NOT nil",
+            regs[29].isNil() ? "nil" : "NOT nil");
+        check(I(20, 2) && I(21, -1) && I(22, 0) && I(23, -1) &&
+              I(24, 3) && I(25, -1) && I(26, 2) &&
+              I(27, -27) && regs[28].isNil() && regs[29].isNil());
+    }
+    catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
 // test_native_registry -- the id-based native-call path (the compiler path).
 //
 // Instead of baking a function ADDRESS into the bytecode (load_native_ptr /
