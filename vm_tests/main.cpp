@@ -180,6 +180,7 @@ int main(int argc, char** argv) {
     run("value_codec_encode_bytes", test_value_codec_encode_bytes);
     run("rooted_pool_release",      test_rooted_pool_release);
     run("value_codec_collects",     test_value_codec_collects);
+    run("value_codec_node_index",   test_value_codec_node_index);
     run("thread_slot_table",        test_thread_slot_table);
     run("concurrent_execute",       test_concurrent_execute);
     run("task_parallel_sums",       test_task_parallel_sums);

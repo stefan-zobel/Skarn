@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,39 @@ inline void put_u32(std::vector<uint8_t>& o, uint32_t v) {
 inline void put_u64(std::vector<uint8_t>& o, uint64_t v) {
     for (int i = 0; i < 8; ++i) o.push_back(uint8_t(v >> (8 * i)));
 }
+
+// ----- bounds-checked write cursor into a buffer sized in advance --------------
+// The same byte-wise little-endian stores as put_*, for a container that computes its
+// exact length first and so needs one allocation instead of a push_back per byte
+// (ValueCodec.h). Every store is checked against the end, so a length computed too
+// short throws instead of writing past the buffer; `overflow` names the container.
+template <class Err>
+struct WriterT {
+    uint8_t*       p;
+    uint8_t* const end;
+    const char*    overflow;
+
+    void need(size_t k) const {
+        if (static_cast<size_t>(end - p) < k) throw Err(overflow);
+    }
+    void u8 (uint8_t v)  { need(1); *p++ = v; }
+    void u16(uint16_t v) { need(2); p[0] = uint8_t(v); p[1] = uint8_t(v >> 8); p += 2; }
+    void u32(uint32_t v) {
+        need(4);
+        p[0] = uint8_t(v); p[1] = uint8_t(v >> 8); p[2] = uint8_t(v >> 16); p[3] = uint8_t(v >> 24);
+        p += 4;
+    }
+    void u64(uint64_t v) {
+        need(8);
+        for (int i = 0; i < 8; ++i) p[i] = uint8_t(v >> (8 * i));
+        p += 8;
+    }
+    void bytes(const void* src, size_t k) {
+        need(k);
+        if (k) std::memcpy(p, src, k);
+        p += k;
+    }
+};
 
 // ----- bounds-checked read cursor --------------------------------------------
 // Templated on the exception it raises, and carrying its own short-read message,

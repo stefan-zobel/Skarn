@@ -3036,6 +3036,60 @@ inline void test_rooted_pool_release() {
                                  release_ms, fast_ok ? "PASS" : "FAIL");
         check(count_ok && before_ok && after_ok && fast_ok);
     } catch (const std::exception& e) { record_fail(e.what()); }
+
+    // A decoded message's pool is released before anything rooted after it, so it sits at the
+    // END of the root list, behind the program's own roots. Releasing it must cost its slots,
+    // not every root of the program: 100 000 small pools behind 20 000 roots took several
+    // hundred ms while the release scanned the whole list, a few ms since it looks from the end.
+    try {
+        Heap heap(64 * 1024);
+        std::vector<Value> program(20000, Value::fromNil());
+        for (Value& s : program) heap.add_root(&s);
+
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 100000; ++i) {
+            RootedValuePool pool;
+            pool.heap = &heap;
+            pool.slots.resize(4);
+            for (Value& s : pool.slots) heap.add_root(&s);
+        }                                              // each destructor releases from the end
+        const double release_ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0).count();
+
+        const bool count_ok = heap.root_count() == 20000;
+        heap.remove_root(&program[19999]);             // the program's roots are all still there
+        heap.remove_root(&program[0]);
+        heap.remove_root(&program[10000]);
+        const bool kept_ok = heap.root_count() == 19997;
+        const bool fast_ok = release_ms < 100.0;
+        std::cout << std::format("  pools at the end, program's roots kept: {} {}\n",
+                                 count_ok ? "PASS" : "FAIL", kept_ok ? "PASS" : "FAIL");
+        std::cout << std::format("  100 k pools behind 20 k roots in {:.2f} ms (< 100): {}\n",
+                                 release_ms, fast_ok ? "PASS" : "FAIL");
+        check(count_ok && kept_ok && fast_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+
+    // remove_root takes out ONE registration, the most recent, and keeps the others in order.
+    try {
+        Heap  heap(64 * 1024);
+        Value a = Value::fromNil(), b = Value::fromNil(), c = Value::fromNil(), d = Value::fromNil();
+        heap.add_root(&a); heap.add_root(&b); heap.add_root(&c); heap.add_root(&d);
+        heap.remove_root(&d);
+        heap.remove_root(&b);
+        heap.remove_root(&a);
+        const bool one_left = heap.root_count() == 1;
+        heap.remove_root(&c);
+        const bool none_left = heap.root_count() == 0;
+        heap.add_root(&a); heap.add_root(&a);          // the same slot twice
+        heap.remove_root(&a);
+        const bool twice_ok = heap.root_count() == 1;
+        heap.remove_root(&a);
+        const bool twice_gone = heap.root_count() == 0;
+        std::cout << std::format("  remove_root, one registration at a time: {} {} {} {}\n",
+                                 one_left ? "PASS" : "FAIL", none_left ? "PASS" : "FAIL",
+                                 twice_ok ? "PASS" : "FAIL", twice_gone ? "PASS" : "FAIL");
+        check(one_left && none_left && twice_ok && twice_gone);
+    } catch (const std::exception& e) { record_fail(e.what()); }
 }
 
 // =============================================================================
@@ -3077,6 +3131,122 @@ inline void test_value_codec_collects() {
                                  dst.stats().collections, collected ? "PASS" : "FAIL");
         std::cout << std::format("  graph still intact afterwards:      {}\n", eq_ok ? "PASS" : "FAIL");
         check(collected && eq_ok);
+    } catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
+// test_value_codec_node_index -- the encoder's node table on BOTH of its paths.
+//
+// encode() finds a node it has seen by a linear search while the graph is small and by a
+// hash table once it has more than LINEAR_NODES nodes, and it keeps its working arrays
+// per thread between calls. The other codec tests use small graphs, so they exercise the
+// linear search alone. Here the same shape is built at sizes around the switch and well
+// beyond it, and checked by pointer identity after the rebuild. Its shared node and its
+// cycles are the nodes interned LAST, so a table that loses its newest entries shows. Then:
+//   * a throw in the middle of a large graph must not leak into the next encode, since
+//     the scratch arrays outlive the call;
+//   * every kind of slot is written, because the buffer is sized in advance from a per-
+//     type byte count and a wrong count must fail loudly.
+// The graphs are built with the non-collecting allocators in a heap large enough for all
+// of them, so no object moves while the test holds raw pointers.
+// =============================================================================
+namespace codec_node_index {
+// A root array of n slots: n-2 distinct strings, then a child array C, then the LAST string
+// again; C = [root, last string, C]. So the graph has exactly n nodes, interned as root,
+// the strings, C: the last string is reached three times, C and the root twice each.
+inline Value build(Heap& h, uint32_t n) {
+    GcObject* root = h.alloc_slots(GcObject::KIND_ARRAY, n);
+    GcObject* c    = h.alloc_slots(GcObject::KIND_ARRAY, 3);
+    if (!root || !c) throw std::runtime_error("test heap too small");
+    Value* r = root->slots();
+    for (uint32_t i = 0; i + 2 < n; ++i) {
+        GcObject* s = h.alloc_string(std::format("n{}", i));
+        if (!s) throw std::runtime_error("test heap too small");
+        r[i] = Value::fromPtr(s->bytes());
+    }
+    r[n - 2] = Value::fromPtr(c->slots());
+    r[n - 1] = r[n - 3];
+    c->slots()[0] = Value::fromPtr(root->slots());
+    c->slots()[1] = r[n - 3];
+    c->slots()[2] = Value::fromPtr(c->slots());
+    return Value::fromPtr(root->slots());
+}
+inline uint32_t node_count(const std::vector<uint8_t>& b) {
+    return b.size() < 4 ? 0 : uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16 | uint32_t(b[3]) << 24;
+}
+} // namespace codec_node_index
+
+inline void test_value_codec_node_index() {
+    std::cout << "=== value_codec_node_index (linear search, table, scratch reuse) ===\n";
+    try {
+        using namespace codec_node_index;
+        const uint32_t T = static_cast<uint32_t>(vcodec::detail::EncodeScratch::LINEAR_NODES);
+        Heap src(8 * 1024 * 1024);
+
+        // ---- sharing and the cycle, around the switch and beyond -------------------
+        bool shape_ok = true;
+        for (uint32_t n : { T - 1, T, T + 1, T + 2, 4 * T, 500u, 5000u }) {
+            const Value root = build(src, n);
+            const auto  buf  = vcodec::encode(root);
+            Heap            dst(1024 * 1024);
+            RootedValuePool pool;
+            const Value q    = vcodec::decode(buf.data(), buf.size(), dst, nullptr, pool, nullptr, 0);
+            const Value* r   = GcObject::from_slots(q.asPtr())->slots();
+            const Value* c   = GcObject::from_slots(r[n - 2].asPtr())->slots();
+            const bool   ok  = node_count(buf) == n &&
+                               r[n - 3].asPtr() == r[n - 1].asPtr() &&       // shared, not copied twice
+                               c[1].asPtr() == r[n - 3].asPtr() &&
+                               c[0].asPtr() == q.asPtr() &&                  // both cycles close on the copy
+                               c[2].asPtr() == r[n - 2].asPtr() &&
+                               q.asPtr() != root.asPtr() &&
+                               vcodec::encode(q) == buf;                     // first-visit order is canonical
+            std::cout << std::format("  {:>4} nodes: shared once, cycle closed, canonical: {}\n", n,
+                                     ok ? "PASS" : "FAIL");
+            shape_ok &= ok;
+        }
+
+        // ---- a throw halfway through a large graph leaves nothing behind -----------
+        const Value good  = build(src, 3 * T);
+        const auto  fresh = vcodec::encode(good);
+        bool threw = false;
+        {
+            GcObject* big = src.alloc_slots(GcObject::KIND_ARRAY, 4 * T);
+            GcObject* clo = src.alloc_slots(GcObject::KIND_CLOSURE, 1);
+            if (!big || !clo) throw std::runtime_error("test heap too small");
+            for (uint32_t i = 0; i < 4 * T - 1; ++i)
+                big->slots()[i] = Value::fromPtr(src.alloc_string(std::format("x{}", i))->bytes());
+            big->slots()[4 * T - 1] = Value::fromPtr(clo->slots());
+            try { (void)vcodec::encode(Value::fromPtr(big->slots())); }
+            catch (const vcodec::ValueCodecError&) { threw = true; }
+        }
+        const bool after_ok = threw && vcodec::encode(good) == fresh;
+        std::cout << std::format("  encode after a throw equals a fresh one: {}\n", after_ok ? "PASS" : "FAIL");
+
+        // ---- every slot type, so the size computed in advance is exercised ---------
+        bool types_ok = false;
+        {
+            GcObject* a = src.alloc_slots(GcObject::KIND_ARRAY, 10);
+            GcObject* s = src.alloc_string("leaf");
+            if (!a || !s) throw std::runtime_error("test heap too small");
+            Value* v = a->slots();
+            v[0] = Value::fromSigned48(-7);  v[1] = Value::fromDouble(2.5); v[2] = Value::fromBool(true);
+            v[3] = Value::fromError(3);      v[4] = Value::fromAtom(4);     v[5] = Value::fromFunc(5);
+            v[6] = Value::fromNil();         v[7] = Value::fromUndefined(); v[8] = Value::tombstone();
+            v[9] = Value::fromPtr(s->bytes());
+            const auto      buf = vcodec::encode(Value::fromPtr(a->slots()));
+            Heap            dst(64 * 1024);
+            RootedValuePool pool;
+            const Value     q = vcodec::decode(buf.data(), buf.size(), dst, nullptr, pool, nullptr, 0);
+            const Value*    w = GcObject::from_slots(q.asPtr())->slots();
+            types_ok = w[0].isInt() && w[0].asSigned48() == -7 && w[1].isDouble() && w[1].asDouble() == 2.5 &&
+                       w[2].isBool() && w[2].asBool() && w[3].type() == Value::Type::Error &&
+                       w[3].asErrorCode() == 3 && w[4].type() == Value::Type::Atom && w[4].asAtomId() == 4 &&
+                       w[5].type() == Value::Type::Func && w[5].asFuncId() == 5 && w[6].isNil() &&
+                       w[7].isUndefined() && w[8].isTombstone() && w[9].isPtr() &&
+                       vcodec::encode(q) == buf;
+        }
+        std::cout << std::format("  every slot type sized and rebuilt:       {}\n", types_ok ? "PASS" : "FAIL");
+        check(shape_ok && after_ok && types_ok);
     } catch (const std::exception& e) { record_fail(e.what()); }
 }
 

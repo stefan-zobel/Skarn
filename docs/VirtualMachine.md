@@ -436,6 +436,10 @@ destination can never move a half-copied graph out from under the copier.
 
 - Every heap object is written once and referred to by index, so shared parts stay shared and cyclic
   values are copied correctly.
+- A small message is cheap to copy. The encoder recognises an object it has already written by a short
+  linear search, and by a hash table only in larger values; it computes the buffer's exact size before
+  writing it, and keeps its working memory per thread between calls. So encoding allocates only the
+  buffer, and decoding only the list of roots for the rebuild.
 - Each slot is stored as its value type plus payload and rebuilt through the normal constructors, never
   as raw bits, so a decoded value can never turn into a pointer.
 - The rebuild keeps every object it has created registered as a collector root, so it stays correct even
