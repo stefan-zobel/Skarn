@@ -1093,6 +1093,11 @@ This is the Erlang/OTP model, and the names match where the ideas do. Four diffe
 - `demo/actor_server/` — an HTTP server on actors, with a load generator.
 - `demo/chat/` — a chat server with topics on active connections (§17), a terminal client, and a
   self-test in which a client that stops reading is dropped.
+- [Sedis](https://github.com/stefan-zobel/Sedis) — not in this repository, but the one to read after the
+  demos: a Redis-compatible key-value server that uses most of this guide at once. An actor per
+  connection, a shard actor per part of the keyspace, a supervisor that restarts a shard (§9), stable
+  addresses so a restarted shard answers where its predecessor did (§11), and requests lost in a crash
+  found by numbering the batches rather than by monitors or timeouts.
 
 The [Skarn Guide](SkarnGuide.md)'s concurrency section covers the two simpler tools beside actors:
 `std::poll`, for many connections on one thread, and `std::task`, for one computation on several cores.

@@ -86,6 +86,14 @@ total 15.07
 Every code block in the guides and every program under `examples/` is run by the test harness, and each
 must print exactly the output shown.
 
+## Written in Skarn
+
+- [**Sedis**](https://github.com/stefan-zobel/Sedis) — a key-value server that speaks RESP, the protocol of
+  Redis, so `redis-cli` and the ordinary client libraries talk to it unchanged. It lives in a repository of
+  its own and is the largest program the language has been used for: one connection actor per client, the
+  keyspace sharded across cores, an append-only log per shard, and shards that crash and come back without
+  the rest of the server noticing.
+
 ## Building
 
 ### macOS (Apple Silicon)

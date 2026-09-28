@@ -1084,6 +1084,9 @@ sent after it has ended is dropped.
 RESP2, the protocol Redis speaks: a value type, an encoder, an incremental decoder for a server, and a
 blocking client. It builds on `std::bytes` and `std::net` and re-exports neither. `use std::resp::*`
 
+A complete server built on this module: [Sedis](https://github.com/stefan-zobel/Sedis), a Redis-compatible
+key-value store written in Skarn, in a repository of its own.
+
 | Function | Purpose |
 |----------|---------|
 | `Resp::Simple(s)` / `Error(s)` / `Integer(n)` / `Bulk(s)` / `Null` / `Arr(items)` / `NullArray` | the seven kinds of value; a bulk string holds any bytes |
