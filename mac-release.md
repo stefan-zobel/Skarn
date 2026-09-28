@@ -36,20 +36,31 @@ ctest --test-dir /tmp/skarn-release/build --output-on-failure
 
 All thirteen entries must pass: the four suites (`vm_tests`, `vm_fault_probe`, `static_compiler_tests`,
 `skarn_lsp_selftest`) and the nine Python gates (`doc_claims`, `doc_examples`, `examples`, `doc_links`,
-`doc_anchors`, `demos`, `stdlib_reference`, `highlighters`, `live_output`, which need Python 3.9 or newer). Expected totals (Release, arm64) — these must
-match the Windows numbers in the release notes:
+`doc_anchors`, `demos`, `stdlib_reference`, `highlighters`, `live_output`, which need Python 3.9 or newer).
+Expected totals for 0.4.0, in ctest's order — the Windows Release run produces exactly these, and the
+arm64 run must match:
 
 ```
-vm_tests               98 passed, 0 failed  (checks: 134 passed, 0 failed)
-vm_fault_probe          1 passed, 0 failed
-static_compiler_tests  <N> passed, 0 failed
-guide claims           <N> passed, 0 failed
-guide examples         <N> passed, <M> check-only, 0 ignored, 0 failed
-examples               <N> passed, 0 failed
-demos                  <N> passed, 0 failed
+vm_tests                146 passed, 0 failed  (checks: 187 passed, 0 failed)
+vm_fault_probe            2 passed, 0 failed
+static_compiler_tests  3715 passed, 0 failed
+skarn_lsp_selftest      241 passed, 0 failed
+doc_claims              288 passed, 0 failed  (288 claims)  (21 support modules skipped)
+doc_examples            243 passed, 4 check-only, 0 ignored, 0 failed
+examples                 13 passed, 0 failed
+doc_links               all anchors resolve — once per guide, so four times
+doc_anchors             every cited section resolves
+demos                    39 passed, 0 failed  (35 entry programs, 4 self-tests)
+stdlib_reference        601 documented, 57 internal natives, 1 allowed undocumented, 0 missing, 0 unknown
+highlighters              0 problems
+live_output               5 passed, 0 failed
 ```
 
-`--output-on-failure` prints these lines only for a failing entry; `ctest -V` prints them all.
+The chat server's self-test runs inside `demos` and prints `selftest: 24 steps ok`.
+
+`--output-on-failure` prints these lines only for a failing entry; `ctest -V` prints them all. The whole
+set takes about three minutes sequentially, of which `static_compiler_tests` is roughly 140 s, so `-j`
+saves little.
 
 Do not publish if anything is red.
 
