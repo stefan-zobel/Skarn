@@ -1,0 +1,217 @@
+// A double-ended queue: push and pop at BOTH ends, and indexed access, all in O(1) (the pushes and
+// pops amortised). A `Vec` grows and shrinks only at its END, so a program that needs a queue has
+// to shift the whole vector on every dequeue, or keep a head index by hand and never give the
+// prefix back. This is that container, written once.
+//
+// OPT-IN: reach these via `use std::deque::*` -- the constructors `Deque::new` / `Deque::fromVec`
+// plus method syntax. Built on `Vec` alone, no native. Tree-shaken when unused.
+//
+//     let mut q: Deque[Int] = Deque::new()
+//     q.pushBack(1)
+//     q.pushBack(2)
+//     q.pushFront(0)
+//     q.popFront()                      // Some(0)
+//     for x in q { println(toString(x)) }   // 1, 2 -- front to back, no copy
+//
+// THE REPRESENTATION, AND WHY IT IS TWO VECTORS RATHER THAN A RING BUFFER.
+// `front` holds the leading elements REVERSED (`front[len-1]` is the deque's first element) and
+// `back` holds the trailing ones in order (`back[len-1]` is the last). Both ends of the deque are
+// therefore the TAIL of a `Vec`, which is the one place a `Vec` is cheap -- so every push and every
+// pop here is a plain `push`/`pop` builtin and nothing does index arithmetic.
+//
+// A ring buffer over one `Vec[T]` is the obvious alternative and cannot be written in this
+// language: its slots must exist before they are written, and there is no value to create them
+// with. `T` is any type and Skarn has no `Default`. A `Vec[Option[T]]` would cost a heap object per
+// element, and taking a placeholder value in the constructor would put a fake element in the API.
+// The two-vector form needs neither -- it only ever pushes real elements.
+//
+// It also keeps a promise the ring buffer would break: `pop` CLEARS the slot it vacates, so a
+// removed element stops being reachable at once. A ring buffer abandons a slot instead, leaving a
+// dead reference in it, and there is (again) no value to overwrite that slot with.
+//
+// WHEN ONE SIDE RUNS EMPTY, HALF OF THE OTHER MOVES OVER -- not all of it. Moving everything is
+// simpler and is a trap: `popFront`, `popBack`, `popFront`, ... would then carry the whole deque
+// across on every single pop, O(n) per element instead of O(1). Moving half leaves each side work
+// in proportion to what it took, which is what keeps the amortised cost constant.
+//
+// `==` COMPARES THE SPLIT, NOT THE CONTENTS. Two deques holding the same elements in the same order
+// are `==` only if their front/back division matches too, because the surface `==` on a struct is a
+// field-by-field comparison and `Eq` is sealed -- it cannot be given another meaning here. No
+// representation with O(1) ends is canonical, so this is a property of the container and not a bug
+// that could be fixed in this file. To compare CONTENTS, compare snapshots: `toVec(a) == toVec(b)`.
+//
+// `get` and `isEmpty` are reachable as METHODS ONLY (`d.get(i)`, `d.isEmpty()`). A bare `get(d, i)`
+// is the Map/Vec/Array builtin and a bare `isEmpty(d)` is `std::string`'s, both of which win over a
+// method of the same name; neither is a deque.
+pub struct Deque[T] { front: Vec[T], back: Vec[T] }
+
+impl[T] Deque[T] {
+  // --- construction (ASSOCIATED functions: no `self`, so `Deque::new()` / `Deque::fromVec(v)`) ---
+
+  // Nothing at a `Deque::new()` call fixes `T`, so it comes either from an annotation
+  // (`let mut q: Deque[Int] = Deque::new()`) or from a later use in the same body (`q.pushBack(3)`).
+  fn new() -> Deque[T] {
+    let f: Vec[T] = vec()
+    let b: Vec[T] = vec()
+    Deque { front: f, back: b }
+  }
+
+  // A deque holding the elements of `v`, first to last (here `T` comes from the argument). The
+  // vector is COPIED, so the caller's own `v` is not aliased by the deque.
+  fn fromVec(v: Vec[T]) -> Deque[T] {
+    let f: Vec[T] = vec()
+    Deque { front: f, back: clone(v) }
+  }
+
+  // --- how many ---
+
+  fn size(self) -> Int { len(self.front) + len(self.back) }
+
+  fn isEmpty(self) -> Bool { len(self.front) == 0 && len(self.back) == 0 }
+
+  // --- the two ends ---
+
+  fn pushFront(mut self, x: T) -> () { push(self.front, x) }
+
+  fn pushBack(mut self, x: T) -> () { push(self.back, x) }
+
+  // The first element, removed -- `None` if the deque is empty.
+  fn popFront(mut self) -> Option[T] {
+    if len(self.front) == 0 {
+      // 0 leaves nothing to take, 1 is taken where it lies: the common drain of a queue ends here
+      // and never builds a vector.
+      if len(self.back) <= 1 { return pop(self.back) }
+      _rebalanceToFront(self)
+    }
+    pop(self.front)
+  }
+
+  // The last element, removed -- `None` if the deque is empty.
+  fn popBack(mut self) -> Option[T] {
+    if len(self.back) == 0 {
+      if len(self.front) <= 1 { return pop(self.front) }
+      _rebalanceToBack(self)
+    }
+    pop(self.back)
+  }
+
+  // The first / last element, left where it is -- `None` if the deque is empty.
+  fn peekFront(self) -> Option[T] {
+    let nf = len(self.front)
+    if nf > 0 { Some(self.front[nf - 1]) }
+    else if len(self.back) > 0 { Some(self.back[0]) }
+    else { None }
+  }
+
+  fn peekBack(self) -> Option[T] {
+    let nb = len(self.back)
+    if nb > 0 { Some(self.back[nb - 1]) }
+    else if len(self.front) > 0 { Some(self.front[0]) }
+    else { None }
+  }
+
+  // --- indexed access, 0 = the front ---
+
+  // The `i`-th element from the front. ABORTS unless `0 <= i < size()`, like `v[i]` on a vector;
+  // `get` is the checked form that answers instead. The bounds test is written out rather than left
+  // to the inner vector index, so that the message names the deque and the index the caller passed.
+  fn at(self, i: Int) -> T {
+    let nf = len(self.front)
+    let n = nf + len(self.back)
+    if i < 0 || i >= n { panic("deque index ${i} is out of range (size ${n})") }
+    if i < nf { self.front[nf - 1 - i] } else { self.back[i - nf] }
+  }
+
+  // The `i`-th element from the front, or `None` if there is no such element.
+  fn get(self, i: Int) -> Option[T] {
+    let nf = len(self.front)
+    if i < 0 {
+      None
+    } else if i < nf {
+      Some(self.front[nf - 1 - i])
+    } else {
+      let j = i - nf
+      if j < len(self.back) { Some(self.back[j]) } else { None }
+    }
+  }
+
+  // --- emptying ---
+
+  // Drop every element. The backing vectors go with them, which matters: a `Vec` backing does not
+  // contract when it is popped, so this is how the memory of a deque that once was large is handed
+  // back to the collector.
+  fn clear(mut self) -> () {
+    let f: Vec[T] = vec()
+    let b: Vec[T] = vec()
+    self.front = f
+    self.back = b
+  }
+}
+
+// Move the first half of `back` onto `front` (reversing it, which is what `front` stores) and keep
+// the rest in `back`. HALF, not all -- see the note on the struct. Called only with `front` empty
+// and at least two elements in `back`.
+fn _rebalanceToFront[T](mut d: Deque[T]) -> () {
+  let n = len(d.back)
+  let take = (n + 1) / 2
+  let mut f: Vec[T] = vec()
+  let mut i = take - 1
+  while i >= 0 {                       // back[take-1] .. back[0]: front[len-1] ends up as back[0],
+    push(f, d.back[i])                 // which is the deque's first element
+    i = i - 1
+  }
+  let mut b: Vec[T] = vec()
+  let mut j = take
+  while j < n {
+    push(b, d.back[j])
+    j = j + 1
+  }
+  d.front = f
+  d.back = b
+}
+
+// The mirror image: move the last half of the deque -- which sits at the LOW indices of `front`,
+// because `front` is reversed -- onto `back`, in order.
+fn _rebalanceToBack[T](mut d: Deque[T]) -> () {
+  let n = len(d.front)
+  let take = (n + 1) / 2
+  let mut b: Vec[T] = vec()
+  let mut i = take - 1
+  while i >= 0 {                       // front[take-1] .. front[0]: back[len-1] ends up as
+    push(b, d.front[i])                // front[0], which is the deque's last element
+    i = i - 1
+  }
+  let mut f: Vec[T] = vec()
+  let mut j = take
+  while j < n {
+    push(f, d.front[j])
+    j = j + 1
+  }
+  d.front = f
+  d.back = b
+}
+
+// `for x in d` + the whole lazy-combinator surface, walked IN PLACE (no snapshot, unlike `Set`).
+// The cursor asks the deque per element, so a deque that shrinks under an iteration ends it early
+// rather than aborting -- the same way `VecCursor` behaves over a shrinking vector.
+struct DequeCursor[T] { d: Deque[T], i: Int }
+impl[T] Iterator[T] for DequeCursor[T] {
+  fn next(mut self) -> Option[T] {
+    match self.d.get(self.i) {
+      Some(x) => { self.i = self.i + 1  Some(x) },
+      None => None
+    }
+  }
+}
+impl[T] IntoIterator[T] for Deque[T] { fn intoIter(self) -> dyn Iterator[T] { DequeCursor { d: self, i: 0 } } }
+
+// The eager SNAPSHOT bridge, which the lazy one above does not cover: it is what makes `toVec(d)`
+// work, and `toVec(a) == toVec(b)` is the contents comparison the `==` note asks for. `Set` does
+// without it; a deque has it because its `==` needs the alternative to be easy to write.
+impl[T] Iterable[T] for Deque[T] {
+  fn iter(self) -> Vec[T] {
+    let mut v: Vec[T] = vec()
+    for x in self { push(v, x) }
+    v
+  }
+}

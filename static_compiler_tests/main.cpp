@@ -2866,6 +2866,10 @@ void test_import_matrix() {
         { "std_log",     "std::log",     "Level",        "Log",          "match Level::Warn { Level::Warn => 2, _ => 0 }", 2 },
         // std::resp builds on std::bytes and std::net; its own items travel every import form.
         { "std_resp",    "std::resp",    "Resp",         "encodeCommand", "match Resp::Integer(4) { Resp::Integer(n) => n, _ => 0 }", 4 },
+        // std::deque exports exactly ONE name, the type: its verbs are inherent methods, which are
+        // reached through a receiver and never enter an importer's bare namespace. So there is no
+        // second item to pin, as there is none for std::random's Rng.
+        { "std_deque",   "std::deque",   "Deque",        nullptr,         "let d: Deque[Int] = Deque::fromVec(toVec([1, 2, 3]))\n d.size()", 3 },
     };
     for (const auto& r : std_rows) {
         const std::string id = std::string("imx_") + r.id;
@@ -8659,6 +8663,207 @@ void test_std_set() {
     check_same("diff_set_of",   U + "let mut v: Vec[Int] = vec()\n push(v, 3) push(v, 3) push(v, 7) push(v, 1)\n Set::fromVec(v).size()", true);
     check_same("diff_set_union", AB + "a.union(b).size() * 100 + a.intersect(b).size()", true);
     check_same("diff_set_member", AB + "if a.isMember(2) { if a.isMember(9) { 2 } else { 1 } } else { 0 }", true);
+}
+
+// ---------------------------------------------------------------------------------------------
+// std::deque -- the opt-in generic Deque[T], two Vecs back to back, pure prelude. Mirrors
+// test_std_set: a `use std::deque::*` prefix and a gate pair. The API is small; what carries the
+// risk is the REBALANCE -- when one end runs empty, HALF of the other moves across, reversed --
+// so most of what follows drives a sequence over that split and reads the order back out. The
+// second theme is the pair of boundaries a hand-rolled ring buffer gets wrong: an empty pop and
+// an out-of-range index, both of which must ANSWER rather than return a stale slot.
+// ---------------------------------------------------------------------------------------------
+void test_std_deque() {
+    std::cout << "[codegen: std::deque]\n";
+    const std::string U = "use std::deque::*\n";
+    auto p_fails = [](const std::string& s) {
+        try { svc::compile(s.c_str(), svc::builtin_prelude()); return false; }
+        catch (const svc::CheckFailure&) { return true; }
+        catch (...) { return false; }
+    };
+    // Gating: `Deque` without `use std::deque` is out of scope -> a CheckFailure.
+    check_true("deque_gate_rejects", p_fails("let d: Deque[Int] = Deque::new()\n d.size()"));
+    check_true("deque_gate_ok",     !p_fails(U + "let d: Deque[Int] = Deque::new()\n d.size()"));
+
+    // --- size, on a deque that has only ever been pushed ---
+    check_int_p("deque_empty_size",      U + "let d: Deque[Int] = Deque::new()\n d.size()", 0);
+    check_bool_p("deque_empty_is_empty", U + "let d: Deque[Int] = Deque::new()\n d.isEmpty()", true);
+    check_int_p("deque_push_back_size",
+        U + "let mut d: Deque[Int] = Deque::new()\n d.pushBack(1)\n d.pushBack(2)\n d.size()", 2);
+    check_int_p("deque_push_front_size",
+        U + "let mut d: Deque[Int] = Deque::new()\n d.pushFront(1)\n d.pushFront(2)\n d.size()", 2);
+    check_bool_p("deque_push_then_not_empty",
+        U + "let mut d: Deque[Int] = Deque::new()\n d.pushBack(1)\n d.isEmpty()", false);
+
+    // Built from BOTH ends, so `front` and `back` each hold something and every index below has to
+    // cross the boundary between them.
+    const std::string BOTH =
+        U + "let mut d: Deque[Int] = Deque::new()\n"
+            "d.pushBack(30)\n d.pushFront(20)\n d.pushBack(40)\n d.pushFront(10)\n";
+    check_int_p("deque_size_both",  BOTH + "d.size()", 4);
+    check_int_p("deque_at_front",   BOTH + "d.at(0)", 10);
+    check_int_p("deque_at_split",   BOTH + "d.at(1) * 100 + d.at(2)", 2030);
+    check_int_p("deque_at_back",    BOTH + "d.at(3)", 40);
+    check_int_p("deque_get_in_range", BOTH + "match d.get(2) { Some(x) => x, None => -1 }", 30);
+    check_int_p("deque_get_past_end", BOTH + "match d.get(4) { Some(x) => x, None => -1 }", -1);
+    check_int_p("deque_get_negative", BOTH + "match d.get(-1) { Some(x) => x, None => -1 }", -1);
+    check_int_p("deque_peek_front", BOTH + "match d.peekFront() { Some(x) => x, None => -1 }", 10);
+    check_int_p("deque_peek_back",  BOTH + "match d.peekBack() { Some(x) => x, None => -1 }", 40);
+    check_int_p("deque_peek_leaves_it_alone",
+        BOTH + "let _ = d.peekFront()\n let _ = d.peekBack()\n d.size()", 4);
+
+    // A peek has to look into the OTHER vector when its own end is empty.
+    check_int_p("deque_peek_front_from_back_only",
+        U + "let mut d: Deque[Int] = Deque::new()\n d.pushBack(5)\n d.pushBack(6)\n"
+            "match d.peekFront() { Some(x) => x, None => -1 }", 5);
+    check_int_p("deque_peek_back_from_front_only",
+        U + "let mut d: Deque[Int] = Deque::new()\n d.pushFront(5)\n d.pushFront(6)\n"
+            "match d.peekBack() { Some(x) => x, None => -1 }", 5);
+
+    // --- the rebalance ---
+
+    // FIFO: ten pushed at the back and taken from the front, so `front` is empty at the first pop
+    // and the halving happens again and again (10 -> 5 -> 3 -> 2 -> 1).
+    check_str("deque_fifo_order",
+        cg_run_out(U + "let mut d: Deque[Int] = Deque::new()\n"
+                       "let mut i = 0\n while i < 10 { d.pushBack(i)  i += 1 }\n"
+                       "while !d.isEmpty() {\n"
+                       "  match d.popFront() { Some(x) => { print(toString(x)) }, None => {} }\n"
+                       "}"),
+        "0123456789");
+    // The mirror: pushed at the front, taken from the back.
+    check_str("deque_lifo_order",
+        cg_run_out(U + "let mut d: Deque[Int] = Deque::new()\n"
+                       "let mut i = 0\n while i < 10 { d.pushFront(i)  i += 1 }\n"
+                       "while !d.isEmpty() {\n"
+                       "  match d.popBack() { Some(x) => { print(toString(x)) }, None => {} }\n"
+                       "}"),
+        "0123456789");
+    // Pushed and popped at the SAME end: a stack never makes the other side empty, so it never
+    // rebalances at all.
+    check_str("deque_stack_order",
+        cg_run_out(U + "let mut d: Deque[Int] = Deque::new()\n"
+                       "let mut i = 0\n while i < 5 { d.pushBack(i)  i += 1 }\n"
+                       "while !d.isEmpty() {\n"
+                       "  match d.popBack() { Some(x) => { print(toString(x)) }, None => {} }\n"
+                       "}"),
+        "43210");
+    // Both directions in one program: fill from the back, drain part of it from the front (which
+    // moves half of `back` across), push at the front again, then read everything out. A move that
+    // kept the order of the half it carries, instead of reversing it, passes every test above and
+    // fails this one.
+    check_str("deque_rebalance_both_ways",
+        cg_run_out(U + "let mut d: Deque[Int] = Deque::new()\n"
+                       "let mut i = 0\n while i < 8 { d.pushBack(i)  i += 1 }\n"
+                       "let mut k = 0\n while k < 3 { let _ = d.popFront()  k += 1 }\n"
+                       "d.pushFront(90)\n d.pushFront(91)\n"
+                       "while !d.isEmpty() {\n"
+                       "  match d.popFront() { Some(x) => { print(toString(x) + \" \") }, None => {} }\n"
+                       "}"),
+        "91 90 3 4 5 6 7 ");
+    // Alternating ends until it is empty -- the pattern that would be quadratic if the rebalance
+    // carried the whole of one side instead of half, and the one that empties both sides in turn.
+    check_str("deque_alternating_drain",
+        cg_run_out(U + "let mut d: Deque[Int] = Deque::fromVec(toVec([1, 2, 3, 4, 5, 6, 7]))\n"
+                       "while !d.isEmpty() {\n"
+                       "  match d.popFront() { Some(x) => { print(toString(x)) }, None => {} }\n"
+                       "  match d.popBack() { Some(x) => { print(toString(x)) }, None => {} }\n"
+                       "}"),
+        "1726354");
+
+    // --- the two boundaries a ring buffer over a filled Vec gets wrong ---
+
+    // An empty pop ANSWERS. The shape this replaces returned its filler element and left the size
+    // at -1, which no caller could see.
+    check_int_p("deque_pop_front_empty",
+        U + "let mut d: Deque[Int] = Deque::new()\n match d.popFront() { Some(x) => x, None => -1 }", -1);
+    check_int_p("deque_pop_back_empty",
+        U + "let mut d: Deque[Int] = Deque::new()\n match d.popBack() { Some(x) => x, None => -1 }", -1);
+    check_int_p("deque_empty_pops_leave_size_0",
+        U + "let mut d: Deque[Int] = Deque::new()\n let _ = d.popFront()\n let _ = d.popBack()\n d.size()", 0);
+    check_int_p("deque_usable_after_empty_pop",
+        U + "let mut d: Deque[Int] = Deque::new()\n let _ = d.popFront()\n d.pushBack(7)\n d.at(0)", 7);
+    // An out-of-range index aborts, and the message names the deque, the index and the size -- the
+    // reason `at` tests the bounds itself instead of leaving it to the inner vector.
+    check_true("deque_at_past_end_aborts",
+        cg_faults_msg(U + "let d: Deque[Int] = Deque::fromVec(toVec([1, 2]))\n d.at(5)",
+                      "deque index 5 is out of range (size 2)"));
+    check_true("deque_at_negative_aborts",
+        cg_faults_msg(U + "let d: Deque[Int] = Deque::fromVec(toVec([1, 2]))\n d.at(-1)",
+                      "deque index -1 is out of range (size 2)"));
+
+    // --- construction from a vector, and emptying ---
+    check_int_p("deque_from_vec_size",  U + "Deque::fromVec(toVec([1, 2, 3])).size()", 3);
+    check_int_p("deque_from_vec_order",
+        U + "let d: Deque[Int] = Deque::fromVec(toVec([7, 8, 9]))\n d.at(0) * 100 + d.at(2)", 709);
+    check_int_p("deque_from_empty_vec", U + "let v: Vec[Int] = vec()\n Deque::fromVec(v).size()", 0);
+    // fromVec COPIES: what the deque does afterwards must not reach the caller's vector.
+    check_int_p("deque_from_vec_copies",
+        U + "let mut v: Vec[Int] = vec()\n push(v, 1)\n"
+            "let mut d: Deque[Int] = Deque::fromVec(v)\n d.pushBack(2)\n len(v)", 1);
+    check_int_p("deque_clear_size",
+        U + "let mut d: Deque[Int] = Deque::fromVec(toVec([1, 2, 3]))\n d.clear()\n d.size()", 0);
+    check_int_p("deque_clear_then_reuse",
+        U + "let mut d: Deque[Int] = Deque::fromVec(toVec([1, 2, 3]))\n d.clear()\n d.pushBack(9)\n d.at(0)", 9);
+
+    // --- iteration: the lazy cursor, and the eager snapshot bridge ---
+    check_str("deque_for_walks_front_to_back",
+        cg_run_out(BOTH + "for x in d { print(toString(x) + \" \") }"), "10 20 30 40 ");
+    check_int_p("deque_to_vec_len",   BOTH + "len(toVec(d))", 4);
+    check_bool_p("deque_to_vec_order", BOTH + "toVec(d) == toVec([10, 20, 30, 40])", true);
+    check_int_p("deque_lazy_pipeline",
+        BOTH + "sum(map(intoIter(d), fn(x: Int) -> Int { x * 2 }))", 200);
+    // The cursor asks the deque per element, so it has to stay right across a rebalance that
+    // happened BEFORE the walk started.
+    check_str("deque_iterates_after_rebalance",
+        cg_run_out(U + "let mut d: Deque[Int] = Deque::new()\n"
+                       "let mut i = 0\n while i < 6 { d.pushBack(i)  i += 1 }\n"
+                       "let _ = d.popFront()\n"
+                       "for x in d { print(toString(x)) }"),
+        "12345");
+    check_str("deque_of_strings",
+        cg_run_out(U + "let mut d: Deque[String] = Deque::new()\n"
+                       "d.pushBack(\"b\")\n d.pushFront(\"a\")\n d.pushBack(\"c\")\n"
+                       "for s in d { print(s) }"),
+        "abc");
+
+    // --- the split is OBSERVABLE through `==`, and that is pinned rather than hidden ---
+    // A struct compares field by field (EQ_DEEP), and the same elements reached from different ends
+    // sit in different vectors. This is a property of every representation with O(1) ends, and the
+    // module says so; `toVec` is the contents comparison it points at instead.
+    const std::string SPLIT =
+        U + "let mut a: Deque[Int] = Deque::new()\n a.pushFront(2)\n a.pushFront(1)\n a.pushBack(3)\n"
+            "let b: Deque[Int] = Deque::fromVec(toVec([1, 2, 3]))\n";
+    check_bool_p("deque_eq_sees_the_split",        SPLIT + "a == b", false);
+    check_bool_p("deque_tovec_compares_contents",  SPLIT + "toVec(a) == toVec(b)", true);
+
+    // The whole module is tree-shaken out of a program that does not use it. It has to be a program
+    // that iterates NOTHING of its own: keeping `IntoIterator` keeps every impl of it, this one
+    // included.
+    check_true("shake_default_drops_deque", [] {
+        const svc::Module m = svc::compile("42", svc::builtin_prelude());
+        for (const auto& s : m.struct_types)   if (s.name == "Deque") return false;
+        for (const auto& s : m.function_names) if (s.find("Deque") != std::string::npos) return false;
+        return true;
+    }());
+
+    // Differentials against the RefEval oracle: the module is ordinary Skarn, so the oracle walks
+    // the same code and the comparison covers the lowering of every verb above.
+    check_same("diff_deque_fifo",
+        U + "let mut d: Deque[Int] = Deque::new()\n"
+            "let mut i = 0\n while i < 12 { d.pushBack(i * 3)  i += 1 }\n"
+            "let mut acc = 0\n"
+            "while !d.isEmpty() { match d.popFront() { Some(x) => { acc = acc * 2 + x }, None => {} } }\n"
+            "acc", true);
+    check_same("diff_deque_both_ends",
+        U + "let mut d: Deque[Int] = Deque::new()\n"
+            "let mut i = 0\n while i < 9 { if i % 2 == 0 { d.pushBack(i) } else { d.pushFront(i) }  i += 1 }\n"
+            "let mut acc = 0\n"
+            "let mut k = 0\n while k < d.size() { acc = acc * 3 + d.at(k)  k += 1 }\n"
+            "acc", true);
+    check_same("diff_deque_iteration",
+        U + "let d: Deque[Int] = Deque::fromVec(toVec([4, 1, 9, 2]))\n"
+            "sum(map(intoIter(d), fn(x: Int) -> Int { x * x }))", true);
 }
 
 // =============================================================================
@@ -14606,6 +14811,7 @@ int main(int argc, char** argv) {
     test_range_const_bounds();
     test_map_helpers();
     test_std_set();
+    test_std_deque();
     test_std_time();
     test_std_cli();
     test_std_hash();

@@ -1,0 +1,14 @@
+// CLAIM: Taking from an empty Deque ANSWERS with None; it neither aborts nor leaves the deque in
+// a state where its size is wrong, so a deque that has been over-drained is still usable.
+// GUIDE: SkarnStdlib.md 27 (`std::deque`)
+// EXPECT: ok None None 0 7
+use std::deque::*
+
+
+let mut d: Deque[Int] = Deque::new()
+let front = d.popFront()
+let back = d.popBack()
+let size = d.size()
+d.pushBack(7)
+
+println(toString(front) + " " + toString(back) + " " + toString(size) + " " + toString(d.at(0)))

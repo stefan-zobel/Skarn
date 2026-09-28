@@ -1,0 +1,403 @@
+// dequebench.skn -- what std::deque costs against the two things a program would otherwise
+// hand-roll, and whether its rebalance is really amortised.
+//
+//   skarnvm demo/bench/dequebench.skn [rounds] [n]
+//
+// THE ARMS. Every workload runs its arms INTERLEAVED inside each round and reports MEDIANS, so a
+// drift in the machine's clock speed hits all of them alike instead of whichever ran last.
+//
+//   deque      std::deque.
+//   deque/nul  std::deque AGAIN -- the NULL CONTROL. It runs the same code as the first arm, so
+//              the spread between the two is this machine's noise floor for this workload, and a
+//              difference smaller than that means nothing. Every number below is read against it.
+//   head-idx   a Vec with a head index: push at the back, never remove, walk the head forward.
+//              The idiomatic hand-rolled queue, and O(1) per operation -- but it never gives the
+//              prefix back, so its memory grows with everything ever enqueued rather than with the
+//              queue's length. It is the arm to beat, not a straw man.
+//   shift      a Vec shifted down by one on every dequeue: the obvious form, and quadratic. It
+//              runs at a hundredth of n, against a deque at that same n, because at full n it
+//              would take minutes.
+//
+// Every arm of a workload computes the SAME checksum, so an arm that is subtly wrong is reported
+// rather than silently timed.
+//
+// THE QUADRATIC CHECK is the last workload: the alternating drain empties both ends in turn, which
+// is the pattern that would be O(n) per element if the rebalance carried the whole of one side
+// instead of half. It runs at n and at 2n and prints the ratio -- ~2 says amortised, ~4 says the
+// policy is wrong.
+use std::deque::*
+use std::env::*
+
+
+// ------------------------------------------------------------------------------------------
+// The workloads. Each returns a checksum over the elements it moved, so nothing can be skipped.
+// ------------------------------------------------------------------------------------------
+
+// 1. Fill from the back, drain from the front -- a queue's whole life, in the order that makes
+//    `front` run empty again and again.
+fn dequeDrain(n: Int) -> Int {
+    let mut d: Deque[Int] = Deque::new()
+    let mut i = 0
+    while i < n {
+        d.pushBack(i)
+        i += 1
+    }
+    let mut acc = 0
+    while !d.isEmpty() {
+        match d.popFront() {
+            Some(x) => { acc += x },
+            None => {}
+        }
+    }
+    acc
+}
+
+// 1b. The same drain, but driven by the Option instead of by isEmpty() -- one method call per
+//     element fewer. Whether that is worth anything is a question for the machine, not for a count
+//     of operations.
+fn dequeDrainOpt(n: Int) -> Int {
+    let mut d: Deque[Int] = Deque::new()
+    let mut i = 0
+    while i < n {
+        d.pushBack(i)
+        i += 1
+    }
+    let mut acc = 0
+    loop {
+        match d.popFront() {
+            Some(x) => { acc += x },
+            None => { break }
+        }
+    }
+    acc
+}
+
+fn headIndexDrain(n: Int) -> Int {
+    let mut v: Vec[Int] = vec()
+    let mut i = 0
+    while i < n {
+        push(v, i)
+        i += 1
+    }
+    let mut acc = 0
+    let mut h = 0
+    while h < len(v) {
+        acc += v[h]
+        h += 1
+    }
+    acc
+}
+
+fn shiftDrain(n: Int) -> Int {
+    let mut v: Vec[Int] = vec()
+    let mut i = 0
+    while i < n {
+        push(v, i)
+        i += 1
+    }
+    let mut acc = 0
+    while len(v) > 0 {
+        acc += v[0]
+        let mut k = 1
+        while k < len(v) {            // this is the arm: every dequeue moves the rest down one
+            v[k - 1] = v[k]
+            k += 1
+        }
+        let _ = pop(v)
+    }
+    acc
+}
+
+// 2. A queue held at a steady depth: one in, one out, for n cycles. What a server does.
+const DEPTH: Int = 1000
+
+fn dequeSteady(n: Int) -> Int {
+    let mut d: Deque[Int] = Deque::new()
+    let mut i = 0
+    while i < DEPTH {
+        d.pushBack(i)
+        i += 1
+    }
+    let mut acc = 0
+    let mut k = 0
+    while k < n {
+        d.pushBack(k)
+        match d.popFront() {
+            Some(x) => { acc += x },
+            None => {}
+        }
+        k += 1
+    }
+    acc
+}
+
+fn headIndexSteady(n: Int) -> Int {
+    let mut v: Vec[Int] = vec()
+    let mut i = 0
+    while i < DEPTH {
+        push(v, i)
+        i += 1
+    }
+    let mut acc = 0
+    let mut h = 0
+    let mut k = 0
+    while k < n {
+        push(v, k)                    // the vector grows by n; nothing is ever reclaimed
+        acc += v[h]
+        h += 1
+        k += 1
+    }
+    acc
+}
+
+// 3. Pushed and popped at the SAME end -- a stack. It never empties the other side, so the deque
+//    never rebalances here and this is the arm that says what the wrapper alone costs.
+fn dequeStack(n: Int) -> Int {
+    let mut d: Deque[Int] = Deque::new()
+    let mut i = 0
+    while i < n {
+        d.pushBack(i)
+        i += 1
+    }
+    let mut acc = 0
+    while !d.isEmpty() {
+        match d.popBack() {
+            Some(x) => { acc += x },
+            None => {}
+        }
+    }
+    acc
+}
+
+fn vecStack(n: Int) -> Int {
+    let mut v: Vec[Int] = vec()
+    let mut i = 0
+    while i < n {
+        push(v, i)
+        i += 1
+    }
+    let mut acc = 0
+    while len(v) > 0 {
+        match pop(v) {
+            Some(x) => { acc += x },
+            None => {}
+        }
+    }
+    acc
+}
+
+// 4. Indexed reads over a deque built from both ends, so half the indices land in each vector and
+//    every read crosses the branch that chooses between them.
+fn dequeIndexed(n: Int) -> Int {
+    let mut d: Deque[Int] = Deque::new()
+    let mut i = 0
+    while i < n {
+        if i % 2 == 0 { d.pushBack(i) } else { d.pushFront(i) }
+        i += 1
+    }
+    let mut acc = 0
+    let mut k = 0
+    let size = d.size()
+    while k < size {
+        acc += d.at(k)
+        k += 1
+    }
+    acc
+}
+
+fn vecIndexed(n: Int) -> Int {
+    let mut v: Vec[Int] = vec()
+    let mut i = 0
+    while i < n {
+        push(v, i)
+        i += 1
+    }
+    let mut acc = 0
+    let mut k = 0
+    while k < len(v) {
+        acc += v[k]
+        k += 1
+    }
+    acc
+}
+
+// 5. Taken from both ends in turn until it is empty -- the quadratic detector.
+fn dequeAlternate(n: Int) -> Int {
+    let mut d: Deque[Int] = Deque::new()
+    let mut i = 0
+    while i < n {
+        d.pushBack(i)
+        i += 1
+    }
+    let mut acc = 0
+    while !d.isEmpty() {
+        match d.popFront() {
+            Some(x) => { acc += x },
+            None => {}
+        }
+        match d.popBack() {
+            Some(x) => { acc += x },
+            None => {}
+        }
+    }
+    acc
+}
+
+
+// ------------------------------------------------------------------------------------------
+// The harness.
+// ------------------------------------------------------------------------------------------
+
+// Time one call and hand back the wall time WITH the checksum: the checksum is what keeps the
+// work from being skippable and what catches an arm that computes something else.
+fn timed(f: fn(Int) -> Int, n: Int) -> (Int, Int) {
+    let t0 = nanoTime()
+    let r = f(n)
+    (nanoTime() - t0, r)
+}
+
+fn median(v: Vec[Int]) -> Int {
+    let s = sorted(v)
+    s[len(s) / 2]
+}
+
+fn runArms(label: String, names: Vec[String], fns: Vec[fn(Int) -> Int],
+           n: Int, rounds: Int) -> Int {
+    let mut times: Vec[Vec[Int]] = vec()
+    let mut a = 0
+    while a < len(fns) {
+        let row: Vec[Int] = vec()
+        push(times, row)
+        a += 1
+    }
+
+    let mut checksum = 0
+    let mut seen = false
+    let mut agree = true
+    let mut r = 0
+    while r < rounds {
+        let mut j = 0
+        while j < len(fns) {                      // arms interleaved WITHIN the round
+            let (ns, sum) = timed(fns[j], n)
+            if !seen {
+                checksum = sum
+                seen = true
+            } else if sum != checksum {
+                agree = false
+            }
+            let mut row = times[j]
+            push(row, ns)
+            j += 1
+        }
+        r += 1
+    }
+
+    let warn = if agree { "" } else { "   *** THE ARMS DISAGREE -- one of them is wrong ***" }
+    println(label + "   n=" + toString(n) + "   checksum=" + toString(checksum) + warn)
+    let base = median(times[0])
+    let mut b = 0
+    while b < len(fns) {
+        let m = median(times[b])
+        let rel = if base > 0 { (m * 100) / base } else { 0 }
+        println("    " + names[b] + "   median_ms=" + toString(m / 1000000)
+                + "   ns/elem=" + toString(m / n) + "   rel=" + toString(rel) + "%")
+        b += 1
+    }
+    base
+}
+
+fn arms2(a: String, b: String) -> Vec[String] {
+    let mut v: Vec[String] = vec()
+    push(v, a)
+    push(v, b)
+    v
+}
+
+fn arms3(a: String, b: String, c: String) -> Vec[String] {
+    let mut v = arms2(a, b)
+    push(v, c)
+    v
+}
+
+fn fns2(a: fn(Int) -> Int, b: fn(Int) -> Int) -> Vec[fn(Int) -> Int] {
+    let mut v: Vec[fn(Int) -> Int] = vec()
+    push(v, a)
+    push(v, b)
+    v
+}
+
+fn fns3(a: fn(Int) -> Int, b: fn(Int) -> Int, c: fn(Int) -> Int) -> Vec[fn(Int) -> Int] {
+    let mut v = fns2(a, b)
+    push(v, c)
+    v
+}
+
+fn arms4(a: String, b: String, c: String, d: String) -> Vec[String] {
+    let mut v = arms3(a, b, c)
+    push(v, d)
+    v
+}
+
+fn fns4(a: fn(Int) -> Int, b: fn(Int) -> Int, c: fn(Int) -> Int,
+        d: fn(Int) -> Int) -> Vec[fn(Int) -> Int] {
+    let mut v = fns3(a, b, c)
+    push(v, d)
+    v
+}
+
+fn intArg(argv: Array[String], i: Int, dflt: Int) -> Int {
+    if i >= len(argv) {
+        return dflt
+    }
+    match parseInt(argv[i]) {
+        Ok(v) => v,
+        Err(_) => dflt
+    }
+}
+
+
+let argv = args()
+let rounds = intArg(argv, 0, 5)
+let n = intArg(argv, 1, 1000000)
+
+println("std::deque -- " + toString(rounds) + " rounds, medians, arms interleaved per round")
+println("")
+
+let _d1 = runArms("queue: fill at the back, drain from the front",
+                  arms4("deque    ", "deque/nul", "deque/opt", "head-idx "),
+                  fns4(dequeDrain, dequeDrain, dequeDrainOpt, headIndexDrain), n, rounds)
+println("")
+
+let _d2 = runArms("queue held at a steady depth of " + toString(DEPTH),
+                  arms3("deque    ", "deque/nul", "head-idx "),
+                  fns3(dequeSteady, dequeSteady, headIndexSteady), n, rounds)
+println("")
+
+let _d3 = runArms("stack: pushed and popped at the same end (no rebalance ever happens)",
+                  arms3("deque    ", "deque/nul", "vec      "),
+                  fns3(dequeStack, dequeStack, vecStack), n, rounds)
+println("")
+
+let _d4 = runArms("indexed reads over a deque built from both ends",
+                  arms3("deque    ", "deque/nul", "vec      "),
+                  fns3(dequeIndexed, dequeIndexed, vecIndexed), n, rounds)
+println("")
+
+let _d5 = runArms("the same queue drain against a Vec shifted per dequeue (n/100, it is quadratic)",
+                  arms2("deque    ", "shift    "),
+                  fns2(dequeDrain, shiftDrain), n / 100, rounds)
+println("")
+
+// The quadratic check: the same workload at n and at 2n. Amortised O(1) per element makes the
+// second about twice the first; a rebalance that carried a whole side instead of half would make
+// it about four times.
+let small = runArms("alternating ends until empty (the quadratic check, at n)",
+                    arms2("deque    ", "deque/nul"),
+                    fns2(dequeAlternate, dequeAlternate), n, rounds)
+println("")
+let large = runArms("alternating ends until empty (the quadratic check, at 2n)",
+                    arms2("deque    ", "deque/nul"),
+                    fns2(dequeAlternate, dequeAlternate), n * 2, rounds)
+println("")
+println("doubling n multiplied the alternating drain by "
+        + toString((large * 100) / small) + "%  (~200% = amortised, ~400% = quadratic)")

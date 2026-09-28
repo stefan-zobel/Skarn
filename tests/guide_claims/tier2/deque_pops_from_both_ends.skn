@@ -1,0 +1,41 @@
+// CLAIM: A Deque takes elements back in the order the end it is taken from implies -- first in,
+// first out at the front, last in, first out at the back -- and it keeps doing so past the point
+// where one of its two halves runs empty and the other is split again.
+// GUIDE: SkarnStdlib.md 27 (`std::deque`)
+// EXPECT: ok 0123456789 0123456789
+use std::deque::*
+
+
+fn drainFront(mut d: Deque[Int]) -> String {
+    let mut s = ""
+    while !d.isEmpty() {
+        match d.popFront() {
+            Some(x) => { s = s + toString(x) },
+            None => {}
+        }
+    }
+    s
+}
+
+fn drainBack(mut d: Deque[Int]) -> String {
+    let mut s = ""
+    while !d.isEmpty() {
+        match d.popBack() {
+            Some(x) => { s = s + toString(x) },
+            None => {}
+        }
+    }
+    s
+}
+
+// Ten is well past the first split, so both drains cross it several times.
+let mut fifo: Deque[Int] = Deque::new()
+let mut lifo: Deque[Int] = Deque::new()
+let mut i = 0
+while i < 10 {
+    fifo.pushBack(i)
+    lifo.pushFront(i)
+    i += 1
+}
+
+println(drainFront(fifo) + " " + drainBack(lifo))

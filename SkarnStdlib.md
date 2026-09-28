@@ -54,6 +54,7 @@ but not run.
 24. [`std::regex`](#24-stdregex)
 25. [`std::log`](#25-stdlog)
 26. [`std::resp`](#26-stdresp)
+27. [`std::deque`](#27-stddeque)
 
 ---
 
@@ -1151,4 +1152,55 @@ fn demo() -> Result[(), String] {
 }
 
 match demo() { Ok(_) => (), Err(e) => println("failed: " + e) }
+```
+## 27. `std::deque`
+
+A double-ended queue `Deque[T]`: push and pop at BOTH ends, and indexed access, all O(1) (the pushes and pops
+amortised). It is what a `Vec` cannot be — `push`/`pop` work only at a vector's END, so taking from the front of
+a `Vec` costs a shift per element. A `Deque` is `IntoIterator` and `Iterable`, so `for x in d`, `toVec(d)` and
+the lazy combinators all work, front to back. `use std::deque::*`
+
+| Function | Purpose |
+|----------|---------|
+| `Deque::new()` / `Deque::fromVec(v)` | an empty `Deque[T]` — `T` comes from how the deque is used (`let mut d = Deque::new()` then `d.pushBack(3)`), or from an annotation (`let d: Deque[Int] = Deque::new()`) when nothing uses it / a deque holding a COPY of the elements of a `Vec`, first to last |
+| `d.size()` / `d.isEmpty()` | how many elements → `Int` / whether there are none → `Bool` (both O(1)) |
+| `d.pushFront(x)` / `d.pushBack(x)` | add `x` at the front / at the back; `d` must be `mut` |
+| `d.popFront()` / `d.popBack()` | remove the first / last element and return it → `Option[T]`, `None` when the deque is empty; `d` must be `mut` |
+| `d.peekFront()` / `d.peekBack()` | the first / last element, left where it is → `Option[T]` |
+| `d.at(i)` / `d.get(i)` | the `i`-th element from the front (0 = the front): `at` ABORTS when `i` is out of range, as `v[i]` does on a vector / `get` answers `Option[T]` instead |
+| `d.clear()` | drop every element, and the backing vectors with them — a `Vec` backing does not contract when it is popped, so this is how the memory of a deque that once was large goes back to the collector; `d` must be `mut` |
+
+A queue: things arrive at one end and are taken from the other.
+
+```rust
+use std::deque::*
+
+let mut q: Deque[Int] = Deque::new()
+q.pushBack(1)
+q.pushBack(2)
+q.pushFront(0)
+println(q.size())                     // => 3
+println(toString(toVec(q)))           // => [0, 1, 2]
+
+match q.popFront() {
+  Some(x) => println(x),              // => 0
+  None => println("the queue is empty")
+}
+println(toString(q.peekBack()))       // => Some(2)
+```
+
+**`==` compares the SPLIT, not the contents.** A deque holds its elements in two vectors, and which element
+sits in which depends on how the deque was BUILT — so two deques holding the same elements in the same order
+may still be `!=`. Every representation with O(1) ends has that property, and `==` on a struct is a
+field-by-field comparison which cannot be given another meaning. Compare snapshots instead:
+
+```rust
+use std::deque::*
+
+let mut a: Deque[Int] = Deque::new()
+a.pushFront(1)
+a.pushBack(2)
+let b: Deque[Int] = Deque::fromVec(toVec([1, 2]))
+println(a == b)                       // => false
+println(toVec(a) == toVec(b))         // => true
 ```

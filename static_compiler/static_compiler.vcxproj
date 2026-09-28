@@ -122,6 +122,7 @@
     <None Include="std\random.skn" />
     <None Include="std\set.skn" />
     <None Include="std\time.skn" />
+    <None Include="std\deque.skn" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
