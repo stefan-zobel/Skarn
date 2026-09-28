@@ -6224,6 +6224,21 @@ void test_codegen_process() {
         == "o");
 #endif
 
+    // cpuCount: the number is the machine's, so what is pinned is what is not. It is at least 1 --
+    // a caller sizes a pool with it and 0 would be useless -- and it does not move within a run.
+    // The first of these also catches the silent failure mode of adding a native: had the id been
+    // left out of native_return_of's NRET_PLAIN list, codegen would put an Ok(n) OBJECT in a
+    // register the checker typed Int, and `>= 1` would be comparing that object.
+    check_true("native_cpu_count", cg_run_native(
+        "println(toString(cpuCount() >= 1))") == "true\n");
+    check_true("native_cpu_count_stable", cg_run_native(
+        "println(toString(cpuCount() == cpuCount()))") == "true\n");
+    // It is reached like any other item of the module, and a function of one's own wins where it
+    // is visible -- the weak-glob rule, which a std name must obey as much as a user one.
+    check_true("cpu_count_gate", check_has_p("cpuCount()\n0", "std::process"));
+    check_int_p("cpu_count_shadowed",
+                "use std::process::*\nfn cpuCount() -> Int { 99 }\ncpuCount()", 99);
+
     // runWith feeds stdin (Bytes) to the child; `sort` reads it and exits 0. The #ifdef stays: which
     // argv names `sort` is the CALLER's choice per platform, which is what run/runWith are for --
     // no defect here, unlike the sh() case above.
@@ -12533,7 +12548,16 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // i.e. how the isolates interleave AND what the network did -- the two things a model cannot reproduce.
 // It is rawSelect's and rawPoll's category, and both are out for the same reason. Pinned by
 // test_select_io in vm_tests and the select_io_* tests here.
-static_assert(NATIVE_COUNT == 100,
+// rawCpuCount (id 100) IS listed, for rawOsId's reason and with rawOsId's limit: it gives one
+// answer per machine, and it cannot change while a program runs. It is NOT mirrored, though. The
+// oracle calls vm_usable_cpus() -- the same function the native calls -- instead of keeping a second
+// copy of its platform branches: rawOsId's mirror is three `return`s and stays honest, an affinity
+// query is twenty lines and would not. So be clear about what this entry buys: NOT that the number
+// is right (no fixture on one machine could show that), but that the LOWERING is -- the checker's
+// type, the CALL_NATIVE, the Plain unwrap (a native missing from native_return_of's NRET_PLAIN list
+// comes back as Ok(n), silently), and the std::process gate. That is the half a compiler change can
+// break, and it is the half the differential now watches.
+static_assert(NATIVE_COUNT == 101,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 
@@ -14285,6 +14309,7 @@ void test_differential() {
     check_same("diff_native_readfile_err","use std::io::*\nisErr(readFile(\"svc_diff_no_such_file_zzz_9x7\"))", true); // Result wrap (discriminant)
     check_same("diff_native_readall",     "use std::io::*\nreadAllStdin()", true);                                // Plain String
     check_same("diff_native_rawosid",     "use std::process::*\nrawOsId()", true);                                // Plain Int
+    check_same("diff_native_rawcpucount", "use std::process::*\nrawCpuCount()", true);                            // Plain Int
     check_same("diff_native_readline",    "use std::io::*\nmatch readLine() { Some(s) => s, None => \"eof\" }", true); // Option wrap
     check_same("diff_native_in_lambda",   // a lambda body referencing a NATIVE -- capture analysis must
         "use std::io::*\n"

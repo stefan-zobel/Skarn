@@ -1357,6 +1357,10 @@ private:
         // rawRun, so the prelude's currentOs() wrapper reaches it as same-module code; that wrapper is
         // what sh() branches on to pick the platform's shell.
         add_native("rawOsId",      {},       ty_int(),                                        STD_PROCESS);
+        // The second platform query, and it sits beside the first for that reason rather than in
+        // std::task: it is a fact about the machine, not about fork-join, and a server that starts
+        // actors should not have to import a module it never spawns a task with.
+        add_native("rawCpuCount",  {},       ty_int(),                                        STD_PROCESS);
         // Ends the program with an exit code, after its ordinary end (actors stopped, threads joined,
         // output flushed). Never returns, so -- like panic -- it fits where any type is expected. The
         // VM refuses it in an actor or a task and a code outside 0..255 (run-time faults).

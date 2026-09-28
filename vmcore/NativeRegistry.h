@@ -183,7 +183,11 @@ enum NativeId : uint16_t {
     // one thread crossing per request fewer. Neither existing wait could do it: a receive and a select
     // park on a condition variable, which no socket can wake, and rawPoll watches only sockets.
     NATIVE_SELECT_IO   = 99,    // rawSelectIo(boxes, fds, interest, timeoutMs) -> Array[Int] (Result)
-    NATIVE_COUNT       = 100,
+    // How many threads this PROCESS may run at once -- the second platform query, beside rawOsId.
+    // A program that starts workers, shards or tasks had no way to ask, so every one of them guessed
+    // a constant. It is what the OS grants THIS process (an affinity mask narrows it), never 0.
+    NATIVE_CPU_COUNT   = 100,   // rawCpuCount()                    -> Int (>= 1; Plain)
+    NATIVE_COUNT       = 101,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -296,6 +300,7 @@ inline int native_id_of(const std::string& name) {
     if (name == "rawParseIntRange") return NATIVE_PARSE_INT_RANGE;
     if (name == "rawIndexOfBytes") return NATIVE_INDEX_OF_BYTES;
     if (name == "rawSelectIo") return NATIVE_SELECT_IO;
+    if (name == "rawCpuCount") return NATIVE_CPU_COUNT;
     return -1;
 }
 
@@ -371,6 +376,7 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_EXIT:
         case NATIVE_INDEX_OF_BYTE:
         case NATIVE_INDEX_OF_BYTES:
+        case NATIVE_CPU_COUNT:
         case NATIVE_READ_ALL_STDIN: return NRET_PLAIN;
         default:                 return NRET_RESULT;
     }
@@ -466,6 +472,7 @@ inline int native_arity(int id) {
         case NATIVE_MAIN_INBOX:
         case NATIVE_SELF_ID:
         case NATIVE_OS_ID:
+        case NATIVE_CPU_COUNT:
         case NATIVE_FLUSH_OUTPUT:
         case NATIVE_READ_ALL_STDIN: return 0;
         default:                return 0;

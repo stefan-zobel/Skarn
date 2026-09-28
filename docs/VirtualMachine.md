@@ -50,9 +50,12 @@ of the runtime sees:
   reader which does not is rejected rather than misled (see "Bytecode container format").
 
 The compiler and the driver contain no platform-specific code at all, and neither does the language
-surface: the one place where a platform is named, `std::process`'s `sh()`, asks which one it is running on
-(`rawOsId`, wrapped as `currentOs()`) and picks `cmd /c` or `/bin/sh -c` accordingly. What remains
-Windows-only is the PowerShell documentation and example gates.
+surface. Two natives ASK about the platform instead of naming one. `rawOsId`, wrapped as `currentOs()`,
+answers which platform this is, and it is what lets `std::process`'s `sh()` pick `cmd /c` or `/bin/sh -c`.
+`rawCpuCount`, wrapped as `cpuCount()`, answers how many threads this process may run at once — what the
+operating system grants it, so an affinity mask narrows the answer below the machine's core count. Both
+keep their platform branches in one place, `Platform.h`, so that the test oracle can call the same code
+rather than keep a copy of it. What remains Windows-only is the PowerShell documentation and example gates.
 
 ## Source files
 

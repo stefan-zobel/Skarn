@@ -487,14 +487,15 @@ println("elapsed >= 0: " + (t1 - t0 >= 0))   // => elapsed >= 0: true
 
 ## 10. `std::process`: running programs
 
-Run an external command and capture its output, ask which platform you are on, and end the program with an
-exit code. `use std::process::*`
+Run an external command and capture its output, ask which platform you are on and how much of it you get,
+and end the program with an exit code. `use std::process::*`
 
 | Function | Purpose |
 |----------|---------|
 | `run(argv)` / `runText(argv)` / `sh(cmdline)` | spawn a process and capture its output (`sh` goes through the platform's shell) |
 | `runWith(argv, input)` | as `run`, with `input: Bytes` fed to the child's standard input |
 | `currentOs()` | which platform the program is running on (`Os::Windows` / `Os::MacOS` / `Os::Other`) |
+| `cpuCount()` | how many threads this program can really run at once → `Int`, never below 1 ([How many cores do I get?](#how-many-cores-do-i-get)) |
 | `exit(code)` | end the program with an exit code from 0 to 255 ([Ending the program](#ending-the-program)) |
 
 `run`, `runWith` and `sh` return a `ProcessOutput` — `stdout` and `stderr` as `Bytes`, and `exitCode` —
@@ -539,6 +540,24 @@ println("running on " + label)
 
 `Os::Other` covers everything that is neither: Skarn is built and tested on Windows x64 and macOS on Apple
 Silicon, and rather than guess at a third platform's name it puts them all in one arm.
+
+### How many cores do I get?
+
+`cpuCount()` answers how many threads this program can really run at the same time. That is not quite the
+same question as how many cores the machine has: it is what the operating system grants *this process*, so
+a program pinned to two of twelve logical CPUs is told 2, not 12. It is never below 1.
+
+```rust
+use std::process::*
+
+let n = cpuCount()
+println(toString(n >= 1))   // => true
+```
+
+It is a sensible *starting size* for a pool of workers, shards or tasks — and no more than that. How many
+a given program actually wants has to be measured: a worker that waits on I/O more than it computes can
+use more threads than there are cores, and one that contends on a shared structure is often fastest with
+fewer. Take it as the number to start measuring from, not the number to use.
 
 ### Ending the program
 

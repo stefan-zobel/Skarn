@@ -1447,6 +1447,15 @@ static Value native_os_id(Value*, uint8_t, Context*) {
 #endif
 }
 
+// rawCpuCount() -> Int (Plain). How many threads this process may run at once -- what the OS grants
+// THIS process, so an affinity mask narrows it below the machine's core count. Always >= 1, because
+// a caller sizes a pool of workers or shards with it. The platform branches are vm_usable_cpus()
+// in Platform.h, which the test oracle calls too rather than keeping a second copy of them.
+// Zero-arg (dummy window base); allocates nothing.
+static Value native_cpu_count(Value*, uint8_t, Context*) {
+    return Value::fromSigned48(static_cast<int64_t>(vm_usable_cpus()));
+}
+
 // args() -> Array[String] (Plain -- no Ok/Err wrap). Builds a fresh KIND_ARRAY of the
 // driver-supplied command-line args (host std::strings in VM::script_args, stable across
 // a collection). Each element string is a separate allocation (a safepoint that can move
@@ -4708,6 +4717,7 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_TCP_LOCAL_PORT] = native_tcp_local_port;
     t[NATIVE_SHA256]       = native_sha256;
     t[NATIVE_OS_ID]        = native_os_id;
+    t[NATIVE_CPU_COUNT]    = native_cpu_count;
     t[NATIVE_SET_NON_BLOCKING] = native_raw_set_non_blocking;
     t[NATIVE_POLL]         = native_raw_poll;
     t[NATIVE_ACCEPT_NB]    = native_raw_accept_nb;

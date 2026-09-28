@@ -182,6 +182,9 @@ inline constexpr std::string_view DIFFERENTIABLE_NATIVES[] = {
     "rawIndexOfByte", "rawIndexOfBytes", "rawParseIntRange",
     // The running platform -- one answer per machine, mirrored below with the same #ifdef
     "rawOsId",
+    // How many threads the process may run at once -- one answer for the length of a run. NOT
+    // mirrored: both sides call vm_usable_cpus(), so this checks the lowering, not the number
+    "rawCpuCount",
     // Ending the program -- deterministic: the code, and what was printed before it
     "exit",
     // std::math -- pure libm, bit-identical on both sides

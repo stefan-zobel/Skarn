@@ -15,6 +15,8 @@
 
 #include "RefEval.h"
 #include "NativeRegistry.h"   // native_id_of -- tells a deliberately excluded native from a forgotten
+#include "Platform.h"         // vm_usable_cpus -- rawCpuCount is answered from the SAME query the
+                              // native uses, deliberately: see the model below
                               // builtin at the one call site where both land (see call_named). The
                               // header is name-table only; it pulls in no VM-runtime dependency.
 
@@ -1707,6 +1709,15 @@ private:
 #else
             out = static_cast<int64_t>(2);
 #endif
+            return true;
+        }
+        if (name == "rawCpuCount") {
+            // Answered from the one implementation, not from a second copy of its platform branches.
+            // rawOsId can mirror three `return`s safely; an affinity query is twenty lines, and a
+            // mirror that drifts turns a green differential into a lie. So what this cross-checks is
+            // the LOWERING -- the checker's type, the CALL_NATIVE, the Plain unwrap, the module gate
+            // -- which is the half a compiler change can actually break.
+            out = static_cast<int64_t>(vm_usable_cpus());
             return true;
         }
         if (name == "readAllStdin") {                     // the rest of the shared stdin cursor

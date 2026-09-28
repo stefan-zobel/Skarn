@@ -723,6 +723,39 @@ inline void test_native_write_err() {
 }
 
 // =============================================================================
+// test_native_cpu_count -- rawCpuCount() at the id/registry path. The number belongs to the
+// machine, so what is asserted here is what does NOT depend on it: the result is a bare Int (a
+// native missing from native_return_of's NRET_PLAIN list would come back wrapped in Ok, with no
+// error anywhere), it is at least 1, it is not absurd, and two calls in one run agree.
+// =============================================================================
+inline void test_native_cpu_count() {
+    std::cout << "=== native_cpu_count (rawCpuCount) ===\n";
+    try {
+        Assembler as;
+        as.label("main");
+        as.call_native_id(0, 8, 0, 0, NATIVE_CPU_COUNT);    // r0 = rawCpuCount()
+        as.call_native_id(1, 8, 1, 0, NATIVE_CPU_COUNT);    // r1 = rawCpuCount()
+        as.J(OpCode::HALT);
+        const auto bytecode = as.assemble();
+
+        Heap heap;
+        StringInterner interner;
+        std::vector<NativeFunc> ntab = build_native_table();
+        auto res = execute(bytecode, &heap, nullptr, &interner, 16, nullptr, nullptr,
+                           nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0,
+                           nullptr, nullptr, nullptr, &ntab);
+        auto* regs = res.get_reg_base();
+        const bool is_int = regs[0].isInt() && regs[1].isInt();
+        const int64_t n = is_int ? regs[0].asSigned48() : 0;
+        std::cout << std::format("cpus = {} (expect 1..4096), plain Int: {}, stable: {}\n",
+            n, is_int ? "yes" : "NO (wrapped?)",
+            is_int && regs[0].asSigned48() == regs[1].asSigned48() ? "yes" : "no");
+        check(is_int && n >= 1 && n <= 4096 && regs[0].asSigned48() == regs[1].asSigned48());
+    }
+    catch (const std::exception& e) { record_fail(e.what()); }
+}
+
+// =============================================================================
 // test_native_process -- rawRun(argv, input) at the id/registry path (the prelude's
 // run/runWith reshape its result into a ProcessOutput struct, tested at the compiler
 // level). rawRun returns a bare Array[3] {stdoutBytes, stderrBytes, exitInt} on a

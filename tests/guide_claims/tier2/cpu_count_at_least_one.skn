@@ -1,0 +1,9 @@
+// CLAIM: cpuCount() answers how many threads may run at once and is never below 1, so a caller may
+// size a pool with it without guarding against 0.
+// GUIDE: SkarnStdlib.md 10 (How many cores do I get?)
+// EXPECT: ok true true
+use std::process::*
+
+
+let n = cpuCount()
+println(toString(n >= 1) + " " + toString(n == cpuCount()))
