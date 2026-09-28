@@ -328,13 +328,21 @@ struct WaitPad {
     std::atomic<int>        pollers{ 0 };   // parked on the wake object below (selectIo)
 #ifdef _WIN32
     HANDLE                  ev = nullptr;   // manual-reset, so a reset is the drain
-    // One WSAEVENT per socket, kept ACROSS calls: associating a socket with an event is free once it
-    // is cached and a kernel-object creation if it is not. Keyed by the OS socket, since that is what
-    // the association belongs to. Bounded: a caller that watches an unbounded number of different
-    // sockets over its life gets the cache rebuilt rather than grown.
-    struct SockEv { socket_t s; WSAEVENT ev; long mask; };
+    // One WSAEVENT per socket, kept ACROSS calls: associating a socket with an event is free once it is
+    // cached and a kernel-object creation if it is not.
+    //
+    // Keyed by the SKARN DESCRIPTOR, not by the OS handle, and that is not a detail: Windows reuses handle
+    // values, so a connection replacing a closed one would hit a cache entry made for its predecessor,
+    // match the mask, and be handed the event back without `WSAEventSelect` ever being called for it --
+    // associated with nothing, and its readiness waking no wait. A descriptor cannot be reused, because it
+    // is `slot | generation << 24` and releasing a slot advances the generation. Found by a churn stress
+    // after the feature's own tests, which never closed a socket while a wait lived, all passed.
+    // Bounded by the caller's watch set, not by a number: `retain_events` drops whatever is no longer
+    // watched. An earlier version capped it and cleared the whole cache on overflow, which closed events
+    // that live sockets were still associated with -- those sockets then held a closed handle, so
+    // WaitForMultipleObjects failed outright and they never woke again.
+    struct SockEv { int64_t fd; socket_t s; WSAEVENT ev; long mask; };
     std::vector<SockEv>     sock_ev;        // guarded by m
-    static constexpr size_t SOCK_EV_MAX = 64;
 #else
     int                     wake_rd = -1, wake_wr = -1;   // a pipe: macOS has no eventfd
 #endif
@@ -375,25 +383,23 @@ struct WaitPad {
     // The event a socket's readiness signals. WSAEventSelect's FD_* are EDGE-triggered, which is why
     // rawSelectIo never reads its FLAGS from here -- it takes them from a zero-timeout sock_poll. This
     // event only has to WAKE the wait.
-    WSAEVENT event_for(socket_t sock, short want) {
+    WSAEVENT event_for(int64_t fd, socket_t sock, short want) {
         const long mask = FD_CLOSE |
                           ((want & POLL_READ)  ? (FD_READ | FD_ACCEPT)   : 0) |
                           ((want & POLL_WRITE) ? (FD_WRITE | FD_CONNECT) : 0);
         std::lock_guard<std::mutex> lk(m);
         for (size_t i = 0; i < sock_ev.size(); ++i) {
-            if (sock_ev[i].s != sock) continue;
-            if (sock_ev[i].mask == mask) return sock_ev[i].ev;
+            if (sock_ev[i].fd != fd) continue;
+            // the same descriptor and the same interest: the association stands
+            if (sock_ev[i].s == sock && sock_ev[i].mask == mask) return sock_ev[i].ev;
             if (WSAEventSelect(sock, sock_ev[i].ev, mask) == 0) {
+                sock_ev[i].s    = sock;
                 sock_ev[i].mask = mask;
                 return sock_ev[i].ev;
             }
-            WSACloseEvent(sock_ev[i].ev);          // the descriptor was reused or closed: start over
+            WSACloseEvent(sock_ev[i].ev);          // that socket is gone: start over
             sock_ev.erase(sock_ev.begin() + static_cast<ptrdiff_t>(i));
             break;
-        }
-        if (sock_ev.size() >= SOCK_EV_MAX) {
-            for (SockEv& e : sock_ev) WSACloseEvent(e.ev);
-            sock_ev.clear();
         }
         WSAEVENT we = WSACreateEvent();
         if (we == WSA_INVALID_EVENT) return we;
@@ -401,10 +407,23 @@ struct WaitPad {
             WSACloseEvent(we);
             return WSA_INVALID_EVENT;
         }
-        sock_ev.push_back(SockEv{ sock, we, mask });
+        sock_ev.push_back(SockEv{ fd, sock, we, mask });
         return we;
     }
 #endif
+
+    // Forget every association for a descriptor that is no longer being watched, and close its event.
+    // Called before a wait, so the cache holds exactly what that wait needs. A socket that comes back
+    // later simply gets associated again -- one WSAEventSelect, which is what this cache exists to avoid
+    // paying per call, not per lifetime.
+    void retain_events(const std::vector<int64_t>& fds) {
+        std::lock_guard<std::mutex> lk(m);
+        for (size_t i = sock_ev.size(); i-- > 0;) {
+            if (std::find(fds.begin(), fds.end(), sock_ev[i].fd) != fds.end()) continue;
+            WSACloseEvent(sock_ev[i].ev);
+            sock_ev.erase(sock_ev.begin() + static_cast<ptrdiff_t>(i));
+        }
+    }
 
     void poke() {                               // one signal, never blocking, outside every lock
 #ifdef _WIN32
@@ -3952,6 +3971,9 @@ static Value native_select_io(Value* args, uint8_t nargs, Context* ctx) {
     WaitPad& pad = *local->pad;
     if (!pad.ensure_pollable())
         return native_make_error(ctx, "rawSelectIo: could not make this isolate's wake");
+#ifdef _WIN32
+    pad.retain_events(fds);     // whatever this caller no longer watches must not keep an association
+#endif
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms < 0 ? 0 : ms);
     std::vector<int64_t>  ready(boxes.size() + socks.size(), 0);
@@ -3998,7 +4020,7 @@ static Value native_select_io(Value* args, uint8_t nargs, Context* ctx) {
             hs[nh++] = pad.ev;
             bool ok = true;
             for (size_t i = 0; i < socks.size(); ++i) {
-                const WSAEVENT we = pad.event_for(socks[i], want[i]);
+                const WSAEVENT we = pad.event_for(fds[i], socks[i], want[i]);
                 if (we == WSA_INVALID_EVENT) { ok = false; break; }
                 hs[nh++] = we;
             }

@@ -9868,6 +9868,116 @@ fn run() -> Result[(), String] {
 }
 )SKN" + RUN_END), "line:hello\nclient got pushed\nline:bye\nclosed\n");
 
+    // Sockets that COME AND GO while the wait lives -- the case that was missing, and the one that hurt.
+    // A worker holds a changing set of connections; each round one joins, every open one must still be
+    // woken, and the oldest is closed. Closing and reopening makes Windows REUSE handle values, and the
+    // per-socket event association is cached, so a reused handle inheriting its predecessor's entry gets
+    // no association of its own and its readiness wakes nothing. Level-triggered polling still found the
+    // data on the next round, so with a deadline it cost one timeout and with none it waited for ever --
+    // invisible to every test that kept its sockets. The deadline here turns that into a FAILURE.
+    check_str("select_io_socket_churn", cg_run_native(NET + "use std::poll::*\n" + R"SKN(
+enum WMsg { Take(SocketHandOff), Stop }
+
+fn churnWorker(inbox: Inbox[WMsg], back: Pid[Int]) -> () {
+  let boxes = toVec([inbox.ref()])
+  let mut conns: Map[Int, NbConn] = #{}
+  let mut going = true
+  while going {
+    let mut fds: Vec[Int] = vec()
+    let mut want: Vec[Int] = vec()
+    for (fd, _) in conns {
+      push(fds, fd)
+      push(want, READABLE)
+    }
+    match selectIo(boxes, fds, want, 5000) {
+      Ok(r) => {
+        if r[0] != 0 {
+          match inbox.receive() {
+            Mail::Msg(WMsg::Take(t)) => {
+              match t.take() {
+                Ok(c) => {
+                  match nonBlockingConn(c) {
+                    Ok(nb) => { conns[nb.fd] = nb },
+                    Err(_) => {}
+                  }
+                },
+                Err(_) => {}
+              }
+            },
+            Mail::Msg(WMsg::Stop) => { going = false },
+            _ => { going = false }
+          }
+        } else {
+          let mut gone: Vec[Int] = vec()
+          let mut k = 0
+          while k < len(fds) {
+            if (r[1 + k] & (READABLE | CLOSED)) != 0 {
+              let c = conns[fds[k]]
+              match c.recv(4096) {
+                Ok(Received::Data(b)) => { send(back, len(b)) },
+                Ok(Received::WouldBlock) => {},
+                _ => { push(gone, fds[k]) }
+              }
+            }
+            k += 1
+          }
+          for fd in gone {
+            let c = conns[fd]
+            let _ = c.close()
+            let _d = delete(conns, fd)
+          }
+        }
+      },
+      Err(_) => { going = false }
+    }
+  }
+}
+
+fn run() -> Result[(), String] {
+  let me: Inbox[Int] = mainInbox()
+  let lst = listen(0)?
+  let port = lst.localPort()?
+  let w = spawnActor(churnWorker, me.pid())
+  let one = toBytes("x")
+  let mut open: Vec[TcpConn] = vec()
+  let mut round = 0
+  let mut lost = 0
+  while round < 40 {
+    let mut c = connect("127.0.0.1", port)?
+    let s = lst.accept()?
+    send(w, WMsg::Take(s.handOff()?))
+    push(open, c)
+    let mut j = 0
+    while j < len(open) {
+      let mut cc = open[j]
+      cc.send(one)?
+      match me.receiveTimeout(4000) {
+        Some(Mail::Msg(_)) => {},
+        _ => { lost += 1 }
+      }
+      j += 1
+    }
+    // keep two, so the set changes without ever emptying
+    while len(open) > 2 {
+      let mut dead = open[0]
+      dead.close()?
+      let mut rest: Vec[TcpConn] = vec()
+      let mut q = 1
+      while q < len(open) {
+        push(rest, open[q])
+        q += 1
+      }
+      open = rest
+    }
+    round += 1
+  }
+  send(w, WMsg::Stop)
+  lst.close()?
+  println("lost " + toString(lost))
+  Ok(())
+}
+)SKN" + RUN_END), "lost 0\n");
+
     // Readiness is LEVEL-triggered, and this is the test that would catch it silently becoming edge-
     // triggered. The reader takes ONE byte per wake and leaves the rest buffered; on Windows the
     // socket's readiness is a WSAEventSelect event, whose FD_READ fires on an edge, so a version that
