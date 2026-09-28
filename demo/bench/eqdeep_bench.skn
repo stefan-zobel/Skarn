@@ -1,0 +1,151 @@
+// eqdeep_bench.skn -- the cost of structural `==` (the EQ_DEEP opcode) on NON-cyclic values.
+//
+//   skarnvm demo/bench/eqdeep_bench.skn <mode>
+//
+// One workload per mode, so every binary under comparison runs the same source and the same
+// bytecode. Each mode builds its values first and times only the comparisons with nanoTime().
+// Prints `mode=… wall_ns=… equal=…`; `equal` counts the comparisons that returned true, which
+// also keeps the work observable.
+//
+// What the modes probe: EQ_DEEP starts remembering the object pairs it has expanded once a single
+// comparison passes a step threshold (see "Structural equality" in docs/VirtualMachine.md).
+//   point, option, vec50      -- far below the threshold: must cost exactly what they did before
+//   vec1m, list100k, map100k  -- far above it: every struct pair is recorded, the price to find
+//   dag22                     -- a shared finite graph: 2^22 paths, 22 distinct pairs
+use std::env::*
+
+
+struct Point { x: Int, y: Int }
+struct Cell { v: Int, next: Option[Cell] }
+struct D { v: Int, l: Option[D], r: Option[D] }
+
+
+fn points(n: Int) -> Vec[Point] {
+    let mut v: Vec[Point] = vec()
+    let mut i = 0
+    while i < n {
+        push(v, Point { x: i, y: i * 2 })
+        i = i + 1
+    }
+    v
+}
+
+
+fn cells(n: Int) -> Cell {
+    let mut c = Cell { v: 0, next: None }
+    let mut i = 1
+    while i < n {
+        c = Cell { v: i, next: Some(c) }
+        i = i + 1
+    }
+    c
+}
+
+
+fn pointMap(n: Int) -> Map[Int, Point] {
+    let mut m: Map[Int, Point] = #{}
+    let mut i = 0
+    while i < n {
+        m[i] = Point { x: i, y: i + 1 }
+        i = i + 1
+    }
+    m
+}
+
+
+fn dag(depth: Int) -> D {
+    let mut d = D { v: 1, l: None, r: None }
+    let mut i = 0
+    while i < depth {
+        d = D { v: 0, l: Some(d), r: Some(d) }
+        i = i + 1
+    }
+    d
+}
+
+
+fn report(mode: String, t0: Int, equal: Int) -> () {
+    println("mode=" + mode + " wall_ns=" + toString(nanoTime() - t0) + " equal=" + toString(equal))
+}
+
+
+let mode = match get(toVec(args()), 0) {
+    Some(m) => m,
+    None => "point"
+}
+
+if mode == "point" {
+    let p = Point { x: 3, y: 4 }
+    let q = Point { x: 3, y: 4 }
+    let mut eq = 0
+    let t0 = nanoTime()
+    let mut i = 0
+    while i < 5000000 {
+        if p == q { eq = eq + 1 }
+        i = i + 1
+    }
+    report(mode, t0, eq)
+} else if mode == "option" {
+    let a: Option[Int] = Some(5)
+    let b: Option[Int] = Some(5)
+    let mut eq = 0
+    let t0 = nanoTime()
+    let mut i = 0
+    while i < 5000000 {
+        if a == b { eq = eq + 1 }
+        i = i + 1
+    }
+    report(mode, t0, eq)
+} else if mode == "vec50" {
+    let a = points(50)
+    let b = points(50)
+    let mut eq = 0
+    let t0 = nanoTime()
+    let mut i = 0
+    while i < 100000 {
+        if a == b { eq = eq + 1 }
+        i = i + 1
+    }
+    report(mode, t0, eq)
+} else if mode == "vec1m" {
+    let a = points(1000000)
+    let b = points(1000000)
+    let mut eq = 0
+    let t0 = nanoTime()
+    let mut i = 0
+    while i < 5 {
+        if a == b { eq = eq + 1 }
+        i = i + 1
+    }
+    report(mode, t0, eq)
+} else if mode == "list100k" {
+    let a = cells(100000)
+    let b = cells(100000)
+    let mut eq = 0
+    let t0 = nanoTime()
+    let mut i = 0
+    while i < 20 {
+        if a == b { eq = eq + 1 }
+        i = i + 1
+    }
+    report(mode, t0, eq)
+} else if mode == "map100k" {
+    let a = pointMap(100000)
+    let b = pointMap(100000)
+    let mut eq = 0
+    let t0 = nanoTime()
+    let mut i = 0
+    while i < 10 {
+        if a == b { eq = eq + 1 }
+        i = i + 1
+    }
+    report(mode, t0, eq)
+} else if mode == "dag22" {
+    let a = dag(22)
+    let b = dag(22)
+    let t0 = nanoTime()
+    let eq = if a == b { 1 } else { 0 }
+    report(mode, t0, eq)
+} else {
+    println("unknown mode: " + mode)
+}

@@ -122,6 +122,16 @@
     <None Include="std\random.skn" />
     <None Include="std\set.skn" />
     <None Include="std\time.skn" />
+    <None Include="std\cli.skn" />
+    <None Include="std\hash.skn" />
+    <None Include="std\net.skn" />
+    <None Include="std\poll.skn" />
+    <None Include="std\task.skn" />
+    <None Include="std\actor.skn" />
+    <None Include="std\supervisor.skn" />
+    <None Include="std\regex.skn" />
+    <None Include="std\log.skn" />
+    <None Include="std\resp.skn" />
     <None Include="std\deque.skn" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
