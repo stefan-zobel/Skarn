@@ -410,12 +410,12 @@ struct WaitPad {
         sock_ev.push_back(SockEv{ fd, sock, we, mask });
         return we;
     }
-#endif
 
     // Forget every association for a descriptor that is no longer being watched, and close its event.
     // Called before a wait, so the cache holds exactly what that wait needs. A socket that comes back
     // later simply gets associated again -- one WSAEventSelect, which is what this cache exists to avoid
-    // paying per call, not per lifetime.
+    // paying per call, not per lifetime. POSIX needs no counterpart: `poll` is handed the whole set on
+    // every call and keeps no association, so the one caller is guarded as well.
     void retain_events(const std::vector<int64_t>& fds) {
         std::lock_guard<std::mutex> lk(m);
         for (size_t i = sock_ev.size(); i-- > 0;) {
@@ -424,6 +424,7 @@ struct WaitPad {
             sock_ev.erase(sock_ev.begin() + static_cast<ptrdiff_t>(i));
         }
     }
+#endif
 
     void poke() {                               // one signal, never blocking, outside every lock
 #ifdef _WIN32
