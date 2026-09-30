@@ -35,3 +35,21 @@ struct VmFault : std::runtime_error {
           cause(std::move(cause_)),
           frames(std::move(frames_)) {}
 };
+
+// =============================================================================
+// ProgramExit -- the program asked to end with an exit code (the `exit` native, std::process).
+// NOT a fault: a driver returns `code` as the process's exit code and prints nothing.
+//
+// Thrown by the native in the ROOT execute() only (an actor or a task gets a located fault
+// instead), so it unwinds out of execute() exactly as a fault does -- and on the way the
+// world's destructor runs the program's ordinary end: the root's partial line is flushed,
+// every actor is told to stop, every thread is joined. It derives from std::exception so a
+// caller that catches only that still sees the run end; a driver catches it FIRST.
+// =============================================================================
+struct ProgramExit : std::exception {
+    int code;
+    explicit ProgramExit(int code_) : code(code_), what_("exit(" + std::to_string(code_) + ")") {}
+    const char* what() const noexcept override { return what_.c_str(); }
+private:
+    std::string what_;
+};

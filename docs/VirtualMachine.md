@@ -50,9 +50,12 @@ of the runtime sees:
   reader which does not is rejected rather than misled (see "Bytecode container format").
 
 The compiler and the driver contain no platform-specific code at all, and neither does the language
-surface: the one place where a platform is named, `std::process`'s `sh()`, asks which one it is running on
-(`rawOsId`, wrapped as `currentOs()`) and picks `cmd /c` or `/bin/sh -c` accordingly. What remains
-Windows-only is the PowerShell documentation and example gates.
+surface. Two natives ASK about the platform instead of naming one. `rawOsId`, wrapped as `currentOs()`,
+answers which platform this is, and it is what lets `std::process`'s `sh()` pick `cmd /c` or `/bin/sh -c`.
+`rawCpuCount`, wrapped as `cpuCount()`, answers how many threads this process may run at once — what the
+operating system grants it, so an affinity mask narrows the answer below the machine's core count. Both
+keep their platform branches in one place, `Platform.h`, so that the test oracle can call the same code
+rather than keep a copy of it. What remains Windows-only is the PowerShell documentation and example gates.
 
 ## Source files
 
@@ -74,7 +77,7 @@ compiler, the driver and the test programs include its headers and link it.
 | `GlobalEnv.h`, `StringInterner.h`, `HashTable.h`, `HashingPolicy.h` | globals, interning and the host-side hash table |
 | `StructType.h`, `FunctionTable.h`, `TypeUniverse.h` | struct descriptors, per-function metadata, type ids for trait dispatch |
 | `NativeRegistry.h`, `Natives.h` | the native-function registry |
-| `Fault.h` | `VmFault`, the structured runtime error |
+| `Fault.h` | `VmFault`, the structured runtime error, and `ProgramExit`, the program's own request to end |
 | `BytecodeIO.h` | the `.skbc` bytecode file format |
 | `ValueCodec.h` | copying a runtime value from one heap to another through a byte buffer |
 | `ByteIO.h` | the little-endian byte primitives both formats above share |
@@ -262,17 +265,44 @@ finding it and using it. What that does not cover is a write larger than the ope
 size, and it says nothing about `writeFile` or a read-modify-write, neither of which is one call.
 
 The socket natives work on small integer descriptors into a per-execution table, never on raw OS handles,
-and close whatever is still open when the execution ends. `tcpConnect` gives up after 10 seconds: on POSIX
+and close whatever is still open when the execution ends. A descriptor is a slot plus a generation: closing
+or handing off a socket advances its slot's generation, so a descriptor kept afterwards is refused instead of
+reaching whichever socket reuses the slot. The file-handle natives behind `std::io`'s `File` (open, read,
+write, sync, close) use a second table of the same shape. A file opened for appending positions every write
+at the end as part of the write, as `appendFile` does, and `sync` is `FlushFileBuffers` on Windows and
+`fsync` on POSIX. Neither kind of descriptor means anything in another isolate, so the checker keeps both
+out of messages. Two natives serve the program's own streams: `flushOutput` flushes its output stream,
+and `rawWriteErr` writes one string to its error stream — the compiler joins the arguments of `eprint` /
+`eprintln` into that one string, so a call arrives in one piece, and the native flushes the output stream
+first, so the two streams appear in the order they were written. `exit` ends the program: in the
+execution that owns the world it throws `ProgramExit` with the code (0 to 255, else a fault), and in a task
+or an actor it is a fault, since nothing could interrupt the root wherever it waits. `tcpConnect` gives up after 10 seconds: on POSIX
 through a non-blocking connect and `select()`, on Windows through a blocking connect bounded by `TCP_MAXRT`,
 because there the `select()` wait can add one timer tick (about 15 ms) even on loopback.
 
+Three natives search or read a byte buffer without allocating: the first byte equal to a given one, the
+first occurrence of a byte sequence, and the decimal integer in a range of the buffer. They exist because
+the loops they replace ran one bytecode operation per byte, and they carry no name of their own — the
+library functions over them are unchanged. The integer one answers through an option, so a malformed range
+is an ordinary absent value rather than an error channel; its magnitude is capped at the language's
+integer range in both signs. One consequence reaches every embedder: because ordinary string handling now
+calls a native, running a program built against the standard library WITHOUT a native table is no longer a
+valid configuration.
+
 **Adding a native:**
 
-1. Append a `NativeId` and extend `native_id_of`, `native_return_of` and `native_arity`.
+1. Append a `NativeId`, raise `NATIVE_COUNT`, and extend `native_id_of`, `native_return_of` and
+   `native_arity`. List the id in `native_return_of` even when it returns a `Result`: an id missing there
+   falls to the default, `Result`, so a forgotten plain native would be wrapped in `Ok(...)` without any
+   error.
 2. Write the `NativeFunc` and add it to `build_native_table()`.
 3. Declare its Skarn signature and its standard-library module in the checker (`add_native` in
-   `static_compiler/Check.cpp`).
-4. Add a test.
+   `static_compiler/Check.cpp`). If it hands out a handle, add the handle's type to the types that
+   cannot be sent in a message (`send_blocker_in`).
+4. Update the `NATIVE_COUNT` pin in `static_compiler_tests`: decide whether the native is deterministic
+   and so belongs in the oracle's list of natives it models.
+5. Add a test. A public wrapper needs a row in `SkarnStdlib.md` and its names in the highlighters; the
+   doc gate checks both.
 
 No opcode is needed.
 
@@ -323,6 +353,11 @@ Growth replaces the backing without changing the header, so every reference to t
 
 - **Map** (`op_map.h`): the header holds the backing, the live count and the used-slot count. The backing is
   a `KIND_ARRAY` of interleaved keys and values, probed linearly, with tombstones for deleted entries.
+  - An insert that would fill the table past 70 % (live entries and tombstones) rehashes it and drops the
+    tombstones. When most of the used slots are live the new table is twice the size; when most are
+    tombstones it is the smallest one that leaves the live entries at most 35 % full, never larger than
+    before. So a map whose keys keep changing stays the size of what it holds. Deleting alone never
+    shrinks the backing; the next insert that finds the table full does.
   - String keys hash and compare by content, which a moving collector cannot change. Other immediates key by
     their bits (`SameValueZero`).
   - A non-string heap object is not a valid key and traps: its address changes when the collector moves it.
@@ -366,6 +401,13 @@ error: division by zero at line 2 (in boom)
 
 A frame replaced by a tail call does not appear in the trace.
 
+A program that ends itself with `std::process`'s `exit` is not a fault. The native throws `ProgramExit`
+(`Fault.h`), which leaves `execute()` the same way, so the world's destructor runs the ordinary end on
+the way out: the root's partial line is flushed, every actor is told to stop and every thread is joined.
+The driver catches it before any fault and returns its code as the process's exit code, printing
+nothing. A caller that catches only `std::exception` still sees the run end, as `ProgramExit` derives
+from it.
+
 The dispatch loop itself contains no exception handler. `run_switch` wraps it in one frame for the faults
 that cannot be located: an access violation, an illegal opcode, heap exhaustion. On Windows that frame is a
 structured-exception handler; on POSIX it is a `sigsetjmp` landing point that the SIGSEGV/SIGBUS handler
@@ -406,6 +448,10 @@ destination can never move a half-copied graph out from under the copier.
 
 - Every heap object is written once and referred to by index, so shared parts stay shared and cyclic
   values are copied correctly.
+- A small message is cheap to copy. The encoder recognises an object it has already written by a short
+  linear search, and by a hash table only in larger values; it computes the buffer's exact size before
+  writing it, and keeps its working memory per thread between calls. So encoding allocates only the
+  buffer, and decoding only the list of roots for the rebuild.
 - Each slot is stored as its value type plus payload and rebuilt through the normal constructors, never
   as raw bits, so a decoded value can never turn into a pointer.
 - The rebuild keeps every object it has created registered as a collector root, so it stays correct even
@@ -522,7 +568,11 @@ calling convention, and halts. Appending the stub leaves every function's addres
   through its mailbox.
 - **Output.** A task's output is collected and written out when the task is joined, in join order, so it
   does not depend on scheduling. An actor writes to the main program's output stream a line at a time, so
-  lines from different actors never mix. Isolates read an empty standard input.
+  lines from different actors never mix. A flush — `std::io`'s `flushOutput()`, or a read from standard
+  input — also writes out the line the isolate has started, and flushes the stream; in a task it changes
+  nothing until the join. Standard error is different: every isolate writes to the main program's error
+  stream at once, a whole call under one lock — a task too, since a diagnostic must arrive even from a
+  task that never ends. Isolates read an empty standard input.
 - **Memory.** An isolate starts small — 64 KiB of register stack and 1024 return frames, and an actor's heap
   at 64 KiB — and grows like any other execution. Hundreds of actors are therefore affordable.
 
@@ -569,6 +619,42 @@ Erlang's "active mode".
   yet delivered are closed when the inbox closes, the listener is closed or its owner ends, so no client is
   left waiting; a ticket already in the inbox is closed, like any untaken ticket, when the world ends.
 
+**Waiting on inboxes and sockets at once.** Active mode above hands the reading to the runtime, which
+costs one thread crossing per request. `rawSelectIo(boxes, fds, interest, timeoutMs)` is the other answer:
+the actor keeps its socket and waits on it AND its inboxes in one call, so nothing forwards the bytes for
+it. Neither other wait can do this -- a receive and a select park on a condition variable, which no socket
+can wake, and the readiness scan watches only sockets.
+- **The answer is a flag array over `boxes` followed by `fds`.** The first entries are 1 where that inbox
+  has something to read (a message, a crash report, or the actor's `Stop`) and 0 otherwise; the rest are
+  the readiness scan's own flag words. Readiness only -- nothing is taken out, so the receive or the read
+  that follows cannot wait. Unlike the select over inboxes it ranks nothing: a socket and an inbox have no
+  natural order, so everything ready is reported and the caller decides.
+- **The wake pad grows a second half**, made the first time an isolate calls this and never before, which
+  every mailbox signals in addition to the generation counter. A program that never calls it pays one more
+  atomic read per wake. It is NOT the loopback socket pair the I/O thread is woken through, which would be
+  one code path for both platforms: a wake through it measures four to five times dearer, because the
+  readiness scan itself is the expensive half. So the wake is the platform's own -- an event object on
+  Windows, a pipe elsewhere.
+- **Readiness is level-triggered on both platforms**, and that is deliberate. The flags always come from a
+  zero-timeout readiness scan, never from the wake object, because Windows signals a socket's event on an
+  EDGE: an implementation that read the flags from the event would stop reporting a buffer whose reader had
+  not drained it. The extra scan costs nothing next to the park.
+- **Everything that ends an actor still reaches it.** `Stop` goes into every inbox an actor owns, and each
+  of them signals both halves of the pad, so an actor parked here can be stopped exactly as one parked in a
+  select can. This matters: a blocking read cannot be interrupted at all, which is why a program that must
+  stay stoppable reads through this call and not through the blocking one.
+- **Limits.** On Windows at most 63 sockets in one call. The wait does not spin before it parks, while the
+  condition variable underneath an inbox-only wait does, so an actor whose partner answers within a few
+  microseconds is better off waiting on inboxes alone -- this call is for an actor that really has to watch
+  both. Active mode also remains the better answer for line framing, for back-pressure through an inbox's
+  capacity, for an activated listener, and for a deadline that closes a peer that stopped reading.
+- **And it does not scale the way it reads.** One runtime thread polling every active connection is not the
+  serial bottleneck it appears to be: a single wait covers all of them, and one wake of it serves every
+  socket that became ready at the same moment. A program that gives each of many connections its own wait
+  pays a park per connection instead, which costs more under load than the forwarding it saves. Measured on
+  a server with sixteen clients, this call made one client's round trip markedly faster and concurrent
+  throughput about a tenth slower. Use it where latency with few connections in flight is what matters.
+
 ## Embedding the VM
 
 A compiler's entire contract with the VM is the instruction set plus the `Assembler` that emits it. It never
@@ -583,15 +669,23 @@ has a default, so small hand-built programs pass only what they use:
 - the constant pool, constant arrays, struct types, string literals and function table;
 - the trait-dispatch table and its dimensions;
 - line, column, function-name and module tables for fault reports;
-- the native table, the program arguments, and the output and input streams.
+- the native table, the program arguments, and the output, input and error streams.
 
 The caller owns the heap, the globals and the interner and passes them in. There is no global or
 thread-local interpreter state, so executions are independent — including at the same time on different
-threads. Each concurrent execution needs its own heap, globals, interner, program arguments and output and
-input streams; the constant pool, struct types, function table, trait table and native table are read-only
-and may be shared. The two stream parameters default to the process-wide standard output and input, which
-two concurrent executions must not both take, or they will interleave their output and compete for the
-same input.
+threads. Each concurrent execution needs its own heap, globals, interner, program arguments and output,
+input and error streams; the constant pool, struct types, function table, trait table and native table are read-only
+and may be shared. The stream parameters default to the process-wide standard output, input and error,
+which two concurrent executions must not both take, or they will interleave their output and compete for
+the same input.
+
+The VM does not decide when output reaches the operating system; the stream it is given does. It flushes
+that stream only when asked to (`flushOutput`, a read from standard input) and when the execution ends.
+The driver `skarnvm` hands it a stream that pushes completed lines on at once when output is sparse, and
+gathers a burst of lines for at most 10 ms before a background thread pushes them — the C runtime alone
+would hold output to a pipe or a file in 4 KiB blocks, which a killed server never writes. A flush per
+line would cost a program printing a million lines four to eleven times its run time; this costs it
+10 to 17 %.
 
 ## Dispatch
 

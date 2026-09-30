@@ -1,0 +1,6 @@
+// CLAIM: what eprint / eprintln write does not appear on standard output.
+// GUIDE: SkarnGuide.md §22 "Printing"; SkarnStdlib.md §1
+// EXPECT: ok only this
+eprintln("a diagnostic")
+println("only this")
+eprint("another")

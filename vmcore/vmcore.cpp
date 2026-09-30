@@ -35,6 +35,7 @@
 #include <optional>   // the world a root execute() owns
 #include <algorithm>  // std::find -- a mailbox's list of senders waiting for room
 #include <utility>    // std::exchange -- a receive takes the I/O thread's pause mark
+#include <cstring>    // std::memchr / std::memcmp -- the byte-search natives
 #ifdef _WIN32
 // Winsock MUST precede <windows.h> to avoid winsock.h/winsock2.h redefinition errors.
 #  include <winsock2.h>
@@ -199,6 +200,73 @@ struct NetRegistry {
     }
 };
 
+// Open-file registry for the rawFile* natives (std::io's File) -- the file counterpart of
+// NetRegistry, with the same shape and for the same reasons: a file is exposed to Skarn as an Int
+// DESCRIPTOR (`slot | gen << SLOT_BITS`), never an OS handle; closing a file advances its slot's
+// generation, so a File kept after close() is refused instead of reaching the next file opened
+// into that slot; and execute() holds one as a stack local whose destructor closes whatever is
+// still open, on the fault path too. NOT a GC root (OS handles, no Values). One per execute(), so a
+// descriptor means nothing in another isolate -- which is why the checker keeps File out of
+// messages. The natives live next to native_append_file.
+struct FileRegistry {
+#ifdef _WIN32
+    using handle_t = HANDLE;
+    static inline const handle_t NO_FILE = INVALID_HANDLE_VALUE;
+#else
+    using handle_t = int;
+    static constexpr handle_t NO_FILE = -1;
+#endif
+    static constexpr int     SLOT_BITS = 24;
+    static constexpr int64_t SLOT_MASK = (int64_t{1} << SLOT_BITS) - 1;
+    struct Slot {
+        handle_t h   = NO_FILE;
+        int64_t  gen = 0;
+    };
+    std::vector<Slot> slots;
+    FileRegistry() = default;
+    FileRegistry(const FileRegistry&) = delete;
+    FileRegistry& operator=(const FileRegistry&) = delete;
+    ~FileRegistry() {
+        for (const Slot& sl : slots)
+            if (sl.h != NO_FILE) close_handle(sl.h);
+    }
+    static void close_handle(handle_t h) {
+#ifdef _WIN32
+        CloseHandle(h);
+#else
+        ::close(h);
+#endif
+    }
+    int64_t add(handle_t h) {
+        size_t i = 0;
+        while (i < slots.size() && slots[i].h != NO_FILE) ++i;
+        if (i == slots.size()) slots.push_back(Slot{});
+        slots[i].h = h;
+        return static_cast<int64_t>(i) | (slots[i].gen << SLOT_BITS);
+    }
+    // The live slot a descriptor names, or null (closed, never issued, or negative).
+    Slot* live(int64_t fd) {
+        if (fd < 0) return nullptr;
+        const auto i = static_cast<size_t>(fd & SLOT_MASK);
+        if (i >= slots.size() || slots[i].gen != (fd >> SLOT_BITS) || slots[i].h == NO_FILE)
+            return nullptr;
+        return &slots[i];
+    }
+    // Closes the file and retires the descriptor. False if `fd` was not live or the OS close failed.
+    bool close(int64_t fd) {
+        Slot* sl = live(fd);
+        if (!sl) return false;
+#ifdef _WIN32
+        const bool ok = CloseHandle(sl->h) != 0;
+#else
+        const bool ok = ::close(sl->h) == 0;
+#endif
+        sl->h   = NO_FILE;
+        sl->gen = (sl->gen + 1) & ((int64_t{1} << 23) - 1);   // stays within a positive 48-bit Int
+        return ok;
+    }
+};
+
 // =============================================================================
 // Tasks and actors -- one runtime for both (the "isolates" of concurrency stage 2).
 //
@@ -244,15 +312,145 @@ struct Mail {
 //     holding NO pad lock, so mail can arrive in between; it then parks only if `gen` is unchanged.
 //   * A notifier takes the mailbox mutex and this one in SEQUENCE, never nested (put/offer release
 //     the box before waking) -- so no lock order between the two exists to get wrong.
+//   * `pollers` and the wake object below are the pollable half, for rawSelectIo: a wait that must
+//     also cover a SOCKET cannot park on `cv`, because no socket can wake a condition variable. It is
+//     made on the first rawSelectIo of this isolate and never before, so a program that does not use
+//     it pays one further relaxed load per wake and nothing else. NOT the loopback socket pair the
+//     I/O hub uses, which would be one code path for both platforms: measured, a wake through it
+//     costs 6.3-7.3 us against 1.4-1.7 us for the platform's own primitive, and WSAPoll itself is the
+//     expensive half (a UDP pair is worse again). See "Waiting on inboxes and sockets at once" in
+//     docs/VirtualMachine.md.
 struct WaitPad {
     std::mutex              m;
     std::condition_variable cv;
     uint64_t                gen = 0;        // guarded by m; bumped on every wake
-    std::atomic<int>        waiters{ 0 };
+    std::atomic<int>        waiters{ 0 };   // parked on `cv`     (receive / select)
+    std::atomic<int>        pollers{ 0 };   // parked on the wake object below (selectIo)
+#ifdef _WIN32
+    HANDLE                  ev = nullptr;   // manual-reset, so a reset is the drain
+    // One WSAEVENT per socket, kept ACROSS calls: associating a socket with an event is free once it is
+    // cached and a kernel-object creation if it is not.
+    //
+    // Keyed by the SKARN DESCRIPTOR, not by the OS handle, and that is not a detail: Windows reuses handle
+    // values, so a connection replacing a closed one would hit a cache entry made for its predecessor,
+    // match the mask, and be handed the event back without `WSAEventSelect` ever being called for it --
+    // associated with nothing, and its readiness waking no wait. A descriptor cannot be reused, because it
+    // is `slot | generation << 24` and releasing a slot advances the generation. Found by a churn stress
+    // after the feature's own tests, which never closed a socket while a wait lived, all passed.
+    // Bounded by the caller's watch set, not by a number: `retain_events` drops whatever is no longer
+    // watched. An earlier version capped it and cleared the whole cache on overflow, which closed events
+    // that live sockets were still associated with -- those sockets then held a closed handle, so
+    // WaitForMultipleObjects failed outright and they never woke again.
+    struct SockEv { int64_t fd; socket_t s; WSAEVENT ev; long mask; };
+    std::vector<SockEv>     sock_ev;        // guarded by m
+#else
+    int                     wake_rd = -1, wake_wr = -1;   // a pipe: macOS has no eventfd
+#endif
+
+    ~WaitPad() {
+#ifdef _WIN32
+        for (SockEv& e : sock_ev) WSACloseEvent(e.ev);
+        if (ev) CloseHandle(ev);
+#else
+        if (wake_rd >= 0) ::close(wake_rd);
+        if (wake_wr >= 0) ::close(wake_wr);
+#endif
+    }
+
+    // Make the pollable half, once. Called only by rawSelectIo, and BEFORE `pollers` is raised -- so a
+    // notifier that sees `pollers > 0` has taken `m` after this released it and reads a made object.
+    bool ensure_pollable() {
+        std::lock_guard<std::mutex> lk(m);
+#ifdef _WIN32
+        if (!ev) ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        return ev != nullptr;
+#else
+        if (wake_rd < 0) {
+            int fd[2];
+            if (::pipe(fd) != 0) return false;
+            for (int i = 0; i < 2; ++i) {
+                const int fl = ::fcntl(fd[i], F_GETFL, 0);
+                if (fl >= 0) ::fcntl(fd[i], F_SETFL, fl | O_NONBLOCK);
+            }
+            wake_rd = fd[0];
+            wake_wr = fd[1];
+        }
+        return wake_rd >= 0;
+#endif
+    }
+
+#ifdef _WIN32
+    // The event a socket's readiness signals. WSAEventSelect's FD_* are EDGE-triggered, which is why
+    // rawSelectIo never reads its FLAGS from here -- it takes them from a zero-timeout sock_poll. This
+    // event only has to WAKE the wait.
+    WSAEVENT event_for(int64_t fd, socket_t sock, short want) {
+        const long mask = FD_CLOSE |
+                          ((want & POLL_READ)  ? (FD_READ | FD_ACCEPT)   : 0) |
+                          ((want & POLL_WRITE) ? (FD_WRITE | FD_CONNECT) : 0);
+        std::lock_guard<std::mutex> lk(m);
+        for (size_t i = 0; i < sock_ev.size(); ++i) {
+            if (sock_ev[i].fd != fd) continue;
+            // the same descriptor and the same interest: the association stands
+            if (sock_ev[i].s == sock && sock_ev[i].mask == mask) return sock_ev[i].ev;
+            if (WSAEventSelect(sock, sock_ev[i].ev, mask) == 0) {
+                sock_ev[i].s    = sock;
+                sock_ev[i].mask = mask;
+                return sock_ev[i].ev;
+            }
+            WSACloseEvent(sock_ev[i].ev);          // that socket is gone: start over
+            sock_ev.erase(sock_ev.begin() + static_cast<ptrdiff_t>(i));
+            break;
+        }
+        WSAEVENT we = WSACreateEvent();
+        if (we == WSA_INVALID_EVENT) return we;
+        if (WSAEventSelect(sock, we, mask) != 0) {
+            WSACloseEvent(we);
+            return WSA_INVALID_EVENT;
+        }
+        sock_ev.push_back(SockEv{ fd, sock, we, mask });
+        return we;
+    }
+
+    // Forget every association for a descriptor that is no longer being watched, and close its event.
+    // Called before a wait, so the cache holds exactly what that wait needs. A socket that comes back
+    // later simply gets associated again -- one WSAEventSelect, which is what this cache exists to avoid
+    // paying per call, not per lifetime. POSIX needs no counterpart: `poll` is handed the whole set on
+    // every call and keeps no association, so the one caller is guarded as well.
+    void retain_events(const std::vector<int64_t>& fds) {
+        std::lock_guard<std::mutex> lk(m);
+        for (size_t i = sock_ev.size(); i-- > 0;) {
+            if (std::find(fds.begin(), fds.end(), sock_ev[i].fd) != fds.end()) continue;
+            WSACloseEvent(sock_ev[i].ev);
+            sock_ev.erase(sock_ev.begin() + static_cast<ptrdiff_t>(i));
+        }
+    }
+#endif
+
+    void poke() {                               // one signal, never blocking, outside every lock
+#ifdef _WIN32
+        if (ev) SetEvent(ev);
+#else
+        if (wake_wr < 0) return;
+        const char b = 1;
+        (void)!::write(wake_wr, &b, 1);
+#endif
+    }
+    void drain() {                              // BEFORE the scan, so a signal after it is not lost
+#ifdef _WIN32
+        if (ev) ResetEvent(ev);
+#else
+        if (wake_rd < 0) return;
+        char b[64];
+        while (::read(wake_rd, b, sizeof(b)) > 0) {}
+#endif
+    }
     void wake() {
-        if (waiters.load(std::memory_order_relaxed) == 0) return;
+        const int w = waiters.load(std::memory_order_relaxed);
+        const int p = pollers.load(std::memory_order_relaxed);
+        if (w == 0 && p == 0) return;
         { std::lock_guard<std::mutex> lk(m); ++gen; }
-        cv.notify_all();
+        if (w) cv.notify_all();
+        if (p) poke();
     }
 };
 
@@ -624,6 +822,8 @@ struct World {
     const ProgramImage*       image  = nullptr;   // the ROOT's image: what every isolate runs
     std::ostream*             target = nullptr;   // the root's real output stream
     std::mutex                out_m;              // one line at a time into `target`
+    std::ostream*             err_target = nullptr;   // the root's error stream (eprint / eprintln)
+    std::mutex                err_m;              // one call at a time into `err_target`
     std::atomic<bool>         actors_started{ false };
     LineForwardBuf            root_buf{ this, false };
     std::ostream              root_out{ &root_buf };
@@ -812,6 +1012,7 @@ struct IsolateLocal {
     int64_t                  id    = 0;
     int64_t                  main_box = 0;   // the id of its main inbox: its own, or the slot it runs in
     bool                     actor = false;
+    bool                     root  = false;   // the execute() that owns the world (not a task, not an actor)
     std::vector<std::pair<int64_t, std::shared_ptr<Mailbox>>> inboxes;
     // This isolate's wake pad: where rawSelect sleeps, and what every inbox above wakes. The same
     // object the World reaches through Isolate::pad -- the two ends a wait-for graph would need.
@@ -855,7 +1056,8 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
                      std::istream* in,
                      const std::vector<std::string>* function_modules,
                      const std::vector<std::vector<Value>>* const_arrays,
-                     const TaskEntry* task) {
+                     const TaskEntry* task,
+                     std::ostream* err) {
     std::vector<uint32_t> padded = bytecode;
     padded.resize(bytecode.size() + 3,
         Instruction::J(static_cast<uint8_t>(OpCode::HALT)).raw);
@@ -885,6 +1087,9 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
     // still open when execute() returns (incl. the VmFault path) -- the safety net behind tcpClose.
     NetRegistry net_registry;
     vm.net                 = &net_registry;
+    // Open files (std::io's File), closed the same way when execute() returns.
+    FileRegistry file_registry;
+    vm.files               = &file_registry;
     // Tasks and actors: the image this call runs, built from its own arguments, and its WORLD. A
     // root (no `task`) owns a new world; a task or actor joins the one it was started in.
     // Declared in this order so the world is destroyed FIRST -- its destructor stops every actor
@@ -910,9 +1115,11 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
         own_world.emplace();
         own_world->image  = &image;
         own_world->target = out ? out : &std::cout;
+        own_world->err_target = err ? err : &std::cerr;
         own_world->main_mailbox->pad = own_world->root_pad;   // the root's inbox wakes the root
         local.world       = &*own_world;
         local.pad         = own_world->root_pad;
+        local.root        = true;
     }
     vm.image   = &image;
     vm.isolate = &local;
@@ -925,6 +1132,10 @@ VM_Resources execute(const std::vector<uint32_t>& bytecode,
     // stdin sink for readLine / readAllStdin: caller-supplied stream, or std::cin by
     // default. A caller (tests, a REPL) can feed input by passing its own std::istream.
     vm.in                = in ? in : &std::cin;
+    // eprint / eprintln sink: the world's error stream, shared by every isolate of the world (a task
+    // or an actor writes there at once, not at its join -- a diagnostic must arrive even from one
+    // that hangs).
+    vm.err               = local.world->err_target;
     // Serious-fault diagnostics (Phase 1): the code origin (instruction 0) so a fault
     // ip maps to an instruction index, plus the per-instruction line table and the
     // per-fn-id name table. Cold-path only (raise_located); not GC roots.
@@ -1237,6 +1448,15 @@ static Value native_os_id(Value*, uint8_t, Context*) {
 #endif
 }
 
+// rawCpuCount() -> Int (Plain). How many threads this process may run at once -- what the OS grants
+// THIS process, so an affinity mask narrows it below the machine's core count. Always >= 1, because
+// a caller sizes a pool of workers or shards with it. The platform branches are vm_usable_cpus()
+// in Platform.h, which the test oracle calls too rather than keeping a second copy of them.
+// Zero-arg (dummy window base); allocates nothing.
+static Value native_cpu_count(Value*, uint8_t, Context*) {
+    return Value::fromSigned48(static_cast<int64_t>(vm_usable_cpus()));
+}
+
 // args() -> Array[String] (Plain -- no Ok/Err wrap). Builds a fresh KIND_ARRAY of the
 // driver-supplied command-line args (host std::strings in VM::script_args, stable across
 // a collection). Each element string is a separate allocation (a safepoint that can move
@@ -1449,6 +1669,147 @@ static Value native_append_file(Value* args, uint8_t nargs, Context* ctx) {
     return Value::fromNil();
 }
 
+// ---- File handles (ids 88-92): std::io's File, over the per-execution FileRegistry. ----------
+// All five are NRET_RESULT: a String is the error message. The descriptor argument is a bare Int;
+// std::io's File passes its field.
+
+// rawFileOpen(path, mode) -> Int descriptor | String. mode 0 = read an existing file, 1 = write
+// (create or truncate), 2 = append (create if absent; every write lands at the true end, as
+// appendFile's do, so several isolates may append to one file).
+static Value native_file_open(Value* args, uint8_t nargs, Context* ctx) {
+    if (nargs < 2 || !is_string(args[0]))
+        return native_make_error(ctx, "openFile: path must be a string");
+    if (!args[1].isInt())
+        return native_make_error(ctx, "openFile: mode must be an Int");
+    const int64_t mode = args[1].asSigned48();
+    if (mode < 0 || mode > 2)
+        return native_make_error(ctx, "openFile: unknown mode");
+    if (!ctx->vm->files)
+        return native_make_error(ctx, "openFile: no file registry");
+    std::string path;
+    {
+        GcObject* o = GcObject::from_slots(args[0].asPtr());
+        path.assign(o->bytes(), o->string_length());
+    }
+#ifdef _WIN32
+    // FILE_SHARE_DELETE lets another handle rename or delete the file while this one is open, as
+    // POSIX always allows (a log is rotated by renaming it).
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    const DWORD access = mode == 0 ? GENERIC_READ : mode == 1 ? GENERIC_WRITE : FILE_APPEND_DATA;
+    const DWORD disposition = mode == 0 ? OPEN_EXISTING : mode == 1 ? CREATE_ALWAYS : OPEN_ALWAYS;
+    const HANDLE h = CreateFileA(path.c_str(), access, share, nullptr, disposition,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return native_make_error(ctx, "could not open file: " + path);
+#else
+    const int flags = mode == 0 ? O_RDONLY
+                    : mode == 1 ? O_WRONLY | O_CREAT | O_TRUNC
+                    :             O_WRONLY | O_CREAT | O_APPEND;
+    const int h = ::open(path.c_str(), flags | O_CLOEXEC, 0644);
+    if (h < 0)
+        return native_make_error(ctx, "could not open file: " + path);
+#endif
+    return Value::fromSigned48(ctx->vm->files->add(h));
+}
+
+// The live registry slot behind a descriptor argument, or null (not an Int, closed, never issued).
+static FileRegistry::Slot* file_slot(Value v, Context* ctx) {
+    if (!v.isInt() || !ctx->vm->files) return nullptr;
+    return ctx->vm->files->live(v.asSigned48());
+}
+
+// rawFileRead(fd, max) -> Bytes | String. Reads at most `max` bytes (at most 16 MiB per call) from
+// the current position; empty Bytes means the end of the file.
+static Value native_file_read(Value* args, uint8_t nargs, Context* ctx) {
+    FileRegistry::Slot* sl = nargs >= 1 ? file_slot(args[0], ctx) : nullptr;
+    if (!sl)
+        return native_make_error(ctx, "read: file is closed or invalid");
+    if (nargs < 2 || !args[1].isInt() || args[1].asSigned48() <= 0)
+        return native_make_error(ctx, "read: max must be a positive Int");
+    const size_t max = static_cast<size_t>(std::min<int64_t>(args[1].asSigned48(), 16 << 20));
+    std::string buf(max, '\0');
+#ifdef _WIN32
+    DWORD got = 0;
+    if (!ReadFile(sl->h, buf.data(), static_cast<DWORD>(max), &got, nullptr))
+        return native_make_error(ctx, "read: could not read the file");
+    buf.resize(got);
+#else
+    ssize_t got;
+    do { got = ::read(sl->h, buf.data(), max); } while (got < 0 && errno == EINTR);
+    if (got < 0)
+        return native_make_error(ctx, "read: could not read the file");
+    buf.resize(static_cast<size_t>(got));
+#endif
+    Value result;
+    bytes_from_str(ctx, &result, buf);
+    return result;
+}
+
+// rawFileWrite(fd, bytes) -> nil | String. ONE OS write per call (WriteFile / write), so on a file
+// opened for appending the whole buffer lands at the end in one piece, as with appendFile. POSIX
+// may write a regular file only partly (a full disk, a signal); the rest is then written by
+// further calls, and a failure is reported.
+static Value native_file_write(Value* args, uint8_t nargs, Context* ctx) {
+    FileRegistry::Slot* sl = nargs >= 1 ? file_slot(args[0], ctx) : nullptr;
+    if (!sl)
+        return native_make_error(ctx, "write: file is closed or invalid");
+    if (nargs < 2 || !args[1].isPtr() ||
+        GcObject::from_slots(args[1].asPtr())->kind != GcObject::KIND_BYTES)
+        return native_make_error(ctx, "write: second argument must be a byte buffer");
+    std::string data;
+    {
+        GcObject*      hdr     = GcObject::from_slots(args[1].asPtr());
+        GcObject*      backing = GcObject::from_slots(hdr->slots()[BYTES_SLOT_BACKING].asPtr());
+        const uint32_t count   = static_cast<uint32_t>(hdr->slots()[BYTES_SLOT_COUNT].asSigned48());
+        data.assign(backing->bytes(), count);
+    }
+    if (data.empty())
+        return Value::fromNil();
+#ifdef _WIN32
+    DWORD wrote = 0;
+    if (!WriteFile(sl->h, data.data(), static_cast<DWORD>(data.size()), &wrote, nullptr) ||
+        wrote != data.size())
+        return native_make_error(ctx, "write: could not write the file");
+#else
+    size_t done = 0;
+    while (done < data.size()) {
+        const ssize_t n = ::write(sl->h, data.data() + done, data.size() - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0)
+            return native_make_error(ctx, "write: could not write the file");
+        done += static_cast<size_t>(n);
+    }
+#endif
+    return Value::fromNil();
+}
+
+// rawFileSync(fd) -> nil | String. Asks the OS to write the file's data out to the storage device
+// before returning (FlushFileBuffers / fsync) -- the call a log makes before it may say "saved".
+// On macOS fsync reaches the drive but not necessarily past the drive's own cache, as for every
+// program that uses it.
+static Value native_file_sync(Value* args, uint8_t nargs, Context* ctx) {
+    FileRegistry::Slot* sl = nargs >= 1 ? file_slot(args[0], ctx) : nullptr;
+    if (!sl)
+        return native_make_error(ctx, "sync: file is closed or invalid");
+#ifdef _WIN32
+    if (!FlushFileBuffers(sl->h))
+        return native_make_error(ctx, "sync: could not flush the file");
+#else
+    if (::fsync(sl->h) != 0)
+        return native_make_error(ctx, "sync: could not flush the file");
+#endif
+    return Value::fromNil();
+}
+
+// rawFileClose(fd) -> nil | String. The descriptor goes stale; closing it again is an error.
+static Value native_file_close(Value* args, uint8_t nargs, Context* ctx) {
+    if (nargs < 1 || !args[0].isInt() || !ctx->vm->files || !ctx->vm->files->live(args[0].asSigned48()))
+        return native_make_error(ctx, "close: file is closed or invalid");
+    if (!ctx->vm->files->close(args[0].asSigned48()))
+        return native_make_error(ctx, "close: could not close the file");
+    return Value::fromNil();
+}
+
 // isFile(path) -> Bool (Plain -- no wrap). True iff the path names a regular file (NOT a
 // directory -- the finer complement of fileExists, which is `test -e`). A non-string arg or
 // a lookup error reads as false. Allocates nothing.
@@ -1603,6 +1964,61 @@ static Value native_read_all_stdin(Value*, uint8_t, Context* ctx) {
                     std::istreambuf_iterator<char>());
     GcObject* s = ctx->vm->heap->alloc_string_gc(all, ctx);
     return Value::fromPtr(s->payload());
+}
+
+// flushOutput() -> (). Pushes what this isolate has printed on to the program's stream now, a
+// partial line included: the root's and an actor's `out` is a LineForwardBuf, whose sync writes the
+// partial line and flushes the world's target under its lock. A task's `out` is its private buffer,
+// handed over at join, so there it changes nothing -- which is the task's ordering promise, not a gap.
+// Zero-arg (dummy window base); allocates nothing.
+static Value native_flush_output(Value*, uint8_t, Context* ctx) {
+    if (ctx->vm->out) ctx->vm->out->flush();
+    return Value::fromNil();
+}
+
+// rawWriteErr(s) -> (). What eprint / eprintln lower to: the compiler joins all arguments (and
+// eprintln's newline) into ONE string first, so one call is one piece of text. It is written and
+// flushed under the world's err_m, so lines of different actors and tasks never mix, and it goes
+// out at once -- also from a task, whose ordinary output waits for its join. No world (a hand-built
+// test context): straight to vm->err, else std::cerr. What this isolate printed before is flushed
+// first, so a terminal shows a diagnostic after the output that preceded it (a task's output is its
+// private buffer, so there this changes nothing). Allocates nothing.
+static Value native_write_err(Value* args, uint8_t nargs, Context* ctx) {
+    if (nargs < 1 || !is_string(args[0])) return Value::fromNil();
+    if (ctx->vm->out) ctx->vm->out->flush();
+    const GcObject* o = GcObject::from_slots(args[0].asPtr());
+    const char* bytes = o->bytes();
+    const auto  n     = static_cast<std::streamsize>(o->string_length());
+    World* w = ctx->vm->isolate ? ctx->vm->isolate->world : nullptr;
+    if (w && w->err_target) {
+        std::lock_guard<std::mutex> lk(w->err_m);
+        w->err_target->write(bytes, n);
+        w->err_target->flush();
+    } else {
+        std::ostream& e = ctx->vm->err ? *ctx->vm->err : std::cerr;
+        e.write(bytes, n);
+        e.flush();
+    }
+    return Value::fromNil();
+}
+
+// exit(code) -> never returns. Ends the program with `code` by throwing ProgramExit out of the ROOT
+// execute(); the unwind destroys the world, which runs the program's ordinary end (the root's partial
+// line flushed, every actor told to stop, every thread joined, the I/O thread stopped). An actor or a
+// task cannot end the program: nothing could interrupt the root wherever it waits (a sleep, a join,
+// stdin, accept), so there it is a located fault -- a crash reported to the actor's starter, an Err at
+// the task's join. The code must fit every platform's exit status, 0..255. A hand-built test context
+// has no isolate record and counts as a root.
+static Value native_exit(Value* args, uint8_t nargs, Context* ctx) {
+    if (ctx->vm->isolate && !ctx->vm->isolate->root)
+        raise_located(ctx, "exit ends the whole program, so only the main program may call it; "
+                           "an actor or a task can send the main program a message instead");
+    const Value code = nargs >= 1 ? args[0] : Value::fromNil();
+    if (!code.isInt() || code.asSigned48() < 0 || code.asSigned48() > 255) {
+        const std::string got = code.isInt() ? std::to_string(code.asSigned48()) : std::string("a non-Int");
+        raise_located(ctx, ("exit code must be between 0 and 255, got " + got).c_str());
+    }
+    throw ProgramExit(static_cast<int>(code.asSigned48()));
 }
 
 // f64ToBytes(x) -> Bytes: the 8 raw IEEE-754 bytes of x, little-endian (Plain). Enables a pure-Skarn
@@ -2246,6 +2662,15 @@ static constexpr int64_t SK_POLL_READABLE = 1;
 static constexpr int64_t SK_POLL_WRITABLE = 2;
 static constexpr int64_t SK_POLL_CLOSED   = 4;
 
+// One place turns a poll result into the Skarn flag word, for rawPoll and rawSelectIo alike.
+static inline int64_t sk_poll_flags(short revents) {
+    int64_t flags = 0;
+    if (revents & POLL_READ)                      flags |= SK_POLL_READABLE;
+    if (revents & POLL_WRITE)                     flags |= SK_POLL_WRITABLE;
+    if (revents & (POLLERR | POLLHUP | POLLNVAL)) flags |= SK_POLL_CLOSED;
+    return flags;
+}
+
 // Read a Vec[Int] or Array[Int] argument into host memory. Same shape as rawRun's argv walk: the
 // whole read happens BEFORE any allocation, so nothing here can be moved out from under us.
 static bool read_int_seq(Value v, std::vector<int64_t>* out) {
@@ -2358,14 +2783,8 @@ static Value native_raw_poll(Value* args, uint8_t nargs, Context* ctx) {
     GcObject* arrObj = ctx->vm->heap->alloc_slots_gc(GcObject::KIND_ARRAY, n, ctx);
     Value     arr    = Value::fromPtr(arrObj->payload());
     Value*    slots  = GcObject::from_slots(arr.asPtr())->slots();
-    for (uint32_t i = 0; i < n; ++i) {
-        const short re = pfds[i].revents;
-        int64_t flags = 0;
-        if (re & POLL_READ)                            flags |= SK_POLL_READABLE;
-        if (re & POLL_WRITE)                           flags |= SK_POLL_WRITABLE;
-        if (re & (POLLERR | POLLHUP | POLLNVAL))       flags |= SK_POLL_CLOSED;
-        slots[i] = Value::fromSigned48(flags);   // immediates only -> no further allocation, no root
-    }
+    for (uint32_t i = 0; i < n; ++i)
+        slots[i] = Value::fromSigned48(sk_poll_flags(pfds[i].revents));   // immediates: no root needed
     return arr;
 }
 
@@ -2523,6 +2942,107 @@ static Value native_sha256(Value* args, uint8_t nargs, Context* ctx) {
     Value result;
     bytes_from_str(ctx, &result, std::string(reinterpret_cast<const char*>(dg), 32));
     return result;
+}
+
+// =============================================================================
+// Byte-buffer searching and decimal parsing
+//
+// These three replace loops that std::bytes, std::resp, std::net and std::string used to run in
+// Skarn, one bytecode op per byte. All of them are PURE, TOTAL and NON-ALLOCATING: no safepoint, no
+// GC interaction, and therefore no host copy of the buffer (unlike sha256 above, which allocates its
+// result and so must copy first). Each mirrors the Skarn function it replaces EXACTLY -- malformed
+// input and clamping included -- so the change is invisible to every caller.
+//
+// The checker guarantees the argument types; a wrong kind is only reachable through hand-assembled
+// bytecode and reads as an empty buffer, which is why none of them can trap.
+
+// A read-only view of a KIND_BYTES argument. False (and an empty view) for anything else; TRUE with
+// an empty view for an EMPTY buffer, which is an ordinary argument -- indexOf(s, "") is 0.
+//
+// An empty KIND_BYTES need not own a backing object at all, so the count is read FIRST and the
+// backing slot is only followed when there is something in it. ARRAY_GET does the same thing by
+// bounds-checking before it reads the backing (Interpreter.h).
+static inline bool bytes_view(const Value& v, const char** data, int64_t* size) {
+    *data = nullptr;
+    *size = 0;
+    if (!v.isPtr()) return false;
+    GcObject* hdr = GcObject::from_slots(v.asPtr());
+    if (hdr->kind != GcObject::KIND_BYTES) return false;
+    const int64_t count   = hdr->slots()[BYTES_SLOT_COUNT].asSigned48();
+    const Value   backing = hdr->slots()[BYTES_SLOT_BACKING];
+    if (count <= 0 || !backing.isPtr()) return true;
+    *data = GcObject::from_slots(backing.asPtr())->bytes();
+    *size = count;
+    return true;
+}
+
+// rawIndexOfByte(b: Bytes, target: Int, from: Int) -> Int (Plain; -1 = absent). The body of
+// std::bytes' indexOfByte, which wraps the -1 back into an Option. `from` is clamped up to 0 as that
+// function documents; a target outside 0..255 can never equal a byte, so it answers -1.
+static Value native_index_of_byte(Value* args, uint8_t nargs, Context*) {
+    const char* d;
+    int64_t     n;
+    if (nargs < 3 || !bytes_view(args[0], &d, &n)) return Value::fromSigned48(-1);
+    const int64_t target = args[1].asSigned48();
+    int64_t       from   = args[2].asSigned48();
+    if (from < 0) from = 0;
+    if (from >= n || target < 0 || target > 255) return Value::fromSigned48(-1);
+    const void* hit = std::memchr(d + from, static_cast<int>(target), static_cast<size_t>(n - from));
+    if (!hit) return Value::fromSigned48(-1);
+    return Value::fromSigned48(static_cast<const char*>(hit) - d);
+}
+
+// rawIndexOfBytes(b: Bytes, sub: Bytes, from: Int) -> Int (Plain; -1 = absent). The body of
+// std::string's _strIndexOf, which took one Skarn call per candidate start and one more per byte
+// compared. An EMPTY needle matches at `from` -- indexOf(s, "") == 0, as the guide claims.
+static Value native_index_of_bytes(Value* args, uint8_t nargs, Context*) {
+    const char* d;
+    const char* sub;
+    int64_t     n;
+    int64_t     m;
+    if (nargs < 3 || !bytes_view(args[0], &d, &n) || !bytes_view(args[1], &sub, &m))
+        return Value::fromSigned48(-1);
+    int64_t from = args[2].asSigned48();
+    if (from < 0) from = 0;
+    if (from + m > n) return Value::fromSigned48(-1);
+    if (m == 0) return Value::fromSigned48(from);
+    const char* p    = d + from;
+    const char* last = d + n - m;                       // the last start a match could have
+    while (p <= last) {
+        const void* c = std::memchr(p, static_cast<unsigned char>(sub[0]),
+                                   static_cast<size_t>(last - p + 1));
+        if (!c) break;
+        p = static_cast<const char*>(c);
+        if (std::memcmp(p, sub, static_cast<size_t>(m)) == 0) return Value::fromSigned48(p - d);
+        ++p;
+    }
+    return Value::fromSigned48(-1);
+}
+
+// rawParseIntRange(b: Bytes, lo: Int, hi: Int) -> Int | nil (Option; nil = malformed). The body of
+// std::resp's _int: the decimal integer in b[lo, hi) -- an optional '-' then 1..15 digits -- without
+// the String a parseInt(s) call would need. Deliberately NOT parseInt's domain: the magnitude is
+// capped at 2^47 - 1 in BOTH signs, because the Skarn loop built the value positively and negated it
+// at the end, so -2^47 was already out of reach. An out-of-range window answers None, never a trap.
+static Value native_parse_int_range(Value* args, uint8_t nargs, Context*) {
+    const char* d;
+    int64_t     n;
+    if (nargs < 3 || !bytes_view(args[0], &d, &n)) return Value::fromNil();
+    int64_t i  = args[1].asSigned48();
+    int64_t hi = args[2].asSigned48();
+    if (i < 0 || hi > n || i >= hi) return Value::fromNil();
+    const bool neg = d[i] == '-';
+    if (neg) ++i;
+    if (i >= hi || hi - i > 15) return Value::fromNil();
+    constexpr int64_t MAX_48 = 140737488355327LL;       // 2^47 - 1
+    int64_t v = 0;
+    for (; i < hi; ++i) {
+        const int digit = static_cast<unsigned char>(d[i]) - '0';
+        if (digit < 0 || digit > 9) return Value::fromNil();
+        if (v > MAX_48 / 10 || (v == MAX_48 / 10 && digit > MAX_48 % 10)) return Value::fromNil();
+        v = v * 10 + digit;
+    }
+    return Value::fromSigned48(neg ? -v : v);           // Some payload (immediate)
 }
 
 // =============================================================================
@@ -3394,6 +3914,171 @@ static Value native_select(Value* args, uint8_t nargs, Context* ctx) {
     return Value::fromSigned48(found);
 }
 
+// rawSelectIo(boxes, fds, interest, timeoutMs) -> Array[Int] (success) | String (error).
+//
+// The one wait that covers an actor's INBOXES and its SOCKETS together, which neither existing wait
+// can: rawReceive and rawSelect park on a condition variable, which no socket can wake, and rawPoll
+// watches only sockets. It exists so a connection actor can read its own socket instead of having the
+// world's I/O thread read it and forward the bytes -- one thread crossing per request fewer.
+//
+// The answer is INDEX-PARALLEL to `boxes` ++ `fds`: the first boxes.size() entries are 1 when that
+// inbox has something to read (mail, or the actor's Stop) and 0 otherwise; the rest are rawPoll's flag
+// words for the sockets. Readiness only -- nothing is taken out, so the rawReceive or rawRecvNb that
+// follows cannot block. Unlike rawSelect, which answers ONE index and makes the lowest one a priority,
+// this reports EVERYTHING that is ready: a socket and an inbox are not ranked by the VM.
+//
+// The loop is rawSelect's -- drain, scan, park on an unchanged generation -- with two differences:
+//   * the socket flags always come from a ZERO-TIMEOUT sock_poll, on both platforms. That is what
+//     makes the two agree: Windows' WSAEventSelect signals FD_READ / FD_WRITE on an EDGE, so an event
+//     alone would lose a readiness its caller did not fully consume, while poll() is level-triggered.
+//     Measured, the extra zero-timeout poll costs nothing next to the park.
+//   * the park is the platform's own. POSIX: one sock_poll over the pad's pipe and the sockets.
+//     Windows: WaitForMultipleObjects over the pad's event and one cached WSAEVENT per socket, so at
+//     most MAXIMUM_WAIT_OBJECTS - 1 sockets in one call.
+// See "Waiting on inboxes and sockets at once" in docs/VirtualMachine.md.
+static Value native_select_io(Value* args, uint8_t nargs, Context* ctx) {
+    IsolateLocal* local = ctx->vm->isolate;
+    if (!ctx->vm->net) return native_make_error(ctx, "rawSelectIo: networking unavailable");
+    if (nargs < 4 || !args[3].isInt())
+        return native_make_error(ctx, "rawSelectIo: expected (boxes: Vec[InboxRef], fds: Vec[Int], "
+                                      "interest: Vec[Int], timeoutMs: Int)");
+    std::vector<int64_t> ids, fds, interest;
+    if (!read_handle_seq(args[0], &ids))
+        return native_make_error(ctx, "rawSelectIo: boxes must be a sequence of InboxRef");
+    if (!read_int_seq(args[1], &fds) || !read_int_seq(args[2], &interest))
+        return native_make_error(ctx, "rawSelectIo: fds and interest must be sequences of Int");
+    if (fds.size() != interest.size())
+        return native_make_error(ctx, "rawSelectIo: fds and interest must have the same length");
+    const int64_t ms = args[3].asSigned48();
+    // Nothing to watch and no deadline: no event could ever end this wait, so it is an error rather
+    // than a program that hangs indistinguishably from a crash. rawPoll and rawSelect both refuse it.
+    if (ids.empty() && fds.empty() && ms < 0)
+        return native_make_error(ctx, "rawSelectIo: a negative timeout with nothing to watch would "
+                                      "wait forever");
+    // Every inbox must be one of ours, checked before anything waits; own_mailbox words the two
+    // refusals (someone else's, or closed) exactly as receive and select do.
+    std::vector<Mailbox*> boxes;
+    boxes.reserve(ids.size());
+    for (const int64_t id : ids)
+        boxes.push_back(&own_mailbox(Value::fromSigned48(id), ctx, "selectIo"));
+    if (!local || !local->pad)
+        return native_make_error(ctx, "rawSelectIo: this execution has no inbox (mainInbox first?)");
+    // The sockets, resolved once, as rawPoll resolves them.
+    std::vector<socket_t> socks(fds.size());
+    std::vector<short>    want(fds.size());
+    for (size_t i = 0; i < fds.size(); ++i) {
+        socks[i] = ctx->vm->net->get(fds[i]);
+        if (socks[i] == INVALID_SOCK)
+            return native_make_error(ctx, std::string("rawSelectIo: ")
+                                          + ctx->vm->net->invalid_reason(fds[i]));
+        want[i] = static_cast<short>(((interest[i] & SK_POLL_READABLE) ? POLL_READ  : 0) |
+                                     ((interest[i] & SK_POLL_WRITABLE) ? POLL_WRITE : 0));
+    }
+#ifdef _WIN32
+    if (socks.size() + 1 > MAXIMUM_WAIT_OBJECTS)
+        return native_make_error(ctx, "rawSelectIo: at most 63 sockets in one call on this platform");
+#endif
+    WaitPad& pad = *local->pad;
+    if (!pad.ensure_pollable())
+        return native_make_error(ctx, "rawSelectIo: could not make this isolate's wake");
+#ifdef _WIN32
+    pad.retain_events(fds);     // whatever this caller no longer watches must not keep an association
+#endif
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms < 0 ? 0 : ms);
+    std::vector<int64_t>  ready(boxes.size() + socks.size(), 0);
+    std::vector<pollfd_t> pf;
+    std::string           err;
+    bool                  any = false;
+
+    pad.pollers.fetch_add(1, std::memory_order_relaxed);
+    for (;;) {
+        pad.drain();                       // BEFORE the scan: a wake after this cannot be lost
+        for (size_t i = 0; i < boxes.size(); ++i) {
+            std::lock_guard<std::mutex> lk(boxes[i]->m);
+            if (!boxes[i]->q.empty() || boxes[i]->stop_seen) { ready[i] = 1; any = true; }
+        }
+        if (!socks.empty()) {              // the flags, level-triggered, on both platforms
+            pf.clear();
+            for (size_t i = 0; i < socks.size(); ++i) {
+                pollfd_t p{};
+                p.fd     = socks[i];
+                p.events = want[i];
+                pf.push_back(p);
+            }
+            if (sock_poll(pf.data(), static_cast<unsigned>(pf.size()), 0) < 0) {
+                err = "rawSelectIo: " + net_error_msg("poll");
+                break;
+            }
+            for (size_t i = 0; i < pf.size(); ++i) {
+                const int64_t f = sk_poll_flags(pf[i].revents);
+                if (f) { ready[boxes.size() + i] = f; any = true; }
+            }
+        }
+        if (any) break;
+        int rem = -1;
+        if (ms >= 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) break;    // the deadline passed with nothing to read
+            rem = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       deadline - now).count());
+        }
+#ifdef _WIN32
+        {
+            HANDLE hs[MAXIMUM_WAIT_OBJECTS];
+            DWORD  nh = 0;
+            hs[nh++] = pad.ev;
+            bool ok = true;
+            for (size_t i = 0; i < socks.size(); ++i) {
+                const WSAEVENT we = pad.event_for(fds[i], socks[i], want[i]);
+                if (we == WSA_INVALID_EVENT) { ok = false; break; }
+                hs[nh++] = we;
+            }
+            if (!ok) { err = "rawSelectIo: " + net_error_msg("WSAEventSelect"); break; }
+            const DWORD rc = WaitForMultipleObjects(nh, hs, FALSE,
+                                                    rem < 0 ? INFINITE : static_cast<DWORD>(rem));
+            if (rc == WAIT_FAILED)  { err = "rawSelectIo: WaitForMultipleObjects failed"; break; }
+            if (rc == WAIT_TIMEOUT) break;
+            // A socket's event is edge-triggered and only enumerating it re-arms the association; the
+            // FLAGS come from the zero-timeout poll at the top of the loop, never from here.
+            if (rc > WAIT_OBJECT_0 && rc < WAIT_OBJECT_0 + nh) {
+                const size_t k = static_cast<size_t>(rc - WAIT_OBJECT_0) - 1;
+                WSANETWORKEVENTS ne{};
+                WSAEnumNetworkEvents(socks[k], hs[rc - WAIT_OBJECT_0], &ne);
+            }
+        }
+#else
+        {
+            pf.clear();
+            pollfd_t w{};
+            w.fd     = pad.wake_rd;
+            w.events = POLL_READ;
+            pf.push_back(w);
+            for (size_t i = 0; i < socks.size(); ++i) {
+                pollfd_t p{};
+                p.fd     = socks[i];
+                p.events = want[i];
+                pf.push_back(p);
+            }
+            const int rc = sock_poll(pf.data(), static_cast<unsigned>(pf.size()), rem);
+            if (rc < 0) { err = "rawSelectIo: " + net_error_msg("poll"); break; }
+            if (rc == 0) break;            // the deadline passed
+        }
+#endif
+    }
+    pad.pollers.fetch_sub(1, std::memory_order_relaxed);
+    if (!err.empty()) return native_make_error(ctx, err);
+
+    // One allocation, elements all immediates -- so nothing can move after the array exists and no
+    // rooting is needed (the rawPoll shape).
+    const uint32_t n = static_cast<uint32_t>(ready.size());
+    GcObject* arrObj = ctx->vm->heap->alloc_slots_gc(GcObject::KIND_ARRAY, n, ctx);
+    Value     arr    = Value::fromPtr(arrObj->payload());
+    Value*    slots  = GcObject::from_slots(arr.asPtr())->slots();
+    for (uint32_t i = 0; i < n; ++i) slots[i] = Value::fromSigned48(ready[i]);
+    return arr;
+}
+
 // rawMailMsg(inbox) -> the message rawReceive took, decoded into THIS heap. Once per message.
 static Value native_mail_msg(Value* args, uint8_t nargs, Context* ctx) {
     (void)own_mailbox(nargs >= 1 ? args[0] : Value::fromNil(), ctx, "receive");
@@ -4033,6 +4718,7 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_TCP_LOCAL_PORT] = native_tcp_local_port;
     t[NATIVE_SHA256]       = native_sha256;
     t[NATIVE_OS_ID]        = native_os_id;
+    t[NATIVE_CPU_COUNT]    = native_cpu_count;
     t[NATIVE_SET_NON_BLOCKING] = native_raw_set_non_blocking;
     t[NATIVE_POLL]         = native_raw_poll;
     t[NATIVE_ACCEPT_NB]    = native_raw_accept_nb;
@@ -4064,10 +4750,22 @@ std::vector<NativeFunc> build_native_table() {
     t[NATIVE_STOP_REQUESTED] = native_stop_requested;
     t[NATIVE_SLEEP]        = native_sleep;
     t[NATIVE_SELECT]       = native_select;
+    t[NATIVE_SELECT_IO]    = native_select_io;
     t[NATIVE_ACTIVATE]     = native_activate;
     t[NATIVE_ACTIVE_SEND]  = native_active_send;
     t[NATIVE_ACTIVE_CLOSE] = native_active_close;
     t[NATIVE_ACTIVATE_LISTENER] = native_activate_listener;
     t[NATIVE_ACTIVE_SET_SEND_TIMEOUT] = native_active_set_send_timeout;
+    t[NATIVE_FILE_OPEN]    = native_file_open;
+    t[NATIVE_FILE_READ]    = native_file_read;
+    t[NATIVE_FILE_WRITE]   = native_file_write;
+    t[NATIVE_FILE_SYNC]    = native_file_sync;
+    t[NATIVE_FILE_CLOSE]   = native_file_close;
+    t[NATIVE_FLUSH_OUTPUT] = native_flush_output;
+    t[NATIVE_WRITE_ERR]    = native_write_err;
+    t[NATIVE_EXIT]         = native_exit;
+    t[NATIVE_INDEX_OF_BYTE]   = native_index_of_byte;
+    t[NATIVE_PARSE_INT_RANGE] = native_parse_int_range;
+    t[NATIVE_INDEX_OF_BYTES]  = native_index_of_bytes;
     return t;
 }

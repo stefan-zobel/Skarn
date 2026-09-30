@@ -48,6 +48,16 @@
 // an index instead of recursing. Both are day-one requirements, not hardening: two lines
 // of ordinary Skarn build a self-referential object.
 //
+// WHY NO HASH MAP FOR A SMALL GRAPH. Every actor message goes through here, and a typical
+// one is a handful of nodes, so the fixed costs are what counts. The node table answers
+// "seen before?" by a linear search up to 16 nodes and switches to a flat open-addressing
+// table beyond; a std::unordered_map allocated on construction and once per node. The
+// buffer is sized exactly by the walk and written through one cursor instead of growing
+// by push_back, and the working arrays of both passes are kept per thread. So encoding a
+// small message allocates only its buffer, and decoding it only its root pool. A special
+// case for "small and acyclic" would not save the table: knowing that a graph has no
+// sharing and no cycle takes exactly the lookup it would skip.
+//
 // WHAT IT REFUSES, AND THE ONE IT CANNOT. A KIND_CLOSURE is refused: its captures could
 // be anything and its function id belongs to the sender's image (EQ_DEEP refuses closures
 // for the same reason). A raw native function pointer (TAG_FUNCPTR) is refused. A `Func`
@@ -66,7 +76,6 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 #include "ByteIO.h"
@@ -100,77 +109,200 @@ inline constexpr const char* EOD_MSG = "value codec: buffer ended mid-value";
 // structure by pointer identity instead.
 [[nodiscard]] bool deep_eq(Value a, Value b, Context* ctx);
 
+namespace detail {
+
+// The bytes one slot takes in the buffer: its tag plus that type's payload. encode()
+// sizes its buffer with this and put_slot writes exactly this much, so a disagreement
+// between the two is a bug the bounds-checked writer turns into a throw.
+[[nodiscard]] inline uint32_t slot_bytes(Value::Type t) noexcept {
+    switch (t) {
+    case Value::Type::Pointer: return 1 + 4;          // a u32 node index
+    case Value::Type::Integer:
+    case Value::Type::Double:  return 1 + 8;
+    case Value::Type::Bool:    return 1 + 1;
+    case Value::Type::Error:
+    case Value::Type::Atom:
+    case Value::Type::Func:    return 1 + 4;
+    default:                   return 1;              // Nil / Undef / Tomb; FuncPtr / Unknown throw when written
+    }
+}
+
+// What encode() needs besides its result, kept per THREAD and reused, so that encoding a
+// small message allocates its buffer and nothing else. See "WHY NO HASH MAP" above.
+//   * `nodes` is the node table in first-visit order and doubles as the walk's worklist.
+//   * `ptr_idx` is the node index of every pointer slot, in the order put_slot writes
+//     them, so the write pass never looks a pointer up a second time.
+//   * `table` indexes `nodes` by address once a graph outgrows the linear search: open
+//     addressing, a power of two, at most half full, `EMPTY` marking a free entry.
+// encode() never calls itself and runs no user code, so one set per thread is enough. It
+// is cleared at the START of every call, so an encode that threw leaves nothing behind
+// that the next one could trust.
+struct EncodeScratch {
+    static constexpr uint32_t EMPTY = UINT32_MAX;
+    std::vector<GcObject*> nodes;
+    std::vector<uint32_t>  ptr_idx;
+    std::vector<uint32_t>  table;
+    uint32_t               shift = 0;                 // 64 - log2(table.size()); 0 = no table
+
+    [[nodiscard]] size_t hash_of(const GcObject* o) const noexcept {
+        return static_cast<size_t>((reinterpret_cast<uintptr_t>(o) >> 3) * 0x9E3779B97F4A7C15ull >> shift);
+    }
+    // (Re)build the table from `nodes`, sized for at least `want` entries.
+    void build_table(size_t want) {
+        size_t cap = 64;
+        while (cap < 2 * want) cap *= 2;
+        table.assign(cap, EMPTY);
+        shift = 64 - static_cast<uint32_t>(std::countr_zero(cap));
+        for (uint32_t i = 0; i < nodes.size(); ++i) {
+            size_t h = hash_of(nodes[i]);
+            while (table[h] != EMPTY) h = (h + 1) & (cap - 1);
+            table[h] = i;
+        }
+    }
+    [[nodiscard]] uint32_t find(const GcObject* o) const noexcept {
+        if (shift == 0) {
+            for (uint32_t i = 0; i < nodes.size(); ++i)
+                if (nodes[i] == o) return i;
+            return EMPTY;
+        }
+        const size_t mask = table.size() - 1;
+        for (size_t h = hash_of(o);; h = (h + 1) & mask) {
+            const uint32_t i = table[h];
+            if (i == EMPTY || nodes[i] == o) return i;
+        }
+    }
+    void add(GcObject* o) {
+        const uint32_t idx = static_cast<uint32_t>(nodes.size());
+        nodes.push_back(o);
+        if (shift == 0) {
+            if (nodes.size() > LINEAR_NODES) build_table(nodes.size());
+        } else if (2 * nodes.size() > table.size()) {
+            build_table(nodes.size());
+        } else {
+            size_t h = hash_of(o);
+            while (table[h] != EMPTY) h = (h + 1) & (table.size() - 1);
+            table[h] = idx;
+        }
+    }
+    void reset() noexcept {
+        nodes.clear();
+        ptr_idx.clear();
+        shift = 0;
+    }
+    // After a very large message, give the memory back rather than keep it for the
+    // thread's lifetime.
+    void trim() noexcept {
+        if (nodes.capacity() > KEEP || ptr_idx.capacity() > KEEP || table.capacity() > 2 * KEEP) {
+            std::vector<GcObject*>().swap(nodes);
+            std::vector<uint32_t>().swap(ptr_idx);
+            std::vector<uint32_t>().swap(table);
+        }
+        shift = 0;
+    }
+    // Up to this many nodes a linear search over `nodes` beats hashing.
+    static constexpr size_t LINEAR_NODES = 16;
+    static constexpr size_t KEEP         = 64 * 1024;
+};
+
+[[nodiscard]] inline EncodeScratch& encode_scratch() {
+    static thread_local EncodeScratch s;
+    return s;
+}
+
+} // namespace detail
+
 // =============================================================================
 // encode -- value graph -> bytes. Allocates nothing on the GC heap, so the graph
-// cannot move underneath it (the property EQ_DEEP relies on for the same reason).
+// cannot move underneath it (the property EQ_DEEP relies on for the same reason). On
+// the C++ heap it allocates the result, sized exactly, and nothing else once the
+// thread's scratch has grown to the message size.
 // =============================================================================
 [[nodiscard]] inline std::vector<uint8_t> encode(Value root) {
-    std::unordered_map<const void*, uint32_t> index;   // payload pointer -> node index
-    std::vector<GcObject*>                    nodes;   // by index
+    detail::EncodeScratch& sc = detail::encode_scratch();
+    sc.reset();
+    struct Trim {
+        detail::EncodeScratch& sc;
+        ~Trim() { sc.trim(); }
+    } trim{ sc };
+
+    size_t size = 4;                                   // node_count
 
     auto intern = [&](Value v) -> uint32_t {
-        void* p = v.asPtr();
-        if (auto it = index.find(p); it != index.end())
-            return it->second;                          // shared or cyclic: reuse the index
-        GcObject* o = GcObject::from_slots(p);
+        GcObject* o = GcObject::from_slots(v.asPtr());
+        if (const uint32_t idx = sc.find(o); idx != detail::EncodeScratch::EMPTY)
+            return idx;                                // shared or cyclic: reuse the index
         if (o->kind == GcObject::KIND_CLOSURE)
             throw ValueCodecError("value codec: a closure cannot be copied "
                                   "(its captures and its function id belong to one image)");
-        const uint32_t idx = static_cast<uint32_t>(nodes.size());
-        index.emplace(p, idx);
-        nodes.push_back(o);
+        size += 1 + 4;                                 // kind, then slot count or byte length
+        if (o->kind == GcObject::KIND_STRING) size += o->string_length();
+        else if (o->kind == GcObject::KIND_OBJECT) size += 2;
+        const uint32_t idx = static_cast<uint32_t>(sc.nodes.size());
+        sc.add(o);
         return idx;
     };
 
     // Reachability walk. The worklist IS `nodes`: interning appends, and the loop
     // re-reads the growing size. `o` is a copy of the element, not a reference into the
     // vector, so a reallocation inside intern() cannot invalidate it -- and heap objects
-    // themselves never move here, because nothing allocates.
-    if (root.isPtr()) intern(root);
+    // themselves never move here, because nothing allocates. The walk visits the slots
+    // in exactly the order the write pass below emits them (node by node, slot by slot),
+    // which is what lets it record each pointer's node index for that pass.
+    const uint32_t root_idx = root.isPtr() ? intern(root) : 0;
 
-    for (size_t i = 0; i < nodes.size(); ++i) {
-        GcObject* o = nodes[i];
+    for (size_t i = 0; i < sc.nodes.size(); ++i) {
+        GcObject* o = sc.nodes[i];
         if (o->kind == GcObject::KIND_STRING) continue;       // raw bytes, no references
         Value* s = o->slots();
         // Every slot within slot_count is a live Value, Nil or Undefined -- never a stale
         // pointer: vec_pop clears the slot it vacates ("unpin from GC", op_vec.h), and a
         // fresh backing is Undefined-filled by the allocator. So a container's whole
         // backing may be walked and copied, tail included, without chasing garbage.
-        for (uint32_t k = 0, n = o->slot_count(); k < n; ++k)
-            if (s[k].isPtr()) intern(s[k]);
+        for (uint32_t k = 0, n = o->slot_count(); k < n; ++k) {
+            const Value::Type t = s[k].type();
+            size += detail::slot_bytes(t);
+            if (t == Value::Type::Pointer) {
+                const uint32_t idx = intern(s[k]);
+                sc.ptr_idx.push_back(idx);
+            }
+        }
     }
+    size += detail::slot_bytes(root.type());
 
-    std::vector<uint8_t> out;
-    byteio::put_u32(out, static_cast<uint32_t>(nodes.size()));
+    std::vector<uint8_t> out(size);
+    byteio::WriterT<ValueCodecError> w{ out.data(), out.data() + out.size(),
+                                        "value codec: internal error, the buffer was sized too small" };
+    w.u32(static_cast<uint32_t>(sc.nodes.size()));
 
-    for (GcObject* o : nodes) {
-        byteio::put_u8(out, o->kind);
+    for (GcObject* o : sc.nodes) {
+        w.u8(o->kind);
         if (o->kind == GcObject::KIND_STRING) {
             const uint32_t n = static_cast<uint32_t>(o->string_length());
-            byteio::put_u32(out, n);
-            out.insert(out.end(), o->bytes(), o->bytes() + n);   // the NUL is re-added on alloc
+            w.u32(n);
+            w.bytes(o->bytes(), n);                    // the NUL is re-added on alloc
         } else {
-            byteio::put_u32(out, o->slot_count());
+            w.u32(o->slot_count());
             if (o->kind == GcObject::KIND_OBJECT)
-                byteio::put_u16(out, o->object_type_id());
+                w.u16(o->object_type_id());
         }
     }
 
-    auto put_slot = [&](Value v) {
+    size_t next_ptr = 0;
+    auto put_slot = [&](Value v, bool is_root) {
         const Value::Type t = v.type();
-        byteio::put_u8(out, static_cast<uint8_t>(t));
+        w.u8(static_cast<uint8_t>(t));
         switch (t) {
-        case Value::Type::Pointer: byteio::put_u32(out, index.at(v.asPtr()));                    break;
-        case Value::Type::Integer: byteio::put_u64(out, static_cast<uint64_t>(v.asSigned48()));  break;
+        case Value::Type::Pointer: w.u32(is_root ? root_idx : sc.ptr_idx[next_ptr++]);  break;
+        case Value::Type::Integer: w.u64(static_cast<uint64_t>(v.asSigned48()));      break;
         // The IEEE bit pattern, not the decimal form: exact, and no formatting anywhere.
-        case Value::Type::Double:  byteio::put_u64(out, std::bit_cast<uint64_t>(v.asDouble()));  break;
-        case Value::Type::Bool:    byteio::put_u8 (out, v.asBool() ? 1 : 0);                     break;
-        case Value::Type::Error:   byteio::put_u32(out, v.asErrorCode());                        break;
-        case Value::Type::Atom:    byteio::put_u32(out, v.asAtomId());                           break;
-        case Value::Type::Func:    byteio::put_u32(out, v.asFuncId());                           break;
+        case Value::Type::Double:  w.u64(std::bit_cast<uint64_t>(v.asDouble()));      break;
+        case Value::Type::Bool:    w.u8(v.asBool() ? 1 : 0);                           break;
+        case Value::Type::Error:   w.u32(v.asErrorCode());                             break;
+        case Value::Type::Atom:    w.u32(v.asAtomId());                                break;
+        case Value::Type::Func:    w.u32(v.asFuncId());                                break;
         case Value::Type::Nil:
         case Value::Type::Undef:
-        case Value::Type::Tomb:    /* the tag alone carries it */                                break;
+        case Value::Type::Tomb:    /* the tag alone carries it */                      break;
         case Value::Type::FuncPtr:
             throw ValueCodecError("value codec: a native function pointer cannot be copied");
         case Value::Type::Unknown:
@@ -179,12 +311,15 @@ inline constexpr const char* EOD_MSG = "value codec: buffer ended mid-value";
         }
     };
 
-    for (GcObject* o : nodes) {
+    for (GcObject* o : sc.nodes) {
         if (o->kind == GcObject::KIND_STRING) continue;
         Value* s = o->slots();
-        for (uint32_t k = 0, n = o->slot_count(); k < n; ++k) put_slot(s[k]);
+        for (uint32_t k = 0, n = o->slot_count(); k < n; ++k)
+            put_slot(s[k], false);
     }
-    put_slot(root);
+    put_slot(root, true);
+    if (w.p != w.end)
+        throw ValueCodecError("value codec: internal error, the buffer was sized too large");
     return out;
 }
 
@@ -261,6 +396,37 @@ inline constexpr const char* EOD_MSG = "value codec: buffer ended mid-value";
 // position, a duplicate key, an odd immediate in a field. Those produce wrong answers,
 // not out-of-bounds accesses.
 // =============================================================================
+namespace detail {
+
+// One node of a buffer being decoded: its descriptor, how often a slot refers to it, and
+// -- for a container header -- which node its slot 0 (the backing) named.
+struct DecodeNode {
+    static constexpr uint32_t NO_NODE = UINT32_MAX;
+    const char* str     = nullptr;   // a string's bytes, inside the buffer
+    uint32_t    n       = 0;         // slot count, or byte length for a string
+    uint32_t    refs    = 0;
+    uint32_t    backing = NO_NODE;
+    uint16_t    type_id = 0;
+    uint8_t     kind    = 0;
+};
+
+// decode()'s node table, kept per THREAD and reused like encode()'s scratch. decode()
+// cannot re-enter itself on one thread: the collections its allocations may run touch
+// only the heap and its roots, and call no user code and no decode.
+struct DecodeScratch {
+    std::vector<DecodeNode> nodes;
+    void trim() noexcept {
+        if (nodes.capacity() > EncodeScratch::KEEP) std::vector<DecodeNode>().swap(nodes);
+    }
+};
+
+[[nodiscard]] inline DecodeScratch& decode_scratch() {
+    static thread_local DecodeScratch s;
+    return s;
+}
+
+} // namespace detail
+
 [[nodiscard]] inline Value decode(const uint8_t* data, size_t size,
                                   Heap& dst, Context* ctx, RootedValuePool& pool,
                                   const StructType* types, std::size_t type_count) {
@@ -272,17 +438,20 @@ inline constexpr const char* EOD_MSG = "value codec: buffer ended mid-value";
 
     Reader r{ data, size, EOD_MSG };
     const uint32_t count = r.u32();
+    // Every descriptor takes at least 5 bytes, so a count the buffer cannot hold is a
+    // truncated buffer -- refused before the node table is sized by it.
+    if (count > (size - r.pos) / 5)
+        throw ValueCodecError(EOD_MSG);
 
-    struct Desc {
-        uint8_t     kind    = 0;
-        uint32_t    n       = 0;   // slot count, or byte length for a string
-        uint16_t    type_id = 0;
-        const char* str     = nullptr;
-    };
-    std::vector<Desc> descs;
-    descs.reserve(count);
+    detail::DecodeScratch& sc = detail::decode_scratch();
+    struct Trim {
+        detail::DecodeScratch& sc;
+        ~Trim() { sc.trim(); }
+    } trim{ sc };
+    std::vector<detail::DecodeNode>& descs = sc.nodes;
+    descs.assign(count, detail::DecodeNode{});
     for (uint32_t i = 0; i < count; ++i) {
-        Desc d;
+        detail::DecodeNode& d = descs[i];
         d.kind = r.u8();
         switch (d.kind) {
         case GcObject::KIND_STRING:
@@ -319,7 +488,6 @@ inline constexpr const char* EOD_MSG = "value codec: buffer ended mid-value";
         default:
             throw ValueCodecError("value codec: unknown object kind in buffer");
         }
-        descs.push_back(d);
     }
 
     // Size the pool ONCE and root every slot BEFORE the first allocation: the addresses
@@ -334,8 +502,8 @@ inline constexpr const char* EOD_MSG = "value codec: buffer ended mid-value";
     // pointer slot lies inside the active semispace, so an object must never hold a
     // source-heap pointer, not even briefly.
     for (uint32_t i = 0; i < count; ++i) {
-        const Desc& d = descs[i];
-        GcObject*   o = nullptr;
+        const detail::DecodeNode& d = descs[i];
+        GcObject*                 o = nullptr;
         if (d.kind == GcObject::KIND_STRING)
             o = dst.alloc_string_gc(std::string_view(d.str, d.n), ctx);
         else if (d.kind == GcObject::KIND_OBJECT)
@@ -351,9 +519,8 @@ inline constexpr const char* EOD_MSG = "value codec: buffer ended mid-value";
     // worst a wrong VALUE -- never a forged pointer, and never an address the collector
     // would then try to follow. Each node reference is counted, and the index of the one
     // read last is kept, for the backing checks after the patch pass.
-    constexpr uint32_t   NO_NODE = UINT32_MAX;
-    std::vector<uint32_t> refs(count, 0);
-    uint32_t              last_node = NO_NODE;
+    constexpr uint32_t NO_NODE   = detail::DecodeNode::NO_NODE;
+    uint32_t           last_node = NO_NODE;
     auto read_slot = [&]() -> Value {
         last_node = NO_NODE;
         switch (static_cast<Value::Type>(r.u8())) {
@@ -361,7 +528,7 @@ inline constexpr const char* EOD_MSG = "value codec: buffer ended mid-value";
             const uint32_t idx = r.u32();
             if (idx >= count)
                 throw ValueCodecError("value codec: node reference out of range");
-            ++refs[idx];
+            ++descs[idx].refs;
             last_node = idx;
             return pool.slots[idx];
         }
@@ -382,13 +549,12 @@ inline constexpr const char* EOD_MSG = "value codec: buffer ended mid-value";
     // --- patch pass. Allocates nothing, therefore collects nothing, therefore every
     // pointer written here stays valid for the rest of the pass. -----------------------
     // A header's backing is its slot 0; remember which node that was.
-    std::vector<uint32_t> backing_of(count, NO_NODE);
     for (uint32_t i = 0; i < count; ++i) {
         if (descs[i].kind == GcObject::KIND_STRING) continue;
         Value* s = GcObject::from_slots(pool.slots[i].asPtr())->slots();
         for (uint32_t k = 0; k < descs[i].n; ++k) {
             s[k] = read_slot();
-            if (k == 0) backing_of[i] = last_node;
+            if (k == 0) descs[i].backing = last_node;
         }
     }
     const Value root = read_slot();
@@ -401,11 +567,11 @@ inline constexpr const char* EOD_MSG = "value codec: buffer ended mid-value";
         const uint8_t kind = descs[i].kind;
         if (kind != GcObject::KIND_VEC && kind != GcObject::KIND_BYTES && kind != GcObject::KIND_MAP)
             continue;
-        const uint32_t b = backing_of[i];
+        const uint32_t b = descs[i].backing;
         const uint8_t  want = kind == GcObject::KIND_BYTES ? GcObject::KIND_STRING : GcObject::KIND_ARRAY;
         if (b == NO_NODE || descs[b].kind != want)
             throw ValueCodecError("value codec: container backing has the wrong kind");
-        if (refs[b] != 1)
+        if (descs[b].refs != 1)
             throw ValueCodecError("value codec: container backing is shared");
         const Value* h = GcObject::from_slots(pool.slots[i].asPtr())->slots();
         const uint64_t cap = descs[b].n;   // slots, or bytes for a Bytes backing

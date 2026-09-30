@@ -72,18 +72,10 @@ impl[K, V] IntoIterator[(K, V)] for Map[K, V] { fn intoIter(self) -> dyn Iterato
 // Keeping the source String around and calling slice(s, ..) per field would re-run toBytes over
 // the WHOLE input for every field -- i.e. O(n^2) over the split as a whole.
 struct SplitCursor { b: Bytes, sep: Bytes, pos: Int, done: Bool }
-fn _strMatchAt(b: Bytes, sep: Bytes, at: Int, i: Int) -> Bool {
-  if i >= len(sep) { true } else if at + i >= len(b) { false }
-  else if b[at + i] != sep[i] { false } else { _strMatchAt(b, sep, at, i + 1) }
-}
-fn _strIndexOf(b: Bytes, sep: Bytes, from: Int) -> Int {
-  if from + len(sep) > len(b) { -1 } else if _strMatchAt(b, sep, from, 0) { from }
-  else { _strIndexOf(b, sep, from + 1) }
-}
 impl Iterator[String] for SplitCursor {
   fn next(mut self) -> Option[String] {
     if self.done { None } else {
-      let k = _strIndexOf(self.b, self.sep, self.pos)
+      let k = rawIndexOfBytes(self.b, self.sep, self.pos)
       if k < 0 {
         let field = sliceBytes(self.b, self.pos, len(self.b))  self.done = true  Some(field)
       } else {

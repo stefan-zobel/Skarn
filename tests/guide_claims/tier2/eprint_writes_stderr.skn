@@ -1,0 +1,7 @@
+// CLAIM: eprint / eprintln write to standard error, variadic without a separator like print /
+//        println, and nothing of it reaches standard output.
+// GUIDE: SkarnGuide.md §22 "Printing"; SkarnStdlib.md §1
+// EXPECT: warn to stderr: 42 true 2.5
+eprint("to stderr: ", 42)
+eprintln(" ", true, " ", 2.5)
+eprintln()

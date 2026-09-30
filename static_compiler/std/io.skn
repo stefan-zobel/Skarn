@@ -6,3 +6,51 @@ pub fn readTextFile(path: String) -> Result[String, String] { match readFile(pat
 pub fn writeTextFile(path: String, s: String) -> Result[(), String] { writeFile(path, toBytes(s)) }
 pub fn appendTextFile(path: String, s: String) -> Result[(), String] { appendFile(path, toBytes(s)) }
 
+// --- File: an open file that stays open between calls ---------------------------------------------
+//
+// The path-based natives above open and close the file on every call. A File keeps it open, so a
+// program can append to a log without reopening it, read a large file in pieces, and ask with
+// `sync()` for the data to reach the disk. A File belongs to the actor (or task) that opened it: it
+// cannot be sent in a message. One left open is closed when the program ends; close it yourself.
+
+// How `openFile` opens: Read an existing file; Write creates the file or empties it; Append creates it
+// if absent and puts every write at its end.
+pub enum FileMode { Read, Write, Append }
+
+// An open file. `fd` is a descriptor the runtime issued; after `close()` it is refused.
+pub struct File { fd: Int }
+
+// Open `path` in `mode`.
+pub fn openFile(path: String, mode: FileMode) -> Result[File, String] {
+  let m = match mode { FileMode::Read => 0, FileMode::Write => 1, FileMode::Append => 2 }
+  let fd = rawFileOpen(path, m)?
+  Ok(File { fd: fd })
+}
+
+impl File {
+  // Read at most `max` bytes from the current position. An EMPTY result means the end of the file.
+  fn read(self, max: Int) -> Result[Bytes, String] { rawFileRead(self.fd, max) }
+
+  // Read everything from the current position to the end of the file.
+  fn readAll(self) -> Result[Bytes, String] {
+    let mut out = bytes()
+    loop {
+      let chunk = rawFileRead(self.fd, 65536)?
+      if len(chunk) == 0 { return Ok(out) }
+      appendBytes(out, chunk)
+    }
+  }
+
+  // Write a whole byte buffer. In Append mode it lands at the end of the file in one piece, even when
+  // other actors append to the same file.
+  fn write(self, data: Bytes) -> Result[(), String] { rawFileWrite(self.fd, data) }
+
+  // Write a whole string's bytes.
+  fn writeStr(self, s: String) -> Result[(), String] { rawFileWrite(self.fd, toBytes(s)) }
+
+  // Ask the operating system to write the file's data out to the storage device, and wait for it.
+  fn sync(self) -> Result[(), String] { rawFileSync(self.fd) }
+
+  // Close the file. A second close returns an Err.
+  fn close(self) -> Result[(), String] { rawFileClose(self.fd) }
+}

@@ -53,6 +53,8 @@ but not run.
 23. [`std::supervisor`](#23-stdsupervisor)
 24. [`std::regex`](#24-stdregex)
 25. [`std::log`](#25-stdlog)
+26. [`std::resp`](#26-stdresp)
+27. [`std::deque`](#27-stddeque)
 
 ---
 
@@ -66,13 +68,23 @@ helps where a definition of your own shadows it.
 | Function | Purpose |
 |----------|---------|
 | `print(a, ...)` / `println(a, ...)` | write values to standard output (`println` adds a newline) |
+| `eprint(a, ...)` / `eprintln(a, ...)` | the same to standard error, for diagnostics |
 | `toString(x)` | render any value as text |
-| `panic(msg)` | abort the program with a message |
+| `panic(msg)` | abort the program with a message, its source position and a call trace — for a bug; an error a user caused ends with [`exit`](#ending-the-program) |
 | `assert(cond, msg)` | abort if `cond` is false |
 | `gcStats()` / `gcResetStats()` | the garbage collector's counters since the start or the last reset → `GcStats` / clear them, so a region can be measured: `gcResetStats()`, the code, then `gcStats()` |
 
 `print` and `println` accept any value and several arguments; the guide shows them in
-[§22](SkarnGuide.md#printing). A `GcStats` is a plain struct of `Double` counters — `collections`,
+[§22](SkarnGuide.md#printing). Output goes out line by line, also into a pipe or a file: a line reaches
+the reader as soon as it is complete, and within a few milliseconds when many lines come in a row. Text
+without a newline waits for one, or for [`flushOutput()`](#standard-output) from `std::io`.
+
+`eprint` and `eprintln` take the same arguments and write to standard error, where a program's
+diagnostics belong: someone who redirects the output to a file still sees them. Each call goes out at
+once and in one piece, so lines from several actors never mix, and whatever the program printed to
+standard output before is written out first, so a terminal shows the two in the order they happened.
+
+A `GcStats` is a plain struct of `Double` counters — `collections`,
 `objectsAlloced`, `bytesAlloced`, `fromUsedSum`, `survivorsSum`, `gcNanosTotal`, `gcNanosMax` and
 `growEvents`; a `Double` holds them exactly, where a 48-bit `Int` might not.
 
@@ -318,8 +330,8 @@ Each section below starts with the `use` that brings the module in. The guide's
 
 ## 8. `std::io`: files and standard input
 
-Files — read / write / append, copy, rename, delete, `mkdir`, `listDir`, stat — and standard input.
-`use std::io::*`
+Files — read / write / append, copy, rename, delete, `mkdir`, `listDir`, stat, files kept open — and
+standard input. `use std::io::*`
 
 | Function | Purpose |
 |----------|---------|
@@ -327,7 +339,13 @@ Files — read / write / append, copy, rename, delete, `mkdir`, `listDir`, stat 
 | `readTextFile` / `writeTextFile` / `appendTextFile` | the same as `String` (byte wrappers over the above) |
 | `fileExists` / `isFile` / `isDir` / `fileSize` | entry / regular-file / directory query, byte length |
 | `deleteFile` / `rename` / `copyFile` / `listDir` / `mkdir` | delete / move / copy / list / make directory |
+| `openFile(path, mode) -> Result[File, String]` | open a file and keep it open; `FileMode::Read` / `Write` / `Append` |
+| `f.read(max)` / `f.readAll()` | read at most `max` bytes (empty = end of file) / the rest of the file, as `Bytes` |
+| `f.write(bytes)` / `f.writeStr(s)` | write at the current position; in `Append` mode at the end, in one piece |
+| `f.sync()` | wait until the operating system has written the file's data to the storage device |
+| `f.close()` | close the file; any later use of `f` is an `Err` |
 | `readLine()` / `readAllStdin()` | read a line / all of standard input |
+| `flushOutput()` | write out now what the program has printed, a line without its newline included |
 
 ### Files
 
@@ -363,10 +381,72 @@ println("isFile: " + isFile(path))                        // => isFile: true   (
 `copyFile(from, to)` move / copy a file (both `Result[(), String]`); `copyFile` fails if the destination
 already exists.
 
+### Files that stay open
+
+The functions above open and close the file on every call. `openFile(path, mode)` returns a `File` that
+stays open until `f.close()`, which is what a log, or a large file read in pieces, wants:
+
+- `FileMode::Read` opens an existing file; `FileMode::Write` creates the file or empties it;
+  `FileMode::Append` creates it if absent and puts every write at its end.
+- `f.read(max)` returns at most `max` bytes, and empty `Bytes` at the end of the file; `f.readAll()`
+  returns the rest.
+- `f.sync()` returns once the operating system has written the file's data to the storage device — the
+  call to make before telling anyone that something is saved. Without it the data may still sit in the
+  operating system's cache when the machine loses power.
+- In `Append` mode each `f.write` lands at the end in one piece, even when other actors append to the
+  same file through their own `File`s.
+
+```rust
+use std::io::*
+
+fn logTwice(path: String) -> Result[String, String] {
+    let log = openFile(path, FileMode::Write)?
+    log.writeStr("first\n")?
+    log.writeStr("second\n")?
+    log.sync()?
+    log.close()?
+    let f = openFile(path, FileMode::Read)?
+    let head = fromBytes(f.read(5)?)                      // at most 5 bytes: "first"
+    let rest = fromBytes(f.readAll()?)                    // the rest: "\nsecond\n"
+    f.close()?
+    Ok(head + " / " + trim(rest))
+}
+
+match logTwice("log.txt") {
+    Ok(s)  => println(s),                                 // => first / second
+    Err(e) => println("failed: " + e)
+}
+```
+
+A `File` belongs to the actor or task that opened it and cannot be sent in a message. One that is never
+closed is closed when the program ends.
+
 ### Standard input
 
 `readLine()` reads one line as an `Option[String]` (`None` at end of input); `readAllStdin()` reads everything
-to end of input as one `String`.
+to end of input as one `String`. Both first write out whatever has been printed, so a prompt printed without a
+newline is shown before the program waits.
+
+### Standard output
+
+Complete lines need nothing: they go out on their own (see [§1](#1-core-and-output)). `flushOutput()`
+writes out now what the program has printed so far, including a line that has no newline yet — a progress
+mark, or a prompt before work that takes a while. In an actor it writes that actor's
+output. A task's output reaches the program when the task is joined, so there it changes nothing.
+
+```rust
+use std::io::*
+
+print("adding up ... ")
+flushOutput()                                             // on the screen before the loop runs
+let mut sum = 0
+let mut i = 1
+while i <= 1000 {
+    sum += i
+    i += 1
+}
+println(sum)                                              // => adding up ... 500500
+```
 
 ## 9. `std::env`: arguments, environment, clocks
 
@@ -408,16 +488,19 @@ println("elapsed >= 0: " + (t1 - t0 >= 0))   // => elapsed >= 0: true
 
 ## 10. `std::process`: running programs
 
-Run an external command and capture its output, and ask which platform you are on. `use std::process::*`
+Run an external command and capture its output, ask which platform you are on and how much of it you get,
+and end the program with an exit code. `use std::process::*`
 
 | Function | Purpose |
 |----------|---------|
 | `run(argv)` / `runText(argv)` / `sh(cmdline)` | spawn a process and capture its output (`sh` goes through the platform's shell) |
 | `runWith(argv, input)` | as `run`, with `input: Bytes` fed to the child's standard input |
+| `currentOs()` | which platform the program is running on (`Os::Windows` / `Os::MacOS` / `Os::Other`) |
+| `cpuCount()` | how many threads this program can really run at once → `Int`, never below 1 ([How many cores do I get?](#how-many-cores-do-i-get)) |
+| `exit(code)` | end the program with an exit code from 0 to 255 ([Ending the program](#ending-the-program)) |
 
 `run`, `runWith` and `sh` return a `ProcessOutput` — `stdout` and `stderr` as `Bytes`, and `exitCode` —
 and `runText` a `ProcessText`, the same with both streams decoded to `String`.
-| `currentOs()` | which platform the program is running on (`Os::Windows` / `Os::MacOS` / `Os::Other`) |
 
 ### Running processes
 
@@ -459,6 +542,58 @@ println("running on " + label)
 `Os::Other` covers everything that is neither: Skarn is built and tested on Windows x64 and macOS on Apple
 Silicon, and rather than guess at a third platform's name it puts them all in one arm.
 
+### How many cores do I get?
+
+`cpuCount()` answers how many threads this program can really run at the same time. That is not quite the
+same question as how many cores the machine has: it is what the operating system grants *this process*, so
+a program pinned to two of twelve logical CPUs is told 2, not 12. It is never below 1.
+
+```rust
+use std::process::*
+
+let n = cpuCount()
+println(toString(n >= 1))   // => true
+```
+
+It is a sensible *starting size* for a pool of workers, shards or tasks — and no more than that. How many
+a given program actually wants has to be measured: a worker that waits on I/O more than it computes can
+use more threads than there are cores, and one that contends on a shared structure is often fastest with
+fewer. Take it as the number to start measuring from, not the number to use.
+
+### Ending the program
+
+`exit(code)` ends the program with that exit code, and never returns — so, like `panic`, it has type
+`Never` and fits where any value is expected. It is how a program reports a failure its user caused, a
+bad option or a port already taken: the message goes to standard error with `eprintln`, the code tells a
+script or a shell that it failed, and nothing else is printed. `panic` is for bugs, and adds a source
+position and a call trace meant for the programmer.
+
+```rust
+use std::process::*
+
+fn port(text: String) -> Result[Int, String] {
+    let n = parseInt(text)?
+    if n < 1 || n > 65535 {
+        return Err("port out of range: ${n}")
+    }
+    Ok(n)
+}
+
+match port("8080") {
+    Ok(p) => println("listening on ${p}"),   // => listening on 8080
+    Err(e) => {
+        eprintln("server: " + e)
+        exit(2)
+    }
+}
+```
+
+The program ends the way it ends on its own: what it printed goes out, a line without a newline too,
+every actor is told to stop and waited for, and so is every task. The code must be between 0 and 255 —
+the range every platform keeps — or `exit` is a run-time error. Only the main program may call it: in an
+actor it is a crash, reported to the actor's starter, and in a task the `join` returns the error. An
+actor that decides the program must end tells the main program, which calls `exit`.
+
 ## 11. `std::math`
 
 Roots, powers, logarithms, trigonometry, `gcd`/`lcm`, generic `minOf`/`maxOf`/`clamp`, `PI`/`E`, and the
@@ -490,6 +625,8 @@ A little-endian binary reader/writer over `Bytes`, with varints and length-prefi
 | `writeVarI(b,v)` | append a signed `Int` as a zigzag varint (compact for small magnitudes); returns `b` |
 | `writeStr(b,s)` | append a length-prefixed `String` (varU byte-length + raw bytes); returns `b` |
 | `writeBytes(b,src)` | append the raw bytes of `src`; returns `b` |
+| `indexOfByte(b, x, from)` | the index of the first byte equal to `x` at or after `from` → `Option[Int]` |
+| `subBytes(b, lo, hi)` | the bytes `b[lo, hi)` as a new buffer (one bulk copy; the bounds are clamped, like `sliceBytes`'s) |
 | `ByteReader::new(b)` | a `ByteReader` cursor over `b` (`pos` starts at 0) |
 | `r.readU8()` / `r.readU16LE()` / `r.readU32LE()` / `r.readI32LE()` | read a 1/2/4-byte value → `Result[Int, String]` (`Err` on underrun) |
 | `r.readVarU()` / `r.readVarI()` | read an unsigned LEB128 / a signed zigzag varint → `Result[Int, String]` |
@@ -820,6 +957,7 @@ program; builds on `std::net`, and `connect` stays blocking. The guide shows it 
 | `c.send(bytes)` / `c.sendStr(s)` | offer bytes → `Result[Int, String]`, the count the kernel **accepted** (may be short, or 0). There is no send-all: keep the tail and retry when `WRITABLE` |
 | `l.close()` / `c.close()` | close and free the descriptor → `Result[(), String]`. A closed descriptor must leave the `fds` vector |
 | `l.fd` / `c.fd` | the descriptor — what goes into `fds`, and the natural key for the program's own state `Map` |
+| `selectIo(boxes, fds, interest, ms)` | wait until one of an actor's inboxes has something OR one of `fds` is ready → `Result[Array[Int], String]`, **index-parallel to `boxes` followed by `fds`** (free). `boxes` holds `inbox.ref()` tokens as `select` takes them; the first `len(boxes)` entries are 1 when that inbox has something and 0 otherwise, the rest are `poll`'s flag words. Test them in the order that matters to you — unlike `select` it ranks nothing. It is the one wait that covers both, so an actor can read its own socket instead of handing the reading to the runtime. **Not always the right one:** waiting on a socket does not spin first, so an actor whose partner answers within a few microseconds is measurably better off in `select`, and `c.activate` stays the answer for line framing, back-pressure, an activated listener or a deadline that closes a client that stopped reading. At most 63 sockets per call on Windows |
 
 ## 21. `std::task`: parallel tasks
 
@@ -941,3 +1079,128 @@ A `Log` — its `Sink`, `Sink::ToFile(path)` or `Sink::ToActor(pid)`, and its mi
 data, so it is sendable: an actor is handed its logger in its start value. Stop a logger
 actor **last** — `Stop` is queued at the end of a mailbox, so everything already sent is written, but a line
 sent after it has ended is dropped.
+
+## 26. `std::resp`
+
+RESP2, the protocol Redis speaks: a value type, an encoder, an incremental decoder for a server, and a
+blocking client. It builds on `std::bytes` and `std::net` and re-exports neither. `use std::resp::*`
+
+A complete server built on this module: [Sedis](https://github.com/stefan-zobel/Sedis), a Redis-compatible
+key-value store written in Skarn, in a repository of its own.
+
+| Function | Purpose |
+|----------|---------|
+| `Resp::Simple(s)` / `Error(s)` / `Integer(n)` / `Bulk(s)` / `Null` / `Arr(items)` / `NullArray` | the seven kinds of value; a bulk string holds any bytes |
+| `appendSimple(out, s)` / `appendError(out, message)` / `appendInteger(out, n)` / `appendBulk(out, s)` | write one value onto `out: Bytes`; returns `out`. A line break in a simple string or an error is written as a space |
+| `appendNull(out)` / `appendNullArray(out)` / `appendArrayHeader(out, n)` | the null bulk string / the null array / the header of an array of `n` values, which follow |
+| `appendResp(out, r)` | any value, arrays included |
+| `r.encode()` | a value on the wire → `Bytes` |
+| `r.render()` | a value as redis-cli shows it: `OK`, `"text"`, `(integer) 3`, `(nil)`, `(error) ERR …`, numbered lines for an array |
+| `appendCommand(out, args)` | a command, `Vec[String]`, onto `out`: the array header and one bulk string per word. Cheaper than `encodeCommand` wherever the result is appended to something anyway, since it needs no buffer of its own |
+| `encodeCommand(args)` | a command, `Vec[String]`, as a client sends it: an array of bulk strings → `Bytes` |
+| `RespReader::new()` | an empty incremental decoder |
+| `rd.feed(chunk)` | add bytes as they arrive (`rd` must be `mut`) |
+| `rd.next()` | the next complete value → `Result[Option[Resp], String]`: `Ok(None)` until it has fully arrived, `Err` on malformed input |
+| `rd.nextCommand()` | the next complete command as its words → `Result[Option[Vec[String]], String]`; also reads an inline command, a line of words as typed into telnet |
+| `rd.buffered()` | bytes received that no value has taken yet |
+| `RespClient::connect(host, port)` | connect to a RESP server → `Result[RespClient, String]` |
+| `c.call(args)` | send one command and wait for its answer → `Result[Resp, String]`; an error answer is `Ok(Resp::Error(…))` |
+| `c.pipeline(commands)` | send several commands at once, then read their answers in order → `Result[Vec[Resp], String]` |
+| `c.close()` | close the connection |
+
+The decoder takes bytes in whatever pieces the network delivers them, which have nothing to do with where
+one value ends and the next begins; it hands out each value once it is complete. Malformed input is an
+`Err`, never a crash — after one, close the connection. The limits keep a peer from making the buffer grow
+without end: a bulk string holds at most 512 MiB, as in Redis, arrays nest at most 64 deep, and a header or
+an inline line is at most 64 KiB long. An integer must fit Skarn's 48 bits; a larger one, which Redis
+allows, is malformed here.
+
+```rust
+use std::resp::*
+
+let wire = encodeCommand(toVec(["SET", "greeting", "hello world"]))
+let mut rd = RespReader::new()
+rd.feed(wire)
+match rd.nextCommand() {
+    Ok(Some(words)) => println("${len(words)} words, the last: ${words[2]}"),  // => 3 words, the last: hello world
+    Ok(None)        => println("not complete yet"),
+    Err(e)          => println(e)
+}
+
+let mut reply = bytes()
+appendArrayHeader(reply, 2)
+appendBulk(reply, "a")
+appendInteger(reply, 42)
+rd.feed(reply)
+match rd.next() {
+    Ok(Some(r)) => println(r.render()),     // => 1) "a"
+    _           => println("no value")      // => 2) (integer) 42
+}
+```
+
+A client, against a Redis server or anything else that speaks RESP:
+
+```rust check
+use std::resp::*
+
+fn demo() -> Result[(), String] {
+    let mut c = RespClient::connect("127.0.0.1", 6379)?
+    println(c.call(toVec(["SET", "counter", "10"]))?.render())       // OK
+    let answers = c.pipeline(toVec([toVec(["INCR", "counter"]), toVec(["GET", "counter"])]))?
+    for a in answers { println(a.render()) }                         // (integer) 11, then "11"
+    c.close()
+}
+
+match demo() { Ok(_) => (), Err(e) => println("failed: " + e) }
+```
+## 27. `std::deque`
+
+A double-ended queue `Deque[T]`: push and pop at BOTH ends, and indexed access, all O(1) (the pushes and pops
+amortised). It is what a `Vec` cannot be — `push`/`pop` work only at a vector's END, so taking from the front of
+a `Vec` costs a shift per element. A `Deque` is `IntoIterator` and `Iterable`, so `for x in d`, `toVec(d)` and
+the lazy combinators all work, front to back. `use std::deque::*`
+
+| Function | Purpose |
+|----------|---------|
+| `Deque::new()` / `Deque::fromVec(v)` | an empty `Deque[T]` — `T` comes from how the deque is used (`let mut d = Deque::new()` then `d.pushBack(3)`), or from an annotation (`let d: Deque[Int] = Deque::new()`) when nothing uses it / a deque holding a COPY of the elements of a `Vec`, first to last |
+| `d.size()` / `d.isEmpty()` | how many elements → `Int` / whether there are none → `Bool` (both O(1)) |
+| `d.pushFront(x)` / `d.pushBack(x)` | add `x` at the front / at the back; `d` must be `mut` |
+| `d.popFront()` / `d.popBack()` | remove the first / last element and return it → `Option[T]`, `None` when the deque is empty; `d` must be `mut` |
+| `d.peekFront()` / `d.peekBack()` | the first / last element, left where it is → `Option[T]` |
+| `d.at(i)` / `d.get(i)` | the `i`-th element from the front (0 = the front): `at` ABORTS when `i` is out of range, as `v[i]` does on a vector / `get` answers `Option[T]` instead |
+| `d.clear()` | drop every element, and the backing vectors with them — a `Vec` backing does not contract when it is popped, so this is how the memory of a deque that once was large goes back to the collector; `d` must be `mut` |
+
+A queue: things arrive at one end and are taken from the other.
+
+```rust
+use std::deque::*
+
+let mut q: Deque[Int] = Deque::new()
+q.pushBack(1)
+q.pushBack(2)
+q.pushFront(0)
+println(q.size())                     // => 3
+println(toString(toVec(q)))           // => [0, 1, 2]
+
+match q.popFront() {
+  Some(x) => println(x),              // => 0
+  None => println("the queue is empty")
+}
+println(toString(q.peekBack()))       // => Some(2)
+```
+
+**`==` compares the SPLIT, not the contents.** A deque holds its elements in two vectors, and which element
+sits in which depends on how the deque was BUILT — so two deques holding the same elements in the same order
+may still be `!=`. Every representation with O(1) ends has that property, and `==` on a struct is a
+field-by-field comparison which cannot be given another meaning. Compare snapshots instead:
+
+```rust
+use std::deque::*
+
+let mut a: Deque[Int] = Deque::new()
+a.pushFront(1)
+a.pushBack(2)
+let b: Deque[Int] = Deque::fromVec(toVec([1, 2]))
+println(a == b)                       // => false
+println(toVec(a) == toVec(b))         // => true
+```

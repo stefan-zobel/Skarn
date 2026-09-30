@@ -71,3 +71,49 @@ static inline int closesocket(int s) { return ::close(s); }
 #else
 #  define SKARN_ALLOC_NOEXCEPT
 #endif
+
+// ---- How many threads this PROCESS may run at once ---------------------------
+// NOT the machine's core count: an affinity mask narrows it, and the answer is what a caller sizes
+// a pool of workers or shards with, so it is never 0. Windows and Linux report what this process
+// was granted; macOS has no affinity API, so there the count of online processors is the honest
+// answer. One implementation, called by the rawCpuCount native and by the test oracle that models
+// it -- a second copy of these branches could drift, and a differential over a drifted mirror is
+// worse than none.
+//
+// The cgroup v2 CPU quota (/sys/fs/cgroup/cpu.max) is deliberately NOT read: neither supported
+// platform has cgroups, so it would ship untested.
+#include <thread>       // hardware_concurrency -- the last-resort fallback below
+#if !defined(_WIN32) && !defined(__APPLE__)
+#  include <sched.h>    // sched_getaffinity / CPU_COUNT -- what THIS process was granted
+#endif
+
+inline unsigned vm_usable_cpus() {
+    unsigned n = 0;
+#ifdef _WIN32
+    // The group-wide count comes first: a process on a machine with several processor groups sees
+    // only its OWN group's affinity mask, so the mask alone would under-report there.
+    n = static_cast<unsigned>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+    if (n != 0 && n <= 64) {
+        DWORD_PTR granted_mask = 0, system_mask = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &granted_mask, &system_mask) != 0) {
+            unsigned granted = 0;
+            for (DWORD_PTR bits = granted_mask; bits != 0; bits &= bits - 1) ++granted;
+            if (granted != 0) n = granted;
+        }
+    }
+#elif defined(__APPLE__)
+    const long online = ::sysconf(_SC_NPROCESSORS_ONLN);
+    if (online > 0) n = static_cast<unsigned>(online);
+#else
+    cpu_set_t granted_set;
+    CPU_ZERO(&granted_set);
+    if (::sched_getaffinity(0, sizeof(granted_set), &granted_set) == 0)
+        n = static_cast<unsigned>(CPU_COUNT(&granted_set));
+    if (n == 0) {
+        const long online = ::sysconf(_SC_NPROCESSORS_ONLN);
+        if (online > 0) n = static_cast<unsigned>(online);
+    }
+#endif
+    if (n == 0) n = std::thread::hardware_concurrency();   // every query above declined to answer
+    return n == 0 ? 1u : n;                                // and even that may say "I do not know"
+}

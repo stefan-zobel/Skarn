@@ -3000,6 +3000,11 @@ fn mustBePositive(n: Int) -> Int {
 println(mustBePositive(5))   // => 5
 ```
 
+An error the *user* caused — a missing file, a bad option — is not a bug, and a location and a call trace
+are no help to them. Report it with `eprintln` and end with `exit(1)` from `std::process`, which prints
+nothing of its own; see [Ending the program](SkarnStdlib.md#ending-the-program). `exit` never returns
+either, so it has type `Never` too.
+
 ---
 
 ## 19. Iterators
@@ -3468,6 +3473,8 @@ the filesystem, and one without `use std::process` cannot start a program.
 | `std::supervisor` | keeping actors running — `supervise` starts a group of child actors and starts again each one that crashes, up to a restart limit; supervisors nest into trees |
 | `std::regex` | linear-time byte-level regular expressions (Thompson NFA / Pike VM) — no catastrophic backtracking, and therefore **no** backreferences or lookaround |
 | `std::log` | timestamped log lines at four levels, filtered by a minimum, written to a file directly or through a logger actor that owns the file; no rotation and no configuration file |
+| `std::resp` | RESP2, the protocol Redis speaks — an encoder, an incremental decoder for a server, and a blocking client |
+| `std::deque` | a double-ended queue `Deque[T]` — push and pop at both ends and indexed access, all O(1); what a `Vec`, which grows and shrinks only at its end, cannot be |
 
 This table says only what each module is *for*. **Every function of every module, with its signature, is listed
 in [the standard library reference](SkarnStdlib.md)**, together with a worked example for most modules.
@@ -3680,6 +3687,21 @@ from the module, does not bring it in.
 
 `print(x)` and `println(x)` write text to standard output (`println` adds a newline). Both accept any value
 and stringify it, and both accept multiple arguments (printed back-to-back with no separator).
+
+Output goes out line by line, also into a pipe or a file, so a program that runs until it is stopped — a
+server, say — loses nothing it has finished printing. Text without a newline waits for one, or for
+`std::io`'s [`flushOutput()`](SkarnStdlib.md#standard-output).
+
+`eprint(x)` and `eprintln(x)` do the same for standard error, where diagnostics belong:
+
+```rust
+let input = "12x"
+match parseInt(input) {
+    Ok(n)  => println(n),
+    Err(_) => eprintln("not a number: ", input)   // on standard error, not in the output
+}
+println("done")              // => done
+```
 
 ```rust
 print("no newline ")

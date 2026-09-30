@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <vector>
+#include <iterator>     // std::next -- remove_root erases through a reverse iterator
 #include <chrono>       // steady_clock -- measurement-only GC timing (--bench)
 #include <ostream>      // debug_dump(std::ostream&)  (<format> comes via Value.h)
 #include "Platform.h"
@@ -262,31 +263,50 @@ public:
     //
     // The caller owns the Value -- Heap only stores the pointer.
     // The Value must remain at a stable address.
+    //
+    // Roots come and go LAST IN, FIRST OUT in practice: add_root appends, the program's
+    // long-lived pools (string literals, atoms, const arrays, globals) are registered first,
+    // and a short-lived root -- a native's temporary, a decoded message's pool -- is removed
+    // before anything registered after it. So both removals look from the END: a message's
+    // release then costs its own slots, not every root of the program (which it did while
+    // they scanned from the front).
     // -------------------------------------------------------------------
     void add_root(Value* slot) {
         assert(slot && "add_root: null slot");
         global_roots_.push_back(slot);
     }
 
+    // Unregister one registration of `slot`, the most recent one.
     void remove_root(Value* slot) noexcept {
-        for (auto it = global_roots_.begin(); it != global_roots_.end(); ++it) {
+        for (auto it = global_roots_.rbegin(); it != global_roots_.rend(); ++it) {
             if (*it == slot) {
-                global_roots_.erase(it);
+                global_roots_.erase(std::next(it).base());
                 return;
             }
         }
     }
 
-    // Unregister every root whose slot lies in [first, last) -- one pass over the root list.
-    // A block of roots released one remove_root() at a time is QUADRATIC (each call is a
-    // linear search plus an erase that shifts the rest): ~0.5 s for a 100 k-slot pool.
+    // Unregister every root whose slot lies in [first, last), each slot registered once (a
+    // RootedValuePool's contract). When they are the last last-first entries of the list --
+    // the usual case, see above -- that is a truncation. Otherwise one pass over the whole
+    // list; a block of roots released one remove_root() at a time would be QUADRATIC (each
+    // call a search plus an erase that shifts the rest): ~0.5 s for a 100 k-slot pool.
     void remove_root_range(Value* first, Value* last) noexcept {
         const auto lo = reinterpret_cast<uintptr_t>(first);
         const auto hi = reinterpret_cast<uintptr_t>(last);
-        std::erase_if(global_roots_, [lo, hi](Value* p) {
+        const auto in = [lo, hi](Value* p) {
             const auto a = reinterpret_cast<uintptr_t>(p);
             return a >= lo && a < hi;
-        });
+        };
+        const size_t n    = static_cast<size_t>(last - first);
+        size_t       tail = 0;
+        while (tail < n && tail < global_roots_.size() && in(global_roots_[global_roots_.size() - 1 - tail]))
+            ++tail;
+        if (tail == n) {
+            global_roots_.resize(global_roots_.size() - n);   // all of them, and nothing else
+            return;
+        }
+        std::erase_if(global_roots_, in);
     }
 
     [[nodiscard]] size_t root_count() const noexcept {
@@ -954,8 +974,9 @@ private:
 //
 // The destructor unregisters everything, INCLUDING on the exception path -- so a
 // caller-owned Heap can never keep a dangling root into a stack-local vector. It does so
-// in ONE pass over the root list (remove_root_range), because the slots are contiguous;
-// one remove_root per slot made releasing a large pool quadratic.
+// with ONE remove_root_range, because the slots are contiguous (one remove_root per slot
+// made releasing a large pool quadratic) -- and a pool released before anything rooted
+// after it, as a decoded message's is, costs only its own slots.
 //
 // Usage is always the same four steps, and the order matters:
 //   pool.heap = &heap;  pool.slots.resize(n);          // size before rooting

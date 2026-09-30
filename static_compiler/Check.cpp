@@ -254,11 +254,15 @@ public:
     // What the builtins that infer_call special-cases accept, written by hand: no FnSig can state
     // them (polymorphic over container kinds, variadic, or a FnSig row that goes unused, as push /
     // pop). One line per accepted shape; keep in step with the check_* function named in infer_call.
+    // A native whose FnSig returns Never is listed too, so the listing says `Never`, as panic's does.
     static constexpr std::pair<std::string_view, std::string_view> SPECIAL_BUILTIN_SIGNATURES[] = {
         { "len",             "fn len(String | List[T] | Array[T] | Vec[T] | Bytes | Map[K, V]) -> Int" },
         { "print",           "fn print(T, ...)" },
         { "println",         "fn println(T, ...)" },
+        { "eprint",          "fn eprint(T, ...)" },
+        { "eprintln",        "fn eprintln(T, ...)" },
         { "panic",           "fn panic(String) -> Never" },
+        { "exit",            "fn exit(Int) -> Never" },
         { "has",             "fn has(Map[K, V], K) -> Bool" },
         { "delete",          "fn delete(Map[K, V], K) -> Bool" },
         { "get",             "fn get(Map[K, V], K) -> Option[V]\nfn get(Array[T], Int) -> Option[T]\n"
@@ -1295,6 +1299,13 @@ private:
         add_native("rename",       { S, S }, make_named(std_Result(), { ty_unit(), S }),       STD_IO);
         add_native("copyFile",     { S, S }, make_named(std_Result(), { ty_unit(), S }),       STD_IO);
         add_native("readAllStdin", {},       S,                                                STD_IO);
+        add_native("flushOutput",  {},       ty_unit(),                                        STD_IO);
+        // File handles -- std::io's File wraps the descriptor; the raw natives stay internal.
+        add_native("rawFileOpen",  { S, ty_int() },        make_named(std_Result(), { ty_int(), S }),    STD_IO);
+        add_native("rawFileRead",  { ty_int(), ty_int() }, make_named(std_Result(), { B, S }),           STD_IO);
+        add_native("rawFileWrite", { ty_int(), B },        make_named(std_Result(), { ty_unit(), S }),   STD_IO);
+        add_native("rawFileSync",  { ty_int() },           make_named(std_Result(), { ty_unit(), S }),   STD_IO);
+        add_native("rawFileClose", { ty_int() },           make_named(std_Result(), { ty_unit(), S }),   STD_IO);
         // Environment / time -- std::env (opt-in).
         add_native("getEnv",       { S },    make_named(std_Option(), { S }),                  STD_ENV);
         add_native("nanoTime",     {},       ty_int(),                                         STD_ENV);
@@ -1304,6 +1315,16 @@ private:
         // Ambient / ring natives (always available -- no `use` needed).
         add_native("parseInt",     { S },    make_named(std_Result(), { ty_int(),    S }));
         add_native("parseDouble",  { S },    make_named(std_Result(), { ty_double(), S }));
+        // Byte-buffer searching and decimal parsing over a range -- the loops std::bytes, std::resp,
+        // std::net and std::string used to run in Skarn one bytecode op per byte. AMBIENT on purpose:
+        // their callers sit in five different std modules, two of them (std::string, std::iter) in the
+        // always-reachable ring, so no single owner could gate them. They are `raw*`, so no user
+        // document may name them and no highlighter may list them; the wrappers around them are the
+        // public surface (std::bytes' indexOfByte, std::string's indexOf, ...) and are unchanged.
+        add_native("rawIndexOfByte",   { B, ty_int(), ty_int() }, ty_int());
+        add_native("rawIndexOfBytes",  { B, B, ty_int() },        ty_int());
+        add_native("rawParseIntRange", { B, ty_int(), ty_int() },
+                                       make_named(std_Option(), { ty_int() }));
         // GC introspection. rawGcStats returns the 8 GcStats counters as an Array[Double] (Double's
         // 53-bit exact-integer range carries a uint64 counter for any realistic run); the prelude
         // gcStats() wrapper unpacks it into a GcStats struct. gcResetStats clears the counters. Ambient.
@@ -1336,6 +1357,14 @@ private:
         // rawRun, so the prelude's currentOs() wrapper reaches it as same-module code; that wrapper is
         // what sh() branches on to pick the platform's shell.
         add_native("rawOsId",      {},       ty_int(),                                        STD_PROCESS);
+        // The second platform query, and it sits beside the first for that reason rather than in
+        // std::task: it is a fact about the machine, not about fork-join, and a server that starts
+        // actors should not have to import a module it never spawns a task with.
+        add_native("rawCpuCount",  {},       ty_int(),                                        STD_PROCESS);
+        // Ends the program with an exit code, after its ordinary end (actors stopped, threads joined,
+        // output flushed). Never returns, so -- like panic -- it fits where any type is expected. The
+        // VM refuses it in an actor or a task and a code outside 0..255 (run-time faults).
+        add_native("exit",         { ty_int() }, ty_never(),                                STD_PROCESS);
         // TCP networking -- std::net (opt-in; the prelude connect/send/recv/... wrappers live there too,
         // so they may call the tcp* natives as same-module code). A socket is an Int descriptor; every
         // native returns a Result (success = Int/Bytes/unit, failure = a String error message).
@@ -1376,6 +1405,15 @@ private:
         add_native("rawRecvNb",    { ty_int(), ty_int() },
                                    make_named(std_Result(), { make_named("Array", { B }), S }), STD_POLL);
         add_native("rawSendNb",    { ty_int(), B },  make_named(std_Result(), { ty_int(),  S }), STD_POLL);
+        // The one wait that covers inboxes AND sockets. It belongs here rather than in
+        // std::actor because everything it adds over `select` is std::poll's: raw descriptors,
+        // the READABLE / WRITABLE flag words, and an index-parallel answer. poll.skn therefore
+        // gains a `use std::actor::*` for InboxRef, as net.skn already has one.
+        add_native("rawSelectIo",  { make_named("Vec", { make_named(std_InboxRef(), {}) }),
+                                     make_named("Vec", { ty_int() }),
+                                     make_named("Vec", { ty_int() }), ty_int() },
+                                   make_named(std_Result(), { make_named("Array", { ty_int() }), S }),
+                                   STD_POLL);
 
         // Fork-join tasks -- std::task (opt-in). The only GENERIC natives: a task's argument and result
         // have the types of the function it runs, which one monomorphic signature cannot state. They are
@@ -1560,10 +1598,10 @@ private:
 
     // print(a, ...) -- variadic; each argument is rendered and written back-to-back with NO separator
     // (sugar for sequential single-arg prints). Requires at least one argument. Special-cased (not a
-    // fixed FnSig) because of the variadic arity.
-    TyPtr check_print(const std::vector<Expr*>& args, Expr& node) {
+    // fixed FnSig) because of the variadic arity. eprint (standard error) has the same rules.
+    TyPtr check_print(const std::vector<Expr*>& args, Expr& node, const char* who) {
         if (args.empty())
-            error(node.line, node.col, "print expects at least one argument");
+            error(node.line, node.col, std::string(who) + " expects at least one argument");
         for (Expr* a : args) infer(*a);   // any type is printable
         return ty_unit();
     }
@@ -4118,8 +4156,10 @@ private:
                     return call_direct_fn(bit->second, id.name, args, node, expected);
                 }
                 if (id.name == "len") { callee.ty = ty_error(); return check_len(args, node); }
-                if (id.name == "print")   { callee.ty = ty_error(); return check_print(args, node); }
+                if (id.name == "print")   { callee.ty = ty_error(); return check_print(args, node, "print"); }
                 if (id.name == "println") { callee.ty = ty_error(); return check_println(args); }
+                if (id.name == "eprint")  { callee.ty = ty_error(); return check_print(args, node, "eprint"); }
+                if (id.name == "eprintln") { callee.ty = ty_error(); return check_println(args); }
                 if (id.name == "panic")   { callee.ty = ty_error(); return check_panic(args, node); }
                 if (id.name == "has")     { callee.ty = ty_error(); return check_map_kv_bool(args, node, "has"); }
                 if (id.name == "delete")  { callee.ty = ty_error(); return check_map_kv_bool(args, node, "delete"); }
@@ -4617,6 +4657,9 @@ private:
             t->name == mangle_name(STD_POLL, "NbConn") || t->name == mangle_name(STD_POLL, "NbListener") ||
             t->name == mangle_name(STD_NET, "ActiveConn") || t->name == mangle_name(STD_NET, "ActiveListener"))
             return "a socket handle (" + r(t) + ")";
+        // A file descriptor names an entry in the sending isolate's own registry.
+        if (t->name == mangle_name(STD_IO, "File"))
+            return "a file handle (" + r(t) + ")";
         // An active connection's events arrive in an inbox of its owner; elsewhere it would be a reading
         // end of someone else's connection. (Its Inbox field would bar it too -- this names the cause.)
         if (t->name == mangle_name(STD_NET, "SockEvents"))

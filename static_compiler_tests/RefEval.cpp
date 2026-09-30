@@ -15,6 +15,8 @@
 
 #include "RefEval.h"
 #include "NativeRegistry.h"   // native_id_of -- tells a deliberately excluded native from a forgotten
+#include "Platform.h"         // vm_usable_cpus -- rawCpuCount is answered from the SAME query the
+                              // native uses, deliberately: see the model below
                               // builtin at the one call site where both land (see call_named). The
                               // header is name-table only; it pulls in no VM-runtime dependency.
 
@@ -38,6 +40,7 @@ struct ReturnSignal { RtValue value; };
 struct BreakSignal { RtValue value; bool has_value = false; };
 struct ContinueSignal {};
 struct PanicSignal   { std::string msg; };
+struct ExitSignal    { int code; };        // std::process's exit: the program ends, not a fault
 // The two ways of declining a program. See the RefEval.h header comment for WHY they are distinct:
 // one silent category made the oracle fail by silence. `Unsupported` must be justified at its throw
 // site (there are only four such sites); every other decline is a gap and must be loud.
@@ -275,7 +278,8 @@ public:
             RtValue last;
             for (const Stmt* s : top_stmts_) last = exec_stmt(*s, top);
             res.value = last;
-        } catch (const PanicSignal& p)   { res.faulted = true; res.fault_msg = p.msg; }
+        } catch (const ExitSignal& x)    { res.exited = true; res.exit_code = x.code; }
+          catch (const PanicSignal& p)   { res.faulted = true; res.fault_msg = p.msg; }
           catch (const Unsupported& u)   { res.faulted = true; res.unsupported = true; res.fault_msg = u.what; }
           catch (const NotModelled& u)   { res.faulted = true; res.oracle_gap  = true; res.fault_msg = u.what; }
           catch (const ReturnSignal&)    { res.faulted = true; res.fault_msg = "return at top level"; }
@@ -283,6 +287,7 @@ public:
           catch (const ContinueSignal&)  { res.faulted = true; res.fault_msg = "continue at top level"; }
           catch (const std::exception& e){ res.faulted = true; res.fault_msg = e.what(); }
         res.output = std::move(out_);
+        res.err_output = std::move(err_);
         res.coverage = cov_;   // what this run evaluated; the caller merges it only if the run AGREED
         return res;
     }
@@ -301,6 +306,7 @@ private:
         bool        ok = false, joined = false;
     };
     std::vector<TaskRec> tasks_;
+    int task_depth_ = 0;   // > 0 while a task's function runs (at its join): there exit is a fault
     std::unordered_map<std::string, const FnItem*> fn_table_;
     std::unordered_map<std::string, const Expr*>   const_defs_;   // module const -> literal (S0; inlined)
     std::unordered_map<std::string, CtorInfo>      ctors_;
@@ -320,6 +326,7 @@ private:
     std::unordered_map<std::string, const Method*> defaults_;        // trait\x1fmethod -> default Method*
     std::vector<const Stmt*> top_stmts_;
     std::string out_;
+    std::string err_;               // eprint / eprintln (a task's text lands when it runs, i.e. at its join)
     NativeEnv    nenv_;             // fixed fixtures for the differentiable natives
     std::size_t  stdin_pos_ = 0;    // shared cursor into nenv_.stdin_text (readLine / readAllStdin)
 
@@ -1365,6 +1372,8 @@ private:
             std::string error;
             bool        ok = false;
             try {
+                ++task_depth_;
+                struct Leave { int& d; ~Leave() { --d; } } leave{ task_depth_ };
                 result = deep_copy(call_fn(fn, std::move(args)));
                 ok     = true;
             } catch (const PanicSignal& p) {
@@ -1548,12 +1557,27 @@ private:
             if (name == "println") out_ += "\n";
             out = RtValue{}; return true;
         }
+        if (name == "eprint" || name == "eprintln") {     // the same, into the error stream
+            for (size_t i = 0; i < argx.size(); ++i) err_ += stringify_arg(argx[i], ev(i));
+            if (name == "eprintln") err_ += "\n";
+            out = RtValue{}; return true;
+        }
         // `panic` DIVERGES, so it is the one builtin that never reaches the handled `return true` the
         // coverage probe sits on -- without this it could never be recorded as covered, no matter how
         // many tests exercise it. Marked here instead, where the divergence starts.
         if (name == "panic")    { RtValue m = ev(0);
                                   record_builtin_call(cov_, name);
                                   throw PanicSignal{ std::holds_alternative<std::string>(m) ? std::get<std::string>(m) : "panic" }; }
+        // `exit` diverges too, so it is marked the same way. Only the root may call it: in a task it is
+        // the VM's fault (the oracle models no actors), as is a code outside 0..255.
+        if (name == "exit")     { RtValue c = ev(0);
+                                  record_builtin_call(cov_, name);
+                                  if (task_depth_ > 0)
+                                      throw PanicSignal{ "exit ends the whole program, so only the main program may call it" };
+                                  const int64_t n = std::get<int64_t>(c);
+                                  if (n < 0 || n > 255)
+                                      throw PanicSignal{ "exit code must be between 0 and 255, got " + std::to_string(n) };
+                                  throw ExitSignal{ static_cast<int>(n) }; }
         // ---- differentiable natives (see NativeEnv): deterministic, side-effect-free, message-
         // independent. run_diff feeds the VM the SAME fixtures, so the two sides agree. Every OTHER
         // native (write/delete/mkdir/listDir/time/process) is left to fall through to `call_named`,
@@ -1589,6 +1613,69 @@ private:
             else out = ok(v);
             return true;
         }
+        // The byte three (NativeRegistry.h ids 96-98): pure functions of a buffer and three Ints. These
+        // mirror the C++ natives statement for statement, INCLUDING the clamping and the malformed
+        // answers, because the whole point of the differential is that the two sides cannot drift.
+        if (name == "rawIndexOfByte" || name == "rawIndexOfBytes" || name == "rawParseIntRange") {
+            // The RtValue must OUTLIVE the view: it owns the shared_ptr, and a view taken from a
+            // temporary would point into a buffer already freed.
+            auto view = [&](const RtValue& v) -> const std::vector<uint8_t>* {
+                if (auto p = std::get_if<std::shared_ptr<Obj>>(&v))
+                    if (*p && (*p)->kind == ObjKind::Bytes) return &(*p)->bytes;
+                return nullptr;
+            };
+            const RtValue                buf = ev(0);
+            const std::vector<uint8_t>*  b   = view(buf);
+            if (name == "rawParseIntRange") {
+                const int64_t lo0 = std::get<int64_t>(ev(1));
+                const int64_t hi  = std::get<int64_t>(ev(2));
+                const int64_t n   = b ? (int64_t)b->size() : 0;
+                int64_t i = lo0;
+                if (!b || i < 0 || hi > n || i >= hi) { out = none(); return true; }
+                const bool neg = (*b)[(size_t)i] == '-';
+                if (neg) ++i;
+                if (i >= hi || hi - i > 15) { out = none(); return true; }
+                constexpr int64_t MAX_48 = 140737488355327LL;
+                int64_t v = 0;
+                for (; i < hi; ++i) {
+                    const int digit = (int)(*b)[(size_t)i] - '0';
+                    if (digit < 0 || digit > 9) { out = none(); return true; }
+                    if (v > MAX_48 / 10 || (v == MAX_48 / 10 && digit > MAX_48 % 10)) { out = none(); return true; }
+                    v = v * 10 + digit;
+                }
+                out = some((int64_t)(neg ? -v : v));
+                return true;
+            }
+            if (name == "rawIndexOfByte") {
+                const int64_t target = std::get<int64_t>(ev(1));
+                int64_t       from   = std::get<int64_t>(ev(2));
+                const int64_t n      = b ? (int64_t)b->size() : 0;
+                if (from < 0) from = 0;
+                int64_t answer = -1;
+                if (b && from < n && target >= 0 && target <= 255)
+                    for (int64_t i = from; i < n; ++i)
+                        if ((int64_t)(*b)[(size_t)i] == target) { answer = i; break; }
+                out = answer;
+                return true;
+            }
+            const RtValue               needle = ev(1);
+            const std::vector<uint8_t>* sub    = view(needle);
+            int64_t       from = std::get<int64_t>(ev(2));
+            const int64_t n    = b ? (int64_t)b->size() : 0;
+            const int64_t m    = sub ? (int64_t)sub->size() : 0;
+            if (from < 0) from = 0;
+            int64_t answer = -1;
+            if (b && sub && from + m <= n) {
+                for (int64_t i = from; i + m <= n; ++i) {
+                    bool hit = true;
+                    for (int64_t j = 0; j < m; ++j)
+                        if ((*b)[(size_t)(i + j)] != (*sub)[(size_t)j]) { hit = false; break; }
+                    if (hit) { answer = i; break; }
+                }
+            }
+            out = answer;
+            return true;
+        }
         if (name == "fileExists") { out = false; return true; }   // generator only queries KNOWN-ABSENT paths
         if (name == "isFile") { out = false; return true; }       // absent path -> not a regular file
         if (name == "isDir")  { out = false; return true; }       // absent path -> not a directory
@@ -1622,6 +1709,15 @@ private:
 #else
             out = static_cast<int64_t>(2);
 #endif
+            return true;
+        }
+        if (name == "rawCpuCount") {
+            // Answered from the one implementation, not from a second copy of its platform branches.
+            // rawOsId can mirror three `return`s safely; an affinity query is twenty lines, and a
+            // mirror that drifts turns a green differential into a lie. So what this cross-checks is
+            // the LOWERING -- the checker's type, the CALL_NATIVE, the Plain unwrap, the module gate
+            // -- which is the half a compiler change can actually break.
+            out = static_cast<int64_t>(vm_usable_cpus());
             return true;
         }
         if (name == "readAllStdin") {                     // the rest of the shared stdin cursor

@@ -63,9 +63,13 @@ native functions attached:
 - `--emit-bytecode <file>` writes a `.skbc` image; `--run-bytecode <file>` runs one without compiling.
   `--strip-debug` omits the source-position tables.
 - `--no-inline` and `--sroa` switch the two optional code-generation transforms.
+- Standard output goes out line by line, also into a pipe or a file: a completed line is written at once
+  when output is sparse, and a burst is gathered for at most 10 ms by a background thread. Standard error
+  (`eprint` / `eprintln`) is written at once.
 
 Exit code 0 means success. 1 means a compile error or a runtime fault, reported with a caret into the right
-source file. 2 means a driver error.
+source file. 2 means a driver error. A program that calls `std::process`'s `exit(code)` ends with that
+code, and the driver prints nothing.
 
 ## The language server: `skarn_lsp`
 
@@ -286,6 +290,11 @@ String interpolation and format specifiers are rewritten by the parser into call
 `toString` renders newtypes, `Char`s and integer-backed enums by name or glyph before falling back to the
 VM's generic dump.
 
+`print` / `println` render each argument this way and write it with `PRINT` / `PRINTLN`. `eprint` /
+`eprintln` have no opcode: the rendered arguments, and `eprintln`'s newline, are joined into one string
+that goes to the `rawWriteErr` native in one call, so a line written by one actor is never split by
+another's.
+
 ### No truthiness
 
 Every condition must be a `Bool`: `if`, `while`, a match guard, the operands of `&&`, `||` and `!`. `&&` and
@@ -318,7 +327,7 @@ copied. The checker therefore adds these rules at every call of `spawn`:
 - **The parameter type and the result type must be sendable.** Sendable means plain data: numbers, `Bool`,
   `String`, `Bytes`, and tuples, collections, structs and enums built only from sendable parts. It excludes
   function values, trait objects, type parameters without the bound `Sendable`, and handles — a socket
-  (`TcpConn`, `TcpListener`, `NbConn`, `NbListener`), a `Task` or an actor's `Inbox`. A handle is a struct
+  (`TcpConn`, `TcpListener`, `NbConn`, `NbListener`), an open `File`, a `Task` or an actor's `Inbox`. A handle is a struct
   over an integer that is meaningful only in the heap that created it. The check walks recursive types,
   treating a type met again as sendable so far, and caches nothing. A disallowed component behind a mutual
   recursion is therefore still found.
@@ -486,6 +495,10 @@ its own.
   - A child made with `child` has a new address after a restart; one made with `childIn` keeps the slot's.
   - A supervisor that gives up tells its children to stop and releases their addresses, but it cannot end
     one that never receives.
+
+`std::resp` is RESP2, the protocol Redis speaks, in plain Skarn over `std::bytes` and `std::net`: an
+encoder, an incremental decoder that takes bytes in whatever pieces they arrive and refuses malformed input
+with an `Err`, and a blocking client. It needs no rule and no native of its own.
 
 `std::log` is logging, also plain Skarn and also over `std::actor`, with no rule and no native of its own.
 A `Log` holds a sink and a minimum level; a line is a timestamp, a level and the text.

@@ -6,7 +6,8 @@
 // per-unit cost (ns/iter, ns/call, ns/elem). To turn a per-unit figure into ns-per-BYTECODE-OP,
 // divide by the measured ops-per-unit noted beside each workload -- those op counts came from a
 // throwaway build of the VM with the dispatch loop instrumented to count ops (`-DVM_COUNT_OPS`,
-// which prints `[VM_OPS] N` at HALT; the shipping VM has no such counter). Because the op count is
+// which prints an `[VM_OPS]` histogram to standard error when the program ends; the shipping VM has
+// no such counter). Because the op count is
 // deterministic, ns/op = (untampered wall from this run) / (op count from the counting build).
 //
 // ---------------------------------------------------------------------------------------------

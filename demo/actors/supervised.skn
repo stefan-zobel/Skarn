@@ -19,6 +19,7 @@ use std::actor::*
 use std::supervisor::*
 use std::cli::*
 use std::env::*
+use std::process::exit
 
 const JOBS: Int = 40
 const WORKERS: Int = 4
@@ -112,7 +113,8 @@ let strategy = if name == "one_for_one" {
 } else if name == "rest_for_one" {
   Strategy::RestForOne
 } else {
-  panic("--strategy must be one_for_one, one_for_all or rest_for_one")
+  eprintln("--strategy must be one_for_one, one_for_all or rest_for_one")
+  exit(1)
 }
 let me: Inbox[Int] = mainInbox()
 let d = spawnActor(dispatcher, Plan { jobs: JOBS, boss: me.pid() })

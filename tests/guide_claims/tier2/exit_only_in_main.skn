@@ -1,0 +1,21 @@
+// CLAIM: only the main program may call exit: in an actor it is a crash, reported to the actor's
+//        starter, and the program goes on.
+// GUIDE: SkarnStdlib.md §10 "Ending the program"; SkarnActors.md §12 "Stopping"
+// EXPECT: ok crashed: true
+use std::actor::*
+use std::process::*
+use std::string::*
+
+
+fn body(inbox: Inbox[Int], code: Int) -> () {
+    exit(code)
+}
+
+let me: Inbox[Int] = mainInbox()
+let _p = spawnActor(body, 5)
+match me.receive() {
+    Mail::Exited(_, why) => {
+        println("crashed: ${hasSubstr(why, "only the main program")}")
+    },
+    _ => println("no report")
+}

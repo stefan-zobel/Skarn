@@ -79,11 +79,14 @@ int main(int argc, char** argv) {
     run("set_and_branch",           test_set_and_branch);
     run("cmov",                     test_cmov);
     run("native_registry",          test_native_registry);
+    run("byte_natives",             test_byte_natives);
     run("call_native_high_regs",    test_call_native_high_registers);
     run("native_time",              test_native_time);
     run("native_procctx",           test_native_procctx);
     run("native_dirops",            test_native_dirops);
     run("native_stdin",             test_native_stdin);
+    run("native_write_err",         test_native_write_err);
+    run("native_cpu_count",         test_native_cpu_count);
     run("native_process",           test_native_process);
     run("gc",                       test_gc);
     run("globals",                  test_globals);
@@ -123,6 +126,7 @@ int main(int argc, char** argv) {
     run("bytes_append",             test_bytes_append);
     run("map",                      test_map);
     run("map_iter_next",            test_map_iter_next);
+    run("map_churn",                test_map_churn);
     run("eq_deep",                  test_eq_deep);
     run("closure_gc",               test_closure_gc);
     run("closure_roots",            test_closure_roots);
@@ -178,6 +182,7 @@ int main(int argc, char** argv) {
     run("value_codec_encode_bytes", test_value_codec_encode_bytes);
     run("rooted_pool_release",      test_rooted_pool_release);
     run("value_codec_collects",     test_value_codec_collects);
+    run("value_codec_node_index",   test_value_codec_node_index);
     run("thread_slot_table",        test_thread_slot_table);
     run("concurrent_execute",       test_concurrent_execute);
     run("task_parallel_sums",       test_task_parallel_sums);
@@ -195,6 +200,7 @@ int main(int argc, char** argv) {
     run("active_socket",            test_active_socket);
     run("active_listener",          test_active_listener);
     run("active_send_deadline",     test_active_send_deadline);
+    run("file_handles",             test_file_handles);
     run("actor_extra_inbox_reply",  test_actor_extra_inbox_reply);
     run("actor_bounded_backpressure", test_actor_bounded_backpressure);
     run("actor_bounded_shutdown",   test_actor_bounded_shutdown);
@@ -205,8 +211,11 @@ int main(int argc, char** argv) {
     run("actor_monitor",            test_actor_monitor);
     run("actor_monitor_others",     test_actor_monitor_others);
     run("actor_stop_requested",     test_actor_stop_requested);
+    run("native_exit",              test_native_exit);
     run("actor_select",             test_actor_select);
     run("actor_select_stop",        test_actor_select_stop);
+    run("select_io",                test_select_io);
+    run("select_io_stop",           test_select_io_stop);
     run("actor_send_cycle",         test_actor_send_cycle);
     // Registered LAST on purpose: on the switch dispatcher a runaway loop can no
     // longer overflow the native stack, but the canary still guards its ~10M-instr

@@ -11,6 +11,8 @@
 #   // EXPECT: ok   <exact-stdout>     -- exit 0, trimmed stdout equals <exact-stdout>
 #   // EXPECT: warn <stderr-substring> -- exit 0, stderr CONTAINS <stderr-substring>
 #   // EXPECT: fail <stderr-substring> -- exit != 0, stderr CONTAINS <stderr-substring>
+#   // EXPECT: exit <n> <exact-stdout> -- exit code n (std::process's exit), trimmed stdout equals
+#                                        <exact-stdout>, and no error message on stderr
 # (// CLAIM:/// GUIDE: lines are documentation only.)
 #
 # Usage (repo root or anywhere; Python 3.9+):
@@ -37,7 +39,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR.parent))
 from skarn_testlib import add_driver_options, find_driver, green, red, rel, run_driver, say  # noqa: E402
 
-DIRECTIVE = re.compile(r"^\s*//\s*EXPECT:\s*(ok|warn|fail)\b\s?(.*)$")
+DIRECTIVE = re.compile(r"^\s*//\s*EXPECT:\s*(ok|warn|fail|exit)\b\s?(.*)$")
 
 
 def check_claim(exe, path, verb, expected, timeout):
@@ -50,6 +52,14 @@ def check_claim(exe, path, verb, expected, timeout):
             return "expected exit 0, got {}; stderr: {}".format(r.code, r.err.strip())
         if r.out.strip() != expected:
             return "stdout '{}' != expected '{}'".format(r.out.strip(), expected)
+    elif verb == "exit":
+        code, _, text = expected.partition(" ")
+        if r.code != int(code):
+            return "expected exit {}, got {}; stderr: {}".format(code, r.code, r.err.strip())
+        if r.out.strip() != text.strip():
+            return "stdout '{}' != expected '{}'".format(r.out.strip(), text.strip())
+        if "error:" in r.err:
+            return "an error message on stderr: {}".format(r.err.strip())
     elif verb == "warn":
         if r.code != 0:
             return "expected exit 0 (warn), got {}".format(r.code)

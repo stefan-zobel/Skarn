@@ -155,7 +155,39 @@ enum NativeId : uint16_t {
     // A deadline for sending on an active connection: a send that cannot finish within it closes the
     // connection (0 = none, the default). A send also ends when its actor is told to stop.
     NATIVE_ACTIVE_SET_SEND_TIMEOUT = 87, // rawActiveSetSendTimeout(conn, ms) -> ()
-    NATIVE_COUNT       = 88,
+    // File handles: an open file stays open between calls, so a program can append to a log without
+    // reopening it and ask for the data to reach the disk. A descriptor is an Int into the per-execution
+    // FileRegistry (slot + generation, like a socket's), closed at the end of the execute() that opened it.
+    NATIVE_FILE_OPEN   = 88,    // rawFileOpen(path, mode) -> Int | String (mode 0 read, 1 write/truncate, 2 append)
+    NATIVE_FILE_READ   = 89,    // rawFileRead(fd, max)    -> Bytes | String (empty Bytes = end of file)
+    NATIVE_FILE_WRITE  = 90,    // rawFileWrite(fd, bytes) -> nil | String (one OS write; atomic per call in append mode)
+    NATIVE_FILE_SYNC   = 91,    // rawFileSync(fd)         -> nil | String (FlushFileBuffers / fsync)
+    NATIVE_FILE_CLOSE  = 92,    // rawFileClose(fd)        -> nil | String (frees the slot; the descriptor goes stale)
+    // Pushes this isolate's buffered output on to the program's stream now, a partial line included
+    // (a progress mark or a prompt printed without a newline).
+    NATIVE_FLUSH_OUTPUT = 93,   // flushOutput()           -> ()
+    // Standard error: what eprint / eprintln lower to (no Skarn name of its own -- codegen emits it).
+    // One call is one piece of text, written at once under the world's lock.
+    NATIVE_WRITE_ERR   = 94,    // rawWriteErr(s)          -> ()
+    // Ends the program with an exit code (0..255), running its ordinary end on the way: actors are told
+    // to stop, every thread is joined, output is flushed. The root only; in an actor or a task a fault.
+    NATIVE_EXIT        = 95,    // exit(code)              -> never returns (throws ProgramExit)
+    // Byte-buffer searching and decimal parsing -- the loops std::bytes, std::resp, std::net and
+    // std::string ran one bytecode op per byte, and the substring search two Skarn calls per byte. All
+    // three are pure, total and non-allocating: no safepoint, and no host copy of the buffer.
+    NATIVE_INDEX_OF_BYTE  = 96, // rawIndexOfByte(b, target, from)  -> Int (index, -1 = absent; Plain)
+    NATIVE_PARSE_INT_RANGE = 97,// rawParseIntRange(b, lo, hi)      -> Int | nil (Option; nil = malformed)
+    NATIVE_INDEX_OF_BYTES = 98, // rawIndexOfBytes(b, sub, from)    -> Int (index, -1 = absent; Plain)
+    // The one wait that covers an actor's INBOXES and its SOCKETS at once, so a connection actor can
+    // read its own socket instead of having the world's I/O thread read it and forward the bytes --
+    // one thread crossing per request fewer. Neither existing wait could do it: a receive and a select
+    // park on a condition variable, which no socket can wake, and rawPoll watches only sockets.
+    NATIVE_SELECT_IO   = 99,    // rawSelectIo(boxes, fds, interest, timeoutMs) -> Array[Int] (Result)
+    // How many threads this PROCESS may run at once -- the second platform query, beside rawOsId.
+    // A program that starts workers, shards or tasks had no way to ask, so every one of them guessed
+    // a constant. It is what the OS grants THIS process (an affinity mask narrows it), never 0.
+    NATIVE_CPU_COUNT   = 100,   // rawCpuCount()                    -> Int (>= 1; Plain)
+    NATIVE_COUNT       = 101,
 };
 
 // How the COMPILER lowers a native's heap-kind result into a surface value.
@@ -256,6 +288,19 @@ inline int native_id_of(const std::string& name) {
     if (name == "rawActiveClose") return NATIVE_ACTIVE_CLOSE;
     if (name == "rawActivateListener") return NATIVE_ACTIVATE_LISTENER;
     if (name == "rawActiveSetSendTimeout") return NATIVE_ACTIVE_SET_SEND_TIMEOUT;
+    if (name == "rawFileOpen") return NATIVE_FILE_OPEN;
+    if (name == "rawFileRead") return NATIVE_FILE_READ;
+    if (name == "rawFileWrite") return NATIVE_FILE_WRITE;
+    if (name == "rawFileSync") return NATIVE_FILE_SYNC;
+    if (name == "rawFileClose") return NATIVE_FILE_CLOSE;
+    if (name == "flushOutput") return NATIVE_FLUSH_OUTPUT;
+    if (name == "rawWriteErr") return NATIVE_WRITE_ERR;
+    if (name == "exit") return NATIVE_EXIT;
+    if (name == "rawIndexOfByte") return NATIVE_INDEX_OF_BYTE;
+    if (name == "rawParseIntRange") return NATIVE_PARSE_INT_RANGE;
+    if (name == "rawIndexOfBytes") return NATIVE_INDEX_OF_BYTES;
+    if (name == "rawSelectIo") return NATIVE_SELECT_IO;
+    if (name == "rawCpuCount") return NATIVE_CPU_COUNT;
     return -1;
 }
 
@@ -289,9 +334,16 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_ACTIVATE:
         case NATIVE_ACTIVE_SEND:
         case NATIVE_ACTIVATE_LISTENER:
-        case NATIVE_RUN_PROCESS: return NRET_RESULT;
+        case NATIVE_FILE_OPEN:
+        case NATIVE_FILE_READ:
+        case NATIVE_FILE_WRITE:
+        case NATIVE_FILE_SYNC:
+        case NATIVE_FILE_CLOSE:
+        case NATIVE_RUN_PROCESS:
+        case NATIVE_SELECT_IO:   return NRET_RESULT;
         case NATIVE_GET_ENV:
-        case NATIVE_READ_LINE:   return NRET_OPTION;
+        case NATIVE_READ_LINE:
+        case NATIVE_PARSE_INT_RANGE: return NRET_OPTION;
         case NATIVE_NANO_TIME:
         case NATIVE_MILLIS_TIME:
         case NATIVE_ARGS:
@@ -319,6 +371,12 @@ inline NativeReturn native_return_of(int id) {
         case NATIVE_MONITOR: case NATIVE_STOP_REQUESTED: case NATIVE_SLEEP: case NATIVE_SELECT:
         case NATIVE_ACTIVE_CLOSE:
         case NATIVE_ACTIVE_SET_SEND_TIMEOUT:
+        case NATIVE_FLUSH_OUTPUT:
+        case NATIVE_WRITE_ERR:
+        case NATIVE_EXIT:
+        case NATIVE_INDEX_OF_BYTE:
+        case NATIVE_INDEX_OF_BYTES:
+        case NATIVE_CPU_COUNT:
         case NATIVE_READ_ALL_STDIN: return NRET_PLAIN;
         default:                 return NRET_RESULT;
     }
@@ -351,10 +409,17 @@ inline int native_arity(int id) {
         case NATIVE_ACTIVE_SEND:
         case NATIVE_ACTIVATE_LISTENER:
         case NATIVE_ACTIVE_SET_SEND_TIMEOUT:
+        case NATIVE_FILE_OPEN:
+        case NATIVE_FILE_READ:
+        case NATIVE_FILE_WRITE:
         case NATIVE_RUN_PROCESS: return 2;
         case NATIVE_ACTOR_SPAWN_BOUNDED:
         case NATIVE_SPAWN_INTO:
+        case NATIVE_INDEX_OF_BYTE:
+        case NATIVE_PARSE_INT_RANGE:
+        case NATIVE_INDEX_OF_BYTES:
         case NATIVE_POLL:        return 3;
+        case NATIVE_SELECT_IO:   return 4;
         case NATIVE_ACTIVATE:    return 5;
         case NATIVE_READ_FILE:
         case NATIVE_GET_ENV:
@@ -391,6 +456,10 @@ inline int native_arity(int id) {
         case NATIVE_STOP_REQUESTED:
         case NATIVE_SLEEP:
         case NATIVE_ACTIVE_CLOSE:
+        case NATIVE_FILE_SYNC:
+        case NATIVE_FILE_CLOSE:
+        case NATIVE_WRITE_ERR:
+        case NATIVE_EXIT:
         case NATIVE_SHA256:
         case NATIVE_F64_TO_BYTES: return 1;
         case NATIVE_NANO_TIME:
@@ -403,6 +472,8 @@ inline int native_arity(int id) {
         case NATIVE_MAIN_INBOX:
         case NATIVE_SELF_ID:
         case NATIVE_OS_ID:
+        case NATIVE_CPU_COUNT:
+        case NATIVE_FLUSH_OUTPUT:
         case NATIVE_READ_ALL_STDIN: return 0;
         default:                return 0;
     }

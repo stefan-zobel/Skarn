@@ -16,9 +16,16 @@
 // this module exists to avoid. The caller keeps the unsent tail and retries when `poll` reports the
 // socket writable.
 //
+// AN ACTOR CAN WAIT ON BOTH. `selectIo` below covers a program's sockets AND an actor's inboxes in
+// one wait, which is what lets a connection actor read its own socket instead of handing the reading
+// to the runtime (`c.activate` in std::net). Neither other wait can: `select` parks on a condition
+// variable, which no socket can wake, and `poll` watches only sockets. Which of the two to use is a
+// real choice, not a formality -- see the note on `selectIo`.
+//
 // LIMITS (deliberate): ONE core -- this is concurrency, not parallelism; a CPU-heavy handler blocks
 // every connection, and so does a garbage-collection pause; `connect` stays BLOCKING (std::net's
 // has its own timeout), so there is no non-blocking client dial; plaintext only, as in std::net.
+use std::actor::*
 use std::net::*
 
 // Readiness flags, as returned by `poll` and passed to it as interest. They are a packed Int, not
@@ -75,6 +82,34 @@ pub fn nonBlockingConn(c: TcpConn) -> Result[NbConn, String] {
 // happened. Both vectors must have the same length.
 pub fn poll(fds: Vec[Int], interest: Vec[Int], timeoutMs: Int) -> Result[Array[Int], String] {
   rawPoll(fds, interest, timeoutMs)
+}
+
+// Wait until one of `boxes` has something to read, or one of `fds` is ready, or `timeoutMs` expires
+// (0 = look and return at once, a negative value = wait indefinitely). `boxes` holds `inbox.ref()`
+// tokens, exactly as `select` takes them; `fds` and `interest` are `poll`'s.
+//
+// The result is INDEX-PARALLEL to `boxes` FOLLOWED BY `fds`, so it is len(boxes) + len(fds) long: the
+// first len(boxes) entries are 1 when that inbox has something (a message, a crash report, or the
+// actor's Stop) and 0 otherwise, and the rest are `poll`'s flag words. Test them in the order that
+// matters to you -- unlike `select`, which answers ONE index and makes the lowest one a priority, this
+// reports everything that is ready and leaves the ranking to you.
+//
+// It reports readiness and takes nothing out, so the `receive()` or `recv()` that follows cannot wait.
+// As in `poll`, watching nothing still waits; a negative timeout with no inbox AND no interest is an
+// Err, since nothing could end that wait.
+//
+// WHEN NOT TO USE IT. Waiting on a socket costs a different kind of wait underneath, and it does not
+// spin first the way an inbox-only wait does. An actor whose partner answers within a few microseconds
+// -- a tight request/reply between two actors -- is measurably WORSE off here than in `select`, while an
+// actor that waits tens of microseconds or more pays little. So reach for this when an actor really has
+// to watch a socket and its inbox together; keep `select`, or std::net's `c.activate`, otherwise.
+// `activate` also remains the better answer when you want line framing, back-pressure through an
+// inbox's capacity, an activated LISTENER, or a deadline that closes a client that stopped reading.
+//
+// On Windows at most 63 sockets may be watched in one call.
+pub fn selectIo(boxes: Vec[InboxRef], fds: Vec[Int], interest: Vec[Int],
+                timeoutMs: Int) -> Result[Array[Int], String] {
+  rawSelectIo(boxes, fds, interest, timeoutMs)
 }
 
 // --- a listener's own API ---

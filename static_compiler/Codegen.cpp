@@ -69,6 +69,9 @@ int builtin_extra_slots(const Expr* callee) {
         // field/call argument materializes a real temp that the scratch stacks on top of, so +2 under-
         // measured the frame by one. (Regression: pop_field_option.)
         if (n == "pop") return 3;
+        // eprint / eprintln hold the joined text for the whole call, beside each argument's string
+        // and then the native id or the "\n" -- two above what print needs. Loose on purpose.
+        if (n == "eprint" || n == "eprintln") return 2;
     }
     return 0;
 }
@@ -3307,6 +3310,39 @@ int Codegen::compile_builtin_call(const std::string& name, const std::vector<con
             else      free_if_temp(rs);
         }
         return result;                                    // Nil == the unit value
+    }
+    if (name == "eprint" || name == "eprintln") {        // -> the joined text, then ONE rawWriteErr call
+        // Standard error has no opcode: every argument is stringified exactly as print does, the pieces
+        // (and eprintln's newline) are joined with ADD, and the whole text goes to the native in one
+        // call -- one call is one piece under the world's lock, so the lines of concurrent actors
+        // never mix. The native returns nil, written over the joined text: the unit value.
+        const bool ln = name == "eprintln";
+        const int acc = alloc_temp();
+        if (args.empty()) {
+            as_.load_str(static_cast<uint8_t>(acc), ln ? "\n" : "");
+        } else {
+            for (size_t i = 0; i < args.size(); ++i) {
+                const int rs = compile_stringify(*args[i]);
+                if (i == 0) {
+                    if (rs != acc) as_.R6(OpCode::MOV, static_cast<uint8_t>(acc), static_cast<uint8_t>(rs), 0);
+                } else {
+                    as_.R6(OpCode::ADD, static_cast<uint8_t>(acc), static_cast<uint8_t>(acc),
+                           static_cast<uint8_t>(rs));
+                }
+                if (rs != acc) free_if_temp(rs);
+            }
+            if (ln) {
+                const int rn = alloc_temp();
+                as_.load_str(static_cast<uint8_t>(rn), "\n");
+                as_.R6(OpCode::ADD, static_cast<uint8_t>(acc), static_cast<uint8_t>(acc), static_cast<uint8_t>(rn));
+                free_if_temp(rn);
+            }
+        }
+        const int id_reg = alloc_temp();
+        as_.call_native_id(static_cast<uint8_t>(acc), static_cast<uint8_t>(id_reg), static_cast<uint8_t>(acc),
+                           1, static_cast<uint16_t>(NATIVE_WRITE_ERR));
+        free_if_temp(id_reg);
+        return acc;                                       // Nil == the unit value
     }
     if (name == "panic") {                               // panic(msg) -> PANIC (diverges; never returns)
         int rmsg = compile_expr(*args[0]);

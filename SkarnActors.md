@@ -182,9 +182,9 @@ fn keeper(inbox: Inbox[Inbox[Int]], unused: Int) -> () {}
 let k = spawnActor(keeper, 0)   // error: cannot be sent to an actor
 ```
 
-Function values, trait objects and open sockets are out for the same reason: each means something only in
-the memory it came from. A lambda captures variables that live in *your* memory; a socket is a number the
-operating system gave to *your* thread.
+Function values, trait objects, open sockets and open files are out for the same reason: each means
+something only in the memory it came from. A lambda captures variables that live in *your* memory; a socket
+or a `File` is a number the runtime gave to *your* actor.
 
 Notice **when** the compiler said no. Not at the `send`, but at `spawnActor` — where the address was made.
 That is the rule throughout: a `Pid[M]` is proof that `M` can be sent, so by the time you hold one, every
@@ -530,6 +530,11 @@ crashes, naming the child, and a shutdown abandons it. At its own `Stop` a super
 in **reverse** start order, each waited for before the next is told — the order a child that depends on an
 earlier one needs.
 
+The whole program ends the same way when the main program calls `std::process`'s `exit(code)`: every
+actor is told to stop and waited for before the process ends with that code. Only the main program may
+call it; in an actor, `exit` is a crash like any other ([§8](#8-when-an-actor-crashes)). An actor that
+decides the program must end sends the main program a message, and the main program calls `exit`.
+
 ## 13. Back-pressure
 
 A mailbox grows for as long as messages arrive faster than the actor reads them. A reader that is 10 %
@@ -830,6 +835,59 @@ connections are closed with it.
 One thread of the runtime reads every active connection of the program. It starts with the first
 `activate`, so a program that never calls it has no such thread at all.
 
+**The other way, and when to prefer it.** That thread is convenient and it is not free: every chunk it
+reads crosses from it into your actor. `std::poll`'s `selectIo` lets the actor keep the socket and wait on
+it *and* its inboxes itself, so nothing forwards the bytes:
+
+```rust
+use std::actor::*
+use std::net::*
+use std::poll::*
+
+fn session(inbox: Inbox[String], t: SocketHandOff) -> () {
+  let conn = match t.take() { Ok(c) => c, Err(e) => panic(e) }
+  let nb = match nonBlockingConn(conn) { Ok(n) => n, Err(e) => panic(e) }
+  let boxes = toVec([inbox.ref()])
+  let fds = toVec([nb.fd])
+  let want = toVec([READABLE])
+  loop {
+    match selectIo(boxes, fds, want, -1) {
+      Ok(r) => {
+        if r[0] != 0 {                                   // an entry per inbox, then one per socket
+          match inbox.receive() { Mail::Msg(m) => { let _ = nb.sendStr(m) }, _ => return () }
+        } else if (r[1] & (READABLE | CLOSED)) != 0 {
+          match nb.recv(4096) {
+            Ok(Received::Data(_b)) => { /* your own framing */ }
+            _ => return ()
+          }
+        }
+      }
+      Err(e) => {
+        println(e)
+        return ()
+      }
+    }
+  }
+}
+```
+
+The answer is a flag array over the inboxes **followed by** the sockets, so you test the entries in the
+order that matters to you — unlike `select`, which answers one index and makes the lowest a priority.
+
+**Which of the two.** `activate` does more for you, and for most servers that is the point: it cuts lines,
+its inbox's capacity is back-pressure on the socket, a LISTENER can be activated the same way, and
+`setSendTimeout` closes a client that stopped reading. `selectIo` does none of that — you frame the bytes,
+you keep the tail of a partial write, you decide when a silent peer has waited long enough — and in
+exchange the bytes reach you without a hop. There is also a case where it is plainly the wrong choice: an
+inbox-only wait spins briefly before it sleeps and a wait that includes a socket does not, so an actor whose
+partner answers within a few microseconds is *slower* with `selectIo` than with `select`. And it does not
+scale the way it reads: one runtime thread polling every active connection covers them all in a single
+wait, so with many connections at once `activate` is the cheaper arrangement, not the dearer one --
+measured on a server with sixteen clients, doing the reading per actor cost about a tenth of its
+throughput while making a single client's round trip markedly faster. Reach for `selectIo` when an actor
+really must watch a socket and its inbox together and latency with few connections in flight is what
+matters; keep `activate` otherwise.
+
 ### A listener that stays reachable
 
 The acceptor in §16 has the same problem one step earlier: while it waits in `accept()`, it cannot see its
@@ -1035,6 +1093,11 @@ This is the Erlang/OTP model, and the names match where the ideas do. Four diffe
 - `demo/actor_server/` — an HTTP server on actors, with a load generator.
 - `demo/chat/` — a chat server with topics on active connections (§17), a terminal client, and a
   self-test in which a client that stops reading is dropped.
+- [Sedis](https://github.com/stefan-zobel/Sedis) — not in this repository, but the one to read after the
+  demos: a Redis-compatible key-value server that uses most of this guide at once. An actor per
+  connection, a shard actor per part of the keyspace, a supervisor that restarts a shard (§9), stable
+  addresses so a restarted shard answers where its predecessor did (§11), and requests lost in a crash
+  found by numbering the batches rather than by monitors or timeouts.
 
 The [Skarn Guide](SkarnGuide.md)'s concurrency section covers the two simpler tools beside actors:
 `std::poll`, for many connections on one thread, and `std::task`, for one computation on several cores.

@@ -2533,10 +2533,18 @@ std::string cg_run_out(const std::string& src) {
     Heap heap;
     StringInterner interner;
     std::ostringstream oss;
+    // The native table is NOT optional for a prelude-linked program. Ordinary string handling lowers
+    // to natives -- std::string's indexOf / hasSubstr / replace and std::iter's split / lines all call
+    // rawIndexOfBytes -- so a run without one reaches CALL_NATIVE with no table to call through. In
+    // Debug that is an assert; in Release it is a wild jump, which is what it cost to find out.
+    static const std::vector<NativeFunc> natives = build_native_table();
     execute(m.bytecode, &heap, nullptr, &interner, m.top_frame_size,
             &m.constants, &m.struct_types, &m.string_literals, &kNoAtoms,
             &m.function_table, /*out=*/&oss,
-            &m.trait_table, m.trait_table_width, m.trait_method_count);
+            &m.trait_table, m.trait_table_width, m.trait_method_count,
+            &m.line_table, &m.function_names, &m.column_table,
+            &natives, /*script_args=*/nullptr, /*in=*/nullptr,
+            /*function_modules=*/nullptr, &m.const_arrays);
     return oss.str();
 }
 
@@ -2586,6 +2594,100 @@ std::string cg_run_native(const std::string& src,
             &m.line_table, &m.function_names, &m.column_table,
             &natives, &args, &in);
     return out.str();
+}
+
+// A string sink that remembers what it held at every flush: the order of the snapshots is the order
+// in which output was PUSHED to the stream, which a final string cannot show.
+class SyncLogBuf : public std::stringbuf {
+public:
+    std::vector<std::string> snapshots;
+protected:
+    int sync() override { snapshots.push_back(str()); return 0; }
+};
+
+// cg_run_native with that sink: the final output, and what it held at each flush.
+std::pair<std::string, std::vector<std::string>> cg_run_native_flushes(const std::string& src) {
+    const std::string full = "use std::io::*\nuse std::env::*\n" + src;
+    std::unique_ptr<svc::Module> compiled;
+    try {
+        compiled = std::make_unique<svc::Module>(svc::compile(full.c_str(), svc::builtin_prelude()));
+    } catch (const std::exception& e) {
+        return { std::string("[the test program does not compile] ") + e.what(), {} };
+    }
+    svc::Module& m = *compiled;
+    Heap heap;
+    StringInterner interner;
+    SyncLogBuf buf;
+    std::ostream out(&buf);
+    std::istringstream in;
+    static const std::vector<NativeFunc> natives = build_native_table();
+    const std::vector<std::string> no_args;
+    execute(m.bytecode, &heap, nullptr, &interner, m.top_frame_size,
+            &m.constants, &m.struct_types, &m.string_literals, &kNoAtoms,
+            &m.function_table, &out,
+            &m.trait_table, m.trait_table_width, m.trait_method_count,
+            &m.line_table, &m.function_names, &m.column_table,
+            &natives, &no_args, &in);
+    return { buf.str(), buf.snapshots };
+}
+
+// cg_run_native with the error stream captured too: { standard output, standard error }.
+std::pair<std::string, std::string> cg_run_native_err(const std::string& src) {
+    const std::string full = "use std::io::*\nuse std::env::*\n" + src;
+    std::unique_ptr<svc::Module> compiled;
+    try {
+        compiled = std::make_unique<svc::Module>(svc::compile(full.c_str(), svc::builtin_prelude()));
+    } catch (const std::exception& e) {
+        return { std::string("[the test program does not compile] ") + e.what(), {} };
+    }
+    svc::Module& m = *compiled;
+    Heap heap;
+    StringInterner interner;
+    std::ostringstream out, err;
+    std::istringstream in;
+    static const std::vector<NativeFunc> natives = build_native_table();
+    const std::vector<std::string> no_args;
+    execute(m.bytecode, &heap, nullptr, &interner, m.top_frame_size,
+            &m.constants, &m.struct_types, &m.string_literals, &kNoAtoms,
+            &m.function_table, &out,
+            &m.trait_table, m.trait_table_width, m.trait_method_count,
+            &m.line_table, &m.function_names, &m.column_table,
+            &natives, &no_args, &in, &m.function_modules, &m.const_arrays, /*task=*/nullptr, &err);
+    return { out.str(), err.str() };
+}
+
+// Compile+run `src` with `use std::process::*` and the real native registry, as a driver does: the
+// code std::process's exit ended it with (-1 if it did not), what it printed, and a fault's message.
+struct ExitRun { int code = -1; std::string out, err, fault; };
+ExitRun cg_run_exit(const std::string& src) {
+    const std::string full = "use std::process::*\n" + src;
+    ExitRun r;
+    std::unique_ptr<svc::Module> compiled;
+    try {
+        compiled = std::make_unique<svc::Module>(svc::compile(full.c_str(), svc::builtin_prelude()));
+    } catch (const std::exception& e) {
+        r.fault = std::string("[the test program does not compile] ") + e.what();
+        return r;
+    }
+    svc::Module& m = *compiled;
+    Heap heap;
+    StringInterner interner;
+    std::ostringstream out, err;
+    std::istringstream in;
+    static const std::vector<NativeFunc> natives = build_native_table();
+    const std::vector<std::string> no_args;
+    try {
+        execute(m.bytecode, &heap, nullptr, &interner, m.top_frame_size,
+                &m.constants, &m.struct_types, &m.string_literals, &kNoAtoms,
+                &m.function_table, &out,
+                &m.trait_table, m.trait_table_width, m.trait_method_count,
+                &m.line_table, &m.function_names, &m.column_table,
+                &natives, &no_args, &in, &m.function_modules, &m.const_arrays, /*task=*/nullptr, &err);
+    } catch (const ProgramExit& x) { r.code = x.code; }
+      catch (const std::exception& x) { r.fault = x.what(); }
+    r.out = out.str();
+    r.err = err.str();
+    return r;
 }
 
 void check_int(const char* name, const std::string& src, int64_t expect) {
@@ -2762,6 +2864,12 @@ void test_import_matrix() {
         // std::log builds on THREE modules (std::io, std::time, std::actor) and re-exports none of
         // them; this row pins that its own items still travel every import form.
         { "std_log",     "std::log",     "Level",        "Log",          "match Level::Warn { Level::Warn => 2, _ => 0 }", 2 },
+        // std::resp builds on std::bytes and std::net; its own items travel every import form.
+        { "std_resp",    "std::resp",    "Resp",         "encodeCommand", "match Resp::Integer(4) { Resp::Integer(n) => n, _ => 0 }", 4 },
+        // std::deque exports exactly ONE name, the type: its verbs are inherent methods, which are
+        // reached through a receiver and never enter an importer's bare namespace. So there is no
+        // second item to pin, as there is none for std::random's Rng.
+        { "std_deque",   "std::deque",   "Deque",        nullptr,         "let d: Deque[Int] = Deque::fromVec(toVec([1, 2, 3]))\n d.size()", 3 },
     };
     for (const auto& r : std_rows) {
         const std::string id = std::string("imx_") + r.id;
@@ -5036,6 +5144,17 @@ void test_codegen_combinators() {
         "let mut m: Map[Int, Int] = #{}\n m[1] = 100  m[2] = 200\n sum(map(intoIter(m), fn(kv: (Int, Int)) -> Int { let (k, v) = kv  v }))", 300);
     check_int_p("map_for_after_delete",     // a tombstone in the backing is skipped by the cursor
         "let mut m: Map[Int, Int] = #{}\n m[1] = 1  m[2] = 2  m[3] = 3\n delete(m, 2)\n let mut s = 0\n for (k, v) in m { s = s + v }\n s", 4);
+    // Keys that keep changing: the backing is rehashed to what is live (not doubled on every
+    // rehash), and nothing live is lost on the way -- values, len and a walk all agree.
+    check_int_p("map_churn_values",         // one live key at a time, 50 000 through
+        "let mut m: Map[Int, Int] = #{}\n let mut i = 0\n"
+        " while i < 50000 { m[i] = i * 2  delete(m, i - 1)  i += 1 }\n"
+        " len(m) * 1000000 + m[49999]", 1000000 + 99998);
+    check_int_p("map_churn_iterate",        // 1000 fixed keys, 20 000 passing beside them
+        "let mut m: Map[Int, Int] = #{}\n let mut j = 0\n while j < 1000 { m[j] = 1  j += 1 }\n"
+        " let mut k = 100000\n while k < 120000 { m[k] = 0  delete(m, k - 1)  k += 1 }\n"
+        " let mut n = 0\n let mut s = 0\n for (_, v) in m { n += 1  s += v }\n"
+        " n * 10000 + s", 1001 * 10000 + 1000);
 }
 
 // Lazy iteration: the Iterator / IntoIterator cursor pipeline in the tree-shakeable prelude --
@@ -5601,6 +5720,312 @@ void test_codegen_natives() {
             "println(\"${n} ${bad}\")\n";
         check_true("native_append_is_atomic", cg_run_native(src) == "600 0\n");
     }
+    // ---- File handles (std::io: openFile / File) ----
+    // Write, sync and close; read back in pieces; the end of the file is an empty read; a second close
+    // and any use after close are Errs.
+    {
+        const std::string src =
+            "fn go(p: String) -> Result[String, String] {\n"
+            "  let w = openFile(p, FileMode::Write)?\n"
+            "  w.write(toBytes(\"abc\"))?\n"
+            "  w.writeStr(\"def\")?\n"
+            "  w.sync()?\n"
+            "  w.close()?\n"
+            "  let r = openFile(p, FileMode::Read)?\n"
+            "  let head = fromBytes(r.read(2)?)\n"
+            "  let rest = fromBytes(r.readAll()?)\n"
+            "  let eof = len(r.read(10)?)\n"
+            "  r.close()?\n"
+            "  let again = match r.close() { Ok(_) => \"ok\", Err(e) => e }\n"
+            "  let after = match r.read(1) { Ok(_) => \"ok\", Err(e) => e }\n"
+            "  Ok(\"${head}|${rest}|${eof}|${again}|${after}\")\n"
+            "}\n"
+            "match go(\"" + f + "\") { Ok(s) => println(s), Err(e) => println(\"error: \" + e) }\n";
+        check_true("file_roundtrip", cg_run_native(src) ==
+            "ab|cdef|0|close: file is closed or invalid|read: file is closed or invalid\n");
+    }
+    // Write truncates; Append adds at the end, also through two handles open at once.
+    {
+        const std::string src =
+            "fn go(p: String) -> Result[String, String] {\n"
+            "  let w = openFile(p, FileMode::Write)?\n"
+            "  w.writeStr(\"old contents\")?\n"
+            "  w.close()?\n"
+            "  let t = openFile(p, FileMode::Write)?\n"
+            "  t.writeStr(\"a\")?\n"
+            "  t.close()?\n"
+            "  let x = openFile(p, FileMode::Append)?\n"
+            "  let y = openFile(p, FileMode::Append)?\n"
+            "  x.writeStr(\"b\")?\n"
+            "  y.writeStr(\"c\")?\n"
+            "  x.writeStr(\"d\")?\n"
+            "  x.close()?\n"
+            "  y.close()?\n"
+            "  readTextFile(p)\n"
+            "}\n"
+            "match go(\"" + f + "\") { Ok(s) => println(s), Err(e) => println(\"error: \" + e) }\n";
+        check_true("file_write_truncates_append_appends", cg_run_native(src) == "abcd\n");
+    }
+    // A File kept after close() is refused even when a new file took its slot -- the generation in the
+    // descriptor, as for sockets.
+    {
+        const std::string src =
+            "fn go(p: String, q: String) -> Result[String, String] {\n"
+            "  let a = openFile(p, FileMode::Write)?\n"
+            "  a.close()?\n"
+            "  let b = openFile(q, FileMode::Write)?\n"
+            "  let stale = match a.writeStr(\"x\") { Ok(_) => \"written\", Err(e) => e }\n"
+            "  b.writeStr(\"y\")?\n"
+            "  b.close()?\n"
+            "  let text = readTextFile(q)?\n"
+            "  let size = fileSize(p)?\n"
+            "  Ok(\"${stale} ${text} ${size}\")\n"
+            "}\n"
+            "match go(\"" + f + "\", \"" + f + ".2\") { Ok(s) => println(s), Err(e) => println(\"error: \" + e) }\n";
+        check_true("file_stale_descriptor_refused", cg_run_native(src) == "write: file is closed or invalid y 0\n");
+    }
+    // Reading a file that does not exist, a non-positive max, and writing to a file opened for reading.
+    {
+        const std::string src =
+            "let m = match openFile(\"" + miss + "\", FileMode::Read) { Ok(_) => \"opened\", Err(e) => e }\n"
+            "println(m)\n"
+            "let w = unwrap(openFile(\"" + f + "\", FileMode::Write))\n"
+            "let _c = w.close()\n"
+            "let r = unwrap(openFile(\"" + f + "\", FileMode::Read))\n"
+            "println(match r.read(0) { Ok(_) => \"ok\", Err(e) => e })\n"
+            "println(match r.writeStr(\"x\") { Ok(_) => \"ok\", Err(e) => e })\n"
+            "let _d = r.close()\n";
+        check_true("file_errors", cg_run_native(src) ==
+            "could not open file: " + miss + "\nread: max must be a positive Int\nwrite: could not write the file\n");
+    }
+    // Append through File is atomic per write, like appendFile: four actors, each with its own File on
+    // the same path, lose and tear no line.
+    {
+        const std::string src =
+            "use std::actor::*\n"
+            "struct Job { path: String, who: Int }\n"
+            "fn writer(inbox: Inbox[Int], j: Job) -> () {\n"
+            "  let out = unwrap(openFile(j.path, FileMode::Append))\n"
+            "  let mut i = 0\n"
+            "  while i < 150 { let _r = out.writeStr(\"w${j.who} n${i}|\\n\")\n i += 1 }\n"
+            "  let _c = out.close()\n"
+            "  for _m in inbox.messages() {}\n"
+            "}\n"
+            "let _d = deleteFile(\"" + f + "\")\n"
+            "let mut kids: Vec[Pid[Int]] = vec()\n"
+            "let mut w = 0\n"
+            "while w < 4 { push(kids, spawnActor(writer, Job { path: \"" + f + "\", who: w }))\n w += 1 }\n"
+            "let watch: Inbox[Int] = newInbox()\n"
+            "for k in kids { let _m = k.actorId().watch(watch)\n let _s = stopActor(k) }\n"
+            "let mut ended = 0\n"
+            "while ended < 4 {\n"
+            "  match watch.receive() { Mail::Exited(_, _) => { ended += 1 }, _ => { ended = 4 } }\n"
+            "}\n"
+            "let text = match readTextFile(\"" + f + "\") { Ok(s) => s, Err(e) => panic(e) }\n"
+            "let mut n = 0\n"
+            "let mut bad = 0\n"
+            "for ln in lines(text) {\n"
+            "  if len(ln) > 0 { n += 1\n"
+            "    if indexOf(ln, \"|\") != len(ln) - 1 { bad += 1 } }\n"
+            "}\n"
+            "let _d2 = deleteFile(\"" + f + "\")\n"
+            "println(\"${n} ${bad}\")\n";
+        check_true("file_append_is_atomic", cg_run_native(src) == "600 0\n");
+    }
+    // A File left open is closed when the program ends: the file can be deleted afterwards.
+    {
+        const std::string src =
+            "let w = unwrap(openFile(\"" + f + "\", FileMode::Append))\n"
+            "let _r = w.writeStr(\"left open\")\n";
+        const std::string first = cg_run_native(src);
+        std::error_code rm;
+        const bool removed = std::filesystem::remove(f, rm);
+        check_true("file_closed_at_end", first.empty() && removed && !rm);
+    }
+    // ---- flushOutput (std::io) ----
+    // The root: a partial line reaches the stream at the flush, not at the end.
+    {
+        const auto [text, snaps] = cg_run_native_flushes(
+            "print(\"abc\")\nflushOutput()\nprint(\"def\")\n");
+        check_true("flush_output_root", text == "abcdef" && !snaps.empty() && snaps[0] == "abc");
+    }
+    // An actor: its partial line goes out with its flush, while the root still waits for it.
+    {
+        const auto [text, snaps] = cg_run_native_flushes(
+            "use std::actor::*\n"
+            "fn body(inbox: Inbox[Int], boss: Pid[Int]) -> () {\n"
+            "  print(\"part\")\n"
+            "  flushOutput()\n"
+            "  let _s = send(boss, 1)\n"
+            "  for _m in inbox.messages() {}\n"
+            "}\n"
+            "let me: Inbox[Int] = mainInbox()\n"
+            "let _p = spawnActor(body, me.pid())\n"
+            "let _m = me.receive()\n");
+        check_true("flush_output_actor", text == "part" && !snaps.empty() && snaps[0] == "part");
+    }
+    // A task: its output is handed over at join, so its flush changes nothing and nothing breaks.
+    {
+        const auto [text, snaps] = cg_run_native_flushes(
+            "use std::task::*\n"
+            "fn work(x: Int) -> Int {\n"
+            "  print(\"t\")\n"
+            "  flushOutput()\n"
+            "  x + 1\n"
+            "}\n"
+            "let t = spawn(work, 1)\n"
+            "println(\"|${unwrap(t.join())}\")\n");
+        check_true("flush_output_task", text == "t|2\n");
+        (void)snaps;
+    }
+    check_true("flush_output_gate", check_has_p("flushOutput()\n0", "std::io"));
+    // ---- eprint / eprintln (standard error) ----
+    // Several arguments without a separator, the empty eprintln, and nothing of it on standard output.
+    {
+        const auto [out, err] = cg_run_native_err(
+            "eprint(\"a\", 1, true)\neprintln(\" b\", 2.5)\neprintln()\nprintln(\"out\")\n"
+            "let c: Char = 'x'\neprintln(c, Some(3))\n");
+        check_true("eprint_basic", out == "out\n" && err == "a1true b2.5\n\nxSome(3)\n");
+    }
+    // Arguments that are calls, nested calls and interpolations: the joined text and every argument's
+    // string are live at once, which the frame measure has to cover.
+    {
+        const auto [out, err] = cg_run_native_err(
+            "fn twice(s: String) -> String { s + s }\n"
+            "fn n(x: Int) -> Int { x * 10 }\n"
+            "let k = 4\n"
+            "eprintln(twice(twice(\"ab\")), n(n(k)), \"${k}-${n(k)}\", [1, 2], (k, \"t\"))\n");
+        check_true("eprint_call_args", out.empty() && err == "abababab400" "4-40[1, 2](4, \"t\")\n");
+    }
+    // Four actors, 200 lines each: every line arrives whole (one call is one piece of text).
+    {
+        const auto [out, err] = cg_run_native_err(
+            "use std::actor::*\n"
+            "fn body(inbox: Inbox[Int], who: Int) -> () {\n"
+            "  let mut i = 0\n"
+            "  while i < 200 { eprintln(\"w\", who, \" n\", i, \" |\")\n i += 1 }\n"
+            "  for _m in inbox.messages() {}\n"
+            "}\n"
+            "let watch: Inbox[Int] = newInbox()\n"
+            "let mut w = 0\n"
+            "while w < 4 {\n"
+            "  let p = spawnActor(body, w)\n"
+            "  let _m = p.actorId().watch(watch)\n"
+            "  let _s = stopActor(p)\n"
+            "  w += 1\n"
+            "}\n"
+            "let mut ended = 0\n"
+            "while ended < 4 {\n"
+            "  match watch.receive() { Mail::Exited(_, _) => { ended += 1 }, _ => { ended = 4 } }\n"
+            "}\n");
+        int lines = 0, bad = 0;
+        std::istringstream ls(err);
+        for (std::string ln; std::getline(ls, ln);) {
+            ++lines;
+            if (ln.size() < 3 || ln[0] != 'w' || ln.find('|') != ln.size() - 1) ++bad;
+        }
+        check_true("eprint_actor_lines_whole", out.empty() && lines == 800 && bad == 0);
+    }
+    // A task writes to standard error at once -- before the root's own line after the join -- while
+    // its ordinary output still waits for the join.
+    {
+        const auto [out, err] = cg_run_native_err(
+            "use std::task::*\n"
+            "fn work(x: Int) -> Int {\n"
+            "  eprintln(\"task \", x)\n"
+            "  println(\"out \", x)\n"
+            "  x + 1\n"
+            "}\n"
+            "let t = spawn(work, 1)\n"
+            "let r = unwrap(t.join())\n"
+            "eprintln(\"root \", r)\n");
+        check_true("eprint_task", out == "out 1\n" && err == "task 1\nroot 2\n");
+    }
+    // A function of one's own named eprintln shadows the builtin in its module, as for every ambient name.
+    {
+        const auto [out, err] = cg_run_native_err(
+            "fn eprintln(s: String) -> () { println(\"mine: \" + s) }\n"
+            "eprintln(\"x\")\n");
+        check_true("eprint_shadowed", out == "mine: x\n" && err.empty());
+    }
+    check_true("eprint_needs_an_argument", check_has_p("eprint()\n0", "eprint expects at least one argument"));
+    // ---- exit (std::process) ----
+    // The code comes back; a partial line printed before it is there; nothing after it runs.
+    {
+        const auto r = cg_run_exit("print(\"before\")\nexit(3)\nprintln(\"after\")\n");
+        check_true("exit_code", r.code == 3 && r.out == "before" && r.fault.empty());
+    }
+    check_true("exit_zero", cg_run_exit("println(\"x\")\nexit(0)\n").code == 0);
+    // exit is Never: the else of an if in a fn returning String, and a match arm beside Int arms.
+    {
+        const auto r = cg_run_exit(
+            "fn name(n: Int) -> String { if n > 0 { \"pos\" } else { exit(7) } }\n"
+            "fn pick(n: Int) -> Int { match n { 0 => 10, 1 => 11, _ => exit(8) } }\n"
+            "println(name(1), pick(1))\n"
+            "println(pick(5))\n");
+        check_true("exit_is_never", r.code == 8 && r.out == "pos11\n" && r.fault.empty());
+    }
+    // Deep in a chain of non-tail calls.
+    {
+        const auto r = cg_run_exit(
+            "fn down(n: Int) -> Int { if n == 0 { exit(9) } else { 1 + down(n - 1) } }\n"
+            "println(down(50))\n");
+        check_true("exit_deep", r.code == 9 && r.out.empty() && r.fault.empty());
+    }
+    check_true("exit_code_too_big",
+        cg_run_exit("exit(256)\n").fault.find("between 0 and 255, got 256") != std::string::npos);
+    check_true("exit_code_negative",
+        cg_run_exit("exit(0 - 1)\n").fault.find("between 0 and 255, got -1") != std::string::npos);
+    // An actor may not end the program: it crashes, its starter is told why, and the root goes on.
+    {
+        const auto r = cg_run_exit(
+            "use std::actor::*\n"
+            "fn body(inbox: Inbox[Int], code: Int) -> () { exit(code) }\n"
+            "let me: Inbox[Int] = mainInbox()\n"
+            "let _p = spawnActor(body, 5)\n"
+            "match me.receive() { Mail::Exited(_, why) => println(why), _ => println(\"other\") }\n"
+            "println(\"root goes on\")\n");
+        check_true("exit_in_actor_is_a_crash", r.code == -1 && r.fault.empty() &&
+                   r.out.find("only the main program may call it") != std::string::npos &&
+                   r.out.find("root goes on") != std::string::npos);
+    }
+    // ... and a task gets an error at its join.
+    {
+        const auto r = cg_run_exit(
+            "use std::task::*\n"
+            "fn work(x: Int) -> Int { exit(x) }\n"
+            "let t = spawn(work, 6)\n"
+            "match t.join() { Ok(_) => println(\"ok\"), Err(e) => println(e) }\n"
+            "println(\"root goes on\")\n");
+        check_true("exit_in_task_is_an_error", r.code == -1 && r.fault.empty() &&
+                   r.out.find("only the main program may call it") != std::string::npos &&
+                   r.out.find("root goes on") != std::string::npos);
+    }
+    // The program's ordinary end runs: an actor still waiting is told to stop and waited for.
+    {
+        const auto r = cg_run_exit(
+            "use std::actor::*\n"
+            "fn body(inbox: Inbox[Int], unused: Int) -> () {\n"
+            "  for _m in inbox.messages() {}\n"
+            "  println(\"actor stopped\")\n"
+            "}\n"
+            "let _p = spawnActor(body, 0)\n"
+            "exit(4)\n");
+        check_true("exit_ends_the_world", r.code == 4 && r.out == "actor stopped\n" && r.fault.empty());
+    }
+    check_true("exit_gate", check_has_p("exit(1)\n0", "std::process"));
+    // A function of one's own named exit wins, as for every native name.
+    {
+        const auto r = cg_run_exit(
+            "fn exit(s: String) -> () { println(\"mine \" + s) }\n"
+            "exit(\"x\")\n");
+        check_true("exit_shadowed", r.code == -1 && r.out == "mine x\n" && r.fault.empty());
+    }
+    // The raw natives stay behind std::io's gate, and a File cannot be sent to another actor.
+    check_true("file_native_gate", cg_check_fails("let _ = rawFileOpen(\"p\", 0)"));
+    check_true("file_rejected_in_message", check_has_p(
+        "use std::io::*\nuse std::actor::*\n"
+        "fn f(inbox: Inbox[File], unused: Int) -> () {}\nlet p = spawnActor(f, 0)\n0", "a file handle"));
     // mkdir + listDir: exactly one file in a fresh dir -> len 1.
     {
         const std::string src =
@@ -5803,6 +6228,21 @@ void test_codegen_process() {
         == "o");
 #endif
 
+    // cpuCount: the number is the machine's, so what is pinned is what is not. It is at least 1 --
+    // a caller sizes a pool with it and 0 would be useless -- and it does not move within a run.
+    // The first of these also catches the silent failure mode of adding a native: had the id been
+    // left out of native_return_of's NRET_PLAIN list, codegen would put an Ok(n) OBJECT in a
+    // register the checker typed Int, and `>= 1` would be comparing that object.
+    check_true("native_cpu_count", cg_run_native(
+        "println(toString(cpuCount() >= 1))") == "true\n");
+    check_true("native_cpu_count_stable", cg_run_native(
+        "println(toString(cpuCount() == cpuCount()))") == "true\n");
+    // It is reached like any other item of the module, and a function of one's own wins where it
+    // is visible -- the weak-glob rule, which a std name must obey as much as a user one.
+    check_true("cpu_count_gate", check_has_p("cpuCount()\n0", "std::process"));
+    check_int_p("cpu_count_shadowed",
+                "use std::process::*\nfn cpuCount() -> Int { 99 }\ncpuCount()", 99);
+
     // runWith feeds stdin (Bytes) to the child; `sort` reads it and exits 0. The #ifdef stays: which
     // argv names `sort` is the CALLER's choice per platform, which is what run/runWith are for --
     // no defect here, unlike the sh() case above.
@@ -5937,6 +6377,15 @@ void test_std_bytes() {
             "let a = unwrap(r.readVarI())\n let c = unwrap(r.readVarI())\n a + c", true);
     check_same("diff_bytes_str",
         U + "let mut b = bytes()\n writeStr(b, \"vMachine\")\n let mut r = ByteReader::new(b)\n len(unwrap(r.readStr()))", true);
+
+    // The byte three (NativeRegistry.h 96-98) under the oracle. indexOfByte IS rawIndexOfByte and
+    // rawParseIntRange is what std::resp's header parsing reads its lengths with, so these two hold
+    // the native and the model to one answer over the shapes that differ: found, absent, a `from`
+    // past the buffer, a negative `from`, an empty buffer, a sign, a non-digit and the 2^47-1 cap.
+    check_same("byte_index_of_byte",
+        U + "let b = toBytes(\"alpha,beta,,gamma\")\n let mut acc = 0\n acc = acc * 100 + (match indexOfByte(b, 44, 0) { Some(i) => i, None => 0 - 1 })\n acc = acc * 100 + (match indexOfByte(b, 44, 6) { Some(i) => i, None => 0 - 1 })\n acc = acc * 100 + (match indexOfByte(b, 99, 0) { Some(i) => i, None => 0 - 1 })\n acc = acc * 100 + (match indexOfByte(b, 44, 0 - 5) { Some(i) => i, None => 0 - 1 })\n acc = acc * 100 + (match indexOfByte(b, 44, 99) { Some(i) => i, None => 0 - 1 })\n acc = acc * 100 + (match indexOfByte(bytes(), 44, 0) { Some(i) => i, None => 0 - 1 })\n acc", true);
+    check_same("byte_parse_int_range",
+        U + "let d = toBytes(\"x-1234y99z140737488355328w\")\n let mut acc = 0\n acc = acc * 10 + (match rawParseIntRange(d, 1, 6) { Some(v) => v, None => 0 - 1 })\n acc = acc * 10 + (match rawParseIntRange(d, 7, 9) { Some(v) => v, None => 0 - 1 })\n acc = acc * 10 + (match rawParseIntRange(d, 0, 6) { Some(v) => v, None => 0 - 1 })\n acc = acc * 10 + (match rawParseIntRange(d, 10, 25) { Some(v) => v, None => 0 - 1 })\n acc = acc * 10 + (match rawParseIntRange(d, 5, 5) { Some(v) => v, None => 0 - 1 })\n acc = acc * 10 + (match rawParseIntRange(d, 1, 99) { Some(v) => v, None => 0 - 1 })\n acc", true);
 }
 
 // End-to-end (codegen + VM) values for radix literals, incl. the negative-valued (sign-extended)
@@ -8216,6 +8665,207 @@ void test_std_set() {
     check_same("diff_set_member", AB + "if a.isMember(2) { if a.isMember(9) { 2 } else { 1 } } else { 0 }", true);
 }
 
+// ---------------------------------------------------------------------------------------------
+// std::deque -- the opt-in generic Deque[T], two Vecs back to back, pure prelude. Mirrors
+// test_std_set: a `use std::deque::*` prefix and a gate pair. The API is small; what carries the
+// risk is the REBALANCE -- when one end runs empty, HALF of the other moves across, reversed --
+// so most of what follows drives a sequence over that split and reads the order back out. The
+// second theme is the pair of boundaries a hand-rolled ring buffer gets wrong: an empty pop and
+// an out-of-range index, both of which must ANSWER rather than return a stale slot.
+// ---------------------------------------------------------------------------------------------
+void test_std_deque() {
+    std::cout << "[codegen: std::deque]\n";
+    const std::string U = "use std::deque::*\n";
+    auto p_fails = [](const std::string& s) {
+        try { svc::compile(s.c_str(), svc::builtin_prelude()); return false; }
+        catch (const svc::CheckFailure&) { return true; }
+        catch (...) { return false; }
+    };
+    // Gating: `Deque` without `use std::deque` is out of scope -> a CheckFailure.
+    check_true("deque_gate_rejects", p_fails("let d: Deque[Int] = Deque::new()\n d.size()"));
+    check_true("deque_gate_ok",     !p_fails(U + "let d: Deque[Int] = Deque::new()\n d.size()"));
+
+    // --- size, on a deque that has only ever been pushed ---
+    check_int_p("deque_empty_size",      U + "let d: Deque[Int] = Deque::new()\n d.size()", 0);
+    check_bool_p("deque_empty_is_empty", U + "let d: Deque[Int] = Deque::new()\n d.isEmpty()", true);
+    check_int_p("deque_push_back_size",
+        U + "let mut d: Deque[Int] = Deque::new()\n d.pushBack(1)\n d.pushBack(2)\n d.size()", 2);
+    check_int_p("deque_push_front_size",
+        U + "let mut d: Deque[Int] = Deque::new()\n d.pushFront(1)\n d.pushFront(2)\n d.size()", 2);
+    check_bool_p("deque_push_then_not_empty",
+        U + "let mut d: Deque[Int] = Deque::new()\n d.pushBack(1)\n d.isEmpty()", false);
+
+    // Built from BOTH ends, so `front` and `back` each hold something and every index below has to
+    // cross the boundary between them.
+    const std::string BOTH =
+        U + "let mut d: Deque[Int] = Deque::new()\n"
+            "d.pushBack(30)\n d.pushFront(20)\n d.pushBack(40)\n d.pushFront(10)\n";
+    check_int_p("deque_size_both",  BOTH + "d.size()", 4);
+    check_int_p("deque_at_front",   BOTH + "d.at(0)", 10);
+    check_int_p("deque_at_split",   BOTH + "d.at(1) * 100 + d.at(2)", 2030);
+    check_int_p("deque_at_back",    BOTH + "d.at(3)", 40);
+    check_int_p("deque_get_in_range", BOTH + "match d.get(2) { Some(x) => x, None => -1 }", 30);
+    check_int_p("deque_get_past_end", BOTH + "match d.get(4) { Some(x) => x, None => -1 }", -1);
+    check_int_p("deque_get_negative", BOTH + "match d.get(-1) { Some(x) => x, None => -1 }", -1);
+    check_int_p("deque_peek_front", BOTH + "match d.peekFront() { Some(x) => x, None => -1 }", 10);
+    check_int_p("deque_peek_back",  BOTH + "match d.peekBack() { Some(x) => x, None => -1 }", 40);
+    check_int_p("deque_peek_leaves_it_alone",
+        BOTH + "let _ = d.peekFront()\n let _ = d.peekBack()\n d.size()", 4);
+
+    // A peek has to look into the OTHER vector when its own end is empty.
+    check_int_p("deque_peek_front_from_back_only",
+        U + "let mut d: Deque[Int] = Deque::new()\n d.pushBack(5)\n d.pushBack(6)\n"
+            "match d.peekFront() { Some(x) => x, None => -1 }", 5);
+    check_int_p("deque_peek_back_from_front_only",
+        U + "let mut d: Deque[Int] = Deque::new()\n d.pushFront(5)\n d.pushFront(6)\n"
+            "match d.peekBack() { Some(x) => x, None => -1 }", 5);
+
+    // --- the rebalance ---
+
+    // FIFO: ten pushed at the back and taken from the front, so `front` is empty at the first pop
+    // and the halving happens again and again (10 -> 5 -> 3 -> 2 -> 1).
+    check_str("deque_fifo_order",
+        cg_run_out(U + "let mut d: Deque[Int] = Deque::new()\n"
+                       "let mut i = 0\n while i < 10 { d.pushBack(i)  i += 1 }\n"
+                       "while !d.isEmpty() {\n"
+                       "  match d.popFront() { Some(x) => { print(toString(x)) }, None => {} }\n"
+                       "}"),
+        "0123456789");
+    // The mirror: pushed at the front, taken from the back.
+    check_str("deque_lifo_order",
+        cg_run_out(U + "let mut d: Deque[Int] = Deque::new()\n"
+                       "let mut i = 0\n while i < 10 { d.pushFront(i)  i += 1 }\n"
+                       "while !d.isEmpty() {\n"
+                       "  match d.popBack() { Some(x) => { print(toString(x)) }, None => {} }\n"
+                       "}"),
+        "0123456789");
+    // Pushed and popped at the SAME end: a stack never makes the other side empty, so it never
+    // rebalances at all.
+    check_str("deque_stack_order",
+        cg_run_out(U + "let mut d: Deque[Int] = Deque::new()\n"
+                       "let mut i = 0\n while i < 5 { d.pushBack(i)  i += 1 }\n"
+                       "while !d.isEmpty() {\n"
+                       "  match d.popBack() { Some(x) => { print(toString(x)) }, None => {} }\n"
+                       "}"),
+        "43210");
+    // Both directions in one program: fill from the back, drain part of it from the front (which
+    // moves half of `back` across), push at the front again, then read everything out. A move that
+    // kept the order of the half it carries, instead of reversing it, passes every test above and
+    // fails this one.
+    check_str("deque_rebalance_both_ways",
+        cg_run_out(U + "let mut d: Deque[Int] = Deque::new()\n"
+                       "let mut i = 0\n while i < 8 { d.pushBack(i)  i += 1 }\n"
+                       "let mut k = 0\n while k < 3 { let _ = d.popFront()  k += 1 }\n"
+                       "d.pushFront(90)\n d.pushFront(91)\n"
+                       "while !d.isEmpty() {\n"
+                       "  match d.popFront() { Some(x) => { print(toString(x) + \" \") }, None => {} }\n"
+                       "}"),
+        "91 90 3 4 5 6 7 ");
+    // Alternating ends until it is empty -- the pattern that would be quadratic if the rebalance
+    // carried the whole of one side instead of half, and the one that empties both sides in turn.
+    check_str("deque_alternating_drain",
+        cg_run_out(U + "let mut d: Deque[Int] = Deque::fromVec(toVec([1, 2, 3, 4, 5, 6, 7]))\n"
+                       "while !d.isEmpty() {\n"
+                       "  match d.popFront() { Some(x) => { print(toString(x)) }, None => {} }\n"
+                       "  match d.popBack() { Some(x) => { print(toString(x)) }, None => {} }\n"
+                       "}"),
+        "1726354");
+
+    // --- the two boundaries a ring buffer over a filled Vec gets wrong ---
+
+    // An empty pop ANSWERS. The shape this replaces returned its filler element and left the size
+    // at -1, which no caller could see.
+    check_int_p("deque_pop_front_empty",
+        U + "let mut d: Deque[Int] = Deque::new()\n match d.popFront() { Some(x) => x, None => -1 }", -1);
+    check_int_p("deque_pop_back_empty",
+        U + "let mut d: Deque[Int] = Deque::new()\n match d.popBack() { Some(x) => x, None => -1 }", -1);
+    check_int_p("deque_empty_pops_leave_size_0",
+        U + "let mut d: Deque[Int] = Deque::new()\n let _ = d.popFront()\n let _ = d.popBack()\n d.size()", 0);
+    check_int_p("deque_usable_after_empty_pop",
+        U + "let mut d: Deque[Int] = Deque::new()\n let _ = d.popFront()\n d.pushBack(7)\n d.at(0)", 7);
+    // An out-of-range index aborts, and the message names the deque, the index and the size -- the
+    // reason `at` tests the bounds itself instead of leaving it to the inner vector.
+    check_true("deque_at_past_end_aborts",
+        cg_faults_msg(U + "let d: Deque[Int] = Deque::fromVec(toVec([1, 2]))\n d.at(5)",
+                      "deque index 5 is out of range (size 2)"));
+    check_true("deque_at_negative_aborts",
+        cg_faults_msg(U + "let d: Deque[Int] = Deque::fromVec(toVec([1, 2]))\n d.at(-1)",
+                      "deque index -1 is out of range (size 2)"));
+
+    // --- construction from a vector, and emptying ---
+    check_int_p("deque_from_vec_size",  U + "Deque::fromVec(toVec([1, 2, 3])).size()", 3);
+    check_int_p("deque_from_vec_order",
+        U + "let d: Deque[Int] = Deque::fromVec(toVec([7, 8, 9]))\n d.at(0) * 100 + d.at(2)", 709);
+    check_int_p("deque_from_empty_vec", U + "let v: Vec[Int] = vec()\n Deque::fromVec(v).size()", 0);
+    // fromVec COPIES: what the deque does afterwards must not reach the caller's vector.
+    check_int_p("deque_from_vec_copies",
+        U + "let mut v: Vec[Int] = vec()\n push(v, 1)\n"
+            "let mut d: Deque[Int] = Deque::fromVec(v)\n d.pushBack(2)\n len(v)", 1);
+    check_int_p("deque_clear_size",
+        U + "let mut d: Deque[Int] = Deque::fromVec(toVec([1, 2, 3]))\n d.clear()\n d.size()", 0);
+    check_int_p("deque_clear_then_reuse",
+        U + "let mut d: Deque[Int] = Deque::fromVec(toVec([1, 2, 3]))\n d.clear()\n d.pushBack(9)\n d.at(0)", 9);
+
+    // --- iteration: the lazy cursor, and the eager snapshot bridge ---
+    check_str("deque_for_walks_front_to_back",
+        cg_run_out(BOTH + "for x in d { print(toString(x) + \" \") }"), "10 20 30 40 ");
+    check_int_p("deque_to_vec_len",   BOTH + "len(toVec(d))", 4);
+    check_bool_p("deque_to_vec_order", BOTH + "toVec(d) == toVec([10, 20, 30, 40])", true);
+    check_int_p("deque_lazy_pipeline",
+        BOTH + "sum(map(intoIter(d), fn(x: Int) -> Int { x * 2 }))", 200);
+    // The cursor asks the deque per element, so it has to stay right across a rebalance that
+    // happened BEFORE the walk started.
+    check_str("deque_iterates_after_rebalance",
+        cg_run_out(U + "let mut d: Deque[Int] = Deque::new()\n"
+                       "let mut i = 0\n while i < 6 { d.pushBack(i)  i += 1 }\n"
+                       "let _ = d.popFront()\n"
+                       "for x in d { print(toString(x)) }"),
+        "12345");
+    check_str("deque_of_strings",
+        cg_run_out(U + "let mut d: Deque[String] = Deque::new()\n"
+                       "d.pushBack(\"b\")\n d.pushFront(\"a\")\n d.pushBack(\"c\")\n"
+                       "for s in d { print(s) }"),
+        "abc");
+
+    // --- the split is OBSERVABLE through `==`, and that is pinned rather than hidden ---
+    // A struct compares field by field (EQ_DEEP), and the same elements reached from different ends
+    // sit in different vectors. This is a property of every representation with O(1) ends, and the
+    // module says so; `toVec` is the contents comparison it points at instead.
+    const std::string SPLIT =
+        U + "let mut a: Deque[Int] = Deque::new()\n a.pushFront(2)\n a.pushFront(1)\n a.pushBack(3)\n"
+            "let b: Deque[Int] = Deque::fromVec(toVec([1, 2, 3]))\n";
+    check_bool_p("deque_eq_sees_the_split",        SPLIT + "a == b", false);
+    check_bool_p("deque_tovec_compares_contents",  SPLIT + "toVec(a) == toVec(b)", true);
+
+    // The whole module is tree-shaken out of a program that does not use it. It has to be a program
+    // that iterates NOTHING of its own: keeping `IntoIterator` keeps every impl of it, this one
+    // included.
+    check_true("shake_default_drops_deque", [] {
+        const svc::Module m = svc::compile("42", svc::builtin_prelude());
+        for (const auto& s : m.struct_types)   if (s.name == "Deque") return false;
+        for (const auto& s : m.function_names) if (s.find("Deque") != std::string::npos) return false;
+        return true;
+    }());
+
+    // Differentials against the RefEval oracle: the module is ordinary Skarn, so the oracle walks
+    // the same code and the comparison covers the lowering of every verb above.
+    check_same("diff_deque_fifo",
+        U + "let mut d: Deque[Int] = Deque::new()\n"
+            "let mut i = 0\n while i < 12 { d.pushBack(i * 3)  i += 1 }\n"
+            "let mut acc = 0\n"
+            "while !d.isEmpty() { match d.popFront() { Some(x) => { acc = acc * 2 + x }, None => {} } }\n"
+            "acc", true);
+    check_same("diff_deque_both_ends",
+        U + "let mut d: Deque[Int] = Deque::new()\n"
+            "let mut i = 0\n while i < 9 { if i % 2 == 0 { d.pushBack(i) } else { d.pushFront(i) }  i += 1 }\n"
+            "let mut acc = 0\n"
+            "let mut k = 0\n while k < d.size() { acc = acc * 3 + d.at(k)  k += 1 }\n"
+            "acc", true);
+    check_same("diff_deque_iteration",
+        U + "let d: Deque[Int] = Deque::fromVec(toVec([4, 1, 9, 2]))\n"
+            "sum(map(intoIter(d), fn(x: Int) -> Int { x * x }))", true);
+}
+
 // =============================================================================
 // std::time -- the opt-in date/time library, pure Skarn (Hinnant civil<->days over epoch-ms). The
 // only impure surface is now()/Stopwatch (wall-clock/monotonic natives), tested VM-only. All KAT
@@ -8800,6 +9450,37 @@ void test_std_poll() {
                       "match probe() { Ok(b) => println(b), Err(e) => println(\"ERR: \" + e) }\n"),
         "true\n");
 
+    // ... and a send to a peer that does not read EVENTUALLY returns less than it was offered, which is
+    // the whole reason this module has no send-all. The test above only pinned "some bytes went", which a
+    // send that always takes everything satisfies just as well -- so the partial-write contract every
+    // caller has to honour was unguarded. It was written while a caller that depends on it was being
+    // tried (a connection actor keeping its own unwritten tail); that caller was measured away again, but
+    // the contract is the module's and every future caller needs it pinned. On this machine it refuses
+    // ~2.7 MB; the assertion is only that it refuses WITHIN 160 MB, which any bounded buffer satisfies.
+    check_str("poll_send_short_write", cg_run_native(R"SKN(
+use std::net::*
+use std::poll::*
+
+fn probe() -> Result[Bool, String] {
+  let lst = listen(0)?
+  let _peer = connect("127.0.0.1", lst.localPort()?)?      // connected, and it never reads
+  let nb = nonBlockingConn(lst.accept()?)?
+  let mut sb = stringBuilder()
+  for _ in range(0, 1024) { sb = sb.append("xxxxxxxx") }   // 8 KiB a go
+  let block = toBytes(sb.build())
+  let mut tries = 0
+  let mut short = false
+  while tries < 20000 && !short {
+    short = nb.send(block)? < len(block)
+    tries = tries + 1
+  }
+  nb.close()?
+  lst.close()?
+  Ok(short)
+}
+match probe() { Ok(b) => println(b), Err(e) => println("ERR: " + e) }
+)SKN"), "true\n");
+
     // poll must WAIT. These four exist because the first version of the two "no interest" guards
     // asserted only that no error came back -- which a call returning instantly satisfies just as
     // well as a correct one. They were green against a live defect (an empty interest set skipped the
@@ -9333,6 +10014,234 @@ fn run() -> Result[(), String] {
   Ok(())
 }
 )SKN" + RUN_END), "line:hello\nclient got pushed\nline:bye\nclosed\n");
+    // The SAME job through the other mechanism: the actor takes the socket over itself
+    // (std::poll's nonBlockingConn) and waits on it AND its inbox with selectIo -- no I/O thread, one
+    // thread crossing per request fewer. Read beside active_select_socket_and_inbox: the transcript is
+    // identical, the framing is the program's own, and the answer is a flag ARRAY over
+    // boxes ++ fds rather than one index.
+    check_str("select_io_socket_and_inbox", cg_run_native(NET + "use std::poll::*\nuse std::bytes::*\n" + R"SKN(
+struct Start { ticket: SocketHandOff, boss: Pid[String] }
+fn session(inbox: Inbox[String], s: Start) -> () {
+  let conn = match s.ticket.take() { Ok(c) => c, Err(e) => panic(e) }
+  let nb = match nonBlockingConn(conn) { Ok(n) => n, Err(e) => panic(e) }
+  let boxes = toVec([inbox.ref()])
+  let fds = toVec([nb.fd])
+  let want = toVec([READABLE])
+  let mut buf = bytes()
+  loop {
+    match selectIo(boxes, fds, want, 5000) {
+      Ok(r) => {
+        if r[0] != 0 {
+          match inbox.receive() {
+            Mail::Msg(m) => { let _ = nb.sendStr(m + "\n") },
+            _ => return ()
+          }
+        } else if (r[1] & (READABLE | CLOSED)) != 0 {
+          match nb.recv(4096) {
+            Ok(Received::Data(b)) => {
+              appendBytes(buf, b)
+              loop {
+                let i = rawIndexOfByte(buf, 10, 0)
+                if i < 0 { break }
+                send(s.boss, "line:" + sliceBytes(buf, 0, i))
+                buf = subBytes(buf, i + 1, len(buf))
+              }
+            },
+            Ok(Received::Closed) => {
+              send(s.boss, "closed")
+              return ()
+            },
+            Ok(Received::WouldBlock) => {},
+            Err(e) => {
+              send(s.boss, "err:" + e)
+              return ()
+            }
+          }
+        } else {
+          send(s.boss, "timeout")
+          return ()
+        }
+      },
+      Err(e) => {
+        send(s.boss, "selectIo:" + e)
+        return ()
+      }
+    }
+  }
+}
+fn run() -> Result[(), String] {
+  let boss: Inbox[String] = mainInbox()
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  client.setTimeout(5000)?
+  let conn = srv.accept()?
+  let pid = spawnActor(session, Start { ticket: conn.handOff()?, boss: boss.pid() })
+  client.sendStr("hello\n")?
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  send(pid, "pushed")
+  match client.recvLine()? { Some(l) => println("client got " + l), None => println("EOF") }
+  client.sendStr("bye\n")?
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  client.close()?
+  match boss.receive() { Mail::Msg(m) => println(m), _ => println("?") }
+  Ok(())
+}
+)SKN" + RUN_END), "line:hello\nclient got pushed\nline:bye\nclosed\n");
+
+    // Sockets that COME AND GO while the wait lives -- the case that was missing, and the one that hurt.
+    // A worker holds a changing set of connections; each round one joins, every open one must still be
+    // woken, and the oldest is closed. Closing and reopening makes Windows REUSE handle values, and the
+    // per-socket event association is cached, so a reused handle inheriting its predecessor's entry gets
+    // no association of its own and its readiness wakes nothing. Level-triggered polling still found the
+    // data on the next round, so with a deadline it cost one timeout and with none it waited for ever --
+    // invisible to every test that kept its sockets. The deadline here turns that into a FAILURE.
+    check_str("select_io_socket_churn", cg_run_native(NET + "use std::poll::*\n" + R"SKN(
+enum WMsg { Take(SocketHandOff), Stop }
+
+fn churnWorker(inbox: Inbox[WMsg], back: Pid[Int]) -> () {
+  let boxes = toVec([inbox.ref()])
+  let mut conns: Map[Int, NbConn] = #{}
+  let mut going = true
+  while going {
+    let mut fds: Vec[Int] = vec()
+    let mut want: Vec[Int] = vec()
+    for (fd, _) in conns {
+      push(fds, fd)
+      push(want, READABLE)
+    }
+    match selectIo(boxes, fds, want, 5000) {
+      Ok(r) => {
+        if r[0] != 0 {
+          match inbox.receive() {
+            Mail::Msg(WMsg::Take(t)) => {
+              match t.take() {
+                Ok(c) => {
+                  match nonBlockingConn(c) {
+                    Ok(nb) => { conns[nb.fd] = nb },
+                    Err(_) => {}
+                  }
+                },
+                Err(_) => {}
+              }
+            },
+            Mail::Msg(WMsg::Stop) => { going = false },
+            _ => { going = false }
+          }
+        } else {
+          let mut gone: Vec[Int] = vec()
+          let mut k = 0
+          while k < len(fds) {
+            if (r[1 + k] & (READABLE | CLOSED)) != 0 {
+              let c = conns[fds[k]]
+              match c.recv(4096) {
+                Ok(Received::Data(b)) => { send(back, len(b)) },
+                Ok(Received::WouldBlock) => {},
+                _ => { push(gone, fds[k]) }
+              }
+            }
+            k += 1
+          }
+          for fd in gone {
+            let c = conns[fd]
+            let _ = c.close()
+            let _d = delete(conns, fd)
+          }
+        }
+      },
+      Err(_) => { going = false }
+    }
+  }
+}
+
+fn run() -> Result[(), String] {
+  let me: Inbox[Int] = mainInbox()
+  let lst = listen(0)?
+  let port = lst.localPort()?
+  let w = spawnActor(churnWorker, me.pid())
+  let one = toBytes("x")
+  let mut open: Vec[TcpConn] = vec()
+  let mut round = 0
+  let mut lost = 0
+  while round < 40 {
+    let mut c = connect("127.0.0.1", port)?
+    let s = lst.accept()?
+    send(w, WMsg::Take(s.handOff()?))
+    push(open, c)
+    let mut j = 0
+    while j < len(open) {
+      let mut cc = open[j]
+      cc.send(one)?
+      match me.receiveTimeout(4000) {
+        Some(Mail::Msg(_)) => {},
+        _ => { lost += 1 }
+      }
+      j += 1
+    }
+    // keep two, so the set changes without ever emptying
+    while len(open) > 2 {
+      let mut dead = open[0]
+      dead.close()?
+      let mut rest: Vec[TcpConn] = vec()
+      let mut q = 1
+      while q < len(open) {
+        push(rest, open[q])
+        q += 1
+      }
+      open = rest
+    }
+    round += 1
+  }
+  send(w, WMsg::Stop)
+  lst.close()?
+  println("lost " + toString(lost))
+  Ok(())
+}
+)SKN" + RUN_END), "lost 0\n");
+
+    // Readiness is LEVEL-triggered, and this is the test that would catch it silently becoming edge-
+    // triggered. The reader takes ONE byte per wake and leaves the rest buffered; on Windows the
+    // socket's readiness is a WSAEventSelect event, whose FD_READ fires on an edge, so a version that
+    // read its flags from the event would report the first byte and then wait for ever.
+    check_str("select_io_partial_read_stays_readable", cg_run_native(NET + "use std::poll::*\n" + R"SKN(
+fn nibbler(inbox: Inbox[Int], s: SocketHandOff) -> () {
+  let conn = match s.take() { Ok(c) => c, Err(e) => panic(e) }
+  let nb = match nonBlockingConn(conn) { Ok(n) => n, Err(e) => panic(e) }
+  let boxes = toVec([inbox.ref()])
+  let fds = toVec([nb.fd])
+  let want = toVec([READABLE])
+  let mut got = 0
+  let mut rounds = 0
+  while got < 4 && rounds < 40 {
+    rounds = rounds + 1
+    match selectIo(boxes, fds, want, 5000) {
+      Ok(r) => {
+        if (r[1] & READABLE) != 0 {
+          match nb.recv(1) {
+            Ok(Received::Data(b)) => { got = got + len(b) },
+            _ => { rounds = 40 }
+          }
+        }
+      },
+      Err(_) => { rounds = 40 }
+    }
+  }
+  println("read " + toString(got) + " in " + toString(rounds) + " rounds")
+  let _ = nb.close()
+}
+fn run() -> Result[(), String] {
+  let srv = listen(0)?
+  let mut client = connect("127.0.0.1", srv.localPort()?)?
+  let conn = srv.accept()?
+  let _ = spawnActor(nibbler, conn.handOff()?)
+  client.sendStr("wxyz")?
+  let me: Inbox[Int] = mainInbox()
+  match me.receiveTimeout(5000) { _ => {} }
+  client.close()?
+  srv.close()?
+  Ok(())
+}
+)SKN" + RUN_END), "read 4 in 4 rounds\n");
+
     // Lines: "\n" and "\r\n" both end a line, a last line without one still arrives at the end of the
     // stream, and Eof comes after it. Raw: the chunks, joined, are exactly what was sent.
     check_str("active_lines_and_raw", cg_run_native(NET + R"SKN(
@@ -10832,6 +11741,177 @@ void test_std_supervisor() {
 // one line format. Every case reads the file back, so it checks what was WRITTEN, not what was
 // returned; the timestamp differs on every run, so only the rest of the line is compared.
 // =============================================================================
+// std::resp: RESP2 values, the encoder, the incremental decoder and the client. Pure Skarn.
+void test_std_resp() {
+    std::cout << "[codegen: std::resp]\n";
+    const std::string U = "use std::resp::*\nuse std::bytes::*\n";
+    // A sample of every kind of value, nested arrays and a bulk string with a line break included.
+    const std::string VALUES =
+        "let values: Vec[Resp] = toVec([\n"
+        "  Resp::Simple(\"OK\"), Resp::Error(\"ERR bad\"), Resp::Integer(-42), Resp::Integer(140737488355327),\n"
+        "  Resp::Bulk(\"line1\\r\\nline2\"), Resp::Bulk(\"\"), Resp::Null, Resp::NullArray,\n"
+        "  Resp::Arr(toVec([Resp::Integer(1), Resp::Arr(toVec([Resp::Bulk(\"x\"), Resp::Null])), Resp::Arr(vec())]))\n"
+        "])\n"
+        "let mut all = bytes()\n"
+        "for v in values { appendResp(all, v) }\n";
+    // Collects every complete value a reader holds.
+    const std::string DRAIN =
+        "fn drain(mut r: RespReader, mut into: Vec[Resp]) -> () {\n"
+        "  loop { match unwrap(r.next()) { Some(v) => push(into, v), None => break } }\n"
+        "}\n";
+    const std::string BAR =
+        "fn bar(ws: Vec[String]) -> String {\n"
+        "  let mut s = \"\"\n"
+        "  for w in ws { s = if len(s) == 0 { w } else { s + \"|\" + w } }\n"
+        "  s\n"
+        "}\n";
+
+    // The wire form of each kind.
+    check_str("resp_encode_each_kind", cg_run_native(U +
+        "let mut out = bytes()\n"
+        "appendSimple(out, \"OK\")\n appendError(out, \"ERR x\")\n appendInteger(out, -7)\n"
+        "appendBulk(out, \"a\\r\\nb\")\n appendNull(out)\n appendNullArray(out)\n appendArrayHeader(out, 2)\n"
+        "print(fromBytes(out))\n"
+        "print(fromBytes(encodeCommand(toVec([\"SET\", \"k\", \"\"]))))\n"),
+        "+OK\r\n-ERR x\r\n:-7\r\n$4\r\na\r\nb\r\n$-1\r\n*-1\r\n*2\r\n*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$0\r\n\r\n");
+    // A line break cannot end a simple string or an error early: it is written as a space.
+    check_str("resp_simple_line_break_replaced", cg_run_native(U +
+        "print(fromBytes(Resp::Simple(\"two\\r\\nlines\").encode()))\n"
+        "print(fromBytes(Resp::Error(\"ERR a\\nb\").encode()))\n"),
+        "+two  lines\r\n-ERR a b\r\n");
+    // Round trip, fed one byte at a time: every value comes out exactly once, equal to what went in.
+    check_str("resp_roundtrip_byte_at_a_time", cg_run_native(U + DRAIN + VALUES +
+        "let mut rd = RespReader::new()\n"
+        "let mut got: Vec[Resp] = vec()\n"
+        "let mut i = 0\n"
+        "while i < len(all) {\n"
+        "  rd.feed(subBytes(all, i, i + 1))\n"
+        "  drain(rd, got)\n"
+        "  i += 1\n"
+        "}\n"
+        "println(\"${len(got)} ${got == values} ${rd.buffered()}\")\n"),
+        "9 true 0\n");
+    // The whole stream cut in two at EVERY position decodes to the same values.
+    check_str("resp_every_split_point", cg_run_native(U + DRAIN + VALUES +
+        "let mut ok = 0\n"
+        "let mut cut = 0\n"
+        "while cut <= len(all) {\n"
+        "  let mut r = RespReader::new()\n"
+        "  let mut g: Vec[Resp] = vec()\n"
+        "  r.feed(subBytes(all, 0, cut))\n"
+        "  drain(r, g)\n"
+        "  r.feed(subBytes(all, cut, len(all)))\n"
+        "  drain(r, g)\n"
+        "  if g == values { ok += 1 }\n"
+        "  cut += 1\n"
+        "}\n"
+        "println(toString(ok == len(all) + 1))\n"),
+        "true\n");
+    // Commands: arrays of bulk strings and inline commands (spaces and tabs, "\n" or "\r\n", empty lines
+    // skipped), in the order they came.
+    check_str("resp_next_command", cg_run_native(U + BAR +
+        "let mut r = RespReader::new()\n"
+        "let mut b = encodeCommand(toVec([\"SET\", \"k\", \"v w\"]))\n"
+        "appendBytes(b, \"\\r\\nPING\\r\\n  ECHO \\t hi \\n*0\\r\\n\")\n"
+        "appendBytes(b, encodeCommand(toVec([\"GET\", \"k\"])))\n"
+        "r.feed(subBytes(b, 0, 20))\n"
+        "loop { match unwrap(r.nextCommand()) { Some(ws) => println(bar(ws)), None => break } }\n"
+        "println(\"--\")\n"
+        "r.feed(subBytes(b, 20, len(b)))\n"
+        "loop { match unwrap(r.nextCommand()) { Some(ws) => println(bar(ws)), None => break } }\n"
+        "println(toString(r.buffered()))\n"),
+        "--\nSET|k|v w\nPING\nECHO|hi\nGET|k\n0\n");
+    // Malformed input is an Err, never a trap: an unknown type byte, a bad integer, a bulk string of the
+    // wrong length, a "\r" without "\n", a negative length other than -1, an integer beyond 48 bits.
+    check_str("resp_malformed_is_err", cg_run_native(U +
+        "for bad in [\"?x\\r\\n\", \":12a\\r\\n\", \"$3\\r\\nabcd\\r\\n\", \":1\\rx\", \"$-2\\r\\n\", \":140737488355328\\r\\n\"] {\n"
+        "  let mut r = RespReader::new()\n"
+        "  r.feed(toBytes(bad))\n"
+        "  println(match r.next() { Ok(Some(v)) => \"value \" + v.render(), Ok(None) => \"more\", Err(e) => e })\n"
+        "}\n"
+        "let mut c = RespReader::new()\n"
+        "c.feed(toBytes(\"*1\\r\\n:1\\r\\n\"))\n"
+        "println(match c.nextCommand() { Ok(_) => \"accepted\", Err(e) => e })\n"),
+        "protocol error: unknown type byte 63\n"
+        "protocol error: invalid integer\n"
+        "protocol error: bulk string not followed by \\r\\n\n"
+        "protocol error: expected \\r\\n after \\r\n"
+        "protocol error: invalid bulk length\n"
+        "protocol error: invalid integer\n"
+        "protocol error: expected '$' in a command\n");
+    // The limits: a header line with no end in sight, arrays nested past 64, an inline line past 64 KiB.
+    check_str("resp_limits", cg_run_native(U +
+        "let mut r = RespReader::new()\n"
+        "r.feed(toBytes(\"+\" + repeatStr(\"a\", 70000)))\n"
+        "println(match r.next() { Ok(None) => \"more\", Ok(Some(_)) => \"value\", Err(e) => e })\n"
+        "let mut d = RespReader::new()\n"
+        "d.feed(toBytes(repeatStr(\"*1\\r\\n\", 70) + \":1\\r\\n\"))\n"
+        "println(match d.next() { Ok(None) => \"more\", Ok(Some(_)) => \"value\", Err(e) => e })\n"
+        "let mut i = RespReader::new()\n"
+        "i.feed(toBytes(repeatStr(\"a\", 70000)))\n"
+        "println(match i.nextCommand() { Ok(None) => \"more\", Ok(Some(_)) => \"command\", Err(e) => e })\n"),
+        "protocol error: line too long\nprotocol error: arrays nested too deep\n"
+        "protocol error: inline command too long\n");
+    // render: redis-cli's way of showing a value.
+    check_str("resp_render", cg_run_native(U +
+        "println(Resp::Arr(toVec([Resp::Bulk(\"a\"), Resp::Arr(toVec([Resp::Integer(1), Resp::Simple(\"OK\")])), Resp::Null])).render())\n"
+        "println(Resp::Arr(vec()).render())\n"
+        "println(Resp::Error(\"ERR no\").render())\n"),
+        "1) \"a\"\n2) 1) (integer) 1\n   2) OK\n3) (nil)\n(empty array)\n(error) ERR no\n");
+    // std::bytes' two helpers.
+    check_str("bytes_index_of_and_sub", cg_run_native("use std::bytes::*\n"
+        "let b = toBytes(\"a\\r\\nbc\\r\\n\")\n"
+        "println(\"${indexOfByte(b, 13, 0)} ${indexOfByte(b, 13, 2)} ${indexOfByte(b, 7, 0)} ${indexOfByte(b, 97, -5)}\")\n"
+        "println(fromBytes(subBytes(b, 3, 5)) + \"|\" + fromBytes(subBytes(b, -2, 1)) + \"|\" + toString(len(subBytes(b, 4, 2))) + \"|\" + toString(len(subBytes(b, 0, 99))))\n"),
+        "Some(1) Some(5) None Some(0)\nbc|a|0|7\n");
+    // The client against a small server in this process: one call at a time, then a pipeline of four.
+    // The server reads 7 bytes at a time, so every command reaches it in pieces.
+    check_str("resp_client_call_and_pipeline", cg_run_native(U +
+        "use std::net::*\nuse std::actor::*\n"
+        "fn server(inbox: Inbox[Int], boss: Pid[Int]) -> () {\n"
+        "  let l = unwrap(listen(0))\n"
+        "  let _s = send(boss, unwrap(l.localPort()))\n"
+        "  let c = unwrap(l.accept())\n"
+        "  let mut rd = RespReader::new()\n"
+        "  let mut going = true\n"
+        "  while going {\n"
+        "    let chunk = unwrap(c.recv(7))\n"
+        "    if len(chunk) == 0 { going = false }\n"
+        "    else {\n"
+        "      rd.feed(chunk)\n"
+        "      let mut more = true\n"
+        "      while more {\n"
+        "        match unwrap(rd.nextCommand()) {\n"
+        "          Some(args) => {\n"
+        "            let mut out = bytes()\n"
+        "            if args[0] == \"PING\" { appendSimple(out, \"PONG\") }\n"
+        "            else if args[0] == \"ECHO\" { appendBulk(out, args[1]) }\n"
+        "            else if args[0] == \"NIL\" { appendNull(out) }\n"
+        "            else { appendError(out, \"ERR unknown command '\" + args[0] + \"'\") }\n"
+        "            unwrap(c.send(out))\n"
+        "          },\n"
+        "          None => { more = false }\n"
+        "        }\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "  let _c = c.close()\n"
+        "}\n"
+        "let boss: Inbox[Int] = mainInbox()\n"
+        "let _p = spawnActor(server, boss.pid())\n"
+        "let port = match boss.receive() { Mail::Msg(p) => p, _ => 0 }\n"
+        "let mut cl = unwrap(RespClient::connect(\"127.0.0.1\", port))\n"
+        "println(unwrap(cl.call(toVec([\"PING\"]))).render())\n"
+        "println(unwrap(cl.call(toVec([\"ECHO\", \"hi\\r\\nthere\"]))).render())\n"
+        "let answers = unwrap(cl.pipeline(toVec([toVec([\"ECHO\", \"1\"]), toVec([\"NIL\"]), toVec([\"NOPE\"]), toVec([\"PING\"])])))\n"
+        "for a in answers { println(a.render()) }\n"
+        "let _x = cl.close()\n"),
+        "PONG\n\"hi\r\nthere\"\n\"1\"\n(nil)\n(error) ERR unknown command 'NOPE'\nPONG\n");
+    // std::resp builds on std::bytes and std::net and re-exports neither.
+    check_true("resp_does_not_reexport_bytes", cg_check_fails("use std::resp::*\nlet n = len(subBytes(bytes(), 0, 0))"));
+    check_true("resp_does_not_reexport_net", cg_check_fails("use std::resp::*\nlet c = connect(\"h\", 1)"));
+}
+
 void test_std_log() {
     std::cout << "[codegen: std::log]\n";
     namespace fs = std::filesystem;
@@ -11655,7 +12735,34 @@ static_assert(static_cast<int>(svc::TokKind::UShrEq) - static_cast<int>(svc::Tok
 // rawActiveSetSendTimeout (id 87) is NOT listed either: its whole effect is on how long a send to a
 // peer that does not read may wait, i.e. time and the network. Pinned by active_send_deadline in
 // vm_tests and the active_send_* tests here.
-static_assert(NATIVE_COUNT == 88,
+// The file-handle five (ids 88-92: rawFileOpen / rawFileRead / rawFileWrite / rawFileSync /
+// rawFileClose) are NOT listed: they are file I/O (OS side effects, like writeFile and appendFile).
+// Pinned by test_file_handles in vm_tests and the file_* tests here.
+// flushOutput (id 93) is NOT listed either: its whole effect is WHEN output reaches the stream, which
+// a model that compares the final text cannot see. Pinned by the flush_output_* tests here.
+// rawWriteErr (id 94) is NOT listed either, and needs no entry: it has no Skarn name. It is what the
+// builtins eprint / eprintln lower to, and the oracle models THOSE (its err_ text, compared by run_diff).
+// exit (id 95) IS listed: the code it ends with and what was printed before it are deterministic, and
+// run_diff compares both (ProgramExit on the VM side, ExitSignal in the oracle).
+// The byte three (ids 96-98: rawIndexOfByte / rawIndexOfBytes / rawParseIntRange) ARE listed: they
+// are pure functions of a buffer and three Ints -- no I/O, no time, no other isolate -- so two
+// implementations can be held to the same answer, which is the whole test here. The oracle models
+// them in RefEval.cpp, and they are exercised through their std wrappers (indexOfByte, indexOf,
+// split, replace, and std::resp's reader) and directly by byte_index_of_byte / byte_parse_int_range.
+// rawSelectIo (id 99) is NOT listed: it answers which inboxes have mail and which sockets are ready,
+// i.e. how the isolates interleave AND what the network did -- the two things a model cannot reproduce.
+// It is rawSelect's and rawPoll's category, and both are out for the same reason. Pinned by
+// test_select_io in vm_tests and the select_io_* tests here.
+// rawCpuCount (id 100) IS listed, for rawOsId's reason and with rawOsId's limit: it gives one
+// answer per machine, and it cannot change while a program runs. It is NOT mirrored, though. The
+// oracle calls vm_usable_cpus() -- the same function the native calls -- instead of keeping a second
+// copy of its platform branches: rawOsId's mirror is three `return`s and stays honest, an affinity
+// query is twenty lines and would not. So be clear about what this entry buys: NOT that the number
+// is right (no fixture on one machine could show that), but that the LOWERING is -- the checker's
+// type, the CALL_NATIVE, the Plain unwrap (a native missing from native_return_of's NRET_PLAIN list
+// comes back as Ok(n), silently), and the std::process gate. That is the half a compiler change can
+// break, and it is the half the differential now watches.
+static_assert(NATIVE_COUNT == 101,
               "a native was added or removed -- decide whether it is deterministic (and so belongs in "
               "refeval::DIFFERENTIABLE_NATIVES), then update this pin");
 
@@ -11709,8 +12816,10 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
     // sources: a svc::CheckFailure (the checker rejected it -- ill-typed) vs. any other throw
     // from svc::compile (codegen: the frame emitter self-check / a CodegenError -- a well-typed
     // program lowering cannot handle). Only the former is a generator bug.
-    std::string vm_canon, vm_out, vm_err;
+    std::string vm_canon, vm_out, vm_err, vm_errout;
     bool vm_fault = false, vm_reject = false, vm_cgfail = false;
+    bool vm_exited = false;
+    int  vm_exit_code = 0;
     try {
         svc::Module m = svc::compile(src.c_str(), prelude);
         try {
@@ -11726,25 +12835,31 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
             Heap heap;
             StringInterner interner;
             std::ostringstream oss;
+            std::ostringstream err_oss;   // eprint / eprintln
             // The native registry + the SAME fixed args/stdin the oracle sees, so a generated native
             // call is deterministic and cross-checkable. Harmless for programs with no native calls.
             static const std::vector<NativeFunc> natives = build_native_table();
             std::istringstream vm_in(nenv.stdin_text);
-            auto res = execute(img.bytecode, &heap, nullptr, &interner, img.top_frame_size,
-                               &img.constants, &img.struct_types, &img.string_literals, &kNoAtoms,
-                               &img.function_table, &oss,
-                               &img.trait_table, img.trait_table_width, img.trait_method_count,
-                               &img.line_table, &img.function_names, &img.column_table,
-                               &natives, &nenv.args, &vm_in,
-                               /*function_modules=*/nullptr, &img.const_arrays);
-            vm_canon = refeval::canonicalize(vm_to_rt(res.get_reg_base()[0], m));
+            try {
+                auto res = execute(img.bytecode, &heap, nullptr, &interner, img.top_frame_size,
+                                   &img.constants, &img.struct_types, &img.string_literals, &kNoAtoms,
+                                   &img.function_table, &oss,
+                                   &img.trait_table, img.trait_table_width, img.trait_method_count,
+                                   &img.line_table, &img.function_names, &img.column_table,
+                                   &natives, &nenv.args, &vm_in,
+                                   /*function_modules=*/nullptr, &img.const_arrays, /*task=*/nullptr, &err_oss);
+                vm_canon = refeval::canonicalize(vm_to_rt(res.get_reg_base()[0], m));
+            } catch (const ProgramExit& x) { vm_exited = true; vm_exit_code = x.code; }   // std::process's exit
             vm_out = oss.str();
+            vm_errout = err_oss.str();
         } catch (const std::exception& e) { vm_fault = true; vm_err = e.what(); }   // runtime trap
     } catch (const svc::CheckFailure& e) { vm_reject = true; vm_err = e.what(); }   // checker rejected
       catch (const std::exception& e)    { vm_cgfail = true; vm_err = e.what(); }   // codegen threw
 
-    std::string rf_canon, rf_out, rf_err;
+    std::string rf_canon, rf_out, rf_err, rf_errout;
     bool rf_fault = false, rf_unsup = false, rf_gap = false, rf_reject = false;
+    bool rf_exited = false;
+    int  rf_exit_code = 0;
     refeval::Coverage rf_cov;
     try {
         svc::Program prog = svc::parse_check(src.c_str(), prelude);   // check only (throws on reject)
@@ -11752,7 +12867,9 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
         rf_fault = rr.faulted; rf_unsup = rr.unsupported; rf_gap = rr.oracle_gap; rf_err = rr.fault_msg;
         rf_cov = rr.coverage;
         rf_out = rr.output;
-        if (!rr.faulted) rf_canon = refeval::canonicalize(rr.value);
+        rf_errout = rr.err_output;
+        rf_exited = rr.exited; rf_exit_code = rr.exit_code;
+        if (!rr.faulted && !rr.exited) rf_canon = refeval::canonicalize(rr.value);
     } catch (const std::exception& e) { rf_reject = true; rf_err = e.what(); }
 
     if (vm_reject || rf_reject)   // ill-typed on either path
@@ -11764,16 +12881,22 @@ DiffOutcome run_diff(const std::string& src, bool with_prelude) {
     if (rf_unsup)                 // the oracle declines by design => an honest skip
         return { DiffOutcome::Unsupported, {}, {}, rf_err };
 
-    const bool agree = (vm_fault == rf_fault) &&
-                       (vm_fault || (vm_canon == rf_canon && vm_out == rf_out));
+    // An exit is compared by its code instead of the program's value (there is none).
+    const bool agree = (vm_fault == rf_fault) && (vm_exited == rf_exited) &&
+                       (vm_fault || ((vm_exited ? vm_exit_code == rf_exit_code : vm_canon == rf_canon) &&
+                                     vm_out == rf_out && vm_errout == rf_errout));
     // Construct coverage is folded in ONLY on agreement, and here -- the single place both the corpus
     // (check_same) and the sweep (test_generated) pass through, so neither can be forgotten. "Covered"
     // therefore means the oracle evaluated the construct AND the bytecode produced the same answer.
     if (agree) merge_coverage(rf_cov);
     DiffOutcome o;
     o.kind    = agree ? DiffOutcome::Agree : DiffOutcome::Disagree;
-    o.vm_desc = vm_fault ? "<fault> " + vm_err : vm_canon + "  out=" + vm_out;
-    o.rf_desc = rf_fault ? "<fault> " + rf_err : rf_canon + "  out=" + rf_out;
+    if (vm_exited) vm_canon = "<exit " + std::to_string(vm_exit_code) + ">";
+    if (rf_exited) rf_canon = "<exit " + std::to_string(rf_exit_code) + ">";
+    o.vm_desc = vm_fault ? "<fault> " + vm_err
+                         : vm_canon + "  out=" + vm_out + (vm_errout.empty() ? "" : "  err=" + vm_errout);
+    o.rf_desc = rf_fault ? "<fault> " + rf_err
+                         : rf_canon + "  out=" + rf_out + (rf_errout.empty() ? "" : "  err=" + rf_errout);
     return o;
 }
 
@@ -12475,6 +13598,14 @@ void test_torture() {
         "let mut m: Map[Int, Int] = #{}\n m[1] = 10  m[2] = 20  m[3] = 30\n let mut s = 0\n for (k, v) in m { s = s + k + v }\n s", true);
     check_same("diff_map_intoiter_sum",
         "let mut m: Map[Int, Int] = #{}\n m[7] = 1  m[8] = 2  m[9] = 3\n fold(intoIter(m), 0, fn(a: Int, kv: (Int, Int)) -> Int { let (k, v) = kv  a + k + v })", true);
+    // Keys that keep changing, beside fixed ones: the rehashes that shrink the backing must keep
+    // every live entry (a walk's sum, len and a read of each fixed key).
+    check_same("diff_map_churn",
+        "let mut m: Map[Int, Int] = #{}\n let mut j = 0\n while j < 300 { m[j] = j  j += 1 }\n"
+        " let mut k = 5000\n while k < 9000 { m[k] = k  delete(m, k - 1)  k += 1 }\n"
+        " let mut s = 0\n for (key, v) in m { s = s + key + v }\n"
+        " let mut r = 0\n j = 0\n while j < 300 { r = r + m[j]  j += 1 }\n"
+        " s * 1000 + len(m) * 7 + r", true);
     // String streaming (split / lines): pure prelude, cross-checked vs the reference interpreter.
     check_same("diff_split_empties",
         "let v = collect(split(\"a,,b,\", \",\"))  len(v) * 10 + len(v[1]) + len(v[3])", true);
@@ -13383,6 +14514,7 @@ void test_differential() {
     check_same("diff_native_readfile_err","use std::io::*\nisErr(readFile(\"svc_diff_no_such_file_zzz_9x7\"))", true); // Result wrap (discriminant)
     check_same("diff_native_readall",     "use std::io::*\nreadAllStdin()", true);                                // Plain String
     check_same("diff_native_rawosid",     "use std::process::*\nrawOsId()", true);                                // Plain Int
+    check_same("diff_native_rawcpucount", "use std::process::*\nrawCpuCount()", true);                            // Plain Int
     check_same("diff_native_readline",    "use std::io::*\nmatch readLine() { Some(s) => s, None => \"eof\" }", true); // Option wrap
     check_same("diff_native_in_lambda",   // a lambda body referencing a NATIVE -- capture analysis must
         "use std::io::*\n"
@@ -13395,6 +14527,15 @@ void test_differential() {
     // multi-arg (no separator, newline once).
     check_same("diff_print_multi",   "print(\"a\", 1, \"b\")", true);
     check_same("diff_println_multi", "println(1, 2, 3)", true);
+    // eprint / eprintln: the error stream is compared as well.
+    check_same("diff_eprint",   "eprint(\"a\", 1)\n eprint(2.5, true)\n 0", true);
+    check_same("diff_eprintln", "eprintln(42)\n eprintln()\n eprintln(\"x\", [1, 2])\n println(\"out\")", true);
+    check_same("diff_eprint_loop", "for i in [1, 2, 3] { eprint(i, \" \") }\n eprintln(\"end\")", true);
+    check_same("diff_exit", "use std::process::*\n print(\"a\")\n eprintln(\"b\")\n exit(3)\n println(\"c\")", true);
+    check_same("diff_exit_in_match",
+        "use std::process::*\n fn f(n: Int) -> Int { match n { 0 => 1, _ => exit(n) } }\n"
+        " println(f(0))\n println(f(2))", true);
+    check_same("diff_exit_range", "use std::process::*\n exit(300)", true);
 }
 
 } // namespace
@@ -13670,6 +14811,7 @@ int main(int argc, char** argv) {
     test_range_const_bounds();
     test_map_helpers();
     test_std_set();
+    test_std_deque();
     test_std_time();
     test_std_cli();
     test_std_hash();
@@ -13679,6 +14821,7 @@ int main(int argc, char** argv) {
     test_std_actor();
     test_std_supervisor();
     test_std_log();
+    test_std_resp();
     test_interpolation();
     test_format();
     test_string_iter();

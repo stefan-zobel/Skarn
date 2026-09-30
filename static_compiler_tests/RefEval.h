@@ -147,7 +147,10 @@ static_assert(static_cast<size_t>(svc::TokKind::Eof)     < 128, "Coverage::op to
 struct RunResult {
     RtValue     value;             // the program's top-level value
     std::string output;            // accumulated print/println text
+    std::string err_output;        // accumulated eprint/eprintln text
     bool        faulted = false;   // a panic / declined program / runtime error occurred
+    bool        exited  = false;   // the program called std::process's exit (not a fault)
+    int         exit_code = 0;     // its code, valid iff `exited`
     bool        unsupported = false;   // declined BY DESIGN (see the header comment) -> an honest skip
     bool        oracle_gap  = false;   // declined because the oracle lacks the construct -> a FAILURE
     std::string fault_msg;
@@ -175,8 +178,15 @@ inline constexpr std::string_view DIFFERENTIABLE_NATIVES[] = {
     "fileExists", "isFile", "isDir", "fileSize", "readFile",
     // Pure parsing
     "parseInt", "parseDouble",
+    // Pure byte searching and range parsing -- functions of a buffer and three Ints, nothing else
+    "rawIndexOfByte", "rawIndexOfBytes", "rawParseIntRange",
     // The running platform -- one answer per machine, mirrored below with the same #ifdef
     "rawOsId",
+    // How many threads the process may run at once -- one answer for the length of a run. NOT
+    // mirrored: both sides call vm_usable_cpus(), so this checks the lowering, not the number
+    "rawCpuCount",
+    // Ending the program -- deterministic: the code, and what was printed before it
+    "exit",
     // std::math -- pure libm, bit-identical on both sides
     "sqrt", "cbrt", "exp", "ln", "pow", "hypot", "abs",
     "sin", "cos", "tan", "asin", "acos", "atan",

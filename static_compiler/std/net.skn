@@ -46,15 +46,6 @@ pub fn listen(port: Int) -> Result[TcpListener, String] {
 
 // --- buffered-text helper internals (built on the byte core) ---
 
-// Index of the first byte == `target` at or after `from` in `b`, or -1 if none.
-fn _indexOfByte(b: Bytes, target: Int, from: Int) -> Int {
-  let n = len(b)
-  let mut i = from
-  let mut found = -1
-  while i < n && found < 0 { if b[i] == target { found = i }  i = i + 1 }
-  found
-}
-
 // The sub-range b[lo, hi) copied into a fresh buffer -- one bulk memcpy (_appendBytesRange) into a
 // pre-sized buffer, not a per-byte push loop. recvLine calls this once per line to keep the tail.
 fn _sub(b: Bytes, lo: Int, hi: Int) -> Bytes {
@@ -99,7 +90,7 @@ impl TcpConn {
   // with nothing buffered; a final unterminated line is returned once, then None.
   fn recvLine(mut self) -> Result[Option[String], String] {
     loop {
-      let idx = _indexOfByte(self.buf, 10, 0)
+      let idx = rawIndexOfByte(self.buf, 10, 0)
       if idx >= 0 {
         let end = if idx > 0 && self.buf[idx - 1] == 13 { idx - 1 } else { idx }
         let line = sliceBytes(self.buf, 0, end)
