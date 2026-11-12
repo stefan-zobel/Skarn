@@ -67,6 +67,8 @@ total 15.07
 
 ## Documentation
 
+The four guides below are also published as a website: <https://stefan-zobel.github.io/Skarn/>
+
 - [Skarn in 30 minutes](SkarnIn30Minutes.md): the working core, enough to write a real program.
 - [The Skarn Language Guide](SkarnGuide.md): the whole language and the cost model.
 - [The Skarn Standard Library](SkarnStdlib.md): every function of every `std` module, with worked examples.
