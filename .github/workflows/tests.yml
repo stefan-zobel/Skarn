@@ -1,0 +1,98 @@
+name: Tests
+
+# Manual only: start it from the Actions tab ("Run workflow") and pick a platform.
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Which platform(s) to test
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - macOS
+          - Windows
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS (arm64, Release)
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'macOS' }}
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Configure
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -- -j$(sysctl -n hw.logicalcpu)
+
+      # The four suites and the Python gates are all registered with ctest.
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows:
+    name: Windows (x64, Release)
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'Windows' }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - uses: microsoft/setup-msbuild@v3
+
+      - name: Build
+        run: msbuild vMachine.sln /m /p:Configuration=Release /p:Platform=x64 /v:minimal
+
+      # One step per gate, so a failure names the gate in the run's summary.
+      - name: vm_tests
+        run: x64\Release\vm_tests.exe
+
+      - name: vm_tests (fault probe)
+        run: x64\Release\vm_tests.exe --fault-probe
+
+      - name: static_compiler_tests
+        run: x64\Release\static_compiler_tests.exe
+
+      - name: skarn_lsp selftest
+        run: x64\Release\skarn_lsp.exe --selftest
+
+      - name: Guide claims
+        run: python tests/guide_claims/run_guide_claims.py --exe x64/Release/skarnvm.exe --no-examples
+
+      - name: Guide examples
+        run: python tests/guide_claims/run_guide_examples.py --exe x64/Release/skarnvm.exe
+
+      - name: Examples
+        run: python tests/run_examples.py --exe x64/Release/skarnvm.exe
+
+      - name: Guide links
+        run: python tests/guide_claims/check_anchors.py
+
+      - name: Doc anchors
+        run: python tests/check_doc_anchors.py
+
+      - name: Demos
+        run: python tests/run_demos.py --exe x64/Release/skarnvm.exe
+
+      - name: Standard library reference
+        run: python tests/check_stdlib_reference.py --exe x64/Release/skarnvm.exe
+
+      - name: Highlighters
+        run: python tests/check_highlighters.py --exe x64/Release/skarnvm.exe
+
+      - name: Live output
+        run: python tests/check_live_output.py --exe x64/Release/skarnvm.exe
