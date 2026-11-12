@@ -49,6 +49,8 @@ a { color: var(--accent); }
 .docs a { color: var(--muted); text-decoration: none; }
 .docs a:hover, .docs a[aria-current] { color: var(--fg); }
 .docs a[aria-current] { font-weight: 600; }
+.repo { margin-left: auto; color: var(--muted); text-decoration: none; }
+.repo:hover { color: var(--fg); }
 
 /* ---- layout ---- */
 .page { display: flex; align-items: flex-start; max-width: 80rem; margin: 0 auto; }
