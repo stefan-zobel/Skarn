@@ -173,6 +173,18 @@ fs.rmSync(dist, { recursive: true, force: true });
 fs.mkdirSync(dist, { recursive: true });
 for (const f of ["style.css", "toc.js"]) fs.copyFileSync(path.join(here, f), path.join(dist, f));
 
+// site/static/ is copied to the site root as it is: files that must exist under a fixed name
+// (a search engine's site-verification file, for instance). They are not pages, so they are
+// neither in the sitemap nor link-checked.
+const staticDir = path.join(here, "static");
+const staticFiles = fs.existsSync(staticDir)
+  ? fs.readdirSync(staticDir, { withFileTypes: true }).filter((e) => e.isFile()).map((e) => e.name)
+  : [];
+for (const f of staticFiles) {
+  if (fs.existsSync(path.join(dist, f))) fail(`site/static/${f} would overwrite a generated file`);
+  fs.copyFileSync(path.join(staticDir, f), path.join(dist, f));
+}
+
 for (const d of DOCS) {
   const text = fs.readFileSync(path.join(repoRoot, d.md), "utf8").replace(/^﻿/, "");
   const md = makeMarkdown(d.md);
@@ -248,7 +260,10 @@ fs.writeFileSync(path.join(dist, "sitemap.xml"), sitemap);
 fs.writeFileSync(path.join(dist, "robots.txt"), `User-agent: *\nAllow: /\n\nSitemap: ${BASE_URL}sitemap.xml\n`);
 
 // ---- verification: the build fails on a link that does not resolve ----------------------------------
-const generated = fs.readdirSync(dist).filter((f) => f.endsWith(".html")).sort();
+const generated = fs
+  .readdirSync(dist)
+  .filter((f) => f.endsWith(".html") && !staticFiles.includes(f))
+  .sort();
 if (JSON.stringify(generated) !== JSON.stringify([...pages].sort())) {
   fail(`the sitemap lists ${pages.join(", ")} but dist holds ${generated.join(", ")}`);
 }
