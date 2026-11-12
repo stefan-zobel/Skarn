@@ -6,3 +6,12 @@
 # Explicitly ensure .cpp, .h and .cs files always use CRLF locally
 *.h text eol=crlf
 *.cpp text eol=crlf
+
+*.html linguist-documentation
+*.js linguist-documentation
+*.css linguist-documentation
+*.ts linguist-documentation
+*.mjs linguist-documentation
+*.mts linguist-documentation
+*.cts linguist-documentation
+*.map linguist-documentation

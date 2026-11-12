@@ -22,3 +22,7 @@ benchmarks/results/
 benchmarks/.DS_Store
 demo/.DS_Store
 .DS_Store
+
+# The generated Pages site and its dependencies
+/site/dist
+/site/node_modules

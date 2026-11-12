@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<meta name="description" content="{{DESCRIPTION}}">
+<link rel="canonical" href="{{CANONICAL}}">
+<link rel="stylesheet" href="style.css">
+<script>document.documentElement.classList.add("js")</script>
+</head>
+<body class="{{LAYOUT}}">
+<header class="top">
+  <a class="brand" href="index.html">Skarn</a>
+  <nav class="docs" aria-label="Documents">{{NAV}}</nav>
+</header>
+<div class="page">
+{{SIDEBAR}}
+<main>
+{{CONTENT}}
+</main>
+</div>
+<script src="toc.js" defer></script>
+</body>
+</html>
